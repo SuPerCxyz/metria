@@ -8,3 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+metria-core = { path = "../metria-core" }

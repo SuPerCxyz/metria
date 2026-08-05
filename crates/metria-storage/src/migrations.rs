@@ -156,11 +156,12 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut conn = open(&path, &DbOptions::default()).unwrap();
         let applied = migrate_embedded(&mut conn, None).unwrap();
-        assert_eq!(applied, vec![1]);
+        assert!(!applied.is_empty(), "至少一个迁移");
+        assert!(applied.windows(2).all(|w| w[0] < w[1]), "版本应升序");
         // 重复迁移应无操作
         let applied2 = migrate_embedded(&mut conn, None).unwrap();
         assert!(applied2.is_empty());
-        assert_eq!(current_version(&conn).unwrap(), 1);
+        assert_eq!(current_version(&conn).unwrap(), *applied.last().unwrap());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

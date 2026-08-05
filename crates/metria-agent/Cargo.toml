@@ -8,3 +8,23 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+notify = "6"
+zstd = "0.13"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+thiserror = "2"
+tracing = "0.1"
+ctrlc = "3"
+metria-core = { path = "../metria-core" }
+metria-storage = { path = "../metria-storage" }
+metria-protocol = { path = "../metria-protocol" }
+metria-pricing = { path = "../metria-pricing" }
+metria-adapter-api = { path = "../metria-adapter-api" }
+metria-adapter-claude = { path = "../metria-adapter-claude" }
+metria-adapter-codex = { path = "../metria-adapter-codex" }
+metria-adapter-opencode = { path = "../metria-adapter-opencode" }
+
+[dev-dependencies]
+tempfile = "3"

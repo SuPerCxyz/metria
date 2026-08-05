@@ -1,0 +1,7 @@
+{"timestamp":"2026-08-03T08:00:00.000Z","type":"session_meta","payload":{"session_id":"malformed-1","cwd":"/home/x/y","cli_version":"0.142.0"}}
+{"timestamp":"2026-08-03T08:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"第一条正常消息"}}
+{"timestamp":"2026-08-03T08:00:02.000Z","type":"response_item","payload":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"截断的 JSON"}}
+{"timestamp":"2026-08-03T08:00:03.000Z","type":"response_item","payload":{"type":"message","id":"m2","role":"assistant","content":[{"type":"output_text","text":"未知字段容忍"},{"type":"future_block","data":1}],"unknown_field":true}}
+{"timestamp":"2026-08-03T08:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call","id":"c1","name":"Read","input":{"path":"a.txt"},"call_id":"call_bad"}}
+{"timestamp":"2026-08-03T08:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_bad","output":{"content":"data"}}}
+{"timestamp":"2026-08-03T08:00:06.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5000,"cached_input_tokens":100,"cache_write_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":30,"total_tokens":5200}}}}

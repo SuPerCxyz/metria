@@ -23,6 +23,8 @@ pub struct HubConfig {
     pub timezone: chrono_tz::Tz,
     /// 日志过滤器。
     pub log_filter: String,
+    /// Demo 模式：启动时生成合成数据。
+    pub demo: bool,
 }
 
 impl Default for HubConfig {
@@ -34,6 +36,7 @@ impl Default for HubConfig {
             content_mode: ContentMode::Metadata,
             timezone: chrono_tz::Tz::Asia__Shanghai,
             log_filter: "info".to_string(),
+            demo: false,
         }
     }
 }
@@ -69,6 +72,9 @@ impl HubConfig {
             .unwrap_or(chrono_tz::Tz::Asia__Shanghai);
 
         let log_filter = var_opt("METRIA_LOG")?.unwrap_or_else(|| "info".to_string());
+        let demo = var_opt("METRIA_DEMO")?
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
         Ok(Self {
             listen,
@@ -77,6 +83,7 @@ impl HubConfig {
             content_mode,
             timezone,
             log_filter,
+            demo,
         })
     }
 

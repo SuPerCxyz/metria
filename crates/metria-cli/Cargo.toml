@@ -9,8 +9,16 @@ repository.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 metria-core = { path = "../metria-core" }
 metria-hub = { path = "../metria-hub" }
+metria-agent = { path = "../metria-agent" }
+metria-adapter-api = { path = "../metria-adapter-api" }
+metria-adapter-claude = { path = "../metria-adapter-claude" }
+metria-adapter-codex = { path = "../metria-adapter-codex" }
+metria-adapter-opencode = { path = "../metria-adapter-opencode" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 

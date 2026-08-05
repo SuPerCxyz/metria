@@ -23,7 +23,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// 启动 Metria Hub 服务
-    Hub,
+    Hub {
+        /// Demo 模式：生成确定性合成数据并展示
+        #[arg(long, default_value_t = false)]
+        demo: bool,
+    },
     /// 启动 Metria Agent（Collector）
     Agent,
     /// 将客户端数据源目录导入为归一化事件
@@ -86,13 +90,48 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Hub => match run_hub() {
+        Command::Agent => match run_agent() {
+            Ok(code) => code,
+            Err(e) => {
+                tracing::error!(%e, "agent 启动失败");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Hub { demo } => match run_hub(demo) {
             Ok(code) => code,
             Err(e) => {
                 tracing::error!(%e, "hub 启动失败");
                 ExitCode::FAILURE
             }
         },
+        Command::Import {
+            source,
+            path,
+            dry_run,
+            out,
+        } => match metria_cli::import::run_import(&source, &path, dry_run, out.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("import 失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Doctor {
+            adapter,
+            hub,
+            database,
+            spool,
+            traffic,
+        } => {
+            match metria_cli::doctor::run_doctor(adapter.as_deref(), hub, database, spool, traffic)
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("doctor 失败: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         other => {
             eprintln!("{NOT_IMPLEMENTED}: {other:?}");
             ExitCode::FAILURE
@@ -107,13 +146,20 @@ fn run_healthcheck() -> Result<(), String> {
     Ok(())
 }
 
-fn run_hub() -> Result<ExitCode, metria_hub::HubError> {
+fn run_agent() -> Result<ExitCode, metria_agent::AgentError> {
+    let cfg = metria_agent::AgentConfig::from_env()?;
+    metria_agent::run(cfg)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_hub(demo: bool) -> Result<ExitCode, metria_hub::HubError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| metria_hub::HubError::Io(std::io::Error::other(e)))?;
     rt.block_on(async {
-        let cfg = metria_hub::HubConfig::from_env()?;
+        let mut cfg = metria_hub::HubConfig::from_env()?;
+        cfg.demo = demo;
         metria_hub::serve(cfg).await?;
         Ok(ExitCode::SUCCESS)
     })

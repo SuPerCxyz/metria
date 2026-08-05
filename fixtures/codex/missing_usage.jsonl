@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-03T07:00:00.000Z","type":"session_meta","payload":{"session_id":"no-usage-sess","cwd":"/home/bob/x","cli_version":"0.140.0"}}
+{"timestamp":"2026-08-03T07:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"没有 token_count 的会话"}}
+{"timestamp":"2026-08-03T07:00:02.000Z","type":"response_item","payload":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"这是响应"}]}}
+{"timestamp":"2026-08-03T07:00:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","completed_at":1,"duration_ms":1000}}
+{"timestamp":"2026-08-03T07:00:04.000Z","type":"response_item","payload":{"type":"unknown_future_item","future_field":{"x":1}}}
+{"timestamp":"2026-08-03T07:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}}}

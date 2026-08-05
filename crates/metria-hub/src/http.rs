@@ -28,7 +28,7 @@ async fn health() -> impl IntoResponse {
     })
 }
 
-async fn static_fallback(uri: Uri) -> Response {
+pub async fn static_fallback(uri: Uri) -> Response {
     let path = uri.path();
     let static_path = path
         .strip_prefix("/static/")

@@ -9,13 +9,24 @@ repository.workspace = true
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+async-stream = "0.3"
+zstd = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 chrono-tz = { version = "0.10" }
 tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
 metria-core = { path = "../metria-core" }
+metria-protocol = { path = "../metria-protocol" }
 metria-storage = { path = "../metria-storage" }
+
+[dev-dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+tempfile = "3"
+serde_json = "1" 

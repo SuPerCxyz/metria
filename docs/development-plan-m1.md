@@ -10,9 +10,40 @@
 | 阶段 | 状态 | 完成日期 |
 |---|---|---|
 | S0 工程骨架 | ✅ 完成 | 2026-08-05 |
-| S1 统一领域模型 + Adapter | ⬜ 进行中 | - |
-| S2 Agent 与 Hub 闭环 | ⬜ 待执行 | - |
-| S3 精简 Web + Demo | ⬜ 待执行 | - |
+| S1 统一领域模型 + Adapter | ✅ 完成 | 2026-08-05 |
+| S2 Agent 与 Hub 闭环 | ✅ 完成 | 2026-08-05 |
+| S3 精简 Web + Demo | ✅ 完成 | 2026-08-05 |
+
+### S2 完成记录（2026-08-05）
+
+- metria-protocol：注册/心跳/批传/状态/配置线协议 + 上限（256 事件 / 256KiB 压缩 / 8MiB 解压 / 深度 32 / 事件 2MiB）。
+- metria-pricing：内置目录（来源标注 builtin_catalog）+ 用户规则，优先级 reported > user 精确 > user 通配 > builtin > unavailable；5 单测。
+- metria-agent（blocking 栈，无 tokio）：本地 Spool（事件/游标/批次/死信/来源健康，事务一致，满则停止采集+告警，断网积压，重启续传）；notify 监听 + 增量扫描 + 每 5 分钟 reconcile；zstd 批传 + 指数退避 + 部分成功 + 幂等（event_id）；心跳；Node ID 优先级（显式 > 持久化 > 生成）。
+- metria-hub：SQLite schema（004-005 迁移共 27 表）；注册/心跳/批传/status/config；认证中间件（admin 会话 + collector token 分离，token 仅存哈希）；批量 ingest 幂等（新插入/重复/失败三清单）+ 增量 rollup（hourly/daily）；查询 API 子集（overview/timeseries/breakdown/nodes/clients/models/calls/sessions/traffic/data-quality）；SSE（token query 兼容 EventSource）；argon2 占位 + 环境注入 admin。
+- e2e 集成测试（metria-hub/tests/e2e.rs）：真实 HTTP 全链路（注册→上传→幂等→overview→401 未授权→非法批次 400→错误 token 401）。
+- CLI 端到端验证：fixture 扫描→spool→上传→hub 落库→rollup→查询全通；断网补传语义验证。
+- doctor --spool/--database/--hub 补全。
+
+### S3 完成记录（2026-08-05）
+
+- Web（Preact+TS+Vite+uPlot）：hash 路由、登录、侧边导航（总览/Nodes/Agent 工具/模型/会话/调用/流量/数据质量）、全局时间范围选择器（from/to/时区/粒度/快捷项/URL 持久化）、uPlot 时间序列、统计卡片、表格、Light/Dark、SSE 增量刷新（EventSource + token）、移动端布局、空/加载/错误态。
+- Demo 模式：`metria hub --demo` 确定性合成数据（3 节点 / 3 客户端 / 5 模型 / 4 项目 / 7 天），走同一 ingest 路径，不读真实目录；启动约 5s。
+- 浏览器冒烟（agent-browser）：登录→总览（37.5M input / $152 cost / 163MiB 估算流量带范围）→Nodes 表格→Traffic 图表→暗色模式全部正常。
+
+### S1 完成记录（2026-08-05）
+
+- metria-core 领域模型全量落地：Id/EventId(blake3)/ContentHash、MicroUsd 金额、全部枚举、Node/Collector/Client/Source/SourceCursor/SourceError、Project、Session/Turn/Message、ModelCall、UsageEvent（finalize 生成稳定 event_id + token 非负校验）、TrafficEstimate/TrafficProfile/TrafficProfileSample、Pricing 模型、ToolEvent/SubagentRelation；归一化（模型/Provider/通配匹配）、脱敏（路径哈希/密钥/URL）、时间分桶（IANA）、内容分类（13 类启发式）。
+- metria-traffic：版本化 Traffic Profile（builtin/user/adapter，来源优先级 + p50/p75/p90 校验）、估算核心（reconstructed/partial/content_bytes/token_profile/unavailable 优先级、full_context/stateful_reference/mixed/unknown、cache 因子、reasoning 保守处理、强制下界<中值<上界、置信度）、8 单测。
+- metria-adapter-api：SourceAdapter trait（discover/scan/health/traffic_capabilities）+ ScanIdentity、ScanBatch、AdapterCapabilities、TrafficCapabilities、分类错误、JSONL 流式解析（限长/半行/非 UTF-8 容忍）、fixture 测试框架。
+- Claude Code Adapter：projects/*.jsonl + 扁平布局发现；modern entry 解析（type/user/assistant/message.usage/cache_*_input_tokens/tool_use/tool_result/summary/ai-title）；turn 分组；ModelCall/UsageEvent/TrafficEstimate 关联；partial_reconstruction + FullContext/FullContentSent；golden+malformed+光标增量 8 测试。
+- Codex Adapter：sessions/**/rollout-*.jsonl 发现；session_meta/user_message/token_count(last_token_usage)/response_item(message/reasoning/custom_tool_call/output) 解析；重复 token_count 去重；全零 usage 不产假调用；previous_response_id 检测→stateful_reference；golden+malformed+cursor 6 测试 + 真机冒烟（20 来源/51 调用）。
+- OpenCode Adapter：全局 opencode.db + project/*/storage 双布局发现；只读打开（READ_ONLY+busy_timeout+query_only，不改 PRAGMA/不 migration）；message/part 解析（text/reasoning/tool/step）；session.cost→reported_cost(微美元)；parent_id→subagent 关系；rowid 增量游标；schema drift 检测；golden+cursor+drift+lock 4 测试。
+- metria import：NDJSON 导出（session/call/usage/traffic），真机导入 14876 次调用验证。
+- metria doctor：--adapter（发现/健康/扫描摘要）、--traffic（能力表）、--hub（healthz 连通性）。
+- fixtures：claude（golden_full/missing_usage/malformed/non_utf8/truncated_tail）、codex（golden_full/missing_usage/malformed）。
+- 门禁：fmt/clippy(-D warnings)/test(98)/web build/docker build/compose config 全绿。
+
+已知限制：adapter 尚不产出 traffic_profile_samples（自动学习在 S2/M2）；Claude 未做子代理关联（isSidechain 无父引用）；Codex 会话级 model 聚合以 message/agent 为粒度。
 
 ### S0 完成记录（2026-08-05）
 
