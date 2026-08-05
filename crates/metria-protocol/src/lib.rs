@@ -172,6 +172,13 @@ pub fn valid_event_id(id: &str) -> bool {
 pub fn valid_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "session" | "source" | "call" | "usage" | "traffic" | "tool" | "subagent"
+        "session"
+            | "source"
+            | "call"
+            | "usage"
+            | "traffic"
+            | "tool"
+            | "subagent"
+            | "traffic_sample"
     )
 }

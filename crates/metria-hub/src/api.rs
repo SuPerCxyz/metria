@@ -112,6 +112,20 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/by-model", get(traffic_by_model))
         .route("/api/v1/traffic/by-provider", get(traffic_by_provider))
         .route("/api/v1/data-quality", get(data_quality))
+        .route(
+            "/api/v1/traffic/profiles",
+            get(traffic_profiles_list).post(traffic_profiles_create),
+        )
+        .route(
+            "/api/v1/traffic/profiles/{id}",
+            axum::routing::delete(traffic_profiles_delete),
+        )
+        .route(
+            "/api/v1/traffic/profiles/learn",
+            post(traffic_profiles_learn),
+        )
+        .route("/api/v1/traffic/profiles/test", post(traffic_profiles_test))
+        .route("/api/v1/traffic/reestimate", post(traffic_reestimate))
         .route("/api/v1/pricing/catalogs", get(pricing_catalogs))
         .route(
             "/api/v1/pricing/rules",
@@ -168,6 +182,142 @@ fn token_query_ok(st: &AppState, query: Option<&str>) -> bool {
         .find(|(k, _)| k == "token")
         .map(|(_, v)| st.sessions.lock().unwrap().contains_key(v.as_str()))
         .unwrap_or(false)
+}
+
+// ============ Traffic Profiles ============
+
+async fn traffic_profiles_list(State(st): State<AppState>) -> Response {
+    Json(serde_json::json!({ "profiles": st.db.list_traffic_profiles(None) })).into_response()
+}
+
+async fn traffic_profiles_create(
+    State(st): State<AppState>,
+    Json(v): Json<serde_json::Value>,
+) -> Response {
+    match st.db.insert_user_profile(&v) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profile_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn traffic_profiles_delete(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match st.db.delete_user_profile(&id) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn traffic_profiles_learn(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    let min_samples = p.limit.unwrap_or(1).max(1);
+    match st.db.aggregate_learned_profiles(min_samples) {
+        Ok(n) => {
+            st.sse.publish("traffic.profile_updated", "{}");
+            Json(serde_json::json!({ "ok": true, "profiles_created": n })).into_response()
+        }
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "learn_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileTestRequest {
+    client: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+}
+
+async fn traffic_profiles_test(
+    State(st): State<AppState>,
+    Json(req): Json<ProfileTestRequest>,
+) -> Response {
+    let profiles = st.db.load_traffic_profiles_parsed();
+    let client = req.client.clone().unwrap_or_else(|| "claude-code".into());
+    let est = metria_traffic::estimate_with_candidates(
+        &metria_traffic::EstimateInput {
+            client: &client,
+            provider: req.provider.as_deref(),
+            model: req.model.as_deref(),
+            input_tokens: req.input_tokens,
+            output_tokens: req.output_tokens,
+            cache_read_tokens: req.cache_read_tokens,
+            cache_write_tokens: req.cache_write_tokens,
+            reasoning_tokens: req.reasoning_tokens,
+            streaming: true,
+            request_text: None,
+            response_text: None,
+            request_reconstruction_quality: metria_core::model::ReconstructionQuality::None,
+            response_reconstruction_quality: metria_core::model::ReconstructionQuality::None,
+            context_transport_mode: metria_core::model::ContextTransportMode::Unknown,
+            cache_transport_behavior: metria_core::model::CacheTransportBehavior::Unknown,
+        },
+        &profiles,
+    );
+    match est {
+        Ok(out) => Json(serde_json::json!({
+            "ok": true,
+            "estimated_total_wire_bytes": out.estimated_total_wire_bytes,
+            "lower_bound_bytes": out.lower_bound_bytes,
+            "upper_bound_bytes": out.upper_bound_bytes,
+            "confidence": out.confidence,
+            "estimation_source": serde_json::to_value(out.estimation_source).unwrap_or(serde_json::json!("unknown")),
+            "notes": out.notes,
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "test_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReestimateRequest {
+    model: Option<String>,
+}
+
+async fn traffic_reestimate(
+    State(st): State<AppState>,
+    Json(req): Json<ReestimateRequest>,
+) -> Response {
+    match st.db.reestimate_calls(req.model.as_deref()) {
+        Ok(n) => {
+            st.sse.publish("traffic.profile_updated", "{}");
+            Json(serde_json::json!({
+                "ok": true,
+                "reestimated": n,
+                "note": "重新估算生成新版本并保留旧版本",
+            }))
+            .into_response()
+        }
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reestimate_failed",
+            &e.to_string(),
+        ),
+    }
 }
 
 // ============ Pricing ============
@@ -611,6 +761,7 @@ async fn ingest_batch(State(st): State<AppState>, body: axum::body::Bytes) -> Re
                 .db
                 .insert_usage(v, resolved.as_deref().unwrap_or_default()),
             "traffic" => st.db.insert_traffic(v),
+            "traffic_sample" => st.db.insert_traffic_profile_sample(v),
             "tool" => st.db.insert_tool(v),
             "subagent" => st.db.insert_subagent(v),
             other => Err(metria_storage::StorageError::Query(format!(

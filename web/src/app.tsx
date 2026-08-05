@@ -11,6 +11,7 @@ import { Models } from './pages/Models'
 import { Sessions, SessionDetail } from './pages/Sessions'
 import { Calls, CallDetail } from './pages/Calls'
 import { Traffic } from './pages/Traffic'
+import { TrafficProfiles } from './pages/TrafficProfiles'
 import { DataQuality } from './pages/DataQuality'
 import { Pricing } from './pages/Pricing'
 
@@ -22,6 +23,7 @@ const NAV = [
   ['sessions', '会话'],
   ['calls', '调用'],
   ['traffic', '流量'],
+  ['traffic-profiles', 'Traffic Profiles'],
   ['pricing', '价格'],
   ['data-quality', '数据质量'],
 ] as const
@@ -43,6 +45,8 @@ function Page() {
       return route.id ? <CallDetail id={route.id} /> : <Calls />
     case '/traffic':
       return <Traffic />
+    case '/traffic-profiles':
+      return <TrafficProfiles />
     case '/pricing':
       return <Pricing />
     case '/data-quality':

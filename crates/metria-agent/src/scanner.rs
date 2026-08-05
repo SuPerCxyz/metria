@@ -279,6 +279,78 @@ pub fn normalize_batch(
         });
     }
 
+    // Traffic 自动学习样本：调用同时有 token 与 payload 字节时生成
+    for s in &batch.traffic_estimates {
+        let Some(call) = batch.model_calls.iter().find(|c| c.id == s.model_call_id) else {
+            continue;
+        };
+        if let (Some(in_tok), Some(req_bytes)) = (call.input_tokens, s.request_payload_bytes) {
+            // 仅从完整重建生成学习样本（partial 重建会系统性低估字节）
+            if in_tok > 0
+                && req_bytes > 0
+                && s.request_reconstruction_quality
+                    == metria_core::model::ReconstructionQuality::Complete
+            {
+                let bpt = (req_bytes as f64 / in_tok as f64 * 100.0).round() / 100.0;
+                let event_id = EventId::from_content(&format!(
+                    "tps:{client}|{provider:?}|{model:?}|request|{in_tok}|{req_bytes}",
+                    client = s.client_id,
+                    provider = s.provider,
+                    model = s.model,
+                ));
+                out.push(PendingEvent {
+                    event_id: event_id.as_str().to_string(),
+                    kind: "traffic_sample".into(),
+                    payload: serde_json::json!({
+                        "id": event_id.as_str(),
+                        "client": s.client_id,
+                        "provider": s.provider,
+                        "model": s.model,
+                        "content_profile": "unknown",
+                        "direction": "request",
+                        "token_count": in_tok,
+                        "payload_bytes": req_bytes,
+                        "bytes_per_token": bpt,
+                        "reconstruction_quality": format!("{:?}", s.request_reconstruction_quality).to_ascii_lowercase(),
+                        "source_hash": event_id.as_str(),
+                    }),
+                });
+            }
+        }
+        if let (Some(out_tok), Some(resp_bytes)) = (call.output_tokens, s.response_payload_bytes) {
+            if out_tok > 0
+                && resp_bytes > 0
+                && s.response_reconstruction_quality
+                    == metria_core::model::ReconstructionQuality::Complete
+            {
+                let bpt = (resp_bytes as f64 / out_tok as f64 * 100.0).round() / 100.0;
+                let event_id = EventId::from_content(&format!(
+                    "tps:{client}|{provider:?}|{model:?}|response|{out_tok}|{resp_bytes}",
+                    client = s.client_id,
+                    provider = s.provider,
+                    model = s.model,
+                ));
+                out.push(PendingEvent {
+                    event_id: event_id.as_str().to_string(),
+                    kind: "traffic_sample".into(),
+                    payload: serde_json::json!({
+                        "id": event_id.as_str(),
+                        "client": s.client_id,
+                        "provider": s.provider,
+                        "model": s.model,
+                        "content_profile": "unknown",
+                        "direction": "response",
+                        "token_count": out_tok,
+                        "payload_bytes": resp_bytes,
+                        "bytes_per_token": bpt,
+                        "reconstruction_quality": format!("{:?}", s.response_reconstruction_quality).to_ascii_lowercase(),
+                        "source_hash": event_id.as_str(),
+                    }),
+                });
+            }
+        }
+    }
+
     for t in &batch.tool_events {
         let event_id = EventId::from_content(&format!("tool:{}", t.id.as_str()));
         out.push(PendingEvent {

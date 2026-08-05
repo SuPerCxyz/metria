@@ -56,15 +56,25 @@ const STREAM_EVENT_OVERHEAD_RATIO: f64 = 0.20;
 /// 重建 JSON 时，正文之外的键/引号开销比例。
 const JSON_ENVELOPE_RATIO: f64 = 0.10;
 
-/// 对一次调用执行请求与响应流量估算。
+/// 对一次调用执行请求与响应流量估算（使用内置候选 Profile）。
 pub fn estimate<'a>(input: &EstimateInput<'a>) -> Result<EstimateOutput> {
+    let candidates = crate::profile::builtin_candidates(input.client);
+    estimate_with_candidates(input, &candidates)
+}
+
+/// 使用指定候选 Profile 集执行估算（用于历史重新估算等场景）。
+pub fn estimate_with_candidates<'a>(
+    input: &EstimateInput<'a>,
+    candidates: &[metria_core::model::TrafficProfile],
+) -> Result<EstimateOutput> {
     let mut notes = Vec::new();
 
     // ---------- 请求 ----------
-    let (request_payload, request_source, req_profile_match) = estimate_request(input, &mut notes);
+    let (request_payload, request_source, req_profile_match) =
+        estimate_request(input, candidates, &mut notes);
     // ---------- 响应 ----------
     let (response_payload, response_source, resp_profile_match) =
-        estimate_response(input, &mut notes);
+        estimate_response(input, candidates, &mut notes);
 
     let source = pick_source(request_source, response_source);
     let profile_match = req_profile_match.or(resp_profile_match);
@@ -109,6 +119,7 @@ pub fn estimate<'a>(input: &EstimateInput<'a>) -> Result<EstimateOutput> {
 
 fn estimate_request<'a>(
     input: &EstimateInput<'a>,
+    candidates: &[metria_core::model::TrafficProfile],
     notes: &mut Vec<String>,
 ) -> (Option<i64>, EstimationSource, Option<ProfileMatch>) {
     // 1. 完整重建 / 直接 payload
@@ -139,7 +150,7 @@ fn estimate_request<'a>(
     };
 
     let profile_match = profile::best_profile(
-        &profile::builtin_candidates(input.client),
+        candidates,
         &MatchRequest {
             client: input.client.to_string(),
             client_version: None,
@@ -218,6 +229,7 @@ fn estimate_request<'a>(
 
 fn estimate_response<'a>(
     input: &EstimateInput<'a>,
+    candidates: &[metria_core::model::TrafficProfile],
     notes: &mut Vec<String>,
 ) -> (Option<i64>, EstimationSource, Option<ProfileMatch>) {
     // 1. 可见内容优先
@@ -264,7 +276,7 @@ fn estimate_response<'a>(
     }
 
     let profile_match = profile::best_profile(
-        &profile::builtin_candidates(input.client),
+        candidates,
         &MatchRequest {
             client: input.client.to_string(),
             client_version: None,

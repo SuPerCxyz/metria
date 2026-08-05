@@ -1057,6 +1057,7 @@ dependencies = [
  "metria-pricing",
  "metria-protocol",
  "metria-storage",
+ "metria-traffic",
  "rust-embed",
  "serde",
  "serde_json",
