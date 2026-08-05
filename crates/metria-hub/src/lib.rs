@@ -7,8 +7,10 @@ pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod demo;
+pub mod export;
 pub mod http;
 pub mod rollup;
+pub mod share;
 
 use metria_core::logging::init_logging;
 use tokio::net::TcpListener;

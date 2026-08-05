@@ -112,6 +112,9 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/by-model", get(traffic_by_model))
         .route("/api/v1/traffic/by-provider", get(traffic_by_provider))
         .route("/api/v1/data-quality", get(data_quality))
+        .route("/api/v1/shares", post(share_create).get(share_list))
+        .route("/api/v1/share/{slug}", get(share_view))
+        .route("/api/v1/export", get(export_data))
         .route(
             "/api/v1/traffic/profiles",
             get(traffic_profiles_list).post(traffic_profiles_create),
@@ -152,7 +155,7 @@ async fn auth_mw(
     // 忽略 next 的显式绑定：Next 通过闭包调用保持生命周期正确
     let _ = &next;
     let path = req.uri().path().to_string();
-    if path == "/healthz" || path == "/api/v1/auth/login" {
+    if path == "/healthz" || path == "/api/v1/auth/login" || path.starts_with("/api/v1/share/") {
         return next.run(req).await;
     }
     let headers = req.headers().clone();
@@ -466,6 +469,123 @@ async fn pricing_reprice(State(st): State<AppState>, _req: Json<RepriceRequest>)
             "reprice_failed",
             &e.to_string(),
         ),
+    }
+}
+
+// ============ Share / Export ============
+
+#[derive(Debug, Deserialize)]
+struct ShareCreateRequest {
+    kind: String,
+    target_id: String,
+}
+
+async fn share_create(State(st): State<AppState>, Json(req): Json<ShareCreateRequest>) -> Response {
+    match crate::share::create_share(&st.db, &req.kind, &req.target_id) {
+        Ok(slug) => {
+            Json(serde_json::json!({ "ok": true, "slug": slug, "url": format!("/s/{slug}") }))
+                .into_response()
+        }
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "share_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn share_list(State(st): State<AppState>) -> Response {
+    let c = st.db.conn();
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = c.prepare(
+        "SELECT slug, kind, target_id, created_at FROM share_links ORDER BY created_at DESC LIMIT 100",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(serde_json::json!({
+                "slug": r.get::<_, String>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "target_id": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+            }))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+    }
+    Json(serde_json::json!({ "shares": out })).into_response()
+}
+
+/// 公开只读分享视图（无鉴权，返回脱敏 DTO）。
+async fn share_view(State(st): State<AppState>, AxumPath(slug): AxumPath<String>) -> Response {
+    let Some((kind, target)) = crate::share::resolve_share(&st.db, &slug) else {
+        return json_err(StatusCode::NOT_FOUND, "share_not_found", "分享链接不存在");
+    };
+    crate::share::record_view(&st.db, &slug);
+    Json(crate::share::build_share_dto(&st.db, &kind, &target)).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExportParams {
+    kind: Option<String>,
+    format: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+async fn export_data(State(st): State<AppState>, Query(p): Query<ExportParams>) -> Response {
+    let fmt = match p.format.as_deref().and_then(crate::export::parse_format) {
+        Some(f) => f,
+        None => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_format",
+                "format 支持 json/ndjson/csv",
+            )
+        }
+    };
+    let (from, to) = (
+        p.from
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30)),
+        p.to.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now),
+    );
+    let result = match p.kind.as_deref() {
+        Some("calls") | None => crate::export::export_calls(&st.db, from, to, &fmt),
+        Some("sessions") => crate::export::export_sessions(&st.db, from, to, &fmt),
+        Some(other) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_kind",
+                &format!("kind 支持 sessions/calls，得到 {other}"),
+            )
+        }
+    };
+    match result {
+        Ok((body, filename)) => {
+            let ct = match fmt {
+                crate::export::Format::Json => "application/json",
+                crate::export::Format::Ndjson => "application/x-ndjson",
+                crate::export::Format::Csv => "text/csv",
+            };
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, ct),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "export_failed", &e),
     }
 }
 

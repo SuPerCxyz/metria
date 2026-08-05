@@ -1014,6 +1014,7 @@ dependencies = [
 name = "metria-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "metria-adapter-api",
  "metria-adapter-claude",
@@ -1022,11 +1023,13 @@ dependencies = [
  "metria-agent",
  "metria-core",
  "metria-hub",
+ "metria-storage",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "ureq",
+ "zstd",
 ]
 
 [[package]]

@@ -10,10 +10,13 @@ repository.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
+zstd = "0.13"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 metria-core = { path = "../metria-core" }
 metria-hub = { path = "../metria-hub" }
+metria-storage = { path = "../metria-storage" }
 metria-agent = { path = "../metria-agent" }
 metria-adapter-api = { path = "../metria-adapter-api" }
 metria-adapter-claude = { path = "../metria-adapter-claude" }

@@ -64,9 +64,17 @@ enum Command {
     /// 导出数据
     Export,
     /// 备份 Hub 数据库
-    Backup,
-    /// 恢复 Hub 数据库
-    Restore,
+    Backup {
+        /// 输出文件路径（默认 ./metria-backup-<ts>.db.zst）
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 恢复 Hub 数据库（需先停止 Hub）
+    Restore {
+        /// 备份文件路径
+        #[arg(long)]
+        input: String,
+    },
     /// 运行只读 MCP 服务
     Mcp,
     /// 容器健康检查（返回 0 表示健康）
@@ -132,11 +140,52 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Backup { out } => match run_backup(out.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("备份失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Restore { input } => match run_restore(&input) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("恢复失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Mcp => match run_mcp() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("MCP 退出: {e}");
+                ExitCode::FAILURE
+            }
+        },
         other => {
             eprintln!("{NOT_IMPLEMENTED}: {other:?}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn hub_db_url() -> Result<String, String> {
+    Ok(metria_hub::HubConfig::from_env()
+        .map_err(|e| e.to_string())?
+        .database_url)
+}
+
+fn run_backup(out: Option<&str>) -> Result<(), String> {
+    let url = hub_db_url()?;
+    metria_cli::backup::backup(&url, out)
+}
+
+fn run_restore(input: &str) -> Result<(), String> {
+    let url = hub_db_url()?;
+    metria_cli::backup::restore(&url, input)
+}
+
+fn run_mcp() -> Result<(), String> {
+    metria_cli::mcp::run()
 }
 
 fn run_healthcheck() -> Result<(), String> {
