@@ -1,0 +1,51 @@
+# Metria Agent（Collector）单服务示例
+#
+# 零侵入约束：
+#   - 客户端目录一律只读挂载（:ro）
+#   - 不挂载 Docker Socket、不使用 Privileged / Host Network / Host PID
+#   - Agent 数据写入持久化卷 /data
+#
+# 权限注意：
+#   Linux home 目录常为 700，容器内非 root 用户可能无法读取。
+#   请使用 `user: "${UID}:${GID}"` 对齐宿主用户，或确保目录对目标 UID 可读。
+#   `metria doctor --adapter <name>` 可检测目录权限。
+services:
+  metria-agent:
+    image: ghcr.io/example/metria:latest
+    container_name: metria-agent
+    command: ["agent"]
+    restart: unless-stopped
+    # 与宿主用户对齐，确保能读 700 权限的 home 目录
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - metria-agent-data:/data
+      - ${CLAUDE_PATH:-/home/example/.claude}:/sources/claude:ro
+      - ${CODEX_PATH:-/home/example/.codex}:/sources/codex:ro
+      - ${OPENCODE_PATH:-/home/example/.local/share/opencode}:/sources/opencode:ro
+    environment:
+      METRIA_NODE_ID: ${METRIA_NODE_ID:-node-01}
+      METRIA_NODE_NAME: ${METRIA_NODE_NAME:-node-01}
+      METRIA_HUB_URL: ${METRIA_HUB_URL:-http://localhost:8080}
+      METRIA_AGENT_TOKEN_FILE: /run/secrets/metria_agent_token
+      METRIA_CLAUDE_PATH: /sources/claude
+      METRIA_CODEX_PATH: /sources/codex
+      METRIA_OPENCODE_PATH: /sources/opencode
+      METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      METRIA_LOG: ${METRIA_LOG:-info}
+    secrets:
+      - metria_agent_token
+    healthcheck:
+      test: ["CMD", "/app/metria", "healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+secrets:
+  # 由 Hub 注册流程生成的 Collector Token，仅存哈希于 Hub。
+  # 创建示例：printf '%s' 'collector-token' > secrets/metria-agent-token
+  metria_agent_token:
+    file: ./secrets/metria-agent-token
+
+volumes:
+  metria-agent-data:

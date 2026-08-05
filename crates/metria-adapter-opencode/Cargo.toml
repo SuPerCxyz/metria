@@ -1,0 +1,10 @@
+[package]
+name = "metria-adapter-opencode"
+description = "OpenCode SQLite Adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,10 @@
+[package]
+name = "metria-agent"
+description = "Metria Agent：发现、监听、扫描、Spool 与上传"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]

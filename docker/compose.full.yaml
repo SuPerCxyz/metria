@@ -1,0 +1,89 @@
+# Metria 完整示例：Hub + Agent + Demo（合成数据）
+#
+# 使用：
+#   cp docker/.env.example docker/.env && 编辑路径与凭据
+#   docker compose -f docker/compose.full.yaml up -d
+#
+# 说明：
+#   - metria-hub   : 数据汇聚与 Web
+#   - metria-demo  : 演示模式（`hub --demo`，生成确定性合成数据，S3 阶段可用）
+#   - metria-agent : 采集器（可选，可注释掉整段后仅运行 Hub + Demo）
+services:
+  metria-hub:
+    image: ghcr.io/example/metria:latest
+    container_name: metria-hub
+    command: ["hub"]
+    restart: unless-stopped
+    ports:
+      - "${METRIA_HTTP_PORT:-8080}:8080"
+    volumes:
+      - metria-hub-data:/data
+    environment:
+      METRIA_DATABASE_URL: sqlite:///data/metria.db
+      METRIA_LISTEN: 0.0.0.0:8080
+      METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
+      METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      METRIA_ADMIN_USER: ${METRIA_ADMIN_USER:-admin}
+      METRIA_ADMIN_PASSWORD: ${METRIA_ADMIN_PASSWORD:-change-me-please}
+    healthcheck:
+      test: ["CMD", "/app/metria", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  metria-demo:
+    image: ghcr.io/example/metria:latest
+    container_name: metria-demo
+    command: ["hub", "--demo"]
+    restart: unless-stopped
+    profiles: ["demo"]
+    volumes:
+      - metria-demo-data:/data
+    environment:
+      METRIA_DATABASE_URL: sqlite:///data/demo.db
+      METRIA_LISTEN: 0.0.0.0:8081
+      METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
+      METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+    healthcheck:
+      test: ["CMD", "/app/metria", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  metria-agent:
+    image: ghcr.io/example/metria:latest
+    container_name: metria-agent
+    command: ["agent"]
+    restart: unless-stopped
+    profiles: ["agent"]
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - metria-agent-data:/data
+      - ${CLAUDE_PATH:-/home/example/.claude}:/sources/claude:ro
+      - ${CODEX_PATH:-/home/example/.codex}:/sources/codex:ro
+      - ${OPENCODE_PATH:-/home/example/.local/share/opencode}:/sources/opencode:ro
+    environment:
+      METRIA_NODE_ID: ${METRIA_NODE_ID:-node-01}
+      METRIA_NODE_NAME: ${METRIA_NODE_NAME:-node-01}
+      METRIA_HUB_URL: ${METRIA_HUB_URL:-http://metria-hub:8080}
+      METRIA_AGENT_TOKEN_FILE: /run/secrets/metria_agent_token
+      METRIA_CLAUDE_PATH: /sources/claude
+      METRIA_CODEX_PATH: /sources/codex
+      METRIA_OPENCODE_PATH: /sources/opencode
+      METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      METRIA_LOG: ${METRIA_LOG:-info}
+    secrets:
+      - metria_agent_token
+    depends_on:
+      - metria-hub
+
+secrets:
+  metria_agent_token:
+    file: ./secrets/metria-agent-token
+
+volumes:
+  metria-hub-data:
+  metria-demo-data:
+  metria-agent-data:

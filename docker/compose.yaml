@@ -1,0 +1,34 @@
+# Metria Hub 单服务示例
+#
+# 使用：
+#   cp docker/.env.example docker/.env   # 按需修改
+#   docker compose -f docker/compose.yaml up -d
+#
+# 首次登录凭据通过环境变量注入（见 .env.example）。
+services:
+  metria-hub:
+    image: ghcr.io/example/metria:latest
+    container_name: metria-hub
+    command: ["hub"]
+    restart: unless-stopped
+    ports:
+      - "${METRIA_HTTP_PORT:-8080}:8080"
+    volumes:
+      - metria-hub-data:/data
+    environment:
+      METRIA_DATABASE_URL: sqlite:///data/metria.db
+      METRIA_LISTEN: 0.0.0.0:8080
+      METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
+      METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      # 单 Admin 初始凭据（首次登录后强制改密）
+      METRIA_ADMIN_USER: ${METRIA_ADMIN_USER:-admin}
+      METRIA_ADMIN_PASSWORD: ${METRIA_ADMIN_PASSWORD:-change-me-please}
+    healthcheck:
+      test: ["CMD", "/app/metria", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  metria-hub-data:

@@ -1,0 +1,9 @@
+{
+  "name": "Metria",
+  "short_name": "Metria",
+  "start_url": "/static/",
+  "display": "standalone",
+  "background_color": "#0f1115",
+  "theme_color": "#0f1115",
+  "icons": []
+}

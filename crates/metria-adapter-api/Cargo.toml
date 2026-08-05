@@ -1,0 +1,10 @@
+[package]
+name = "metria-adapter-api"
+description = "客户端 Adapter 接口、ScanBatch、Cursor、能力与错误定义"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
