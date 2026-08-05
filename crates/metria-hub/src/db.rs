@@ -248,6 +248,112 @@ impl HubDb {
         Ok(())
     }
 
+    // ---------- 价格 ----------
+
+    pub fn list_pricing_catalogs(&self) -> Vec<serde_json::Value> {
+        let c = self.conn();
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = c.prepare(
+            "SELECT id, name, kind, enabled, priority, base_url, last_success_at, last_error, created_at FROM pricing_catalogs ORDER BY priority",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "enabled": r.get::<_, i64>(3)? != 0,
+                    "priority": r.get::<_, i64>(4)?,
+                    "base_url": r.get::<_, Option<String>>(5)?,
+                    "last_success_at": r.get::<_, Option<String>>(6)?,
+                    "last_error": r.get::<_, Option<String>>(7)?,
+                    "created_at": r.get::<_, String>(8)?,
+                }))
+            }) {
+                for row in rows.flatten() {
+                    out.push(row);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn list_pricing_rules(&self) -> Vec<serde_json::Value> {
+        let c = self.conn();
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = c.prepare(
+            "SELECT id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, effective_from, effective_to, metadata, created_at FROM pricing_rules ORDER BY priority DESC",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "source": r.get::<_, String>(1)?,
+                    "channel": r.get::<_, String>(2)?,
+                    "provider_pattern": r.get::<_, String>(3)?,
+                    "model_pattern": r.get::<_, String>(4)?,
+                    "client_pattern": r.get::<_, String>(5)?,
+                    "input_price": r.get::<_, Option<i64>>(6)?,
+                    "output_price": r.get::<_, Option<i64>>(7)?,
+                    "cache_read_price": r.get::<_, Option<i64>>(8)?,
+                    "cache_write_price": r.get::<_, Option<i64>>(9)?,
+                    "reasoning_price": r.get::<_, Option<i64>>(10)?,
+                    "request_price": r.get::<_, Option<i64>>(11)?,
+                    "priority": r.get::<_, i64>(12)?,
+                    "enabled": r.get::<_, i64>(13)? != 0,
+                    "effective_from": r.get::<_, Option<String>>(14)?,
+                    "effective_to": r.get::<_, Option<String>>(15)?,
+                    "metadata": r.get::<_, String>(16)?,
+                    "created_at": r.get::<_, String>(17)?,
+                }))
+            }) {
+                for row in rows.flatten() {
+                    out.push(row);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn insert_pricing_rule(&self, v: &Value) -> Result<(), StorageError> {
+        let c = self.conn();
+        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
+        let now = Utc::now().to_rfc3339();
+        let provider = if g("provider_pattern").is_empty() {
+            ".*"
+        } else {
+            g("provider_pattern")
+        };
+        let model = if g("model_pattern").is_empty() {
+            ".*"
+        } else {
+            g("model_pattern")
+        };
+        let client = if g("client_pattern").is_empty() {
+            "*"
+        } else {
+            g("client_pattern")
+        };
+        c.execute(
+            "INSERT INTO pricing_rules (id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, metadata, created_at, updated_at) VALUES (?1, NULL, 'user_override', 'vendor_direct', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, '{}', ?12, ?12)",
+            params![
+                metria_core::model::Id::new().as_str().to_string(),
+                provider,
+                model,
+                client,
+                gn("input_price"),
+                gn("output_price"),
+                gn("cache_read_price"),
+                gn("cache_write_price"),
+                gn("reasoning_price"),
+                gn("request_price"),
+                gn("priority").unwrap_or(0),
+                now,
+            ],
+        )
+        .map_err(StorageError::from)?;
+        Ok(())
+    }
+
     // ---------- 事件落库 ----------
 
     pub fn session_key(node: &str, source: &str) -> String {

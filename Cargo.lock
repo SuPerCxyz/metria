@@ -1054,6 +1054,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "metria-core",
+ "metria-pricing",
  "metria-protocol",
  "metria-storage",
  "rust-embed",

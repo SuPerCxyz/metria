@@ -7,7 +7,7 @@
 #
 # 构建：
 #   docker build -f docker/Dockerfile --target hub -t metria:dev .
-#   docker buildx build --platform linux/amd64,linux/arm64 --target hub -t ghcr.io/example/metria:0.1.0 .
+#   docker buildx build --platform linux/amd64,linux/arm64 --target hub -t ghcr.io/supercxyz/metria:0.1.0 .
 
 # ---- Web build ----
 FROM node:24-alpine AS web

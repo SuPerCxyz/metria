@@ -10,7 +10,7 @@
 #   - metria-agent : 采集器（可选，可注释掉整段后仅运行 Hub + Demo）
 services:
   metria-hub:
-    image: ghcr.io/example/metria:latest
+    image: ghcr.io/supercxyz/metria:latest
     container_name: metria-hub
     command: ["hub"]
     restart: unless-stopped
@@ -33,7 +33,7 @@ services:
       start_period: 5s
 
   metria-demo:
-    image: ghcr.io/example/metria:latest
+    image: ghcr.io/supercxyz/metria:latest
     container_name: metria-demo
     command: ["hub", "--demo"]
     restart: unless-stopped
@@ -53,7 +53,7 @@ services:
       start_period: 5s
 
   metria-agent:
-    image: ghcr.io/example/metria:latest
+    image: ghcr.io/supercxyz/metria:latest
     container_name: metria-agent
     command: ["agent"]
     restart: unless-stopped

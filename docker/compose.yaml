@@ -7,7 +7,7 @@
 # 首次登录凭据通过环境变量注入（见 .env.example）。
 services:
   metria-hub:
-    image: ghcr.io/example/metria:latest
+    image: ghcr.io/supercxyz/metria:latest
     container_name: metria-hub
     command: ["hub"]
     restart: unless-stopped

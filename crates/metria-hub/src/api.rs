@@ -112,6 +112,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/by-model", get(traffic_by_model))
         .route("/api/v1/traffic/by-provider", get(traffic_by_provider))
         .route("/api/v1/data-quality", get(data_quality))
+        .route("/api/v1/pricing/catalogs", get(pricing_catalogs))
+        .route(
+            "/api/v1/pricing/rules",
+            get(pricing_rules).post(pricing_rules_create),
+        )
+        .route("/api/v1/pricing/test", post(pricing_test))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_mw))
         .layer(TraceLayer::new_for_http())
@@ -162,6 +168,86 @@ fn token_query_ok(st: &AppState, query: Option<&str>) -> bool {
         .find(|(k, _)| k == "token")
         .map(|(_, v)| st.sessions.lock().unwrap().contains_key(v.as_str()))
         .unwrap_or(false)
+}
+
+// ============ Pricing ============
+
+async fn pricing_catalogs(State(st): State<AppState>) -> Response {
+    Json(serde_json::json!({ "catalogs": st.db.list_pricing_catalogs() })).into_response()
+}
+
+async fn pricing_rules(State(st): State<AppState>) -> Response {
+    Json(serde_json::json!({ "rules": st.db.list_pricing_rules() })).into_response()
+}
+
+async fn pricing_rules_create(
+    State(st): State<AppState>,
+    Json(v): Json<serde_json::Value>,
+) -> Response {
+    match st.db.insert_pricing_rule(&v) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rule_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// 规则测试：给定 model/provider/tokens，返回匹配规则与计算费用。
+#[derive(Debug, Deserialize)]
+struct PricingTestRequest {
+    model: Option<String>,
+    provider: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+}
+
+async fn pricing_test(State(st): State<AppState>, Json(req): Json<PricingTestRequest>) -> Response {
+    // 从 DB 加载用户规则
+    let rules: Vec<metria_core::model::PricingRule> = st
+        .db
+        .list_pricing_rules()
+        .into_iter()
+        .filter_map(|r| serde_json::from_value(r).ok())
+        .collect();
+    let mut engine = metria_pricing::PricingEngine::new();
+    for r in rules {
+        engine.add_user_rule(r);
+    }
+    let usage = metria_core::model::Usage {
+        input: req.input_tokens,
+        output: req.output_tokens,
+        cache_read: req.cache_read_tokens,
+        cache_write: req.cache_write_tokens,
+        reasoning: req.reasoning_tokens,
+    };
+    match engine.compute(
+        &usage,
+        req.model.as_deref(),
+        req.provider.as_deref(),
+        Utc::now(),
+        None,
+    ) {
+        Ok(c) => Json(serde_json::json!({
+            "ok": true,
+            "reported_micro_usd": c.reported_micro_usd,
+            "calculated_micro_usd": c.calculated_micro_usd,
+            "estimated_micro_usd": c.estimated_micro_usd,
+            "rule_id": c.rule_id,
+            "pricing_available": c.pricing_available,
+            "note": "内置价格仅为近似参考，非厂商直连保证",
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pricing_test_failed",
+            &e.to_string(),
+        ),
+    }
 }
 
 // ============ 工具 ============

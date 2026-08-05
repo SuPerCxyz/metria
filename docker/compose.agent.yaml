@@ -11,7 +11,7 @@
 #   `metria doctor --adapter <name>` 可检测目录权限。
 services:
   metria-agent:
-    image: ghcr.io/example/metria:latest
+    image: ghcr.io/supercxyz/metria:latest
     container_name: metria-agent
     command: ["agent"]
     restart: unless-stopped

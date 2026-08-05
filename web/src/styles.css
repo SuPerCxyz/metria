@@ -385,6 +385,14 @@ label {
   flex-wrap: wrap;
 }
 
+/* ---- 表单 ---- */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
 /* ---- 时间序列 ---- */
 .timeseries {
   width: 100%;

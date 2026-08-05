@@ -39,7 +39,7 @@ docker compose -f docker/compose.agent.yaml up -d
 # 构建
 docker build -f docker/Dockerfile --target hub -t metria:dev .
 # 多架构
-docker buildx build --platform linux/amd64,linux/arm64 --target hub -t ghcr.io/example/metria:0.1.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 --target hub -t ghcr.io/supercxyz/metria:0.1.0 --push .
 
 # 健康检查
 docker run --rm metria:dev healthcheck

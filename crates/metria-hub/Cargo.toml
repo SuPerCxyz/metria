@@ -23,6 +23,7 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 metria-core = { path = "../metria-core" }
+metria-pricing = { path = "../metria-pricing" }
 metria-protocol = { path = "../metria-protocol" }
 metria-storage = { path = "../metria-storage" }
 

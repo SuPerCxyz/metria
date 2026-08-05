@@ -1,0 +1,108 @@
+# Metria Release：打 tag（v*）时构建发布产物
+#
+# - 编译 linux/amd64 与 linux/arm64 二进制（上传为 release artifacts）
+# - 构建并推送多架构镜像到 ghcr.io/supercxyz/metria:<tag> 与 :latest
+# - 生成 SBOM（buildx provenance）
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/supercxyz/metria
+
+jobs:
+  release:
+    name: Release 构建与发布
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端
+        run: cd web && npm ci && npm run build
+
+      # ---- amd64 二进制 ----
+      - name: 构建 linux/amd64 发布二进制
+        run: cargo build --release --workspace --bin metria
+
+      - name: 上传 amd64 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: metria-linux-amd64
+          path: target/release/metria
+
+      # ---- arm64 二进制（交叉编译） ----
+      - name: 安装 arm64 交叉编译链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: 构建 linux/arm64 发布二进制
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo build --release --workspace --bin metria --target aarch64-unknown-linux-gnu
+
+      - name: 上传 arm64 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: metria-linux-arm64
+          path: target/aarch64-unknown-linux-gnu/release/metria
+
+      # ---- 多架构镜像 + SBOM ----
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送多架构镜像（含 SBOM/provenance）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: hub
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
+          sbom: true
+          provenance: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- 将二进制附到 GitHub Release ----
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            target/release/metria
+            target/aarch64-unknown-linux-gnu/release/metria
+          generate_release_notes: true
