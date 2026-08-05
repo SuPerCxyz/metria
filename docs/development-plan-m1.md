@@ -299,9 +299,9 @@ metria/
 | 23–27 | 请求估算 / 响应估算 / Session 流量 / 任意时间范围估算 / 上下界+Confidence | ✅ |
 | 28–30 | Hourly Rollup / Daily Rollup / 任意时间范围查询 | ✅ |
 | 31–40 | Overview / Nodes / Node Detail / Agent Tools / Models / Calls / Traffic / Sessions / Pricing(基础) / Traffic Profiles(基础) | ✅ |
-| 41–42 | OpenRouter / LiteLLM 目录 | ⬜ M3 |
+| 41–42 | OpenRouter / LiteLLM 目录 | ✅ M3 |
 | 43 | 用户自定义价格（基础） | ✅ |
-| 44 | 用户自定义 Traffic Profile | ⬜ M2 |
+| 44 | 用户自定义 Traffic Profile | ✅ M2 |
 | 45–47 | Data Quality / Light / Dark | ✅ |
 | 48–50 | 基础登录 / SSE / Demo | ✅ |
 | 51 | 完整 README | ✅ |

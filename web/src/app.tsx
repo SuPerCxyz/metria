@@ -14,6 +14,8 @@ import { Traffic } from './pages/Traffic'
 import { TrafficProfiles } from './pages/TrafficProfiles'
 import { DataQuality } from './pages/DataQuality'
 import { Pricing } from './pages/Pricing'
+import { Settings } from './pages/Settings'
+import { Shares } from './pages/Shares'
 
 const NAV = [
   ['overview', '总览'],
@@ -26,6 +28,8 @@ const NAV = [
   ['traffic-profiles', 'Traffic Profiles'],
   ['pricing', '价格'],
   ['data-quality', '数据质量'],
+  ['shares', '分享'],
+  ['settings', '设置'],
 ] as const
 
 function Page() {
@@ -49,6 +53,10 @@ function Page() {
       return <TrafficProfiles />
     case '/pricing':
       return <Pricing />
+    case '/shares':
+      return <Shares />
+    case '/settings':
+      return <Settings />
     case '/data-quality':
       return <DataQuality />
     default:
