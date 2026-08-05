@@ -6,7 +6,29 @@ import { fmtUsd } from '../lib/format'
 
 export function Pricing() {
   const catalogs = useQuery<any>('/pricing/catalogs', () => api('/pricing/catalogs'))
+  const snapshots = useQuery<any>('/pricing/snapshots', () => api('/pricing/snapshots'))
   const rules = useQuery<any>('/pricing/rules', () => api('/pricing/rules'))
+  const [msg, setMsg] = useState('')
+
+  const refreshCatalog = async (id: string) => {
+    try {
+      const r = await api<any>(`/pricing/catalogs/${id}/refresh`, { method: 'POST' })
+      setMsg(r.fetched ? `已同步：${r.rules} 条规则` : '未变化（ETag 未修改）')
+      catalogs.refresh()
+      snapshots.refresh()
+    } catch (e) {
+      setMsg(`同步失败：${(e as Error).message}（继续使用旧快照）`)
+    }
+  }
+
+  const reprice = async () => {
+    try {
+      const r = await api<any>('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
+      setMsg(`重新计价完成：${r.repriced} 条（保留历史版本）`)
+    } catch (e) {
+      setMsg(`重新计价失败：${(e as Error).message}`)
+    }
+  }
 
   // 新建规则表单
   const [form, setForm] = useState({
@@ -78,16 +100,22 @@ export function Pricing() {
       <h2>价格</h2>
       <p class="page-note">内置价格为近似参考；OpenRouter 等第三方目录在后续版本同步。</p>
 
+      {msg && <div class="state-box">{msg}</div>}
+
       <Card title="价格目录">
+        <p class="page-note">
+          OpenRouter 价格标记渠道 openrouter（非厂商直连）；LiteLLM 为第三方维护数据，可能存在延迟或误差。
+        </p>
         {(catalogs.data?.catalogs || []).length === 0 && <Empty text="暂无目录" />}
         <table class="table">
           <thead>
             <tr>
               <th>名称</th>
               <th>类型</th>
-              <th>启用</th>
               <th>优先级</th>
-              <th>最后成功</th>
+              <th>最后同步</th>
+              <th>错误</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -95,13 +123,49 @@ export function Pricing() {
               <tr key={c.id}>
                 <td>{c.name}</td>
                 <td>{c.kind}</td>
-                <td>{c.enabled ? '是' : '否'}</td>
                 <td>{c.priority}</td>
                 <td>{c.last_success_at || '—'}</td>
+                <td>{(c.last_error || '').slice(0, 40) || '—'}</td>
+                <td>
+                  {c.kind !== 'builtin' && (
+                    <button type="button" class="btn small" onClick={() => refreshCatalog(c.id)}>
+                      刷新
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+      </Card>
+
+      <Card title="价格快照">
+        {(snapshots.data?.snapshots || []).length === 0 && <Empty text="暂无快照" />}
+        <table class="table">
+          <thead>
+            <tr>
+              <th>目录</th>
+              <th>获取时间</th>
+              <th>记录数</th>
+              <th>ETag</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(snapshots.data?.snapshots || []).slice(0, 20).map((s: any) => (
+              <tr key={s.id}>
+                <td>{s.catalog_id}</td>
+                <td>{s.fetched_at}</td>
+                <td>{s.record_count}</td>
+                <td class="mono">{(s.etag || '—').slice(0, 20)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div class="dim-switch" style="margin-top:8px">
+          <button type="button" class="btn small" onClick={reprice}>
+            历史重新计价
+          </button>
+        </div>
       </Card>
 
       <div class="grid-2">

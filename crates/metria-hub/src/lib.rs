@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod demo;
@@ -64,6 +65,10 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     // 内置 admin（env 注入）与内置价格目录
     ensure_admin(&db);
 
+    // 价格目录种子 + 后台同步
+    seed_catalogs(&db);
+    spawn_catalog_sync(db.clone());
+
     // Demo 模式：生成确定性合成数据
     if cfg.demo {
         match demo::seed_demo(&db) {
@@ -98,6 +103,88 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
         .map_err(|e| HubError::Io(std::io::Error::other(e)))?;
     info!("Hub 已退出");
     Ok(())
+}
+
+/// 按环境变量启用外部价格目录。
+#[allow(clippy::type_complexity)]
+fn seed_catalogs(db: &db::HubDb) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let or_url = "https://openrouter.ai/api/v1/models".to_string();
+    let litellm_url =
+        "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+            .to_string();
+    let custom_url = std::env::var("METRIA_PRICING_CUSTOM_URL").unwrap_or_default();
+    let custom_auth = std::env::var("METRIA_PRICING_CUSTOM_AUTH").ok();
+    let defs: Vec<(&str, &str, &str, i64, String, Option<String>)> = vec![
+        (
+            "catalog-openrouter",
+            "OpenRouter 价格目录",
+            "openrouter",
+            30,
+            or_url,
+            None,
+        ),
+        (
+            "catalog-litellm",
+            "LiteLLM 价格目录",
+            "litellm",
+            20,
+            litellm_url,
+            None,
+        ),
+        (
+            "catalog-custom",
+            "自定义 HTTP 价格目录",
+            "custom",
+            25,
+            custom_url,
+            custom_auth,
+        ),
+    ];
+    let c = db.conn();
+    for (id, name, kind, priority, url, auth) in defs {
+        let enabled = match kind {
+            "openrouter" => std::env::var("METRIA_PRICING_OPENROUTER_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            "litellm" => std::env::var("METRIA_PRICING_LITELLM_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            _ => !url.is_empty(),
+        };
+        if !enabled {
+            continue;
+        }
+        let _ = c.execute(
+            "INSERT OR IGNORE INTO pricing_catalogs (id, name, kind, enabled, base_url, authentication_type, refresh_interval_seconds, priority, created_at, updated_at) VALUES (?1,?2,?3,1,?4,?5,86400,?6,?7,?7)",
+            metria_storage::rusqlite::params![id, name, kind, url, auth, priority, now],
+        );
+    }
+}
+
+/// 后台周期同步外部价格目录（失败保留旧快照，不影响 Hub 运行）。
+fn spawn_catalog_sync(db: db::HubDb) {
+    tokio::spawn(async move {
+        // 延迟启动，避免阻塞启动路径
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        loop {
+            let catalogs = catalog::catalogs_from_db(&db);
+            for cat in &catalogs {
+                match catalog::sync_catalog(&db, cat) {
+                    Ok(r) => {
+                        if r.fetched {
+                            info!("价格目录 {} 同步完成（{} 条规则）", cat.name, r.rules);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = db.mark_catalog_error(&cat.id, &e);
+                        warn!("价格目录 {} 同步失败（使用旧快照）: {e}", cat.name);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
 }
 
 fn ensure_admin(db: &db::HubDb) {

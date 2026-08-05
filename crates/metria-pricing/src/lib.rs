@@ -129,11 +129,22 @@ const BUILTIN: &[BuiltinPrice] = &[
     },
 ];
 
+/// 价格来源优先级（越大越优先）。
+pub fn source_order(src: PricingSource) -> i64 {
+    match src {
+        PricingSource::UserOverride => 40,
+        PricingSource::CustomHttpCatalog | PricingSource::OpenRouterCatalog => 30,
+        PricingSource::LiteLlmCatalog => 20,
+        PricingSource::BuiltinCatalog => 10,
+        PricingSource::ClientReported => 50,
+    }
+}
+
 /// 价格引擎。
 #[derive(Debug, Default)]
 pub struct PricingEngine {
-    /// 用户规则（按优先级降序）。
-    user_rules: Vec<PricingRule>,
+    /// 全部规则（按 source_order + priority 排序）。
+    rules: Vec<PricingRule>,
     /// 内置目录是否启用。
     builtin_enabled: bool,
 }
@@ -141,14 +152,19 @@ pub struct PricingEngine {
 impl PricingEngine {
     pub fn new() -> Self {
         Self {
-            user_rules: Vec::new(),
+            rules: Vec::new(),
             builtin_enabled: true,
         }
     }
 
-    /// 添加用户规则（调用方保证按优先级插入）。
+    /// 添加规则（任意来源）。
+    pub fn add_rule(&mut self, rule: PricingRule) {
+        self.rules.push(rule);
+    }
+
+    /// 添加用户规则（兼容入口）。
     pub fn add_user_rule(&mut self, rule: PricingRule) {
-        self.user_rules.push(rule);
+        self.rules.push(rule);
     }
 
     pub fn set_builtin_enabled(&mut self, enabled: bool) {
@@ -174,15 +190,19 @@ impl PricingEngine {
             });
         }
 
-        let rule: Option<PricingRule> = match self
-            .user_rules
+        // 找到最佳规则：source_order 优先，其次 rule.priority
+        let mut ranked: Vec<&PricingRule> = self
+            .rules
             .iter()
             .filter(|r| r.effective_at(at))
             .filter(|r| model_is_match(r, model))
             .filter(|r| provider_is_match(r, provider))
             .filter(|r| has_price(r))
-            .min_by_key(|r| -r.priority)
-        {
+            .collect();
+        ranked.sort_by(|a, b| {
+            (source_order(b.source), b.priority).cmp(&(source_order(a.source), a.priority))
+        });
+        let rule: Option<PricingRule> = match ranked.into_iter().next() {
             Some(r) => Some(r.clone()),
             None if self.builtin_enabled => self.builtin_rule(model, provider, at),
             None => None,

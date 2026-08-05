@@ -128,6 +128,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/reestimate", post(traffic_reestimate))
         .route("/api/v1/pricing/catalogs", get(pricing_catalogs))
         .route(
+            "/api/v1/pricing/catalogs/{id}/refresh",
+            post(pricing_catalog_refresh),
+        )
+        .route("/api/v1/pricing/snapshots", get(pricing_snapshots))
+        .route("/api/v1/pricing/reprice", post(pricing_reprice))
+        .route(
             "/api/v1/pricing/rules",
             get(pricing_rules).post(pricing_rules_create),
         )
@@ -357,16 +363,11 @@ struct PricingTestRequest {
 }
 
 async fn pricing_test(State(st): State<AppState>, Json(req): Json<PricingTestRequest>) -> Response {
-    // 从 DB 加载用户规则
-    let rules: Vec<metria_core::model::PricingRule> = st
-        .db
-        .list_pricing_rules()
-        .into_iter()
-        .filter_map(|r| serde_json::from_value(r).ok())
-        .collect();
+    // 从 DB 加载全部规则（用户 + 目录快照）
+    let rules = st.db.load_all_rules();
     let mut engine = metria_pricing::PricingEngine::new();
     for r in rules {
-        engine.add_user_rule(r);
+        engine.add_rule(r);
     }
     let usage = metria_core::model::Usage {
         input: req.input_tokens,
@@ -395,6 +396,74 @@ async fn pricing_test(State(st): State<AppState>, Json(req): Json<PricingTestReq
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "pricing_test_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn pricing_catalog_refresh(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let defs = crate::catalog::catalogs_from_db(&st.db);
+    let Some(cat) = defs.into_iter().find(|c| c.id == id) else {
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "catalog_not_found",
+            "目录不存在或未启用",
+        );
+    };
+    match crate::catalog::sync_catalog(&st.db, &cat) {
+        Ok(r) => {
+            st.sse.publish("pricing.updated", "{}");
+            Json(serde_json::json!({
+                "ok": true,
+                "fetched": r.fetched,
+                "rules": r.rules,
+                "etag": r.etag,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let _ = st.db.mark_catalog_error(&cat.id, &e);
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e,
+                "note": "同步失败，继续使用最后一个有效快照",
+            }))
+            .into_response()
+        }
+    }
+}
+
+async fn pricing_snapshots(State(st): State<AppState>) -> Response {
+    Json(serde_json::json!({ "snapshots": st.db.list_pricing_snapshots() })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RepriceRequest {
+    // 预留筛选
+}
+
+async fn pricing_reprice(State(st): State<AppState>, _req: Json<RepriceRequest>) -> Response {
+    let rules = st.db.load_all_rules();
+    let mut engine = metria_pricing::PricingEngine::new();
+    for r in rules {
+        engine.add_rule(r);
+    }
+    match st.db.reprice_all(&engine) {
+        Ok(n) => {
+            st.sse.publish("pricing.updated", "{}");
+            Json(serde_json::json!({
+                "ok": true,
+                "repriced": n,
+                "note": "重新计价生成新版本并保留历史 pricing_matches",
+            }))
+            .into_response()
+        }
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reprice_failed",
             &e.to_string(),
         ),
     }
