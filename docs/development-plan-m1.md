@@ -24,6 +24,22 @@
 - CLI 端到端验证：fixture 扫描→spool→上传→hub 落库→rollup→查询全通；断网补传语义验证。
 - doctor --spool/--database/--hub 补全。
 
+### M2/M3/M6/M7 完成记录（2026-08-05）
+
+- M2 Traffic：agent 生成学习样本并上传；Hub 样本存储 + learned profile 聚合（P50/P75/P90）；
+  profile 列表/创建/删除/匹配测试；历史重新估算（生成新版本保留旧版）；metria-traffic
+  支持自定义候选 profile；Web Traffic Profiles 页。
+- M3 Pricing：PricingEngine 多来源优先级（user > openrouter/custom > litellm > builtin）；
+  OpenRouter/LiteLLM/Custom HTTP 目录同步（per-token→微美元/百万、模型名归一化、ETag/304、
+  快照+来源保存、失败保留旧快照）；后台周期同步；目录刷新/快照/重新计价 API；Web Pricing 增强。
+- M6 分享/导出/MCP/备份：Share Link（公开只读脱敏 DTO + 查看审计）；sessions/calls 导出
+  JSON/NDJSON/CSV；`metria mcp` stdio 只读查询（7 个工具）；`metria backup`（VACUUM INTO +
+  zstd）/ `metria restore`。
+- M7 生产完善：10 万/100 万事件基准 + 价格匹配/流量重建基准（docs/operations.md 记录）；
+  运维文档（保留策略/备份/升级/回滚）。
+
+验证：fmt/clippy(-D warnings)/test 全绿；web typecheck+build 通过；各里程碑端到端验证通过。
+
 ### S3 完成记录（2026-08-05）
 
 - Web（Preact+TS+Vite+uPlot）：hash 路由、登录、侧边导航（总览/Nodes/Agent 工具/模型/会话/调用/流量/数据质量）、全局时间范围选择器（from/to/时区/粒度/快捷项/URL 持久化）、uPlot 时间序列、统计卡片、表格、Light/Dark、SSE 增量刷新（EventSource + token）、移动端布局、空/加载/错误态。

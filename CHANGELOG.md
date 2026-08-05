@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- M2 Traffic：Profile 自动学习、用户/学习 Profile Web 管理、历史重新估算。
+- M3 Pricing：OpenRouter / LiteLLM / Custom HTTP 价格目录同步（ETag/快照/失败保留）、重新计价。
+- M6 分享 / 导出（JSON/NDJSON/CSV）/ MCP 只读查询 / 备份恢复。
+- M7 性能基准（10 万/100 万事件）与运维文档（保留策略/备份/升级/回滚）。
+
 ## [0.1.0] - 2026-08-05
 
 ### Added
