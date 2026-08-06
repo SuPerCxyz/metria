@@ -71,6 +71,9 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     seed_catalogs(&db);
     spawn_catalog_sync(db.clone());
 
+    // 后台维护：周期 rollup 对账 + WAL checkpoint
+    spawn_maintenance(db.clone());
+
     // Demo 模式：生成确定性合成数据
     if cfg.demo {
         match demo::seed_demo(&db) {
@@ -185,6 +188,42 @@ fn spawn_catalog_sync(db: db::HubDb) {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+/// 后台维护任务：周期 rollup 对账 + WAL checkpoint（§9 要求）。
+///
+/// - 每 6 小时对最近 24h 的 rollup 做一次对账，发现漂移则重建最近 24h。
+/// - 每 6 小时执行 `wal_checkpoint(TRUNCATE)` 回收 WAL，控制磁盘占用。
+fn spawn_maintenance(db: db::HubDb) {
+    tokio::spawn(async move {
+        // 延迟启动，避免阻塞启动路径
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            tick.tick().await;
+            // rollup 对账（最近 24h）
+            match db.reconcile_rollups(1) {
+                Ok(report) => {
+                    if report.drift_buckets > 0 {
+                        warn!(
+                            buckets = report.buckets,
+                            drift = report.drift_buckets,
+                            "rollup 对账发现漂移，触发重建"
+                        );
+                        match db.rebuild_drift(1) {
+                            Ok(rebuilt) => info!("rollup 重建完成: {rebuilt} 条"),
+                            Err(e) => warn!("rollup 重建失败: {e}"),
+                        }
+                    }
+                }
+                Err(e) => warn!("rollup 对账失败: {e}"),
+            }
+            // WAL checkpoint
+            if let Err(e) = db.wal_checkpoint() {
+                warn!("WAL checkpoint 失败: {e}");
+            }
         }
     });
 }

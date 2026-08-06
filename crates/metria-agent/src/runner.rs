@@ -123,7 +123,7 @@ fn register(cfg: &AgentConfig, node_id: String, client: &HubClient) -> Result<Sc
         node_architecture: Some(arch),
         node_timezone: Some("UTC".into()),
         agent_version: metria_core::VERSION.to_string(),
-        protocol_version: 1,
+        protocol_version: metria_protocol::limits::PROTOCOL_VERSION,
         container_image: None,
         collector_id_hint: None,
     };

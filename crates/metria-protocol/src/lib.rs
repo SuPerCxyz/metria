@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub mod limits {
     /// 协议 schema 版本。
     pub const SCHEMA_VERSION: u32 = 1;
+    /// Collector 线协议版本：不兼容时 register 拒绝并返回 400。
+    pub const PROTOCOL_VERSION: u32 = 1;
     /// 单批最大事件数。
     pub const MAX_EVENTS_PER_BATCH: usize = 256;
     /// 单批压缩后最大字节数。
@@ -148,19 +150,39 @@ pub fn validate_batch(batch: &UploadBatch) -> Result<(), String> {
             limits::MAX_EVENTS_PER_BATCH
         ));
     }
-    let total: usize = batch
-        .events
-        .iter()
-        .map(|e| {
-            serde_json::to_string(&e.payload)
-                .map(|s| s.len())
-                .unwrap_or(0)
-        })
-        .sum();
+    let mut total: usize = 0;
+    for e in &batch.events {
+        let s = serde_json::to_string(&e.payload).map_err(|e| e.to_string())?;
+        if s.len() > limits::MAX_EVENT_BYTES {
+            return Err(format!(
+                "单条事件 {} 超过大小上限（{} > {} 字节）",
+                e.event_id,
+                s.len(),
+                limits::MAX_EVENT_BYTES
+            ));
+        }
+        if json_depth(&e.payload) > limits::MAX_JSON_DEPTH {
+            return Err(format!(
+                "单条事件 {} 嵌套深度超过上限 {}",
+                e.event_id,
+                limits::MAX_JSON_DEPTH
+            ));
+        }
+        total += s.len();
+    }
     if total > limits::MAX_UNCOMPRESSED_BODY {
         return Err("解压后超过大小上限".into());
     }
     Ok(())
+}
+
+/// 计算 JSON 值嵌套深度（顶层为 1）。
+pub fn json_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        _ => 1,
+    }
 }
 
 /// 事件 ID 基本格式校验。

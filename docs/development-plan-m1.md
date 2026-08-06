@@ -19,6 +19,22 @@
 | M7 基准/运维文档 | ✅ 完成 | 2026-08-05 |
 | 生产完善：CI 多架构构建修复/验证、设置与分享页 | ✅ 完成 | 2026-08-06 |
 | 收尾：token 7 天有效期、Claude 子代理、Web Waterfall/子代理树/模型切换、i18n | ✅ 完成 | 2026-08-06 |
+| 查缺补漏：rollup 对账/checkpoint、协议协商、ingest 限长、前端测试、集成测试、文件拆分、docs | ✅ 完成 | 2026-08-06 |
+
+### 查缺补漏完成记录（2026-08-06）
+
+- Rollup 对账后台任务（S2.12）：`reconcile_rollups` 逐 bucket 对比 raw 与汇总，`rebuild_drift`
+  从事件表重建最近 N 天；`spawn_maintenance` 每 6h 对账 + 漂移自动重建 + `wal_checkpoint(TRUNCATE)`（§9）。
+- 协议版本协商（S2.9）：`limits::PROTOCOL_VERSION`；不兼容 register 拒绝 400，e2e 覆盖。
+- Ingest 校验（S2.10）：单事件 ≤2MiB、JSON 深度 ≤32 进入 `validate_batch`；`zstd_decode` 限长
+  防 zip bomb（解压超 8MiB 拒绝）。e2e 覆盖 deep_nested / oversized / zstd_bomb。
+- Web 前端测试（S3.11）：Vitest + jsdom，format/i18n/range/api 序列化 4 文件 26 用例。
+- 集成测试补全（S2.16）：断网补传（spool 重启续传）、部分成功重传（仅失败子集）、重试耗尽转死信、
+  Hub 部分成功响应、heartbeat 时钟偏移（`clock_skew_seconds` 计算与存储）。
+- 文件拆分（§7）：`db/mod.rs`(639) + `db/traffic.rs` + `db/pricing.rs`；
+  `api/mod.rs`(674) + `api/handlers_query.rs`(817) + `api/handlers_misc.rs`，全部 <800 行。
+- docs 补齐（§1）：architecture/data-model/adapters/api/deployment/privacy/development + README 文档链接修正。
+
 
 ### 收尾完成记录（2026-08-06）
 

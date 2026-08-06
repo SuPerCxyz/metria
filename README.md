@@ -90,11 +90,11 @@ scripts/           构建与门禁脚本
 - [架构](docs/architecture.md)
 - [数据模型](docs/data-model.md)
 - [Adapter](docs/adapters.md)
-- [价格体系](docs/pricing.md)
-- [流量估算](docs/traffic-estimation.md)
 - [API](docs/api.md)
 - [部署](docs/deployment.md)
-- [隐私](docs/privacy.md)
+- [隐私与数据诚实性](docs/privacy.md)
+- [运维手册](docs/operations.md)
+- [开发指南](docs/development.md)
 - [开发计划](docs/development-plan-m1.md)
 
 ## 许可

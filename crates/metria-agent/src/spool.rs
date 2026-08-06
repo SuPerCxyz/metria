@@ -460,4 +460,106 @@ mod tests {
         assert_eq!(spool.dead_letter_count(), 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn offline_events_survive_restart_and_catch_up() {
+        // 断网补传：事件写入 spool，重启后仍在 pending，可续传
+        let path = std::env::temp_dir().join(format!("spool-offline-{}", std::process::id()));
+        tmp(&path);
+        let mk = |id: &str| PendingEvent {
+            event_id: id.into(),
+            kind: "usage".into(),
+            payload: serde_json::json!({"x": 1}),
+        };
+        {
+            let mut spool = Spool::open(&path, 100, 10_000_000).unwrap();
+            spool.insert_batch(&[mk("off1"), mk("off2")], &[]).unwrap();
+            assert_eq!(spool.pending_count(), 2);
+        } // 模拟 Agent 重启（连接关闭）
+        {
+            let mut spool = Spool::open(&path, 100, 10_000_000).unwrap();
+            assert_eq!(spool.pending_count(), 2, "重启后事件不应丢失");
+            let (batch, items) = spool.next_batch(10, 10_000);
+            assert_eq!(items.len(), 2);
+            // 网络恢复：ack 后清空
+            spool
+                .ack_uploaded(&batch, &["off1".into(), "off2".into()])
+                .unwrap();
+            assert_eq!(spool.pending_count(), 0);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn partial_success_retries_only_failed() {
+        // 部分成功：仅 ack 成功子集，失败子集保留并重试
+        let path = std::env::temp_dir().join(format!("spool-partial-{}", std::process::id()));
+        tmp(&path);
+        let mk = |id: &str| PendingEvent {
+            event_id: id.into(),
+            kind: "usage".into(),
+            payload: serde_json::json!({"x": 1}),
+        };
+        let mut spool = Spool::open(&path, 100, 10_000_000).unwrap();
+        spool
+            .insert_batch(&[mk("p1"), mk("p2"), mk("p3")], &[])
+            .unwrap();
+        let (batch, _items) = spool.next_batch(10, 10_000);
+        // 服务器确认 p1；p2/p3 可重试失败
+        spool.ack_uploaded(&batch, &["p1".into()]).unwrap();
+        spool
+            .fail_events(&batch, &["p2".into(), "p3".into()], true, "hub busy")
+            .unwrap();
+        assert_eq!(spool.pending_count(), 2, "失败子集应保留重试");
+        // 重传：再次取批，只含失败子集
+        let (_, items2) = spool.next_batch(10, 10_000);
+        assert_eq!(items2.len(), 2);
+        let ids: Vec<&str> = items2.iter().map(|e| e.event_id.as_str()).collect();
+        assert!(
+            ids.contains(&"p2") && ids.contains(&"p3"),
+            "只应重传失败子集: {ids:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retry_exhausted_moves_to_dead_letter() {
+        // 重试次数超限 → 转死信，避免无限重试
+        let path = std::env::temp_dir().join(format!("spool-exhaust-{}", std::process::id()));
+        tmp(&path);
+        let mut spool = Spool::open(&path, 100, 10_000_000).unwrap();
+        spool
+            .insert_batch(
+                &[PendingEvent {
+                    event_id: "exh".into(),
+                    kind: "usage".into(),
+                    payload: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
+        let (batch, _) = spool.next_batch(10, 10_000);
+        // 多次可重试失败累积 attempts
+        for _ in 0..5 {
+            spool
+                .fail_events(&batch, &["exh".into()], true, "busy")
+                .unwrap();
+        }
+        let attempts: i64 = spool
+            .conn
+            .query_row(
+                "SELECT attempts FROM pending_events WHERE event_id = 'exh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(attempts, 5, "attempts 应累积");
+        // 非可重试失败 → 转死信
+        spool
+            .fail_events(&batch, &["exh".into()], false, "invalid")
+            .unwrap();
+        assert_eq!(spool.pending_count(), 0);
+        assert_eq!(spool.dead_letter_count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
 }

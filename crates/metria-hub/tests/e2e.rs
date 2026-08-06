@@ -398,3 +398,177 @@ async fn collector_token_has_seven_day_expiry() {
         "重新注册应刷新有效期"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incompatible_protocol_version_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 不兼容的协议版本 → 400，不静默注册
+    let resp = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "proto-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 999}),
+        )
+        .unwrap_err();
+    assert!(matches!(resp, ureq::Error::Status(400, _)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_nested_event_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 深度超过 32 的事件 → 400
+    let mut deep = json!({"leaf": "x"});
+    for _ in 0..40 {
+        deep = json!({"wrap": deep});
+    }
+    let batch = json!({
+        "schema_version": 1, "batch_id": "deep", "node_id": "n", "collector_id": "c",
+        "agent_version": "0.1.0",
+        "events": [{"kind": "usage", "event_id": "blake3:deep1", "payload": deep}]
+    });
+    let resp = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+        .unwrap_err();
+    assert!(matches!(resp, ureq::Error::Status(400, _)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_single_event_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 单事件 payload 超过 2MiB → 400
+    let big = "x".repeat(3 * 1024 * 1024);
+    let batch = json!({
+        "schema_version": 1, "batch_id": "bigevent", "node_id": "n", "collector_id": "c",
+        "agent_version": "0.1.0",
+        "events": [{"kind": "usage", "event_id": "blake3:big1", "payload": {"blob": big}}]
+    });
+    match ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+    {
+        // 3MiB 未压缩请求体被 axum 默认 limit 拒绝（413）或解压后超限（400）
+        Ok(r) => panic!("应被拒绝，实际成功: status {}", r.status()),
+        Err(ureq::Error::Status(400, _)) => {}
+        Err(ureq::Error::Status(413, _)) => {}
+        Err(e) => panic!("应返回 400/413，实际: {e}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zstd_bomb_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 高度可压缩的爆炸负载：解压后远超 8MiB 上限
+    let payload = "compressme-".repeat(3 * 1024 * 1024);
+    let batch = json!({
+        "schema_version": 1, "batch_id": "bomb", "node_id": "n", "collector_id": "c",
+        "agent_version": "0.1.0",
+        "events": [{"kind": "usage", "event_id": "blake3:bomb1", "payload": {"blob": payload}}]
+    });
+    let raw = serde_json::to_vec(&batch).unwrap();
+    let mut enc = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    std::io::Write::write_all(&mut enc, &raw).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    let resp = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .set("Content-Encoding", "zstd")
+        .send_bytes(&compressed);
+    match resp {
+        Ok(r) => panic!("应被拒绝，实际成功: status {}", r.status()),
+        Err(ureq::Error::Status(400, _)) => {}
+        Err(ureq::Error::Status(413, _)) => {}
+        Err(e) => panic!("应返回 400/413，实际: {e}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_success_keeps_good_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 混合批次：2 个合法 + 1 个非法类型 → accepted=2, failed=1, 合法事件落库
+    let batch = json!({
+        "schema_version": 1, "batch_id": "partial", "node_id": "n", "collector_id": "c",
+        "agent_version": "0.1.0",
+        "events": [
+            {"kind": "session", "event_id": "blake3:ok1", "payload": {
+                "source_session_id": "ps-1", "started_at": "2026-08-06T01:00:00Z",
+                "node_id": "n", "collector_id": "c", "client_id": "claude-code",
+                "source_id": "s", "status": "active"
+            }},
+            {"kind": "call", "event_id": "blake3:ok2", "payload": {
+                "started_at": "2026-08-06T01:01:00Z", "node_id": "n", "collector_id": "c",
+                "client_id": "claude-code", "source_id": "s"
+            }},
+            {"kind": "no-such-kind", "event_id": "blake3:bad1", "payload": {}}
+        ]
+    });
+    let resp: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch.clone())
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(
+        resp["accepted"].as_array().unwrap().len(),
+        2,
+        "合法事件应接受: {resp}"
+    );
+    assert_eq!(
+        resp["failed"].as_array().unwrap().len(),
+        1,
+        "非法事件应失败: {resp}"
+    );
+    assert_eq!(resp["failed"][0]["event_id"], "blake3:bad1");
+    assert_eq!(resp["failed"][0]["retryable"], false);
+
+    // 合法事件确实落库
+    let token = admin_token(&base);
+    let sessions: Value = ureq::get(&format!(
+        "{base}/api/v1/sessions?from=2026-08-01T00:00:00Z&to=2026-08-06T23:59:59Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(!sessions["sessions"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeat_records_clock_skew() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, state) = spawn_hub(dir.path()).await;
+    // 注册
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "skew-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap();
+    // 心跳：agent 时钟比 Hub 慢 300 秒
+    let agent_clock = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+    ureq::post(&format!("{base}/api/v1/collectors/heartbeat"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({"schema_version": 1, "node_id": "skew-node", "collector_id": "collector-skew-node",
+            "spool_pending_events": 0, "spool_size_bytes": 0, "source_count": 0, "agent_clock": agent_clock}))
+        .unwrap();
+    let skew: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT clock_skew_seconds FROM collectors WHERE id = 'collector-skew-node'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        (skew - 300).abs() <= 5,
+        "clock_skew 应约 300 秒，实际 {skew}"
+    );
+}
