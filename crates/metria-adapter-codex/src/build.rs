@@ -225,9 +225,16 @@ impl SessionBuilder {
         };
         if let Some(c) = &content {
             if self.running_bytes < RUNNING_TEXT_CAP {
-                let add = c.len().min(RUNNING_TEXT_CAP - self.running_bytes);
-                self.running_text.push_str(&c[..add]);
-                self.running_bytes += add;
+                let room = RUNNING_TEXT_CAP - self.running_bytes;
+                let add = c.len().min(room);
+                // 在 UTF-8 字符边界截断，避免越过 char 边界 panic
+                let cut = c
+                    .char_indices()
+                    .filter_map(|(i, ch)| (i + ch.len_utf8() <= add).then_some(i + ch.len_utf8()))
+                    .next_back()
+                    .unwrap_or(0);
+                self.running_text.push_str(&c[..cut]);
+                self.running_bytes += cut;
             }
         }
         self.session.message_count += 1;

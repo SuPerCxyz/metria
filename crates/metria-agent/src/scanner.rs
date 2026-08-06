@@ -184,10 +184,13 @@ pub struct SourceScan {
     pub skipped_full: bool,
 }
 
-/// 将 ScanBatch 归一化为待上传事件（含定价与隐私处理）。
+/// 将 ScanBatch 归一化为待上传事件（含定价）。
+///
+/// 精简模式：只上传 session 概要（聚合计数，无正文）、call、usage、traffic、
+/// traffic_sample；不采集 message/tool/subagent 等会话详细内容，聚焦 Token/Cost/Traffic。
 pub fn normalize_batch(
     batch: &ScanBatch,
-    content_mode: ContentMode,
+    _content_mode: ContentMode,
     pricing: &PricingEngine,
     source_id: &str,
 ) -> Vec<PendingEvent> {
@@ -200,29 +203,6 @@ pub fn normalize_batch(
             event_id: event_id.as_str().to_string(),
             kind: "session".into(),
             payload: serde_json::to_value(s).unwrap_or_default(),
-        });
-    }
-
-    for m in &batch.messages {
-        let event_id = EventId::from_content(&format!("message:{}", m.id.as_str()));
-        let mut payload = serde_json::to_value(m).unwrap_or_default();
-        // 隐私：按 content_mode 剥离或脱敏正文
-        match content_mode {
-            ContentMode::Full => {
-                if let Some(c) = payload.get_mut("content").and_then(|c| c.as_str()) {
-                    let redacted = metria_core::privacy::redact_text(c);
-                    payload["content"] = serde_json::Value::String(redacted);
-                }
-            }
-            ContentMode::Metadata | ContentMode::None => {
-                payload["content"] = serde_json::Value::Null;
-                payload["redacted"] = serde_json::Value::Bool(true);
-            }
-        }
-        out.push(PendingEvent {
-            event_id: event_id.as_str().to_string(),
-            kind: "message".into(),
-            payload,
         });
     }
 
@@ -349,24 +329,6 @@ pub fn normalize_batch(
                 });
             }
         }
-    }
-
-    for t in &batch.tool_events {
-        let event_id = EventId::from_content(&format!("tool:{}", t.id.as_str()));
-        out.push(PendingEvent {
-            event_id: event_id.as_str().to_string(),
-            kind: "tool".into(),
-            payload: serde_json::to_value(t).unwrap_or_default(),
-        });
-    }
-
-    for r in &batch.subagent_relations {
-        let event_id = EventId::from_content(&format!("subagent:{}", r.id.as_str()));
-        out.push(PendingEvent {
-            event_id: event_id.as_str().to_string(),
-            kind: "subagent".into(),
-            payload: serde_json::to_value(r).unwrap_or_default(),
-        });
     }
 
     // source_id 附注（用于 hub 关联；payload 内已有）

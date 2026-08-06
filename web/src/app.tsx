@@ -72,23 +72,31 @@ export function App() {
   const [authed, setAuthed] = useState<boolean | null>(null)
 
   useEffect(() => {
-    if (!getToken()) {
-      setAuthed(false)
-      return
-    }
-    api('/auth/me')
-      .then(() => setAuthed(true))
-      .catch(() => {
-        setAuthed(false)
-        nav('login')
-      })
     const onUnauth = () => {
       setAuthed(false)
       nav('login')
     }
-    const onAuthed = () => setAuthed(true)
+    const onAuthed = () => {
+      // 登录成功后重新校验并进入主界面
+      api('/auth/me')
+        .then(() => setAuthed(true))
+        .catch(() => {
+          setAuthed(false)
+          nav('login')
+        })
+    }
     window.addEventListener('metria:unauth', onUnauth)
     window.addEventListener('metria:authed', onAuthed)
+    if (!getToken()) {
+      setAuthed(false)
+    } else {
+      api('/auth/me')
+        .then(() => setAuthed(true))
+        .catch(() => {
+          setAuthed(false)
+          nav('login')
+        })
+    }
     return () => {
       window.removeEventListener('metria:unauth', onUnauth)
       window.removeEventListener('metria:authed', onAuthed)
