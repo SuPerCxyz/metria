@@ -141,9 +141,12 @@ export function CallDetail({ id }: { id: string }) {
           ['Input', fmtTokens(c.input_tokens)],
           ['Output', fmtTokens(c.output_tokens)],
           ['Cache Read', fmtTokens(c.cache_read_tokens)],
+          ['Cache Write', fmtTokens(c.cache_write_tokens)],
           ['Reasoning', fmtTokens(c.reasoning_tokens)],
+          [t('calls.duration'), c.duration_ms != null ? `${(c.duration_ms / 1000).toFixed(1)}s` : '—'],
           ['Reported Cost', fmtUsd(c.reported_cost_micro_usd)],
           ['Calculated Cost', fmtUsd(c.calculated_cost_micro_usd)],
+          ['Estimated Cost', fmtUsd(c.estimated_cost_micro_usd)],
         ].map(([label, value]) => (
           <div class="kv" key={label}>
             <span class="kv-label">{label}</span>
@@ -168,6 +171,9 @@ export function CallDetail({ id }: { id: string }) {
               ['估算来源', tr.estimation_source],
               ['上下文传输', tr.context_transport_mode],
               ['Cache 行为', tr.cache_transport_behavior],
+              ['请求重建', tr.request_reconstruction_quality],
+              ['响应重建', tr.response_reconstruction_quality],
+              [t('calls.profile'), tr.profile_id ? `${tr.profile_id} v${tr.profile_version ?? ''}` : t('calls.noProfile')],
             ].map(([label, value]) => (
               <div class="kv" key={label}>
                 <span class="kv-label">{label}</span>
@@ -180,6 +186,31 @@ export function CallDetail({ id }: { id: string }) {
           </p>
         </div>
       </Card>
+
+      <Card title={t('calls.missingFields')}>
+        <MissingCallFields c={c} tr={tr} />
+      </Card>
     </div>
+  )
+}
+
+function MissingCallFields({ c, tr }: { c: any; tr: any }) {
+  const notes: string[] = []
+  const add = (cond: boolean, msg: string) => cond && notes.push(msg)
+  add(c.input_tokens == null, 'usage 缺失：客户端日志未记录本次调用 Token，相关统计为空')
+  add(c.reported_cost_micro_usd == null && c.calculated_cost_micro_usd == null, '费用缺失：无 reported/calculated 成本，仅可能估算')
+  add(!tr.estimation_source, '流量估算不可用：缺少足够日志或 Token 数据')
+  add(tr.estimation_source === 'unavailable', '流量估算来源为 unavailable（数据不足），未硬造数值')
+  add(tr.confidence == null, '估算可信度缺失')
+  add(c.cache_read_tokens == null, '缓存信息缺失：无法评估 Cache 命中')
+  if (notes.length === 0) {
+    return <div class="state-box">{t('calls.noMissing')}</div>
+  }
+  return (
+    <ul class="call-missing">
+      {notes.map((n) => (
+        <li key={n}>· {n}</li>
+      ))}
+    </ul>
   )
 }

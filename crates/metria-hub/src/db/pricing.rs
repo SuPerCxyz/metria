@@ -342,11 +342,12 @@ impl HubDb {
         out
     }
 
-    pub fn insert_pricing_rule(&self, v: &Value) -> Result<(), StorageError> {
+    pub fn insert_pricing_rule(&self, v: &Value) -> Result<String, StorageError> {
         let c = self.conn();
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
         let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
         let now = Utc::now().to_rfc3339();
+        let id = metria_core::model::Id::new().as_str().to_string();
         let provider = if g("provider_pattern").is_empty() {
             ".*"
         } else {
@@ -365,7 +366,7 @@ impl HubDb {
         c.execute(
             "INSERT INTO pricing_rules (id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, metadata, created_at, updated_at) VALUES (?1, NULL, 'user_override', 'vendor_direct', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, '{}', ?12, ?12)",
             params![
-                metria_core::model::Id::new().as_str().to_string(),
+                &id,
                 provider,
                 model,
                 client,
@@ -380,7 +381,7 @@ impl HubDb {
             ],
         )
         .map_err(StorageError::from)?;
-        Ok(())
+        Ok(id)
     }
 
     /// 更新用户规则（编辑价格 / 优先级 / 生效区间 / 停用启用）。
@@ -406,7 +407,7 @@ impl HubDb {
                 effective_to = COALESCE(NULLIF(?12,''), effective_to),
                 enabled = COALESCE(?13, enabled),
                 updated_at = ?14
-             WHERE id = ?15 AND source = 'user'",
+             WHERE id = ?15 AND source = 'user_override'",
                 params![
                     g("provider_pattern"),
                     g("model_pattern"),
@@ -434,7 +435,7 @@ impl HubDb {
         let c = self.conn();
         let n = c
             .execute(
-                "DELETE FROM pricing_rules WHERE id = ?1 AND source = 'user'",
+                "DELETE FROM pricing_rules WHERE id = ?1 AND source = 'user_override'",
                 [id],
             )
             .map_err(StorageError::from)?;

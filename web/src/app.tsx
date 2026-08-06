@@ -5,6 +5,7 @@ import { LogoutButton } from './components/ui'
 import { t, getLocale, setLocale } from './lib/i18n'
 import { useRoute, nav } from './lib/router'
 import { Login } from './pages/Login'
+import { ShareView } from './pages/ShareView'
 import { Overview } from './pages/Overview'
 import { Nodes, NodeDetail } from './pages/Nodes'
 import { Clients } from './pages/Clients'
@@ -113,6 +114,13 @@ export function App() {
   void localeTick
 
   if (authed === null) return <div class="state-box">{t('common.loading')}</div>
+  if (route.path === '/s' && route.parts[1]) {
+    return (
+      <div data-theme={theme}>
+        <ShareView slug={route.parts[1]} />
+      </div>
+    )
+  }
   if (!authed) {
     return (
       <div data-theme={theme}>

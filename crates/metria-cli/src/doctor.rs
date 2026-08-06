@@ -159,6 +159,7 @@ fn check_hub() -> Result<(), String> {
                 r.status(),
                 elapsed.as_millis()
             );
+            check_hub_time(base);
             check_hub_upload(base)?;
             Ok(())
         }
@@ -201,7 +202,64 @@ fn check_hub_upload(base: &str) -> Result<(), String> {
         Ok(r) => {
             if let Ok(body) = r.into_json::<serde_json::Value>() {
                 let nodes = body.get("nodes").and_then(|v| v.as_array());
-                println!("  [OK] 节点数: {}", nodes.map(|n| n.len()).unwrap_or(0));
+                let n = nodes.map(|n| n.len()).unwrap_or(0);
+                println!("  [OK] 节点数: {n}");
+                // 最近上传：遍历节点 detail 取 collector last_upload_at
+                if let Some(arr) = nodes {
+                    let mut last_upload: Option<(String, String)> = None;
+                    let mut last_heartbeat: Option<(String, String)> = None;
+                    for node in arr {
+                        let id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Ok(detail) = ureq::get(&format!("{base}/api/v1/nodes/{id}"))
+                            .set("Authorization", &format!("Bearer {token}"))
+                            .timeout(std::time::Duration::from_secs(5))
+                            .call()
+                        {
+                            if let Ok(dbody) = detail.into_json::<serde_json::Value>() {
+                                for c in dbody
+                                    .get("collectors")
+                                    .and_then(|v| v.as_array())
+                                    .unwrap_or(&vec![])
+                                {
+                                    if let Some(u) =
+                                        c.get("last_upload_at").and_then(|v| v.as_str())
+                                    {
+                                        if last_upload
+                                            .as_ref()
+                                            .map(|(_, t)| u > t.as_str())
+                                            .unwrap_or(true)
+                                        {
+                                            last_upload = Some((id.to_string(), u.to_string()));
+                                        }
+                                    }
+                                    if let Some(h) =
+                                        c.get("last_heartbeat_at").and_then(|v| v.as_str())
+                                    {
+                                        if last_heartbeat
+                                            .as_ref()
+                                            .map(|(_, t)| h > t.as_str())
+                                            .unwrap_or(true)
+                                        {
+                                            last_heartbeat = Some((id.to_string(), h.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match last_upload {
+                        Some((node_id, ts)) => {
+                            println!("  [OK] 最近上传: node={node_id} at {ts}");
+                        }
+                        None => println!("  [WARN] 未发现任何 Collector 上传记录"),
+                    }
+                    match last_heartbeat {
+                        Some((node_id, ts)) => {
+                            println!("  [OK] 最近心跳: node={node_id} at {ts}");
+                        }
+                        None => println!("  [WARN] 未发现任何 Collector 心跳记录"),
+                    }
+                }
             }
             Ok(())
         }
@@ -209,6 +267,46 @@ fn check_hub_upload(base: &str) -> Result<(), String> {
             println!("  [WARN] 查询 nodes 失败: {e}");
             Ok(())
         }
+    }
+}
+
+/// 检查本机与 Hub 的时钟偏差（S2.17）：对比 Hub 响应头日期与本机时间。
+fn check_hub_time(base: &str) {
+    println!("== Hub 时间差 ==");
+    let resp = ureq::get(&format!("{base}/healthz"))
+        .timeout(std::time::Duration::from_secs(5))
+        .call();
+    let hub_date = match resp {
+        Ok(r) => r.header("Date").map(|s| s.to_string()),
+        Err(e) => {
+            println!("  [FAIL] 无法获取 Hub 时间: {e}");
+            return;
+        }
+    };
+    let Some(hub_date) = hub_date else {
+        println!("  [WARN] Hub 未返回 Date 响应头，跳过时间差检查");
+        return;
+    };
+    let Ok(hub_http_date) = httpdate::parse_http_date(&hub_date) else {
+        println!("  [WARN] 无法解析 Hub Date 头（{hub_date}），跳过时间差检查");
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let skew = now
+        .duration_since(hub_http_date)
+        .or_else(|_| hub_http_date.duration_since(now))
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if skew > 60.0 {
+        println!(
+            "  [WARN] 本机与 Hub 时钟偏差约 {:.0}s（Hub: {hub_date}）。过大偏差会导致时间戳与告警失真",
+            skew
+        );
+    } else {
+        println!(
+            "  [OK] 本机与 Hub 时钟偏差 {:.0}s 以内（Hub: {hub_date}）",
+            skew
+        );
     }
 }
 

@@ -7,6 +7,7 @@ import { t } from '../lib/i18n'
 /** 分享：创建公开只读链接并管理。 */
 export function Shares() {
   const shares = useQuery<any>('/shares', () => api('/shares'))
+  const audits = useQuery<any>('/shares/audits', () => api('/shares/audits'))
   const [kind, setKind] = useState('session')
   const [targetId, setTargetId] = useState('')
   const [msg, setMsg] = useState('')
@@ -25,6 +26,16 @@ export function Shares() {
       shares.refresh()
     } catch (e) {
       setMsg(`创建失败：${(e as Error).message}`)
+    }
+  }
+
+  const remove = async (slug: string) => {
+    if (!window.confirm(`确认删除分享链接 ${slug}？`)) return
+    try {
+      await api(`/shares/${encodeURIComponent(slug)}`, { method: 'DELETE' })
+      shares.refresh()
+    } catch (e) {
+      setMsg(`删除失败：${(e as Error).message}`)
     }
   }
 
@@ -65,6 +76,7 @@ export function Shares() {
               <th>目标</th>
               <th>创建时间</th>
               <th>链接</th>
+              <th>{t('common.actions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -79,6 +91,33 @@ export function Shares() {
                     /s/{s.slug}
                   </a>
                 </td>
+                <td>
+                  <button type="button" class="btn small" onClick={() => remove(s.slug)}>
+                    {t('common.delete')}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('shares.audits')}>
+        {(audits.data?.audits || []).length === 0 && <Empty text={t('shares.noAudits')} />}
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Slug</th>
+              <th>IP</th>
+              <th>{t('shares.viewedAt')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(audits.data?.audits || []).slice(0, 100).map((a: any) => (
+              <tr key={a.id}>
+                <td class="mono">{a.slug}</td>
+                <td>{a.ip || '—'}</td>
+                <td>{a.viewed_at}</td>
               </tr>
             ))}
           </tbody>

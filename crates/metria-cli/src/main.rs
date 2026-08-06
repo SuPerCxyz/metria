@@ -62,7 +62,23 @@ enum Command {
     /// 查看或生成配置
     Config,
     /// 导出数据
-    Export,
+    Export {
+        /// 导出内容：sessions | calls | usage
+        #[arg(long)]
+        kind: String,
+        /// 导出格式：json | ndjson | csv
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// 起始时间（RFC3339），默认 30 天前
+        #[arg(long)]
+        from: Option<String>,
+        /// 结束时间（RFC3339），默认当前
+        #[arg(long)]
+        to: Option<String>,
+        /// 输出文件路径（默认 ./metria-export-<kind>-<ts>）
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// 备份 Hub 数据库
     Backup {
         /// 输出文件路径（默认 ./metria-backup-<ts>.db.zst）
@@ -161,6 +177,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Export {
+            kind,
+            format,
+            from,
+            to,
+            out,
+        } => match run_export(
+            &kind,
+            &format,
+            from.as_deref(),
+            to.as_deref(),
+            out.as_deref(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("导出失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
         other => {
             eprintln!("{NOT_IMPLEMENTED}: {other:?}");
             ExitCode::FAILURE
@@ -182,6 +217,37 @@ fn run_backup(out: Option<&str>) -> Result<(), String> {
 fn run_restore(input: &str) -> Result<(), String> {
     let url = hub_db_url()?;
     metria_cli::backup::restore(&url, input)
+}
+
+fn run_export(
+    kind: &str,
+    format: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    out: Option<&str>,
+) -> Result<(), String> {
+    let url = hub_db_url()?;
+    let kind = metria_cli::export::parse_kind(kind)
+        .ok_or_else(|| format!("未知导出类型: {kind}（支持 sessions/calls/usage）"))?;
+    let fmt = metria_hub::export::parse_format(format)
+        .ok_or_else(|| format!("未知导出格式: {format}（支持 json/ndjson/csv）"))?;
+    let from = from
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("from 解析失败: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::days(30));
+    let to = to
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("to 解析失败: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_else(chrono::Utc::now);
+    metria_cli::export::export(&url, kind, &fmt, from, to, out)
 }
 
 fn run_mcp() -> Result<(), String> {

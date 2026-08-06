@@ -125,6 +125,10 @@ export function SessionDetail({ id }: { id: string }) {
 
   const callList: any[] = calls.data?.calls || []
   const maxTraffic = Math.max(0, ...callList.map((c: any) => Number(c.estimated_total_bytes) || 0))
+  const maxTokens = Math.max(
+    0,
+    ...callList.map((c: any) => Number(c.input_tokens ?? 0) + Number(c.output_tokens ?? 0)),
+  )
 
   const saChildren = new Map(
     (subagents.data?.children || []).map((c: any) => [c.id, c]),
@@ -184,6 +188,36 @@ export function SessionDetail({ id }: { id: string }) {
                   {switched && <span class="wf-switch"> ⚠ {t('sessions.switchBadge')}</span>}
                 </span>
                 <span class="wf-val">{fmtBytes(bytes)}</span>
+              </div>
+            )
+          })}
+        </div>
+      </Card>
+
+      <Card title={t('sessions.tokenWaterfall')}>
+        <div class="waterfall">
+          {callList.length === 0 && <div class="sa-empty">{t('common.empty')}</div>}
+          {callList.map((c: any, i: number) => {
+            const tokens = Number(c.input_tokens ?? 0) + Number(c.output_tokens ?? 0)
+            const pctW = maxTokens > 0 ? Math.max(1, (tokens / maxTokens) * 100) : 0
+            const prev = callList[i - 1]
+            const switched = prev && prev.model && c.model && prev.model !== c.model
+            return (
+              <div key={c.id} class="wf-row">
+                <span class="wf-time">{fmtDateTime(c.started_at)}</span>
+                <span class="wf-bar-wrap">
+                  <span class="wf-bar token" style={{ width: `${pctW}%` }} />
+                </span>
+                <span class="wf-model" onClick={() => nav(`calls/${c.id}`)} title={c.id}>
+                  {c.model || t('common.notAvailable')}
+                  {switched && <span class="wf-switch"> ⚠ {t('sessions.switchBadge')}</span>}
+                </span>
+                <span class="wf-val">
+                  {fmtTokens(Number(c.input_tokens ?? 0) + Number(c.output_tokens ?? 0))}
+                  {Number(c.cache_read_tokens ?? 0) > 0 && (
+                    <span class="text-muted"> (+cache {fmtTokens(c.cache_read_tokens)})</span>
+                  )}
+                </span>
               </div>
             )
           })}

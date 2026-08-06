@@ -160,7 +160,7 @@ pub(crate) async fn pricing_rules_create(
     Json(v): Json<serde_json::Value>,
 ) -> Response {
     match st.db.insert_pricing_rule(&v) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(id) => Json(serde_json::json!({ "ok": true, "id": id })).into_response(),
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "rule_failed",
@@ -392,6 +392,30 @@ pub(crate) async fn share_view(
     };
     crate::share::record_view(&st.db, &slug);
     Json(crate::share::build_share_dto(&st.db, &kind, &target)).into_response()
+}
+
+/// 删除（吊销）分享链接（需 Admin 会话）。
+pub(crate) async fn share_delete(
+    State(st): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    match crate::share::delete_share(&st.db, &slug) {
+        Ok(true) => Json(serde_json::json!({ "ok": true, "slug": slug })).into_response(),
+        Ok(false) => json_err(StatusCode::NOT_FOUND, "share_not_found", "分享链接不存在"),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "share_delete_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// 分享查看审计（需 Admin 会话）。
+pub(crate) async fn share_audits(State(st): State<AppState>) -> Response {
+    Json(serde_json::json!({
+        "audits": crate::share::list_share_audits(&st.db)
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -22,6 +22,35 @@
 | 查缺补漏：rollup 对账/checkpoint、协议协商、ingest 限长、前端测试、集成测试、文件拆分、docs | ✅ 完成 | 2026-08-06 |
 | 全量补齐：allocation_mode/cursor 分页/排序/虚拟滚动、Agent Tools Detail、argon2+签名 token、token 轮换/吊销、Pricing 编辑、Overview 汇总、jitter、TOML 合并、incremental_vacuum、Node 分布 | ✅ 完成 | 2026-08-06 |
 | UI 增强与质量修复：Models Detail、Node Collector 信息、Data Quality 增强、doctor --hub 增强、body limit 修复、handler 自死锁修复 | ✅ 完成 | 2026-08-06 |
+| 计划缺口全量修复：pricing 编辑/删除 bug、CLI export、分享落地页、doctor 最近上传、ingest 关系校验、参数统一、Web spec 字段补齐 | ✅ 完成 | 2026-08-06 |
+
+### 计划缺口全量修复完成记录（2026-08-06）
+
+**🔴 真实缺陷修复**
+- S3.8：pricing 规则 update/delete 的 `source` 不匹配（插入 `user_override` vs 更新删除 `user`）
+  → 统一为 `user_override`；insert 返回 id；前端规则表 source 判断同步修正。
+- S2.13：`metria export` 子命令实现（sessions/calls/usage × json/ndjson/csv，读 Hub SQLite）。
+- S3.8：分享链接 `/s/{slug}` 前端落地页（公开只读，调 `/api/v1/share/{slug}`）；并新增
+  删除/吊销（`DELETE /shares/{slug}`）与查看审计（`GET /shares/audits`）。
+- S2.17：`doctor --hub` 增加最近上传/最近心跳（遍历节点 detail 取 collector）与时钟差
+  （HTTP Date 头 vs 本机）。
+- S2.10：ingest 增加 node/collector 关系校验（token 身份与 batch 声明一致，403），e2e 覆盖。
+- S2.12：demo 数据未来时间偏移（base 回退 1h）；projects 维度表未填充（upsert_session 同步
+  insert projects，用同一 conn 避免重入死锁）。
+
+**🟠 后端参数统一**
+- S2.13：`allocation_mode` 扩展到 `node_calls`/`node_sessions`；`node_calls` 补齐 cursor 分页。
+
+**🟡 S3 spec 字段补齐（前端 + 后端）**
+- S3.3 Overview：AgentTool/Model/Project 计数、Token 构成、Collector 在线状态（≤5min 心跳）。
+- S3.4 Nodes：列表 Detected Clients 徽标；Detail 时间范围统计、按 Client 分布。
+- S3.5 Client Detail：Project 分布、最近 Calls、Source 健康、版本分布。
+- S3.6 Models：列表 Bytes per Input/Output Token；Detail 时间序列（Token/Cost/Traffic）、最近 Calls。
+- S3.7 Session：Token Waterfall；Call Detail：duration/Cache Write/Estimated Cost、Profile
+  （profile_id/version + 重建质量）、缺失字段说明。
+- S3.8 DataQuality：confidence 占比、cursor 状态、告警。
+- S3.8 Pricing：effective_from/to、编辑表单（预填 + PUT）。
+- S3.8 Shares：删除/吊销、查看审计。
 
 ### UI 增强与质量修复完成记录（2026-08-06）
 

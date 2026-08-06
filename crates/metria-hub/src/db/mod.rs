@@ -345,6 +345,19 @@ impl HubDb {
         let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
         let gf = |k: &str| v.get(k).and_then(|x| x.as_f64());
         let key = Self::session_key(g("node_id"), g("source_session_id"));
+        // 同步维护 projects 维度表（project_id 存在时，使用已持有的 conn 避免重入死锁）
+        let project_id = g("project_id");
+        if !project_id.is_empty() {
+            let _ = c.execute(
+                "INSERT OR IGNORE INTO projects (id, canonical_key, path_hash, metadata, first_seen_at, last_seen_at, created_at, updated_at) VALUES (?1,?2,?3,'{}',?4,?4,?4,?4)",
+                params![
+                    format!("project-{}", &blake3_hex(project_id)[..16]),
+                    project_id,
+                    g("working_directory_hash"),
+                    now,
+                ],
+            );
+        }
         let n = c
             .execute(
                 "INSERT OR IGNORE INTO sessions (

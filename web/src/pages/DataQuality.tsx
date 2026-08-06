@@ -1,7 +1,7 @@
 import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
-import { fmtBytes, fmtTokens, pct } from '../lib/format'
+import { fmtBytes, fmtDateTime, fmtTokens, pct } from '../lib/format'
 import { t } from '../lib/i18n'
 
 export function DataQuality() {
@@ -86,6 +86,92 @@ export function DataQuality() {
               <td>最后扫描</td>
               <td>{d.source_scan?.last_scan_at || t('common.notAvailable')}</td>
             </tr>
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('dataQuality.confidence')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('dataQuality.level')}</th>
+              <th>{t('common.count')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.confidence_distribution || []).map((x: any) => (
+              <tr key={x.level}>
+                <td>{x.level}</td>
+                <td>{x.count}</td>
+              </tr>
+            ))}
+            {(d.confidence_distribution || []).length === 0 && (
+              <tr>
+                <td colSpan={2}>{t('common.empty')}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('dataQuality.cursorStatus')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('sessions.client')}</th>
+              <th>Adapter</th>
+              <th>{t('common.status')}</th>
+              <th>{t('nodes.lastScan')}</th>
+              <th>{t('clients.withErrors')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.cursor_status || []).map((s: any) => (
+              <tr key={s.source_id}>
+                <td>{s.client_id}</td>
+                <td>{s.adapter_id}</td>
+                <td>{s.status}</td>
+                <td>{s.last_scan_at ? fmtDateTime(s.last_scan_at) : '—'}</td>
+                <td>{s.last_error || '—'}</td>
+              </tr>
+            ))}
+            {(d.cursor_status || []).length === 0 && (
+              <tr>
+                <td colSpan={5}>{t('common.empty')}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('dataQuality.alerts')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('common.status')}</th>
+              <th>Phase</th>
+              <th>Pattern</th>
+              <th>{t('dataQuality.samples')}</th>
+              <th>最近</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.alerts || []).map((a: any) => (
+              <tr key={a.id}>
+                <td>
+                  <span class={`badge badge-${a.severity === 'critical' ? 'err' : 'warn'}`}>{a.severity}</span>
+                </td>
+                <td>{a.phase}</td>
+                <td class="mono">{a.pattern}</td>
+                <td>{a.sample_count}</td>
+                <td>{a.last_seen_at}</td>
+              </tr>
+            ))}
+            {(d.alerts || []).length === 0 && (
+              <tr>
+                <td colSpan={5}>{t('common.empty')}</td>
+              </tr>
+            )}
           </tbody>
         </table>
       </Card>

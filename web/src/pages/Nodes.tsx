@@ -1,7 +1,7 @@
 import { api, q } from '../api/client'
-import { Card, ErrorBox, Empty, Badge, statusTone } from '../components/ui'
+import { Card, ErrorBox, Empty, Badge, statusTone, StatCard } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
-import { fmtBytes, fmtDateTime, fmtTokens } from '../lib/format'
+import { fmtBytes, fmtDateTime, fmtTokens, fmtUsd } from '../lib/format'
 import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
@@ -20,6 +20,7 @@ export function Nodes() {
               <th>Node</th>
               <th>{t('nodes.platform')}</th>
               <th>架构</th>
+              <th>{t('nodes.detectedClients')}</th>
               <th>{t('common.status')}</th>
               <th>{t('nodes.lastHeartbeat')}</th>
               <th>{t('nodes.firstSeen')}</th>
@@ -34,6 +35,9 @@ export function Nodes() {
                 </td>
                 <td>{n.platform || '—'}</td>
                 <td>{n.architecture || '—'}</td>
+                <td>
+                  <Badge text={`${n.detected_clients ?? 0} ${t('nodes.detected')}`} tone="muted" />
+                </td>
                 <td>
                   <Badge text={n.status} tone={statusTone(n.status)} />
                 </td>
@@ -51,7 +55,7 @@ export function Nodes() {
 export function NodeDetail({ id }: { id: string }) {
   const range = getRange()
   const params = { from: range.from, to: range.to, timezone: range.timezone }
-  const node = useQuery<any>(`node${id}`, () => api(`/nodes/${encodeURIComponent(id)}`))
+  const node = useQuery<any>(`node${id}`, () => api(`/nodes/${encodeURIComponent(id)}${q(params)}`))
   const sources = useQuery<any>(`node-src${id}`, () => api(`/nodes/${encodeURIComponent(id)}/clients`))
   const sessions = useQuery<any>(`node-sess${id}${q(params)}`, () => api(`/nodes/${encodeURIComponent(id)}/sessions${q(params)}`))
   const calls = useQuery<any>(`node-calls${id}${q(params)}`, () => api(`/nodes/${encodeURIComponent(id)}/calls${q(params)}`))
@@ -76,6 +80,19 @@ export function NodeDetail({ id }: { id: string }) {
         <Card title={t('nodes.firstSeen')}>{fmtDateTime(n.first_seen_at)}</Card>
         <Card title={t('nodes.lastHeartbeat')}>{fmtDateTime(n.last_seen_at)}</Card>
       </div>
+
+      {(n.range_summary && Object.keys(n.range_summary).length > 0 && (
+        <Card title={t('nodes.rangeStats')}>
+          <div class="stat-grid">
+            <StatCard label="Input" value={fmtTokens(n.range_summary.input_tokens)} />
+            <StatCard label="Output" value={fmtTokens(n.range_summary.output_tokens)} />
+            <StatCard label={t('common.cost')} value={fmtUsd(n.range_summary.cost_micro_usd)} />
+            <StatCard label={t('common.estimatedTraffic')} value={fmtBytes(n.range_summary.estimated_total_bytes)} />
+            <StatCard label={t('common.modelCalls')} value={fmtTokens(n.range_summary.model_calls)} />
+            <StatCard label={t('common.sessions')} value={fmtTokens(n.range_summary.sessions)} />
+          </div>
+        </Card>
+      ))}
 
       <Card title={t('nodes.collectors')}>
         <table class="table">
@@ -141,6 +158,32 @@ export function NodeDetail({ id }: { id: string }) {
                 <td>{s.last_error || '—'}</td>
               </tr>
             ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('nodes.byClient')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('sessions.client')}</th>
+              <th>{t('nodes.sources')}</th>
+              <th>{t('common.modelCalls')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(n.clients || []).map((cl: any) => (
+              <tr key={cl.client_id} class="clickable" onClick={() => nav(`clients/${cl.client_id}`)}>
+                <td>{cl.client_id}</td>
+                <td>{cl.source_count}</td>
+                <td>{cl.model_calls ?? '—'}</td>
+              </tr>
+            ))}
+            {(n.clients || []).length === 0 && (
+              <tr>
+                <td colSpan={3}>{t('common.empty')}</td>
+              </tr>
+            )}
           </tbody>
         </table>
       </Card>

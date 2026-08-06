@@ -1,5 +1,6 @@
 import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
+import { TimeSeries } from '../components/TimeSeries'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtTokens, fmtUsd } from '../lib/format'
 import { t } from '../lib/i18n'
@@ -23,6 +24,8 @@ export function Models() {
               <th>Provider</th>
               <th>Input</th>
               <th>Output</th>
+              <th>{t('models.bpi')}</th>
+              <th>{t('models.bpo')}</th>
               <th>{t('common.estimatedTraffic')}</th>
               <th>Calls</th>
               <th>Sessions</th>
@@ -38,6 +41,8 @@ export function Models() {
                 <td>{m.provider || '—'}</td>
                 <td>{fmtTokens(m.input_tokens)}</td>
                 <td>{fmtTokens(m.output_tokens)}</td>
+                <td>{m.bytes_per_input_token != null ? fmtBytes(m.bytes_per_input_token) : '—'}</td>
+                <td>{m.bytes_per_output_token != null ? fmtBytes(m.bytes_per_output_token) : '—'}</td>
                 <td>{fmtBytes(m.estimated_traffic_bytes)}</td>
                 <td>{m.model_calls}</td>
                 <td>{m.sessions}</td>
@@ -88,6 +93,18 @@ export function ModelDetail({ id }: { id: string }) {
             <span class="kv-value">{value}</span>
           </div>
         ))}
+      </div>
+
+      <div class="grid-2">
+        <Card title={t('overview.tokenSeries')}>
+          <TimeSeries data={(d.series || []).map((p: any) => ({ bucket: p.bucket, value: p.input_tokens + p.output_tokens }))} />
+        </Card>
+        <Card title={t('overview.costSeries')}>
+          <TimeSeries data={(d.series || []).map((p: any) => ({ bucket: p.bucket, value: p.cost_micro_usd }))} />
+        </Card>
+        <Card title={t('overview.trafficSeries')}>
+          <TimeSeries data={(d.series || []).map((p: any) => ({ bucket: p.bucket, value: p.estimated_traffic_bytes }))} />
+        </Card>
       </div>
 
       <div class="grid-2">
@@ -162,6 +179,33 @@ export function ModelDetail({ id }: { id: string }) {
                 <td>{sd.started_at}</td>
                 <td>{sd.model_call_count}</td>
                 <td>{fmtBytes(sd.estimated_total_bytes)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('models.recentCalls')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('common.model')}</th>
+              <th>Provider</th>
+              <th>{t('common.startTime')}</th>
+              <th>Input</th>
+              <th>Output</th>
+              <th>{t('common.cost')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.recent_calls || []).map((c: any) => (
+              <tr key={c.id} class="clickable" onClick={() => nav(`calls/${c.id}`)}>
+                <td>{c.model || '—'}</td>
+                <td>{c.provider || '—'}</td>
+                <td>{c.started_at}</td>
+                <td>{fmtTokens(c.input_tokens)}</td>
+                <td>{fmtTokens(c.output_tokens)}</td>
+                <td>{fmtUsd(c.calculated_cost_micro_usd)}</td>
               </tr>
             ))}
           </tbody>

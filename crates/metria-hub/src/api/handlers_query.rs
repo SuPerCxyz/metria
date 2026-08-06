@@ -62,6 +62,40 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         })
         .unwrap_or(0)
         .into();
+    // S3.3：AgentTool(Client)/Model/Project 计数（范围过滤）
+    let range_clause = "started_at >= ?1 AND started_at < ?2";
+    body["agent_tools"] = c
+        .query_row(
+            &format!("SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause}"),
+            [from.to_rfc3339(), to.to_rfc3339()],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .into();
+    body["models"] = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != ''"
+            ),
+            [from.to_rfc3339(), to.to_rfc3339()],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .into();
+    body["projects"] = c
+        .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        .into();
+    // S3.3：Collector 在线状态列表（最近心跳 ≤ 5 分钟视为在线）
+    let online_window = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    body["collectors_online"] = c
+        .query_row(
+            "SELECT COUNT(*) FROM collectors WHERE last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?1",
+            [&online_window],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .into();
     Json(body).into_response()
 }
 
@@ -146,7 +180,10 @@ pub(crate) async fn usage_breakdown(
 pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(
-        "SELECT id, name, platform, architecture, timezone, status, first_seen_at, last_seen_at FROM nodes ORDER BY last_seen_at DESC",
+        "SELECT n.id, n.name, n.platform, n.architecture, n.timezone, n.status, n.first_seen_at, n.last_seen_at,
+            (SELECT COUNT(DISTINCT client_id) FROM sources s WHERE s.node_id = n.id),
+            (SELECT COUNT(*) FROM collectors col WHERE col.node_id = n.id)
+         FROM nodes n ORDER BY n.last_seen_at DESC",
     ));
     let rows = q!(stmt.query_map([], |r| {
         Ok(serde_json::json!({
@@ -158,6 +195,8 @@ pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
             "status": r.get::<_, String>(5)?,
             "first_seen_at": r.get::<_, String>(6)?,
             "last_seen_at": r.get::<_, String>(7)?,
+            "detected_clients": r.get::<_, i64>(8)?,
+            "collector_count": r.get::<_, i64>(9)?,
         }))
     }));
     let nodes: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -167,7 +206,9 @@ pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
 pub(crate) async fn node_detail(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(p): Query<RangeParams>,
 ) -> Response {
+    let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let node = c
         .query_row(
@@ -188,16 +229,6 @@ pub(crate) async fn node_detail(
         )
         .ok()
         .unwrap_or(serde_json::json!({}));
-    let mut clients = Vec::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT DISTINCT client_id, COUNT(*) as src_count FROM sources WHERE node_id = ?1 GROUP BY client_id",
-    ) {
-        if let Ok(rows) = stmt.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
-            for row in rows.flatten() {
-                clients.push(serde_json::json!({ "client_id": row.0, "source_count": row.1 }));
-            }
-        }
-    }
     // 分布统计（S3.4）：按 Model / Project 汇总本 Node 的调用与 token
     let mut by_model = Vec::new();
     if let Ok(mut stmt) = c.prepare(
@@ -259,12 +290,57 @@ pub(crate) async fn node_detail(
         out
     };
 
+    // S3.4：按 Client 分布（范围过滤，含 usage 汇总）
+    let mut clients = Vec::new();
+    if let Ok(mut stmt) = c.prepare(
+        "SELECT s.client_id, COUNT(DISTINCT s.id) as src_count,
+                COALESCE(SUM(mc.model_call_count),0)
+         FROM sources s LEFT JOIN sessions se ON se.node_id = s.node_id AND se.client_id = s.client_id
+         LEFT JOIN hourly_rollups mc ON mc.node_id = s.node_id AND mc.client_id = s.client_id AND mc.bucket >= ?2 AND mc.bucket < ?3
+         WHERE s.node_id = ?1 GROUP BY s.client_id",
+    ) {
+        if let Ok(rows) = stmt.query_map(
+            params![id, from.to_rfc3339(), to.to_rfc3339()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ) {
+            for row in rows.flatten() {
+                clients.push(serde_json::json!({
+                    "client_id": row.0, "source_count": row.1, "model_calls": row.2
+                }));
+            }
+        }
+    }
+
+    // S3.4：时间范围统计（token/cost/traffic/calls/sessions）
+    let range_summary = c
+        .query_row(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                    COALESCE(SUM(estimated_total_bytes),0),
+                    COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0)
+             FROM hourly_rollups WHERE node_id = ?1 AND bucket >= ?2 AND bucket < ?3",
+            params![id, from.to_rfc3339(), to.to_rfc3339()],
+            |r| {
+                Ok(serde_json::json!({
+                    "input_tokens": r.get::<_, i64>(0)?,
+                    "output_tokens": r.get::<_, i64>(1)?,
+                    "cost_micro_usd": r.get::<_, i64>(2)?,
+                    "estimated_total_bytes": r.get::<_, i64>(3)?,
+                    "model_calls": r.get::<_, i64>(4)?,
+                    "sessions": r.get::<_, i64>(5)?,
+                }))
+            },
+        )
+        .unwrap_or(serde_json::json!({}));
+
     Json(serde_json::json!({
         "node": node,
         "clients": clients,
         "collectors": collectors,
         "by_model": by_model,
         "by_project": by_project,
+        "range_summary": range_summary,
+        "range": { "from": from.to_rfc3339(), "to": to.to_rfc3339() },
     }))
     .into_response()
 }
@@ -303,29 +379,64 @@ pub(crate) async fn node_sessions(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(50).min(500);
-    let mut stmt = q!(c.prepare(
-        "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
-         FROM sessions WHERE node_id = ?1 AND started_at >= ?2 AND started_at < ?3 ORDER BY started_at DESC LIMIT ?4",
-    ));
-    let rows = q!(stmt.query_map(
-        params![id, from.to_rfc3339(), to.to_rfc3339(), limit],
-        |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
-                "source_session_id": r.get::<_, String>(1)?,
-                "client_id": r.get::<_, String>(2)?,
-                "title": r.get::<_, Option<String>>(3)?,
-                "model": r.get::<_, Option<String>>(4)?,
-                "started_at": r.get::<_, String>(5)?,
-                "ended_at": r.get::<_, Option<String>>(6)?,
-                "message_count": r.get::<_, i64>(7)?,
-                "model_call_count": r.get::<_, i64>(8)?,
-                "input_tokens": r.get::<_, Option<i64>>(9)?,
-                "output_tokens": r.get::<_, Option<i64>>(10)?,
-                "estimated_total_bytes": r.get::<_, Option<i64>>(11)?,
-            }))
-        },
-    ));
+    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+        match crate::api::decode_cursor(cur) {
+            Some((ts, sid)) => (
+                format!(
+                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
+                       AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
+                     ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                ),
+                vec![
+                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(from.to_rfc3339()),
+                    SqlValue::Text(to.to_rfc3339()),
+                    SqlValue::Text(ts),
+                    SqlValue::Text(sid),
+                    SqlValue::Integer(limit),
+                ],
+            ),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "分页游标无效",
+                )
+            }
+        }
+    } else {
+        (
+            format!(
+                "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+                 FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
+            ),
+            vec![
+                SqlValue::Text(id),
+                SqlValue::Text(from.to_rfc3339()),
+                SqlValue::Text(to.to_rfc3339()),
+                SqlValue::Integer(limit),
+            ],
+        )
+    };
+    let mut stmt = q!(c.prepare(&sql));
+    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "source_session_id": r.get::<_, String>(1)?,
+            "client_id": r.get::<_, String>(2)?,
+            "title": r.get::<_, Option<String>>(3)?,
+            "model": r.get::<_, Option<String>>(4)?,
+            "started_at": r.get::<_, String>(5)?,
+            "ended_at": r.get::<_, Option<String>>(6)?,
+            "message_count": r.get::<_, i64>(7)?,
+            "model_call_count": r.get::<_, i64>(8)?,
+            "input_tokens": r.get::<_, Option<i64>>(9)?,
+            "output_tokens": r.get::<_, Option<i64>>(10)?,
+            "estimated_total_bytes": r.get::<_, Option<i64>>(11)?,
+        }))
+    },));
     let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
     let next_cursor = sessions.last().and_then(|v| {
         let id = v.get("id")?.as_str()?;
@@ -343,30 +454,70 @@ pub(crate) async fn node_calls(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(50).min(500);
-    let mut stmt = q!(c.prepare(
-        "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
-         FROM model_calls WHERE node_id = ?1 AND started_at >= ?2 AND started_at < ?3 ORDER BY started_at DESC LIMIT ?4",
-    ));
-    let rows = q!(stmt.query_map(
-        params![id, from.to_rfc3339(), to.to_rfc3339(), limit],
-        |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
-                "model": r.get::<_, Option<String>>(1)?,
-                "provider": r.get::<_, Option<String>>(2)?,
-                "started_at": r.get::<_, String>(3)?,
-                "status": r.get::<_, String>(4)?,
-                "input_tokens": r.get::<_, Option<i64>>(5)?,
-                "output_tokens": r.get::<_, Option<i64>>(6)?,
-                "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
-                "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
-                "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
-                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
-            }))
-        },
-    ));
+    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+        match crate::api::decode_cursor(cur) {
+            Some((ts, cid)) => (
+                format!(
+                    "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
+                     FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
+                       AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
+                     ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                ),
+                vec![
+                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(from.to_rfc3339()),
+                    SqlValue::Text(to.to_rfc3339()),
+                    SqlValue::Text(ts),
+                    SqlValue::Text(cid),
+                    SqlValue::Integer(limit),
+                ],
+            ),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "分页游标无效",
+                )
+            }
+        }
+    } else {
+        (
+            format!(
+                "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
+                 FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
+            ),
+            vec![
+                SqlValue::Text(id),
+                SqlValue::Text(from.to_rfc3339()),
+                SqlValue::Text(to.to_rfc3339()),
+                SqlValue::Integer(limit),
+            ],
+        )
+    };
+    let mut stmt = q!(c.prepare(&sql));
+    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "model": r.get::<_, Option<String>>(1)?,
+            "provider": r.get::<_, Option<String>>(2)?,
+            "started_at": r.get::<_, String>(3)?,
+            "status": r.get::<_, String>(4)?,
+            "input_tokens": r.get::<_, Option<i64>>(5)?,
+            "output_tokens": r.get::<_, Option<i64>>(6)?,
+            "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
+            "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
+            "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
+            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
+        }))
+    },));
     let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "calls": calls })).into_response()
+    let next_cursor = calls.last().and_then(|v| {
+        let id = v.get("id")?.as_str()?;
+        let ts = v.get("started_at")?.as_str()?;
+        Some(crate::api::encode_cursor(ts, id))
+    });
+    Json(serde_json::json!({ "calls": calls, "next_cursor": next_cursor })).into_response()
 }
 
 pub(crate) async fn list_clients(
@@ -461,10 +612,94 @@ pub(crate) async fn client_detail(
         )
         .unwrap_or((0, 0));
 
+    // S3.5：按 Project 分布
+    let by_project: Vec<serde_json::Value> = {
+        let mut st = q!(c.prepare(
+            "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(model_call_count),0),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(estimated_total_bytes),0)
+             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+             GROUP BY project_id ORDER BY 3 DESC LIMIT 10",
+        ));
+        let r = q!(
+            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                Ok(serde_json::json!({
+                    "project_id": r.get::<_, String>(0)?,
+                    "sessions": r.get::<_, i64>(1)?,
+                    "model_calls": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "estimated_total_bytes": r.get::<_, i64>(4)?,
+                }))
+            },)
+        );
+        r.filter_map(|x| x.ok()).collect()
+    };
+
+    // S3.5：最近 Calls
+    let recent_calls: Vec<serde_json::Value> = {
+        let mut st = q!(c.prepare(
+            "SELECT id, session_id, provider_normalized, model_normalized, started_at, status,
+                    input_tokens, output_tokens, calculated_cost_micro_usd
+             FROM model_calls WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+             ORDER BY started_at DESC LIMIT 20",
+        ));
+        let r = q!(
+            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "session_id": r.get::<_, String>(1)?,
+                    "provider": r.get::<_, Option<String>>(2)?,
+                    "model": r.get::<_, Option<String>>(3)?,
+                    "started_at": r.get::<_, String>(4)?,
+                    "status": r.get::<_, String>(5)?,
+                    "input_tokens": r.get::<_, Option<i64>>(6)?,
+                    "output_tokens": r.get::<_, Option<i64>>(7)?,
+                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(8)?,
+                }))
+            },)
+        );
+        r.filter_map(|x| x.ok()).collect()
+    };
+
+    // S3.5：Source 健康（总数/健康/错误）+ 版本分布
+    let source_health = c
+        .query_row(
+            "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+             FROM sources WHERE client_id = ?1",
+            [&id],
+            |r| {
+                Ok(serde_json::json!({
+                    "total": r.get::<_, i64>(0)?,
+                    "healthy": r.get::<_, i64>(1)?,
+                    "with_errors": r.get::<_, i64>(2)?,
+                }))
+            },
+        )
+        .unwrap_or(serde_json::json!({}));
+
+    let version_dist: Vec<serde_json::Value> = {
+        let mut st = q!(c.prepare(
+            "SELECT COALESCE(adapter_version,'(unknown)'), COUNT(*)
+             FROM sources WHERE client_id = ?1 GROUP BY adapter_version ORDER BY 2 DESC",
+        ));
+        let r = q!(st.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "version": r.get::<_, String>(0)?,
+                "count": r.get::<_, i64>(1)?,
+            }))
+        }));
+        r.filter_map(|x| x.ok()).collect()
+    };
+
     Json(serde_json::json!({
         "client_id": id,
         "by_node": by_node,
+        "by_project": by_project,
         "recent_sessions": recent,
+        "recent_calls": recent_calls,
+        "source_health": source_health,
+        "version_dist": version_dist,
         "calculated_cost_micro_usd": summary.0,
         "estimated_total_bytes": summary.1,
     }))
@@ -541,7 +776,29 @@ pub(crate) async fn list_models(
                 }))
             },)
         );
-        rows.filter_map(|r| r.ok()).collect()
+        let mut models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        // S3.6：Bytes per Input/Output Token（估算流量 ÷ tokens，tokens 为 0 时置空）
+        for m in &mut models {
+            let in_t = m.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            let out_t = m.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            let bytes = m
+                .get("estimated_traffic_bytes")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let bpi = if in_t > 0 {
+                serde_json::json!((bytes as f64) / (in_t as f64))
+            } else {
+                serde_json::Value::Null
+            };
+            let bpo = if out_t > 0 {
+                serde_json::json!((bytes as f64) / (out_t as f64))
+            } else {
+                serde_json::Value::Null
+            };
+            m["bytes_per_input_token"] = bpi;
+            m["bytes_per_output_token"] = bpo;
+        }
+        models
     };
     // 附带每个模型的定价来源（命中用户规则 / 内置目录）
     let rules = st.db.load_all_rules();
@@ -568,7 +825,7 @@ pub(crate) async fn model_detail(
 ) -> Response {
     let (from, to) = parse_range(&p);
     // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
-    let (raws, summary, recent_sessions) = {
+    let (raws, summary, recent_sessions, recent_calls, series) = {
         let c = st.db.conn();
         // raw 名称 + provider 分布
         let mut stmt = q!(c.prepare(
@@ -584,31 +841,35 @@ pub(crate) async fn model_detail(
         let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
         // 汇总（Token/Cost/Traffic/Cache Hit）
-        let summary = c
-            .query_row(
-                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                        COALESCE(SUM(reasoning_tokens),0),
-                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
-                        COALESCE(SUM(session_count),0)
-                 FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3",
-                params![id, from.to_rfc3339(), to.to_rfc3339()],
-                |r| {
-                    Ok(serde_json::json!({
-                        "input_tokens": r.get::<_, i64>(0)?,
-                        "output_tokens": r.get::<_, i64>(1)?,
-                        "cache_read_tokens": r.get::<_, i64>(2)?,
-                        "cache_write_tokens": r.get::<_, i64>(3)?,
-                        "reasoning_tokens": r.get::<_, i64>(4)?,
-                        "cost_micro_usd": r.get::<_, i64>(5)?,
-                        "estimated_total_bytes": r.get::<_, i64>(6)?,
-                        "model_calls": r.get::<_, i64>(7)?,
-                        "sessions": r.get::<_, i64>(8)?,
-                    }))
-                },
-            )
-            .unwrap_or(serde_json::json!({}));
+        let summary = match c.query_row(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                    COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+                    COALESCE(SUM(session_count),0)
+             FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3",
+            params![id, from.to_rfc3339(), to.to_rfc3339()],
+            |r| {
+                Ok(serde_json::json!({
+                    "input_tokens": r.get::<_, i64>(0)?,
+                    "output_tokens": r.get::<_, i64>(1)?,
+                    "cache_read_tokens": r.get::<_, i64>(2)?,
+                    "cache_write_tokens": r.get::<_, i64>(3)?,
+                    "reasoning_tokens": r.get::<_, i64>(4)?,
+                    "cost_micro_usd": r.get::<_, i64>(5)?,
+                    "estimated_total_bytes": r.get::<_, i64>(6)?,
+                    "model_calls": r.get::<_, i64>(7)?,
+                    "sessions": r.get::<_, i64>(8)?,
+                }))
+            },
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(%e, model=%id, "model_detail summary 查询失败");
+                serde_json::json!({})
+            }
+        };
 
         // 最近 sessions / calls
         let recent_sessions: Vec<serde_json::Value> = {
@@ -633,7 +894,60 @@ pub(crate) async fn model_detail(
             r.filter_map(|x| x.ok()).collect()
         };
 
-        (raws, summary, recent_sessions)
+        // S3.6：最近 Calls
+        let recent_calls: Vec<serde_json::Value> = {
+            let mut st = q!(c.prepare(
+                "SELECT m.id, m.session_id, m.provider_normalized, m.model_normalized, m.started_at, m.status,
+                        m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd, t.estimated_total_wire_bytes
+                 FROM model_calls m LEFT JOIN traffic_estimates t ON t.model_call_id = m.id
+                 WHERE m.model_normalized = ?1 AND m.started_at >= ?2 AND m.started_at < ?3
+                 ORDER BY m.started_at DESC LIMIT 20",
+            ));
+            let r = q!(
+                st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "session_id": r.get::<_, String>(1)?,
+                        "provider": r.get::<_, Option<String>>(2)?,
+                        "model": r.get::<_, Option<String>>(3)?,
+                        "started_at": r.get::<_, String>(4)?,
+                        "status": r.get::<_, String>(5)?,
+                        "input_tokens": r.get::<_, Option<i64>>(6)?,
+                        "output_tokens": r.get::<_, Option<i64>>(7)?,
+                        "calculated_cost_micro_usd": r.get::<_, Option<i64>>(8)?,
+                        "estimated_total_bytes": r.get::<_, Option<i64>>(9)?,
+                    }))
+                },)
+            );
+            r.filter_map(|x| x.ok()).collect()
+        };
+
+        // S3.6：Token/Cost/Traffic 时间序列（按小时）
+        let series: Vec<serde_json::Value> = {
+            let mut st = q!(c.prepare(
+                "SELECT bucket,
+                        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
+                 FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3
+                 GROUP BY bucket ORDER BY bucket",
+            ));
+            let r = q!(
+                st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "bucket": r.get::<_, String>(0)?,
+                        "input_tokens": r.get::<_, i64>(1)?,
+                        "output_tokens": r.get::<_, i64>(2)?,
+                        "cost_micro_usd": r.get::<_, i64>(3)?,
+                        "estimated_traffic_bytes": r.get::<_, i64>(4)?,
+                        "model_calls": r.get::<_, i64>(5)?,
+                    }))
+                },)
+            );
+            r.filter_map(|x| x.ok()).collect()
+        };
+
+        (raws, summary, recent_sessions, recent_calls, series)
     };
 
     // 匹配的定价规则
@@ -656,6 +970,8 @@ pub(crate) async fn model_detail(
         "summary": summary,
         "pricing_rules": rules,
         "recent_sessions": recent_sessions,
+        "recent_calls": recent_calls,
+        "series": series,
     }))
     .into_response()
 }
@@ -844,7 +1160,8 @@ pub(crate) async fn call_detail(
         .unwrap_or(serde_json::json!({}));
     let traffic = c
         .query_row(
-            "SELECT estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes, lower_bound_bytes, upper_bound_bytes, estimation_source, context_transport_mode, cache_transport_behavior, confidence
+            "SELECT estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes, lower_bound_bytes, upper_bound_bytes, estimation_source, context_transport_mode, cache_transport_behavior, confidence,
+                    request_reconstruction_quality, response_reconstruction_quality, profile_id, profile_version
              FROM traffic_estimates WHERE model_call_id = ?1",
             [&id],
             |r| {
@@ -858,6 +1175,10 @@ pub(crate) async fn call_detail(
                     "context_transport_mode": r.get::<_, String>(6)?,
                     "cache_transport_behavior": r.get::<_, String>(7)?,
                     "confidence": r.get::<_, Option<f64>>(8)?,
+                    "request_reconstruction_quality": r.get::<_, Option<String>>(9)?,
+                    "response_reconstruction_quality": r.get::<_, Option<String>>(10)?,
+                    "profile_id": r.get::<_, Option<String>>(11)?,
+                    "profile_version": r.get::<_, Option<i64>>(12)?,
                 }))
             },
         )
@@ -1315,6 +1636,80 @@ pub(crate) async fn data_quality(
         out
     };
 
+    // S3.8：估算置信度占比（traffic_estimates.confidence 分级）
+    let confidence_dist: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT CASE
+                        WHEN confidence >= 0.8 THEN 'high'
+                        WHEN confidence >= 0.5 THEN 'medium'
+                        WHEN confidence IS NOT NULL THEN 'low'
+                        ELSE 'unknown' END AS level,
+                    COUNT(*)
+             FROM traffic_estimates GROUP BY level",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "level": r.get::<_, String>(0)?,
+                    "count": r.get::<_, i64>(1)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
+    // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康）
+    let cursor_status: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT id, client_id, adapter_id, status, last_scan_at, last_error
+             FROM sources ORDER BY last_scan_at DESC LIMIT 100",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "source_id": r.get::<_, String>(0)?,
+                    "client_id": r.get::<_, String>(1)?,
+                    "adapter_id": r.get::<_, String>(2)?,
+                    "status": r.get::<_, String>(3)?,
+                    "last_scan_at": r.get::<_, Option<String>>(4)?,
+                    "last_error": r.get::<_, Option<String>>(5)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
+    // S3.8：告警（spool 满/死信 → Hub 侧以严重 source_errors 与解析错误为代表）
+    let alerts: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT id, source_id, phase, severity, pattern, sample_count, last_seen_at
+             FROM source_errors WHERE severity IN ('error','critical') ORDER BY last_seen_at DESC LIMIT 50",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "source_id": r.get::<_, String>(1)?,
+                    "phase": r.get::<_, String>(2)?,
+                    "severity": r.get::<_, String>(3)?,
+                    "pattern": r.get::<_, String>(4)?,
+                    "sample_count": r.get::<_, i64>(5)?,
+                    "last_seen_at": r.get::<_, String>(6)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
     Json(serde_json::json!({
         "usage_distribution": usage_dist,
         "traffic_distribution": traffic_dist,
@@ -1322,6 +1717,9 @@ pub(crate) async fn data_quality(
         "source_errors": source_errors,
         "source_scan": source_scan,
         "clock_skew_warnings": clock_skew_warns,
+        "confidence_distribution": confidence_dist,
+        "cursor_status": cursor_status,
+        "alerts": alerts,
     }))
     .into_response()
 }

@@ -64,11 +64,14 @@ pub fn seed_demo(db: &HubDb) -> Result<(), String> {
             db.register_node_collector(node, node, Some("linux"), Some("x86_64"), "0.1.0", 1, now);
     }
 
-    // 7 天 × 每节点每小时若干事件
+    // 7 天 × 每节点每小时若干事件（全部落在过去：起始回退 1 小时避免边界未来数据）
     let days = 7i64;
     for day in 0..days {
         for hour in 0..24 {
-            let base = now - chrono::Duration::days(day) - chrono::Duration::hours(hour);
+            let base = now
+                - chrono::Duration::days(day)
+                - chrono::Duration::hours(hour)
+                - chrono::Duration::hours(1);
             for node in NODES {
                 let activity = rng.range(0, 2);
                 for _ in 0..activity {

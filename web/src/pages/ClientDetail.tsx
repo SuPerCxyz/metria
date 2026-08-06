@@ -36,6 +36,20 @@ export function ClientDetail({ id }: { id: string }) {
             <span class="kv-value">{value}</span>
           </div>
         ))}
+        {d.source_health && (
+          <div class="kv">
+            <span class="kv-label">{t('clients.sourceHealth')}</span>
+            <span class="kv-value">
+              {d.source_health.total ?? 0} / {d.source_health.healthy ?? 0}{' '}
+              <span class="text-muted">
+                {t('clients.healthy')}
+                {(d.source_health.with_errors || 0) > 0 && (
+                  <span> · {d.source_health.with_errors} {t('clients.withErrors')}</span>
+                )}
+              </span>
+            </span>
+          </div>
+        )}
       </div>
 
       <div class="grid-2">
@@ -90,6 +104,50 @@ export function ClientDetail({ id }: { id: string }) {
             </tbody>
           </table>
         </Card>
+
+        <Card title={t('clients.byProject')}>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>{t('common.project')}</th>
+                <th>Sessions</th>
+                <th>Calls</th>
+                <th>Input</th>
+                <th>{t('common.estimatedTraffic')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(d.by_project || []).map((p: any) => (
+                <tr key={p.project_id}>
+                  <td>{p.project_id}</td>
+                  <td>{p.sessions}</td>
+                  <td>{p.model_calls}</td>
+                  <td>{fmtTokens(p.input_tokens)}</td>
+                  <td>{fmtBytes(p.estimated_total_bytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+
+        <Card title={t('clients.versionDist')}>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>{t('common.version')}</th>
+                <th>{t('common.count')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(d.version_dist || []).map((v: any) => (
+                <tr key={v.version}>
+                  <td>{v.version}</td>
+                  <td>{v.count}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
       </div>
 
       <Card title={t('clients.recentSessions')}>
@@ -113,6 +171,33 @@ export function ClientDetail({ id }: { id: string }) {
                 <td>{s.started_at}</td>
                 <td>{s.model_call_count}</td>
                 <td>{fmtBytes(s.estimated_total_bytes)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('clients.recentCalls')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('common.model')}</th>
+              <th>Provider</th>
+              <th>{t('common.startTime')}</th>
+              <th>Input</th>
+              <th>Output</th>
+              <th>{t('common.cost')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.recent_calls || []).map((c: any) => (
+              <tr key={c.id} class="clickable" onClick={() => nav(`calls/${c.id}`)}>
+                <td>{c.model || '—'}</td>
+                <td>{c.provider || '—'}</td>
+                <td>{c.started_at}</td>
+                <td>{fmtTokens(c.input_tokens)}</td>
+                <td>{fmtTokens(c.output_tokens)}</td>
+                <td>{fmtUsd(c.calculated_cost_micro_usd)}</td>
               </tr>
             ))}
           </tbody>

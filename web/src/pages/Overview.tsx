@@ -61,11 +61,17 @@ export function Overview() {
         <StatCard label="Sessions" value={fmtTokens(o.sessions)} />
         <StatCard label={t("overview.activeNodes")} value={String(o.nodes)} />
         <StatCard label={t("overview.activeCollectors")} value={String(o.collectors)} />
+        <StatCard label={t("overview.agentTools")} value={String(o.agent_tools ?? '—')} />
+        <StatCard label={t("overview.models")} value={String(o.models ?? '—')} />
+        <StatCard label={t("overview.projects")} value={String(o.projects ?? '—')} />
       </div>
 
       <div class="grid-2">
         <Card title={t('overview.tokenSeries')}>
           {tokSeries.data?.length ? <TimeSeries data={tokSeries.data} /> : <Empty />}
+        </Card>
+        <Card title={t('overview.tokenComposition')}>
+          <TokenComposition o={o} />
         </Card>
         <Card title={t('overview.costSeries')}>
           {costSeries.data?.length ? <TimeSeries data={costSeries.data} /> : <Empty />}
@@ -117,6 +123,22 @@ export function Overview() {
         </Card>
       </div>
 
+      <Card title={t('overview.collectorStatus')}>
+        <div class="stat-grid">
+          <StatCard label={t('overview.collectorsTotal')} value={String(o.collectors)} />
+          <StatCard label={t('overview.collectorsOnline')} value={String(o.collectors_online ?? '—')} accent={o.collectors_online > 0 ? '#16a34a' : '#dc2626'} />
+          <StatCard label={t('overview.nodesTotal')} value={String(o.nodes)} />
+        </div>
+      </Card>
+
+      <Card title={t('overview.collectorStatus')}>
+        <div class="stat-grid">
+          <StatCard label={t('overview.collectorsTotal')} value={String(o.collectors)} />
+          <StatCard label={t('overview.collectorsOnline')} value={String(o.collectors_online ?? '—')} accent={o.collectors_online > 0 ? '#16a34a' : '#dc2626'} />
+          <StatCard label={t('overview.nodesTotal')} value={String(o.nodes)} />
+        </div>
+      </Card>
+
       <Card title={t('overview.recentSessions')}>
         <table class="table">
           <thead>
@@ -141,6 +163,43 @@ export function Overview() {
           </tbody>
         </table>
       </Card>
+    </div>
+  )
+}
+
+function TokenComposition({ o }: { o: any }) {
+  const parts = [
+    { label: 'Input', value: o.input_tokens || 0, color: '#2563eb' },
+    { label: 'Output', value: o.output_tokens || 0, color: '#7c3aed' },
+    { label: 'Cache Read', value: o.cache_read_tokens || 0, color: '#059669' },
+    { label: 'Cache Write', value: o.cache_write_tokens || 0, color: '#d97706' },
+    { label: 'Reasoning', value: o.reasoning_tokens || 0, color: '#dc2626' },
+  ]
+  const total = parts.reduce((a, p) => a + p.value, 0)
+  if (total <= 0) return <Empty text={t('overview.noTokenData')} />
+  return (
+    <div>
+      <div class="stacked-bar" style={{ display: 'flex', height: 16, borderRadius: 6, overflow: 'hidden' }}>
+        {parts.map((p) =>
+          p.value > 0 ? (
+            <div
+              key={p.label}
+              title={`${p.label}: ${fmtTokens(p.value)}`}
+              style={{ width: `${(p.value / total) * 100}%`, background: p.color }}
+            />
+          ) : null,
+        )}
+      </div>
+      <div class="stacked-legend" style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: '8px 16px' }}>
+        {parts.map((p) =>
+          p.value > 0 ? (
+            <span key={p.label} style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ width: 10, height: 10, borderRadius: 2, background: p.color, display: 'inline-block' }} />
+              {p.label}: {fmtTokens(p.value)}
+            </span>
+          ) : null,
+        )}
+      </div>
     </div>
   )
 }

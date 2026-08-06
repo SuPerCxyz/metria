@@ -636,3 +636,79 @@ async fn collector_token_rotate_and_revoke() {
         "吊销后新 token 也应失效"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_enforces_node_collector_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 注册（testtok bootstrap）→ 拿到 collector
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "id-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap();
+
+    // Admin 轮换 → 生成持久化 token（带身份）
+    let token = admin_token(&base);
+    let rot: Value = ureq::post(&format!(
+        "{base}/api/v1/collectors/collector-id-node/tokens"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .send_json(json!({}))
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(rot["ok"], true);
+    let new_tok = rot["token"].as_str().unwrap().to_string();
+
+    // 匹配身份：node=id-node, collector=collector-id-node → 通过
+    let good = json!({
+        "schema_version": 1, "batch_id": "id-ok", "node_id": "id-node",
+        "collector_id": "collector-id-node", "agent_version": "0.1.0",
+        "events": [{
+            "kind": "usage", "event_id": "blake3:idok1",
+            "payload": {"node_id": "id-node", "collector_id": "collector-id-node",
+                        "client_id": "claude-code", "model_normalized": "claude-sonnet-4.5",
+                        "timestamp": "2026-08-05T01:00:00Z", "input_tokens": 100}
+        }]
+    });
+    let ok: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", &format!("Bearer {new_tok}"))
+        .send_json(good)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(ok["ok"], true, "身份匹配应通过: {ok}");
+
+    // 身份不匹配：batch 声明其他 node → 403
+    let bad = json!({
+        "schema_version": 1, "batch_id": "id-bad", "node_id": "other-node",
+        "collector_id": "collector-id-node", "agent_version": "0.1.0",
+        "events": []
+    });
+    let err = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", &format!("Bearer {new_tok}"))
+        .send_json(bad)
+        .unwrap_err();
+    assert!(
+        matches!(err, ureq::Error::Status(403, _)),
+        "身份不匹配应被拒绝 403，实际: {err}"
+    );
+
+    // 身份不匹配：batch 声明其他 collector → 403
+    let bad2 = json!({
+        "schema_version": 1, "batch_id": "id-bad2", "node_id": "id-node",
+        "collector_id": "collector-other", "agent_version": "0.1.0",
+        "events": []
+    });
+    let err2 = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", &format!("Bearer {new_tok}"))
+        .send_json(bad2)
+        .unwrap_err();
+    assert!(
+        matches!(err2, ureq::Error::Status(403, _)),
+        "collector 不匹配应被拒绝 403，实际: {err2}"
+    );
+}

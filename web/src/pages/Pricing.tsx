@@ -43,7 +43,10 @@ export function Pricing() {
     reasoning_price: '',
     request_price: '',
     priority: '10',
+    effective_from: '',
+    effective_to: '',
   })
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [saved, setSaved] = useState('')
   const [testModel, setTestModel] = useState('claude-sonnet-4.5')
   const [testIn, setTestIn] = useState('1000')
@@ -64,13 +67,45 @@ export function Pricing() {
       const v = (form as any)[k]
       if (v !== '') payload[k] = Number(v)
     }
+    if (form.effective_from) payload.effective_from = form.effective_from
+    if (form.effective_to) payload.effective_to = form.effective_to
     try {
-      await api('/pricing/rules', { method: 'POST', body: JSON.stringify(payload) })
-      setSaved('规则已保存')
+      if (editingId) {
+        await api(`/pricing/rules/${encodeURIComponent(editingId)}`, { method: 'PUT', body: JSON.stringify(payload) })
+        setSaved('规则已更新')
+      } else {
+        await api('/pricing/rules', { method: 'POST', body: JSON.stringify(payload) })
+        setSaved('规则已保存')
+      }
+      setEditingId(null)
+      setForm({
+        provider_pattern: '', model_pattern: 'claude-*', client_pattern: '*',
+        input_price: '3000000', output_price: '15000000', cache_read_price: '', cache_write_price: '',
+        reasoning_price: '', request_price: '', priority: '10', effective_from: '', effective_to: '',
+      })
       rules.refresh()
     } catch (e) {
       setSaved(`保存失败：${(e as Error).message}`)
     }
+  }
+
+  const editRule = (r: any) => {
+    setEditingId(r.id)
+    setForm({
+      provider_pattern: r.provider_pattern || '',
+      model_pattern: r.model_pattern || '',
+      client_pattern: r.client_pattern || '',
+      input_price: r.input_price != null ? String(r.input_price) : '',
+      output_price: r.output_price != null ? String(r.output_price) : '',
+      cache_read_price: r.cache_read_price != null ? String(r.cache_read_price) : '',
+      cache_write_price: r.cache_write_price != null ? String(r.cache_write_price) : '',
+      reasoning_price: r.reasoning_price != null ? String(r.reasoning_price) : '',
+      request_price: r.request_price != null ? String(r.request_price) : '',
+      priority: String(r.priority ?? 0),
+      effective_from: r.effective_from || '',
+      effective_to: r.effective_to || '',
+    })
+    setSaved('')
   }
 
   const toggleRule = async (id: string, enabled: boolean) => {
@@ -200,6 +235,7 @@ export function Pricing() {
                 <th>Input/百万</th>
                 <th>Output/百万</th>
                 <th>{t('common.priority')}</th>
+                <th>生效区间</th>
                 <th>{t('common.status')}</th>
                 <th>{t('common.actions')}</th>
               </tr>
@@ -212,10 +248,14 @@ export function Pricing() {
                   <td>{fmtUsd(r.input_price)}</td>
                   <td>{fmtUsd(r.output_price)}</td>
                   <td>{r.priority}</td>
-                  <td>{r.source === 'user' ? (r.enabled ? t('common.enabled') : t('common.disabled')) : r.source}</td>
+                  <td>{r.effective_from ? `${r.effective_from} ~ ${r.effective_to || '∞'}` : '—'}</td>
+                  <td>{r.source === 'user_override' ? (r.enabled ? t('common.enabled') : t('common.disabled')) : r.source}</td>
                   <td>
-                    {r.source === 'user' && (
+                    {r.source === 'user_override' && (
                       <div class="dim-switch" style="gap:4px;margin:0">
+                        <button type="button" class="btn small" onClick={() => editRule(r)}>
+                          {t('common.edit')}
+                        </button>
                         <button
                           type="button"
                           class="btn small"
@@ -235,7 +275,7 @@ export function Pricing() {
           </table>
         </Card>
 
-        <Card title={t('pricing.newUserRule')}>
+        <Card title={editingId ? t('pricing.editRule') : t('pricing.newUserRule')}>
           <div class="form-grid">
             <label>
               Provider 匹配
@@ -266,13 +306,47 @@ export function Pricing() {
               <input type="number" value={form.cache_write_price} onInput={set('cache_write_price')} />
             </label>
             <label>
+              Reasoning 价格
+              <input type="number" value={form.reasoning_price} onInput={set('reasoning_price')} />
+            </label>
+            <label>
+              Request 价格
+              <input type="number" value={form.request_price} onInput={set('request_price')} />
+            </label>
+            <label>
               优先级
               <input type="number" value={form.priority} onInput={set('priority')} />
             </label>
+            <label>
+              {t('pricing.effectiveFrom')}（RFC3339，可空）
+              <input value={form.effective_from} onInput={set('effective_from')} placeholder="2026-08-01T00:00:00Z" />
+            </label>
+            <label>
+              {t('pricing.effectiveTo')}（RFC3339，可空）
+              <input value={form.effective_to} onInput={set('effective_to')} placeholder="2026-12-31T23:59:59Z" />
+            </label>
           </div>
-          <button type="button" class="btn primary" onClick={submitRule}>
-            保存规则
-          </button>
+          <div class="dim-switch" style="gap:8px;margin:0">
+            <button type="button" class="btn primary" onClick={submitRule}>
+              {editingId ? t('common.save') : t('common.save')}
+            </button>
+            {editingId && (
+              <button
+                type="button"
+                class="btn"
+                onClick={() => {
+                  setEditingId(null)
+                  setForm({
+                    provider_pattern: '', model_pattern: 'claude-*', client_pattern: '*',
+                    input_price: '3000000', output_price: '15000000', cache_read_price: '', cache_write_price: '',
+                    reasoning_price: '', request_price: '', priority: '10', effective_from: '', effective_to: '',
+                  })
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+            )}
+          </div>
           {saved && <div class="state-box">{saved}</div>}
         </Card>
 

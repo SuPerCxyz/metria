@@ -128,6 +128,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/by-provider", get(traffic_by_provider))
         .route("/api/v1/data-quality", get(data_quality))
         .route("/api/v1/shares", post(share_create).get(share_list))
+        .route("/api/v1/shares/audits", get(share_audits))
+        .route("/api/v1/shares/{slug}", axum::routing::delete(share_delete))
         .route("/api/v1/share/{slug}", get(share_view))
         .route("/api/v1/export", get(export_data))
         .route(
@@ -169,7 +171,7 @@ pub fn app_router(state: AppState) -> Router {
 /// 认证中间件：查询端点要求 admin 会话；collector 端点要求 collector token。
 async fn auth_mw(
     State(st): State<AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
     // 忽略 next 的显式绑定：Next 通过闭包调用保持生命周期正确
@@ -194,6 +196,12 @@ async fn auth_mw(
                 "unauthorized",
                 "collector token 无效",
             );
+        }
+        // 注入 token 身份（如有），供 ingest_batch 校验 node/collector 关系
+        if path == "/api/v1/events/batch" {
+            if let Some(identity) = resolve_collector_token(&st, tok) {
+                req.extensions_mut().insert(identity);
+            }
         }
         return next.run(req).await;
     }
@@ -259,6 +267,30 @@ fn check_collector_token(st: &AppState, token: &str) -> bool {
         }
     }
     st.db.verify_collector_token(token).is_some()
+}
+
+/// Collector token 关联的身份（collector + node）。
+#[derive(Debug, Clone)]
+pub(crate) struct CollectorIdentity {
+    pub collector_id: String,
+    pub node_id: String,
+}
+
+/// 解析 collector token → (collector_id, node_id)；env bootstrap token 无注册身份返回 None。
+fn resolve_collector_token(st: &AppState, token: &str) -> Option<CollectorIdentity> {
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(configured) = &st.collector_token {
+        if configured == token {
+            return None;
+        }
+    }
+    let (collector_id, node_id) = st.db.verify_collector_token(token)?;
+    Some(CollectorIdentity {
+        collector_id,
+        node_id,
+    })
 }
 
 fn publish_ingest(st: &AppState, kind: &str) {
@@ -686,7 +718,18 @@ async fn collector_config(State(_st): State<AppState>) -> Response {
 }
 
 /// 批处理：解压 → 校验 → 幂等落库 → rollup → 部分成功响应。
-async fn ingest_batch(State(st): State<AppState>, body: axum::body::Bytes) -> Response {
+async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -> Response {
+    let identity = req.extensions().get::<CollectorIdentity>().cloned();
+    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "请求体过大",
+            )
+        }
+    };
     let decompressed: Vec<u8> = if body_encoding(body.as_ref()) == "zstd" {
         match zstd_decode(body.as_ref()) {
             Ok(d) => d,
@@ -708,6 +751,17 @@ async fn ingest_batch(State(st): State<AppState>, body: axum::body::Bytes) -> Re
     };
     if let Err(e) = metria_protocol::validate_batch(&batch) {
         return json_err(StatusCode::BAD_REQUEST, "invalid_batch", &e);
+    }
+
+    // node/collector 关系校验：token 身份与 batch 声明一致（env bootstrap token 跳过）
+    if let Some(identity) = &identity {
+        if identity.node_id != batch.node_id || identity.collector_id != batch.collector_id {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "identity_mismatch",
+                "batch node/collector 与 token 身份不匹配",
+            );
+        }
     }
 
     let mut accepted = Vec::new();

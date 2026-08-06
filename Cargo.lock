@@ -1124,6 +1124,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "httpdate",
  "metria-adapter-api",
  "metria-adapter-claude",
  "metria-adapter-codex",

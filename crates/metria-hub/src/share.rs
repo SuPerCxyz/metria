@@ -135,3 +135,35 @@ fn node_dto(db: &HubDb, node_id: &str) -> serde_json::Value {
     }
     json!({ "kind": "node", "node_id": node_id, "clients": clients })
 }
+
+/// 删除（吊销）分享链接。
+pub fn delete_share(db: &HubDb, slug: &str) -> Result<bool, StorageError> {
+    let c = db.conn();
+    let n = c
+        .execute("DELETE FROM share_links WHERE slug = ?1", [slug])
+        .map_err(StorageError::from)?;
+    Ok(n > 0)
+}
+
+/// 分享查看审计（最近 200 条）。
+pub fn list_share_audits(db: &HubDb) -> Vec<serde_json::Value> {
+    let c = db.conn();
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = c.prepare(
+        "SELECT id, slug, ip, viewed_at FROM share_audits ORDER BY viewed_at DESC LIMIT 200",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "slug": r.get::<_, String>(1)?,
+                "ip": r.get::<_, Option<String>>(2)?,
+                "viewed_at": r.get::<_, String>(3)?,
+            }))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
