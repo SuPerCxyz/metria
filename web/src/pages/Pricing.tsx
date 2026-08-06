@@ -73,6 +73,27 @@ export function Pricing() {
     }
   }
 
+  const toggleRule = async (id: string, enabled: boolean) => {
+    try {
+      await api(`/pricing/rules/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      })
+      rules.refresh()
+    } catch (e) {
+      setSaved(`操作失败：${(e as Error).message}`)
+    }
+  }
+
+  const deleteRule = async (id: string) => {
+    try {
+      await api(`/pricing/rules/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      rules.refresh()
+    } catch (e) {
+      setSaved(`删除失败：${(e as Error).message}`)
+    }
+  }
+
   const runTest = async () => {
     try {
       const res = await api<any>('/pricing/test', {
@@ -174,11 +195,13 @@ export function Pricing() {
           <table class="table">
             <thead>
               <tr>
-                <th>模型</th>
+                <th>{t('common.model')}</th>
                 <th>Provider</th>
                 <th>Input/百万</th>
                 <th>Output/百万</th>
-                <th>优先级</th>
+                <th>{t('common.priority')}</th>
+                <th>{t('common.status')}</th>
+                <th>{t('common.actions')}</th>
               </tr>
             </thead>
             <tbody>
@@ -189,6 +212,23 @@ export function Pricing() {
                   <td>{fmtUsd(r.input_price)}</td>
                   <td>{fmtUsd(r.output_price)}</td>
                   <td>{r.priority}</td>
+                  <td>{r.source === 'user' ? (r.enabled ? t('common.enabled') : t('common.disabled')) : r.source}</td>
+                  <td>
+                    {r.source === 'user' && (
+                      <div class="dim-switch" style="gap:4px;margin:0">
+                        <button
+                          type="button"
+                          class="btn small"
+                          onClick={() => toggleRule(r.id, !r.enabled)}
+                        >
+                          {r.enabled ? t('common.disable') : t('common.enable')}
+                        </button>
+                        <button type="button" class="btn small" onClick={() => deleteRule(r.id)}>
+                          {t('common.delete')}
+                        </button>
+                      </div>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

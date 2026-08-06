@@ -20,6 +20,27 @@
 | 生产完善：CI 多架构构建修复/验证、设置与分享页 | ✅ 完成 | 2026-08-06 |
 | 收尾：token 7 天有效期、Claude 子代理、Web Waterfall/子代理树/模型切换、i18n | ✅ 完成 | 2026-08-06 |
 | 查缺补漏：rollup 对账/checkpoint、协议协商、ingest 限长、前端测试、集成测试、文件拆分、docs | ✅ 完成 | 2026-08-06 |
+| 全量补齐：allocation_mode/cursor 分页/排序/虚拟滚动、Agent Tools Detail、argon2+签名 token、token 轮换/吊销、Pricing 编辑、Overview 汇总、jitter、TOML 合并、incremental_vacuum、Node 分布 | ✅ 完成 | 2026-08-06 |
+
+### 全量补齐完成记录（2026-08-06）
+
+- S2.13：Query API 支持 `allocation_mode`（call_start/call_end）与真实 `cursor` 分页
+  （calls/sessions 基于时间+id 排序键，base64 游标，返回 next_cursor）。
+- S3.7：Calls/Sessions 列表可点击表头排序；Sessions 列表虚拟滚动（窗口化渲染）；
+  Calls 支持「加载更多」分页。
+- S3.5：Agent Tools Detail 页（`/clients/{id}`）：Node 分布、模型分布、最近会话，
+  后端 client_detail 补充 cost/traffic/recent_sessions。
+- S2.14：Admin 密码 argon2（PHC 格式，兼容旧 prehash）；会话签名 token
+  （HMAC-SHA256，`METRIA_SESSION_SECRET`），登录/校验/篡改检测测试通过。
+- S2.9：token 轮换/吊销 API（`/collectors/{id}/tokens` + `/revoke`，Admin 会话），e2e 覆盖。
+- S3.8：Pricing 规则编辑/停用/删除（PUT/DELETE `/pricing/rules/{id}`）+ 前端操作按钮。
+- S3.3：Overview 汇总维度切换（node/client/model/provider/project，`dim` 参数）。
+- S2.4：上传退避加 jitter；S2.7：SIGTERM 优雅停止 + 收尾等待。
+- S0.3：`METRIA_CONFIG_FILE` TOML 合并（env 优先，TOML 兜底）+ 单测。
+- S2.11：incremental_vacuum 接入维护任务。
+- S3.4：Node Detail 按模型/项目分布统计。
+- 豁免项（用户确认不需要）已从 plan 移除：collector config 下发、首登强制改密、多用户。
+
 
 ### 查缺补漏完成记录（2026-08-06）
 
@@ -120,7 +141,7 @@
 | 决策点 | 结论 |
 |---|---|
 | 首轮范围 | M1 核心闭环 + 精简 Web |
-| 认证 | 单 Admin（env 初始凭据，首登强制改密，users 表预留多用户） |
+| 认证 | 单 Admin（env 初始凭据） |
 | Spool 满 | 停止采集 + 明确告警（保「断网丢失 0」），可配置 |
 | Web 语言 | 中文为主，预留 i18n 抽象 |
 | 金额 | 整数微美元（i64），禁止浮点累计 |
@@ -277,12 +298,12 @@ metria/
 | 步骤 | 任务 | 要点 |
 |---|---|---|
 | S2.8 | Hub 配置/启动 | `HubConfig`：listen/database_url/timezone/content_mode/collector token 源/admin 初始凭据 env/协议版本；启动序列：migrations → integrity → rollup 对账后台异步（不在启动路径，保证 ≤2s 启动）→ 价格内置目录初始化 → axum serve；健康检查端点 |
-| S2.9 | Collector 协议 API | `POST /api/v1/collectors/register`、`heartbeat`、`events/batch`、`GET config`、`GET status`；认证=每 Collector 独立 token（DB 只存 argon2 hash，支持轮换/吊销，预留表）；register 建 node+collector 并返回 token+node_id；heartbeat 更新 last_seen/clock_skew；config 下发（扫描间隔、content_mode 覆盖、profile 白名单）；协议版本协商 |
+| S2.9 | Collector 协议 API | `POST /api/v1/collectors/register`、`heartbeat`、`events/batch`、`GET config`、`GET status`；认证=每 Collector 独立 token（DB 只存哈希，支持轮换/吊销、7 天有效期）；register 建 node+collector 并返回 token+node_id；heartbeat 更新 last_seen/clock_skew；协议版本协商。采集参数写死（Agent 默认扫描全部客户端），不做远端 config 下发 |
 | S2.10 | Ingest 处理 | 解 zstd→校验（zip bomb 限制、JSON 深度≤32、单消息/单 tool output 字节上限、事件数≤256、event_id 唯一、node/collector 关系校验）→ 幂等（event_id unique 冲突跳过）→ 写入原始事件表 → 触发增量 rollup → 部分成功响应（成功/失败/重复三清单）；Batch 幂等（upload_batches） |
 | S2.11 | Hub SQLite schema | 按 spec 四十四建表（nodes/collectors/collector_tokens/clients/sources/projects/sessions/turns/messages/model_calls/usage_events/tool_events/subagent_relations/traffic_estimates/traffic_profiles/traffic_profile_samples/pricing_catalogs/pricing_snapshots/pricing_rules/pricing_matches/hourly_rollups/daily_rollups/source_errors/share_links/share_audits/upload_batches/schema_migrations/users）+ 关键唯一约束；索引（事件表按 event_id/time/node；rollup 按 time_bucket+维度前缀）；WAL+定期 checkpoint+incremental_vacuum |
 | S2.12 | Rollup 引擎 | hourly/daily 按 spec 四十五维度与统计字段；事件写入后增量更新；支持按范围重建与重算（幂等，upsert）；重复上传不重复统计（靠 event_id 幂等保证）；对账任务后台周期校验 rollup 与事件数 |
 | S2.13 | Query API（子集） | 实现 M1 Web 需要的端点：`/api/v1/overview`、`/usage/timeseries`、`/usage/breakdown`、`/nodes`+`:id`（含 clients/sources/usage/traffic/sessions/calls）、`/clients`+`:id`、`/models`、`/calls`+`:id`、`/traffic/summary`、`/sessions`+`:id`+`/timeline`、`/pricing/rules`、`/data-quality`；全部支持 `from/to/timezone/granularity/allocation_mode(call_start 默认)` + 维度过滤 + cursor 分页；Overview 读 rollup，Detail 读原始 |
-| S2.14 | Auth | `POST /auth/login`（argon2 校验）→ 会话 cookie/JWT（简单签名，secret 来自 env）；`logout/me/change-password`；首次登录强制改密标记；中间件保护 `/api/v1/**`（排除 login 与 stream 的兼容） |
+| S2.14 | Auth | `POST /auth/login`（argon2 校验）→ 签名会话 token（secret 来自 env）；`logout/me/change-password`；中间件保护 `/api/v1/**`（排除 login 与 stream 的兼容） |
 | S2.15 | SSE | `GET /api/v1/stream`：事件推送（node/collector/source/session/call/usage/traffic/pricing 相关子集）；30s 心跳；事件过滤按当前用户可见范围 |
 | S2.16 | 集成测试 | Rust 集成测试（metria-hub `tests/`）：mock agent→真实 hub（内存 SQLite）全链路：注册→扫描 fixture→spool→上传→rollup→API 断言；断网场景（hub 关闭→agent 事件积压→hub 恢复→补传成功→幂等验证）；重复上传统计不重复；部分成功重传；clock skew 检测 |
 | S2.17 | Doctor 补全 | `--spool`（事件数/大小/告警/最近错误/死信）、`--hub`（连通性/TLS/时间差/最近上传）、`--database`（integrity/版本/rollup 对账） |

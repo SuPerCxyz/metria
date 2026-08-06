@@ -220,9 +220,12 @@ fn spawn_maintenance(db: db::HubDb) {
                 }
                 Err(e) => warn!("rollup 对账失败: {e}"),
             }
-            // WAL checkpoint
+            // WAL checkpoint + 空间回收
             if let Err(e) = db.wal_checkpoint() {
                 warn!("WAL checkpoint 失败: {e}");
+            }
+            if let Err(e) = db.incremental_vacuum() {
+                warn!("incremental_vacuum 失败: {e}");
             }
         }
     });
@@ -231,19 +234,14 @@ fn spawn_maintenance(db: db::HubDb) {
 fn ensure_admin(db: &db::HubDb) {
     let user = std::env::var("METRIA_ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let pass = std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_else(|_| "metria-admin".into());
-    let hash = format!("prehash:{}", blake3_hex(&pass));
+    // argon2 哈希（与 api::verify_password 配套）；旧库 prehash 兼容校验
+    let hash = api::hash_password(&pass);
     let now = chrono::Utc::now().to_rfc3339();
     let c = db.conn();
     let _ = c.execute(
         "INSERT OR IGNORE INTO users (id, username, password_hash, must_change_password, role, created_at, updated_at) VALUES (?1, ?2, ?3, 1, 'admin', ?4, ?4)",
         metria_storage::rusqlite::params![format!("user-{user}"), user, hash, now],
     );
-}
-
-fn blake3_hex(s: &str) -> String {
-    metria_core::model::ContentHash::hash_str(s)
-        .as_str()
-        .to_string()
 }
 
 async fn shutdown_signal() {

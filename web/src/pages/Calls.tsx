@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks'
 import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
@@ -5,12 +6,63 @@ import { fmtBytes, fmtDateTime, fmtTokens, fmtUsd } from '../lib/format'
 import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
+type SortKey = 'started_at' | 'model' | 'client_id' | 'input_tokens' | 'output_tokens' | 'calculated_cost_micro_usd'
+
+const SORTABLE: { key: SortKey; label: string }[] = [
+  { key: 'started_at', label: '时间' },
+  { key: 'client_id', label: 'Client' },
+  { key: 'model', label: '模型' },
+  { key: 'input_tokens', label: 'Input' },
+  { key: 'output_tokens', label: 'Output' },
+  { key: 'calculated_cost_micro_usd', label: '费用' },
+]
+
+function sortCalls(list: any[], key: SortKey, dir: 1 | -1): any[] {
+  return [...list].sort((a, b) => {
+    const av = a[key] ?? ''
+    const bv = b[key] ?? ''
+    const cmp = typeof av === 'number' ? av - (bv as number) : String(av).localeCompare(String(bv))
+    return cmp * dir
+  })
+}
+
 export function Calls() {
   const range = getRange()
   const params = { from: range.from, to: range.to, timezone: range.timezone }
-  const calls = useQuery<any>(`calls${q(params)}`, () => api(`/calls${q(params)}`))
+  const [sortKey, setSortKey] = useState<SortKey>('started_at')
+  const [sortDir, setSortDir] = useState<1 | -1>(-1)
+  const [cursor, setCursor] = useState<string | undefined>()
+  const [all] = useState<any[]>([])
+  const [loadingMore, setLoadingMore] = useState(false)
+
+  const pageParams = cursor ? { ...params, cursor } : params
+  const calls = useQuery<any>(`calls${q({ ...pageParams, limit: 200 })}`, () =>
+    api(`/calls${q({ ...pageParams, limit: 200 })}`),
+  )
+
   if (calls.error) return <ErrorBox error={calls.error} onRetry={calls.refresh} />
-  if (calls.loading) return <Empty text={t('common.loading')} />
+  if (calls.loading && all.length === 0) return <Empty text={t('common.loading')} />
+
+  const pageList: any[] = calls.data?.calls || []
+  const list = cursor ? [...all, ...pageList] : pageList
+  const nextCursor = calls.data?.next_cursor as string | undefined
+
+  const toggleSort = (key: SortKey) => {
+    if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1))
+    else {
+      setSortKey(key)
+      setSortDir(key === 'started_at' ? -1 : 1)
+    }
+  }
+
+  const loadMore = async () => {
+    if (!nextCursor || loadingMore) return
+    setLoadingMore(true)
+    setCursor(nextCursor)
+    setLoadingMore(false)
+  }
+
+  const sorted = sortCalls(list, sortKey, sortDir)
 
   return (
     <div class="page">
@@ -19,33 +71,45 @@ export function Calls() {
         <table class="table">
           <thead>
             <tr>
-              <th>时间</th>
-              <th>Client</th>
-              <th>{t('common.model')}</th>
+              {SORTABLE.map((col) => (
+                <th
+                  key={col.key}
+                  class="clickable"
+                  onClick={() => toggleSort(col.key)}
+                  title={sortKey === col.key ? (sortDir === 1 ? '升序' : '降序') : '点击排序'}
+                >
+                  {col.label}
+                  {sortKey === col.key ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
+                </th>
+              ))}
               <th>Provider</th>
               <th>{t('common.status')}</th>
-              <th>Input</th>
-              <th>Output</th>
               <th>Cache</th>
-              <th>{t('common.cost')}</th>
             </tr>
           </thead>
           <tbody>
-            {(calls.data?.calls || []).map((c: any) => (
+            {sorted.map((c: any) => (
               <tr key={c.id} class="clickable" onClick={() => nav(`calls/${c.id}`)}>
                 <td>{fmtDateTime(c.started_at)}</td>
                 <td>{c.client_id}</td>
                 <td>{c.model || '—'}</td>
-                <td>{c.provider || '—'}</td>
-                <td>{c.status}</td>
                 <td>{fmtTokens(c.input_tokens)}</td>
                 <td>{fmtTokens(c.output_tokens)}</td>
-                <td>{fmtTokens((c.cache_read_tokens ?? 0) + (c.cache_write_tokens ?? 0))}</td>
                 <td>{fmtUsd(c.calculated_cost_micro_usd ?? c.reported_cost_micro_usd)}</td>
+                <td>{c.provider || '—'}</td>
+                <td>{c.status}</td>
+                <td>{fmtTokens((c.cache_read_tokens ?? 0) + (c.cache_write_tokens ?? 0))}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        {nextCursor && (
+          <div class="dim-switch" style="margin-top:10px">
+            <button type="button" class="btn small" onClick={loadMore} disabled={loadingMore}>
+              {t('common.more')} ↓
+            </button>
+          </div>
+        )}
       </Card>
     </div>
   )

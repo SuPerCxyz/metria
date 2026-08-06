@@ -181,6 +181,47 @@ pub(crate) struct PricingTestRequest {
     reasoning_tokens: Option<i64>,
 }
 
+/// 更新用户价格规则（编辑/停用/生效区间）。
+pub(crate) async fn pricing_rule_update(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(v): Json<serde_json::Value>,
+) -> Response {
+    match st.db.update_pricing_rule(&id, &v) {
+        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => json_err(
+            StatusCode::NOT_FOUND,
+            "rule_not_found",
+            "规则不存在或非用户规则",
+        ),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rule_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// 删除用户价格规则。
+pub(crate) async fn pricing_rule_delete(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match st.db.delete_pricing_rule(&id) {
+        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => json_err(
+            StatusCode::NOT_FOUND,
+            "rule_not_found",
+            "规则不存在或非用户规则",
+        ),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rule_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
 pub(crate) async fn pricing_test(
     State(st): State<AppState>,
     Json(req): Json<PricingTestRequest>,

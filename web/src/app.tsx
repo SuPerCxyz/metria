@@ -8,6 +8,7 @@ import { Login } from './pages/Login'
 import { Overview } from './pages/Overview'
 import { Nodes, NodeDetail } from './pages/Nodes'
 import { Clients } from './pages/Clients'
+import { ClientDetail } from './pages/ClientDetail'
 import { Models } from './pages/Models'
 import { Sessions, SessionDetail } from './pages/Sessions'
 import { Calls, CallDetail } from './pages/Calls'
@@ -41,7 +42,7 @@ function Page() {
     case '/nodes':
       return route.id ? <NodeDetail id={route.id} /> : <Nodes />
     case '/clients':
-      return <Clients />
+      return route.id ? <ClientDetail id={route.id} /> : <Clients />
     case '/models':
       return <Models />
     case '/sessions':

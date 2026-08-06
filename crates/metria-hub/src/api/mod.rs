@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response, Sse};
@@ -89,6 +89,14 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/collectors/heartbeat", post(heartbeat))
         .route("/api/v1/collectors/status", get(collector_status))
         .route("/api/v1/collectors/config", get(collector_config))
+        .route(
+            "/api/v1/collectors/{id}/tokens",
+            get(list_collector_tokens_handler).post(rotate_collector_token_handler),
+        )
+        .route(
+            "/api/v1/collectors/{id}/tokens/revoke",
+            post(revoke_collector_token_handler),
+        )
         .route("/api/v1/events/batch", post(ingest_batch))
         .route("/api/v1/stream", get(sse_stream))
         .route("/api/v1/overview", get(overview))
@@ -146,6 +154,10 @@ pub fn app_router(state: AppState) -> Router {
             "/api/v1/pricing/rules",
             get(pricing_rules).post(pricing_rules_create),
         )
+        .route(
+            "/api/v1/pricing/rules/{id}",
+            axum::routing::put(pricing_rule_update).delete(pricing_rule_delete),
+        )
         .route("/api/v1/pricing/test", post(pricing_test))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_mw))
@@ -165,6 +177,13 @@ async fn auth_mw(
         return next.run(req).await;
     }
     let headers = req.headers().clone();
+    // token 管理端点需要 Admin 会话（rotete/revoke 是运维操作，非 collector 请求）
+    if path.contains("/collectors/") && path.contains("/tokens") {
+        if auth_user(&st, &headers).is_none() {
+            return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "需要 Admin 会话");
+        }
+        return next.run(req).await;
+    }
     if path.starts_with("/api/v1/collectors/") || path == "/api/v1/events/batch" {
         let tok = bearer(&headers).unwrap_or("");
         if !check_collector_token(&st, tok) {
@@ -222,6 +241,9 @@ fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 fn auth_user(st: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
     let tok = bearer(headers)?;
+    if let Some(u) = verify_session(tok) {
+        return Some(u);
+    }
     st.sessions.lock().unwrap().get(tok).cloned()
 }
 
@@ -284,13 +306,27 @@ fn blake3_hex(s: &str) -> String {
         .to_string()
 }
 
-fn hash_password(p: &str) -> String {
-    // M1 占位哈希；生产部署务必设置 METRIA_ADMIN_PASSWORD（后续替换为 argon2）。
-    format!("prehash:{}", blake3_hex(p))
+pub(crate) fn hash_password(p: &str) -> String {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut OsRng);
+    argon2::Argon2::default()
+        .hash_password(p.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| format!("prehash:{}", blake3_hex(p)))
 }
 
 fn verify_password(plain: &str, hash: &str) -> bool {
-    hash_password(plain) == hash
+    // 兼容旧版占位哈希（M1 之前版本）
+    if let Some(old) = hash.strip_prefix("prehash:") {
+        return blake3_hex(plain) == old;
+    }
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    match PasswordHash::new(hash) {
+        Ok(parsed) => argon2::Argon2::default()
+            .verify_password(plain.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// 查询参数。
@@ -307,6 +343,10 @@ pub struct RangeParams {
     pub project_id: Option<String>,
     pub limit: Option<i64>,
     pub cursor: Option<String>,
+    /// 调用归属时间口径：call_start（默认，用 started_at）或 call_end（用 completed_at）。
+    pub allocation_mode: Option<String>,
+    /// 汇总维度：node/client/model/provider/project（breakdown 用）。
+    pub dim: Option<String>,
     /// SSE 通过 EventSource 连接，无法携带 Authorization 头，允许用 query 传会话 token。
     pub token: Option<String>,
 }
@@ -367,6 +407,29 @@ pub(crate) fn range_args(
     v
 }
 
+/// 解析 allocation_mode：call_start（默认）/ call_end。
+pub(crate) fn time_column(mode: Option<&str>) -> &'static str {
+    match mode {
+        Some("call_end") => "completed_at",
+        _ => "started_at",
+    }
+}
+
+/// 编码分页游标：base64("<ts>|<id>")。
+pub(crate) fn encode_cursor(ts: &str, id: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(format!("{ts}|{id}"))
+}
+
+/// 解码分页游标，失败返回 None。
+pub(crate) fn decode_cursor(c: &str) -> Option<(String, String)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD.decode(c).ok()?;
+    let s = String::from_utf8(raw).ok()?;
+    let (ts, id) = s.split_once('|')?;
+    Some((ts.to_string(), id.to_string()))
+}
+
 // ============ 认证 ============
 
 #[derive(Debug, Deserialize)]
@@ -380,6 +443,55 @@ struct LoginRequest {
 struct ChangePasswordRequest {
     old_password: String,
     new_password: String,
+}
+
+fn session_secret() -> Vec<u8> {
+    use sha2::Digest;
+    let secret = std::env::var("METRIA_SESSION_SECRET")
+        .unwrap_or_else(|_| "metria-dev-session-secret-change-me".into());
+    sha2::Sha256::digest(secret.as_bytes()).to_vec()
+}
+
+/// 签发签名会话 token：`sess.<username>.<sig>`（sig = HMAC-SHA256(secret, username)）。
+fn sign_session(username: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    type H = Hmac<sha2::Sha256>;
+    let mut mac = H::new_from_slice(&session_secret()).expect("hmac key");
+    mac.update(username.as_bytes());
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!(
+        "sess.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(username),
+        sig
+    )
+}
+
+/// 校验签名会话 token，返回用户名（验签失败返回 None）。
+fn verify_session(token: &str) -> Option<String> {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    type H = Hmac<sha2::Sha256>;
+    let mut parts = token.split('.');
+    let prefix = parts.next()?;
+    if prefix != "sess" {
+        return None;
+    }
+    let user_b64 = parts.next()?;
+    let sig_b64 = parts.next()?;
+    let username = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(user_b64)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())?;
+    let mut mac = H::new_from_slice(&session_secret()).ok()?;
+    mac.update(username.as_bytes());
+    let expected =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    if expected == sig_b64 {
+        Some(username)
+    } else {
+        None
+    }
 }
 
 fn admin_hash() -> (String, String) {
@@ -397,7 +509,7 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Res
             "用户名或密码错误",
         );
     }
-    let token = format!("sess-{}", metria_core::model::Id::new());
+    let token = sign_session(&req.username);
     st.sessions
         .lock()
         .unwrap()
@@ -518,6 +630,48 @@ async fn collector_status(State(_st): State<AppState>) -> Response {
         hub_time: Utc::now(),
     })
     .into_response()
+}
+
+/// 列出 collector 的 token（需 Admin 会话）。
+async fn list_collector_tokens_handler(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    Json(serde_json::json!({ "tokens": st.db.list_collector_tokens(&id) })).into_response()
+}
+
+/// 轮换 collector token：吊销旧 token，签发新 token 返回明文。
+async fn rotate_collector_token_handler(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let new_token = format!("mct-{}", metria_core::model::Id::new());
+    match st.db.rotate_collector_token(&id, &new_token) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true, "collector_id": id, "token": new_token
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rotate_failed",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// 吊销 collector 全部 active token。
+async fn revoke_collector_token_handler(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match st.db.revoke_collector_token(&id) {
+        Ok(n) => Json(serde_json::json!({ "ok": true, "revoked": n })).into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "revoke_failed",
+            &e.to_string(),
+        ),
+    }
 }
 
 async fn collector_config(State(_st): State<AppState>) -> Response {
@@ -675,4 +829,34 @@ async fn sse_stream(
         }
     };
     Sse::new(stream).into_response()
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn argon2_hash_and_verify_roundtrip() {
+        let h = hash_password("s3cret");
+        assert!(h.starts_with("$argon2"), "应生成 PHC argon2 哈希: {h}");
+        assert!(verify_password("s3cret", &h));
+        assert!(!verify_password("wrong", &h));
+    }
+
+    #[test]
+    fn legacy_prehash_still_verifies() {
+        let old = format!("prehash:{}", blake3_hex("oldpass"));
+        assert!(verify_password("oldpass", &old));
+        assert!(!verify_password("nope", &old));
+    }
+
+    #[test]
+    fn signed_session_roundtrip() {
+        let tok = sign_session("admin");
+        assert!(tok.starts_with("sess."));
+        assert_eq!(verify_session(&tok).as_deref(), Some("admin"));
+        // 篡改 token 应校验失败
+        assert_eq!(verify_session(&format!("{tok}x")), None);
+        assert_eq!(verify_session("sess.garbage"), None);
+    }
 }

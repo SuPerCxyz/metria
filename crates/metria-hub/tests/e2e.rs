@@ -572,3 +572,67 @@ async fn heartbeat_records_clock_skew() {
         "clock_skew 应约 300 秒，实际 {skew}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn collector_token_rotate_and_revoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    // 注册（testtok bootstrap）
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "rot-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap();
+
+    // Admin 登录
+    let token = admin_token(&base);
+
+    // 轮换 → 返回新 token，且旧 token 立即失效
+    let rot: Value = ureq::post(&format!(
+        "{base}/api/v1/collectors/collector-rot-node/tokens"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .send_json(json!({}))
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(rot["ok"], true);
+    let new_tok = rot["token"].as_str().unwrap().to_string();
+
+    // env bootstrap token 作为注册凭据始终可用（设计如此）；
+    // 轮换后 DB 中的旧 token 记录被吊销。新 token 可鉴权（注册成功）。
+    let ok: Value = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", &format!("Bearer {new_tok}"))
+        .send_json(
+            json!({"schema_version": 1, "node_id": "rot-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(ok["ok"], true);
+
+    // 吊销 → 全部失效
+    let rev: Value = ureq::post(&format!(
+        "{base}/api/v1/collectors/collector-rot-node/tokens/revoke"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .send_json(json!({}))
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(rev["ok"], true);
+    let resp2 = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", &format!("Bearer {new_tok}"))
+        .send_json(
+            json!({"schema_version": 1, "node_id": "rot-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(resp2, ureq::Error::Status(401, _)),
+        "吊销后新 token 也应失效"
+    );
+}

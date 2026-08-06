@@ -1,7 +1,7 @@
 import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty, Badge, statusTone } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
-import { fmtDateTime } from '../lib/format'
+import { fmtBytes, fmtDateTime, fmtTokens } from '../lib/format'
 import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
@@ -108,6 +108,51 @@ export function NodeDetail({ id }: { id: string }) {
           </tbody>
         </table>
       </Card>
+
+      <div class="grid-2">
+        <Card title={t('nodes.byModel')}>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>{t('common.model')}</th>
+                <th>Calls</th>
+                <th>Input</th>
+                <th>Output</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(n.by_model || []).map((m: any) => (
+                <tr key={m.model}>
+                  <td>{m.model}</td>
+                  <td>{m.calls}</td>
+                  <td>{fmtTokens(m.input_tokens)}</td>
+                  <td>{fmtTokens(m.output_tokens)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+        <Card title={t('nodes.byProject')}>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>{t('common.project')}</th>
+                <th>Sessions</th>
+                <th>{t('common.estimatedTraffic')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(n.by_project || []).map((p: any) => (
+                <tr key={p.project_id}>
+                  <td>{p.project_id}</td>
+                  <td>{p.sessions}</td>
+                  <td>{fmtBytes(p.estimated_total_bytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      </div>
 
       <div class="grid-2">
         <Card title={t('overview.recentSessions')}>

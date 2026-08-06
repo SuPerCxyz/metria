@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks'
 import { api, q } from '../api/client'
 import { Card, StatCard, ErrorBox, Empty } from '../components/ui'
 import { TimeSeries } from '../components/TimeSeries'
@@ -17,7 +18,10 @@ export function Overview() {
 
   const overview = useQuery<any>(`overview${q(params)}`, () => api(`/overview${q(params)}`))
   const series = useQuery<any>(`ts${q(params)}`, () => api(`/usage/timeseries${q(params)}`))
-  const byNode = useQuery<any>(`breakdown${q(params)}`, () => api(`/usage/breakdown${q(params)}`))
+  const [dim, setDim] = useState('node')
+  const byNode = useQuery<any>(`breakdown${q({ ...params, dim })}`, () =>
+    api(`/usage/breakdown${q({ ...params, dim })}`),
+  )
   const recentSessions = useQuery<any>(
     `sessions${q({ ...params, limit: 8 })}`,
     () => api(`/sessions${q({ ...params, limit: 8 })}`),
@@ -69,11 +73,23 @@ export function Overview() {
         <Card title={t('overview.trafficSeries')}>
           {trafficSeries.data?.length ? <TimeSeries data={trafficSeries.data} /> : <Empty />}
         </Card>
-        <Card title={t('traffic.byNode')}>
+        <Card title={t('overview.byDimension')}>
+          <div class="dim-switch">
+            {(['node', 'client', 'model', 'provider', 'project'] as const).map((d) => (
+              <button
+                type="button"
+                key={d}
+                class={`btn small ${dim === d ? 'primary' : ''}`}
+                onClick={() => setDim(d)}
+              >
+                {t(`overview.dim.${d}`)}
+              </button>
+            ))}
+          </div>
           <table class="table">
             <thead>
               <tr>
-                <th>Node</th>
+                <th>{t(`overview.dim.${dim}`)}</th>
                 <th>Input</th>
                 <th>Output</th>
                 <th>{t('common.estimatedTraffic')}</th>
@@ -81,9 +97,15 @@ export function Overview() {
               </tr>
             </thead>
             <tbody>
-              {(byNode.data?.by_node || []).map((n: any) => (
-                <tr key={n.node_id} class="clickable" onClick={() => nav(`nodes/${n.node_id}`)}>
-                  <td>{n.node_id}</td>
+              {(byNode.data?.by || []).map((n: any) => (
+                <tr
+                  key={n.dimension}
+                  class="clickable"
+                  onClick={() =>
+                    dim === 'node' ? nav(`nodes/${encodeURIComponent(n.dimension)}`) : undefined
+                  }
+                >
+                  <td>{n.dimension || t('common.notAvailable')}</td>
                   <td>{fmtTokens(n.input_tokens)}</td>
                   <td>{fmtTokens(n.output_tokens)}</td>
                   <td>{fmtBytes(n.estimated_traffic_bytes)}</td>

@@ -382,4 +382,62 @@ impl HubDb {
         .map_err(StorageError::from)?;
         Ok(())
     }
+
+    /// 更新用户规则（编辑价格 / 优先级 / 生效区间 / 停用启用）。
+    pub fn update_pricing_rule(&self, id: &str, v: &Value) -> Result<bool, StorageError> {
+        let c = self.conn();
+        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
+        let en = v.get("enabled").and_then(|x| x.as_bool());
+        let n = c
+            .execute(
+                "UPDATE pricing_rules SET
+                provider_pattern = COALESCE(NULLIF(?1,''), provider_pattern),
+                model_pattern = COALESCE(NULLIF(?2,''), model_pattern),
+                client_pattern = COALESCE(NULLIF(?3,''), client_pattern),
+                input_price = COALESCE(?4, input_price),
+                output_price = COALESCE(?5, output_price),
+                cache_read_price = COALESCE(?6, cache_read_price),
+                cache_write_price = COALESCE(?7, cache_write_price),
+                reasoning_price = COALESCE(?8, reasoning_price),
+                request_price = COALESCE(?9, request_price),
+                priority = COALESCE(?10, priority),
+                effective_from = COALESCE(NULLIF(?11,''), effective_from),
+                effective_to = COALESCE(NULLIF(?12,''), effective_to),
+                enabled = COALESCE(?13, enabled),
+                updated_at = ?14
+             WHERE id = ?15 AND source = 'user'",
+                params![
+                    g("provider_pattern"),
+                    g("model_pattern"),
+                    g("client_pattern"),
+                    gn("input_price"),
+                    gn("output_price"),
+                    gn("cache_read_price"),
+                    gn("cache_write_price"),
+                    gn("reasoning_price"),
+                    gn("request_price"),
+                    gn("priority"),
+                    g("effective_from"),
+                    g("effective_to"),
+                    en.map(|b| if b { 1 } else { 0 }),
+                    Utc::now().to_rfc3339(),
+                    id,
+                ],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n > 0)
+    }
+
+    /// 删除用户规则。
+    pub fn delete_pricing_rule(&self, id: &str) -> Result<bool, StorageError> {
+        let c = self.conn();
+        let n = c
+            .execute(
+                "DELETE FROM pricing_rules WHERE id = ?1 AND source = 'user'",
+                [id],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n > 0)
+    }
 }

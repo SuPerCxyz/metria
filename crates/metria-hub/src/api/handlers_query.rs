@@ -6,7 +6,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use metria_storage::rusqlite::{params, params_from_iter};
+use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValue};
 
 use crate::api::{json_err, parse_range, range_args, range_filter, AppState, RangeParams};
 use crate::q;
@@ -111,26 +111,36 @@ pub(crate) async fn usage_breakdown(
 ) -> Response {
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter(&p);
+    // 支持多维度汇总（S3.3）：node/client/model/provider/project
+    let (col, key) = match p.dim.as_deref() {
+        Some("client") => ("client_id", "client_id"),
+        Some("model") => ("model", "model"),
+        Some("provider") => ("provider", "provider"),
+        Some("project") => ("project_id", "project_id"),
+        _ => ("node_id", "node_id"),
+    };
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(&format!(
-        "SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-            COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
+        "SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+            COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+            COALESCE(SUM(session_count),0)
          FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter}
-         GROUP BY node_id ORDER BY 5 DESC"
+         GROUP BY {col} ORDER BY 5 DESC"
     )));
     let rows = q!(
         stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
             Ok(serde_json::json!({
-                "node_id": r.get::<_, String>(0)?,
+                "dimension": r.get::<_, String>(0)?,
                 "input_tokens": r.get::<_, i64>(1)?,
                 "output_tokens": r.get::<_, i64>(2)?,
                 "estimated_traffic_bytes": r.get::<_, i64>(3)?,
                 "model_calls": r.get::<_, i64>(4)?,
+                "sessions": r.get::<_, i64>(5)?,
             }))
         },)
     );
     let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "by_node": items })).into_response()
+    Json(serde_json::json!({ "by": items, "dimension": key })).into_response()
 }
 
 pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
@@ -188,7 +198,45 @@ pub(crate) async fn node_detail(
             }
         }
     }
-    Json(serde_json::json!({ "node": node, "clients": clients })).into_response()
+    // 分布统计（S3.4）：按 Model / Project 汇总本 Node 的调用与 token
+    let mut by_model = Vec::new();
+    if let Ok(mut stmt) = c.prepare(
+        "SELECT COALESCE(model_normalized,'(unknown)'), COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+         FROM model_calls WHERE node_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized ORDER BY 2 DESC LIMIT 10",
+    ) {
+        if let Ok(rows) = stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "model": r.get::<_, String>(0)?,
+                "calls": r.get::<_, i64>(1)?,
+                "input_tokens": r.get::<_, i64>(2)?,
+                "output_tokens": r.get::<_, i64>(3)?,
+            }))
+        }) {
+            by_model = rows.filter_map(|x| x.ok()).collect();
+        }
+    }
+    let mut by_project = Vec::new();
+    if let Ok(mut stmt) = c.prepare(
+        "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(estimated_total_bytes),0)
+         FROM sessions WHERE node_id = ?1 GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
+    ) {
+        if let Ok(rows) = stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "project_id": r.get::<_, String>(0)?,
+                "sessions": r.get::<_, i64>(1)?,
+                "estimated_total_bytes": r.get::<_, i64>(2)?,
+            }))
+        }) {
+            by_project = rows.filter_map(|x| x.ok()).collect();
+        }
+    }
+    Json(serde_json::json!({
+        "node": node,
+        "clients": clients,
+        "by_model": by_model,
+        "by_project": by_project,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn node_clients(
@@ -249,7 +297,12 @@ pub(crate) async fn node_sessions(
         },
     ));
     let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    let next_cursor = sessions.last().and_then(|v| {
+        let id = v.get("id")?.as_str()?;
+        let ts = v.get("started_at")?.as_str()?;
+        Some(crate::api::encode_cursor(ts, id))
+    });
+    Json(serde_json::json!({ "sessions": sessions, "next_cursor": next_cursor })).into_response()
 }
 
 pub(crate) async fn node_calls(
@@ -340,7 +393,52 @@ pub(crate) async fn client_detail(
         },)
     );
     let by_node: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "client_id": id, "by_node": by_node })).into_response()
+
+    // 最近 sessions（Agent Tools Detail）
+    let recent: Vec<serde_json::Value> = {
+        let mut st = q!(c.prepare(
+            "SELECT id, source_session_id, node_id, title, primary_model_normalized, started_at,
+                    model_call_count, input_tokens, output_tokens, estimated_total_bytes
+             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+             ORDER BY started_at DESC LIMIT 20",
+        ));
+        let r = q!(
+            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "source_session_id": r.get::<_, String>(1)?,
+                    "node_id": r.get::<_, String>(2)?,
+                    "title": r.get::<_, Option<String>>(3)?,
+                    "model": r.get::<_, Option<String>>(4)?,
+                    "started_at": r.get::<_, String>(5)?,
+                    "model_call_count": r.get::<_, i64>(6)?,
+                    "input_tokens": r.get::<_, Option<i64>>(7)?,
+                    "output_tokens": r.get::<_, Option<i64>>(8)?,
+                    "estimated_total_bytes": r.get::<_, Option<i64>>(9)?,
+                }))
+            },)
+        );
+        r.filter_map(|x| x.ok()).collect()
+    };
+
+    // 汇总（三口径 cost / 流量）
+    let summary = c
+        .query_row(
+            "SELECT COALESCE(SUM(calculated_cost_micro_usd),0), COALESCE(SUM(estimated_total_bytes),0)
+             FROM hourly_rollups WHERE client_id = ?1 AND bucket >= ?2 AND bucket < ?3",
+            params![id, from.to_rfc3339(), to.to_rfc3339()],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((0, 0));
+
+    Json(serde_json::json!({
+        "client_id": id,
+        "by_node": by_node,
+        "recent_sessions": recent,
+        "calculated_cost_micro_usd": summary.0,
+        "estimated_total_bytes": summary.1,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn client_models(
@@ -423,34 +521,78 @@ pub(crate) async fn list_calls(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(100).min(1000);
-    let mut stmt = q!(c.prepare(
-        "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
-            input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
-            reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
-         FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 ORDER BY started_at DESC LIMIT ?3",
-    ));
-    let rows = q!(
-        stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339(), limit], |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
-                "client_id": r.get::<_, String>(1)?,
-                "session_id": r.get::<_, String>(2)?,
-                "provider": r.get::<_, Option<String>>(3)?,
-                "model": r.get::<_, Option<String>>(4)?,
-                "started_at": r.get::<_, String>(5)?,
-                "status": r.get::<_, String>(6)?,
-                "input_tokens": r.get::<_, Option<i64>>(7)?,
-                "output_tokens": r.get::<_, Option<i64>>(8)?,
-                "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
-                "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
-                "reported_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
-                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
-                "estimated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
-            }))
-        },)
-    );
+    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+    // cursor 分页：基于 (时间, id) 排序键的游标
+    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+        match crate::api::decode_cursor(cur) {
+            Some((ts, id)) => (
+                format!(
+                    "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
+                        input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
+                        reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
+                     FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
+                       AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
+                     ORDER BY {tcol} DESC, id DESC LIMIT ?5"
+                ),
+                vec![
+                    SqlValue::Text(from.to_rfc3339()),
+                    SqlValue::Text(to.to_rfc3339()),
+                    SqlValue::Text(ts),
+                    SqlValue::Text(id),
+                    SqlValue::Integer(limit),
+                ],
+            ),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cursor",
+                    "分页游标无效",
+                )
+            }
+        }
+    } else {
+        (
+            format!(
+                "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
+                    input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
+                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
+                 FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
+                 ORDER BY {tcol} DESC, id DESC LIMIT ?3"
+            ),
+            vec![
+                SqlValue::Text(from.to_rfc3339()),
+                SqlValue::Text(to.to_rfc3339()),
+                SqlValue::Integer(limit),
+            ],
+        )
+    };
+    let mut stmt = q!(c.prepare(&sql));
+    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "client_id": r.get::<_, String>(1)?,
+            "session_id": r.get::<_, String>(2)?,
+            "provider": r.get::<_, Option<String>>(3)?,
+            "model": r.get::<_, Option<String>>(4)?,
+            "started_at": r.get::<_, String>(5)?,
+            "status": r.get::<_, String>(6)?,
+            "input_tokens": r.get::<_, Option<i64>>(7)?,
+            "output_tokens": r.get::<_, Option<i64>>(8)?,
+            "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
+            "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
+            "reported_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
+            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
+            "estimated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+        }))
+    },));
     let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "calls": calls })).into_response()
+    // 生成下一页游标（取最后一条）
+    let next_cursor = calls.last().and_then(|v| {
+        let id = v.get("id")?.as_str()?;
+        let ts = v.get("started_at")?.as_str()?;
+        Some(crate::api::encode_cursor(ts, id))
+    });
+    Json(serde_json::json!({ "calls": calls, "next_cursor": next_cursor })).into_response()
 }
 
 pub(crate) async fn call_detail(
@@ -524,35 +666,71 @@ pub(crate) async fn list_sessions(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(100).min(1000);
-    let mut stmt = q!(c.prepare(
-        "SELECT id, source_session_id, client_id, title, provider_normalized, primary_model_normalized, started_at, ended_at,
-            message_count, tool_call_count, model_call_count, input_tokens, output_tokens,
-            reported_cost_micro_usd, estimated_total_bytes
-         FROM sessions WHERE started_at >= ?1 AND started_at < ?2 ORDER BY started_at DESC LIMIT ?3",
-    ));
-    let rows = q!(
-        stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339(), limit], |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
-                "source_session_id": r.get::<_, String>(1)?,
-                "client_id": r.get::<_, String>(2)?,
-                "title": r.get::<_, Option<String>>(3)?,
-                "provider": r.get::<_, Option<String>>(4)?,
-                "model": r.get::<_, Option<String>>(5)?,
-                "started_at": r.get::<_, String>(6)?,
-                "ended_at": r.get::<_, Option<String>>(7)?,
-                "message_count": r.get::<_, i64>(8)?,
-                "tool_call_count": r.get::<_, i64>(9)?,
-                "model_call_count": r.get::<_, i64>(10)?,
-                "input_tokens": r.get::<_, Option<i64>>(11)?,
-                "output_tokens": r.get::<_, Option<i64>>(12)?,
-                "reported_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
-                "estimated_total_bytes": r.get::<_, Option<i64>>(14)?,
-            }))
-        },)
-    );
+    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+        match crate::api::decode_cursor(cur) {
+            Some((ts, id)) => (
+                format!(
+                    "SELECT id, source_session_id, client_id, title, provider_normalized, primary_model_normalized, started_at, ended_at,
+                        message_count, tool_call_count, model_call_count, input_tokens, output_tokens,
+                        reported_cost_micro_usd, estimated_total_bytes
+                     FROM sessions WHERE {tcol} >= ?1 AND {tcol} < ?2
+                       AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
+                     ORDER BY {tcol} DESC, id DESC LIMIT ?5"
+                ),
+                vec![
+                    SqlValue::Text(from.to_rfc3339()),
+                    SqlValue::Text(to.to_rfc3339()),
+                    SqlValue::Text(ts),
+                    SqlValue::Text(id),
+                    SqlValue::Integer(limit),
+                ],
+            ),
+            None => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", "分页游标无效"),
+        }
+    } else {
+        (
+            format!(
+                "SELECT id, source_session_id, client_id, title, provider_normalized, primary_model_normalized, started_at, ended_at,
+                    message_count, tool_call_count, model_call_count, input_tokens, output_tokens,
+                    reported_cost_micro_usd, estimated_total_bytes
+                 FROM sessions WHERE {tcol} >= ?1 AND {tcol} < ?2
+                 ORDER BY {tcol} DESC, id DESC LIMIT ?3"
+            ),
+            vec![
+                SqlValue::Text(from.to_rfc3339()),
+                SqlValue::Text(to.to_rfc3339()),
+                SqlValue::Integer(limit),
+            ],
+        )
+    };
+    let mut stmt = q!(c.prepare(&sql));
+    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "source_session_id": r.get::<_, String>(1)?,
+            "client_id": r.get::<_, String>(2)?,
+            "title": r.get::<_, Option<String>>(3)?,
+            "provider": r.get::<_, Option<String>>(4)?,
+            "model": r.get::<_, Option<String>>(5)?,
+            "started_at": r.get::<_, String>(6)?,
+            "ended_at": r.get::<_, Option<String>>(7)?,
+            "message_count": r.get::<_, i64>(8)?,
+            "tool_call_count": r.get::<_, i64>(9)?,
+            "model_call_count": r.get::<_, i64>(10)?,
+            "input_tokens": r.get::<_, Option<i64>>(11)?,
+            "output_tokens": r.get::<_, Option<i64>>(12)?,
+            "reported_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+            "estimated_total_bytes": r.get::<_, Option<i64>>(14)?,
+        }))
+    },));
     let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    let next_cursor = sessions.last().and_then(|v| {
+        let id = v.get("id")?.as_str()?;
+        let ts = v.get("started_at")?.as_str()?;
+        Some(crate::api::encode_cursor(ts, id))
+    });
+    Json(serde_json::json!({ "sessions": sessions, "next_cursor": next_cursor })).into_response()
 }
 
 pub(crate) async fn session_detail(

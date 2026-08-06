@@ -61,6 +61,14 @@ impl HubDb {
         metria_storage::wal_checkpoint(&c)
     }
 
+    /// 执行 incremental_vacuum，回收空闲页（§9）。阈值由 caller 决定。
+    pub fn incremental_vacuum(&self) -> Result<(), StorageError> {
+        let c = self.conn();
+        c.execute_batch("PRAGMA incremental_vacuum")
+            .map_err(StorageError::from)?;
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<i64, StorageError> {
         let c = self.conn();
         metria_storage::migrations::current_version(&c)
@@ -175,6 +183,53 @@ impl HubDb {
         )
         .map_err(StorageError::from)?;
         Ok(())
+    }
+
+    /// 吊销 collector token（软删除：置为 revoked）。
+    pub fn revoke_collector_token(&self, collector_id: &str) -> Result<usize, StorageError> {
+        let c = self.conn();
+        let n = c
+            .execute(
+                "UPDATE collector_tokens SET status = 'revoked', revoked_at = ?1
+                 WHERE collector_id = ?2 AND status = 'active'",
+                params![Utc::now().to_rfc3339(), collector_id],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n)
+    }
+
+    /// 为 collector 生成并注册新 token（轮换：吊销旧 token，写入新 token 哈希）。
+    pub fn rotate_collector_token(
+        &self,
+        collector_id: &str,
+        new_token: &str,
+    ) -> Result<(), StorageError> {
+        self.revoke_collector_token(collector_id)?;
+        self.upsert_collector_token(collector_id, new_token)
+    }
+
+    /// 列出某 collector 的全部 token 记录（用于管理界面展示）。
+    pub fn list_collector_tokens(&self, collector_id: &str) -> Vec<serde_json::Value> {
+        let c = self.conn();
+        let Ok(mut stmt) = c.prepare(
+            "SELECT id, label, status, created_at, expires_at, revoked_at
+             FROM collector_tokens WHERE collector_id = ?1 ORDER BY created_at DESC",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([collector_id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "label": r.get::<_, Option<String>>(1)?,
+                "status": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+                "expires_at": r.get::<_, Option<String>>(4)?,
+                "revoked_at": r.get::<_, Option<String>>(5)?,
+            }))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|x| x.ok()).collect()
     }
 
     pub fn heartbeat(

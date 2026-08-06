@@ -39,8 +39,9 @@ pub fn run(cfg: AgentConfig) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     std::thread::spawn(move || {
+        // ctrlc crate 同时处理 SIGINT 与 SIGTERM（cargo 特性 signal-hook）
         let _ = ctrlc::set_handler(move || {
-            tracing::info!("收到退出信号");
+            tracing::info!("收到退出信号（SIGINT/SIGTERM）");
             stop_thread.store(true, Ordering::Relaxed);
         });
     });
@@ -81,11 +82,13 @@ pub fn run(cfg: AgentConfig) -> Result<()> {
     // 主线程等待退出信号
     loop {
         if stop.load(Ordering::Relaxed) {
-            tracing::info!("Agent 退出");
+            tracing::info!("Agent 退出，等待子线程收尾");
             break;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+    // 优雅停止：给各线程一个心跳周期的收尾时间（冲刷 in-flight 批次）
+    std::thread::sleep(Duration::from_secs(2));
     Ok(())
 }
 
@@ -234,6 +237,11 @@ fn uploader_loop(
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(5);
     let max_backoff = Duration::from_secs(300);
+    // 指数退避 + 抖动（S2.4）：避免多 Agent 同步冲击
+    let jittered = |b: Duration| {
+        let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..=0.5);
+        b + Duration::from_secs_f64(b.as_secs_f64() * jitter)
+    };
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -286,7 +294,7 @@ fn uploader_loop(
                     }
                     Err(e) => {
                         tracing::warn!("上传失败（将重试）: {e}");
-                        std::thread::sleep(backoff);
+                        std::thread::sleep(jittered(backoff));
                         backoff = (backoff * 2).min(max_backoff);
                     }
                 }

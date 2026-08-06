@@ -1,3 +1,4 @@
+import { useMemo, useRef, useState } from 'preact/hooks'
 import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
@@ -5,47 +6,107 @@ import { fmtBytes, fmtDateTime, fmtTokens } from '../lib/format'
 import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
+type SortKey = 'started_at' | 'title' | 'client_id' | 'model' | 'message_count' | 'model_call_count' | 'input_tokens' | 'estimated_total_bytes'
+
+const SORTABLE: { key: SortKey; label: string }[] = [
+  { key: 'started_at', label: '开始' },
+  { key: 'title', label: '标题' },
+  { key: 'client_id', label: 'Agent 工具' },
+  { key: 'model', label: '模型' },
+  { key: 'message_count', label: '消息' },
+  { key: 'model_call_count', label: 'Calls' },
+  { key: 'input_tokens', label: 'Input' },
+  { key: 'estimated_total_bytes', label: '估算流量' },
+]
+
+const ROW_H = 38
+const VIEW_H = 520
+
+/** 窗口化渲染：只渲染可视区附近的行，实现虚拟滚动。 */
+function VirtualRows({ rows }: { rows: any[] }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - 8)
+  const end = Math.min(rows.length, Math.ceil((scrollTop + VIEW_H) / ROW_H) + 8)
+  const visible = rows.slice(start, end)
+
+  return (
+    <div
+      ref={ref}
+      style={{ height: VIEW_H, overflowY: 'auto', position: 'relative' }}
+      onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
+    >
+      <div style={{ height: rows.length * ROW_H, position: 'relative' }}>
+        {visible.map((s: any, i: number) => {
+          const rowIdx = start + i
+          return (
+            <div
+              key={s.id}
+              class="vrow clickable"
+              style={{ position: 'absolute', top: rowIdx * ROW_H, left: 0, right: 0, height: ROW_H }}
+              onClick={() => nav(`sessions/${s.id}`)}
+            >
+              <span class="vcell title">{s.title || s.source_session_id}</span>
+              <span class="vcell">{s.client_id}</span>
+              <span class="vcell">{s.model || '—'}</span>
+              <span class="vcell">{fmtDateTime(s.started_at)}</span>
+              <span class="vcell num">{s.message_count}</span>
+              <span class="vcell num">{s.model_call_count}</span>
+              <span class="vcell num">{fmtTokens(s.input_tokens)}</span>
+              <span class="vcell num">{fmtTokens(s.output_tokens)}</span>
+              <span class="vcell num">{fmtBytes(s.estimated_total_bytes)}</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 export function Sessions() {
   const range = getRange()
   const params = { from: range.from, to: range.to, timezone: range.timezone }
+  const [sortKey, setSortKey] = useState<SortKey>('started_at')
+  const [sortDir, setSortDir] = useState<1 | -1>(-1)
   const sessions = useQuery<any>(`sessions${q(params)}`, () => api(`/sessions${q(params)}`))
   if (sessions.error) return <ErrorBox error={sessions.error} onRetry={sessions.refresh} />
   if (sessions.loading) return <Empty text={t('common.loading')} />
+
+  const rows = useMemo(() => {
+    const list = sessions.data?.sessions || []
+    return [...list].sort((a, b) => {
+      const av = a[sortKey] ?? ''
+      const bv = b[sortKey] ?? ''
+      const cmp = typeof av === 'number' ? av - (bv as number) : String(av).localeCompare(String(bv))
+      return cmp * sortDir
+    })
+  }, [sessions.data, sortKey, sortDir])
+
+  const toggleSort = (key: SortKey) => {
+    if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1))
+    else {
+      setSortKey(key)
+      setSortDir(key === 'started_at' ? -1 : 1)
+    }
+  }
 
   return (
     <div class="page">
       <h2>{t('sessions.title')}</h2>
       <Card>
-        <table class="table">
-          <thead>
-            <tr>
-              <th>{t('sessions.titleColumn')}</th>
-              <th>{t('sessions.client')}</th>
-              <th>{t('common.model')}</th>
-              <th>{t('common.startTime')}</th>
-              <th>{t('sessions.messages')}</th>
-              <th>{t('sessions.calls')}</th>
-              <th>{t('common.input')}</th>
-              <th>{t('common.output')}</th>
-              <th>{t('sessions.traffic')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(sessions.data?.sessions || []).map((s: any) => (
-              <tr key={s.id} class="clickable" onClick={() => nav(`sessions/${s.id}`)}>
-                <td>{s.title || s.source_session_id}</td>
-                <td>{s.client_id}</td>
-                <td>{s.model || '—'}</td>
-                <td>{fmtDateTime(s.started_at)}</td>
-                <td>{s.message_count}</td>
-                <td>{s.model_call_count}</td>
-                <td>{fmtTokens(s.input_tokens)}</td>
-                <td>{fmtTokens(s.output_tokens)}</td>
-                <td>{fmtBytes(s.estimated_total_bytes)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div class="vhead">
+          {SORTABLE.map((col) => (
+            <span
+              key={col.key}
+              class={`vcell clickable${col.key === sortKey ? ' sorted' : ''}`}
+              onClick={() => toggleSort(col.key)}
+            >
+              {col.label}
+              {col.key === sortKey ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
+            </span>
+          ))}
+        </div>
+        {rows.length === 0 ? <Empty /> : <VirtualRows rows={rows} />}
       </Card>
     </div>
   )
