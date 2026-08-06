@@ -45,7 +45,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     fi
 
 # ---- Runtime（目标平台） ----
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS hub
+FROM debian:bookworm-slim AS hub
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
