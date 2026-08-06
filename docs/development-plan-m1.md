@@ -21,6 +21,25 @@
 | 收尾：token 7 天有效期、Claude 子代理、Web Waterfall/子代理树/模型切换、i18n | ✅ 完成 | 2026-08-06 |
 | 查缺补漏：rollup 对账/checkpoint、协议协商、ingest 限长、前端测试、集成测试、文件拆分、docs | ✅ 完成 | 2026-08-06 |
 | 全量补齐：allocation_mode/cursor 分页/排序/虚拟滚动、Agent Tools Detail、argon2+签名 token、token 轮换/吊销、Pricing 编辑、Overview 汇总、jitter、TOML 合并、incremental_vacuum、Node 分布 | ✅ 完成 | 2026-08-06 |
+| UI 增强与质量修复：Models Detail、Node Collector 信息、Data Quality 增强、doctor --hub 增强、body limit 修复、handler 自死锁修复 | ✅ 完成 | 2026-08-06 |
+
+### UI 增强与质量修复完成记录（2026-08-06）
+
+- S3.5 扩展：Models Detail 页（`/models/{id}`）：模型汇总（token/cost/traffic/calls）、
+  raw 名称分布、命中定价规则（通配匹配）、最近会话；列表增加 `pricing_source` 列。
+- S3.4 扩展：Node Detail 增加 Collector 卡片（agent_version/protocol/status/last_upload/
+  clock_skew/spool 统计）；`node_detail` 返回 `collectors` 数组。
+- S3.8 扩展：Data Quality 增加来源错误明细（`source_errors`）、来源扫描状态
+  （`source_scan`：total/healthy/with_errors/last_scan_at）、时钟偏移告警
+  （`clock_skew_warnings`，|skew|>60s）；前端对应卡片。
+- S2.9 增强：`metria doctor --hub` 增加 TLS 检测与节点数检查（Admin 登录）。
+- 修复：`list_models` / `model_detail` / `client_models` 在持有 `db.conn()` 锁期间
+  再次调用 `load_all_rules()` / `list_pricing_rules()` 导致 std Mutex 自死锁（请求永久挂起）——
+  以块作用域提前释放 conn 锁。
+- 修复：axum 默认 body limit 2MiB 早于 handler 校验，导致 3MiB 请求被直接断连（客户端
+  Broken pipe）而非返回 413；显式设置 `DefaultBodyLimit` 为 16MiB，解压后仍由 handler
+  校验 8MiB 上限。
+- 性能：Agent notify debounce 1s → 500ms。
 
 ### 全量补齐完成记录（2026-08-06）
 

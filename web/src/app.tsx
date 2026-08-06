@@ -9,7 +9,7 @@ import { Overview } from './pages/Overview'
 import { Nodes, NodeDetail } from './pages/Nodes'
 import { Clients } from './pages/Clients'
 import { ClientDetail } from './pages/ClientDetail'
-import { Models } from './pages/Models'
+import { Models, ModelDetail } from './pages/Models'
 import { Sessions, SessionDetail } from './pages/Sessions'
 import { Calls, CallDetail } from './pages/Calls'
 import { Traffic } from './pages/Traffic'
@@ -44,7 +44,7 @@ function Page() {
     case '/clients':
       return route.id ? <ClientDetail id={route.id} /> : <Clients />
     case '/models':
-      return <Models />
+      return route.id ? <ModelDetail id={route.id} /> : <Models />
     case '/sessions':
       return route.id ? <SessionDetail id={route.id} /> : <Sessions />
     case '/calls':

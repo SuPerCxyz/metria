@@ -230,9 +230,39 @@ pub(crate) async fn node_detail(
             by_project = rows.filter_map(|x| x.ok()).collect();
         }
     }
+    // Collector 信息（S3.4）
+    let collectors: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT id, agent_version, protocol_version, container_image, status,
+                    last_heartbeat_at, last_upload_at, spool_pending_events, spool_size_bytes, clock_skew_seconds
+             FROM collectors WHERE node_id = ?1 ORDER BY created_at",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([&id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "agent_version": r.get::<_, String>(1)?,
+                    "protocol_version": r.get::<_, i64>(2)?,
+                    "container_image": r.get::<_, Option<String>>(3)?,
+                    "status": r.get::<_, String>(4)?,
+                    "last_heartbeat_at": r.get::<_, Option<String>>(5)?,
+                    "last_upload_at": r.get::<_, Option<String>>(6)?,
+                    "spool_pending_events": r.get::<_, i64>(7)?,
+                    "spool_size_bytes": r.get::<_, i64>(8)?,
+                    "clock_skew_seconds": r.get::<_, i64>(9)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
     Json(serde_json::json!({
         "node": node,
         "clients": clients,
+        "collectors": collectors,
         "by_model": by_model,
         "by_project": by_project,
     }))
@@ -445,21 +475,39 @@ pub(crate) async fn client_models(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
-         FROM model_calls WHERE client_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized, provider_normalized ORDER BY cnt DESC",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "model": r.get::<_, String>(0)?,
-            "provider": r.get::<_, Option<String>>(1)?,
-            "calls": r.get::<_, i64>(2)?,
-            "input_tokens": r.get::<_, i64>(3)?,
-            "output_tokens": r.get::<_, i64>(4)?,
-        }))
-    }));
-    let models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+    let models: Vec<serde_json::Value> = {
+        // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
+        let c = st.db.conn();
+        let mut stmt = q!(c.prepare(
+            "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+             FROM model_calls WHERE client_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized, provider_normalized ORDER BY cnt DESC",
+        ));
+        let rows = q!(stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "model": r.get::<_, String>(0)?,
+                "provider": r.get::<_, Option<String>>(1)?,
+                "calls": r.get::<_, i64>(2)?,
+                "input_tokens": r.get::<_, i64>(3)?,
+                "output_tokens": r.get::<_, i64>(4)?,
+            }))
+        }));
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    // 附带每个模型的定价来源（命中用户规则 / 内置目录）
+    let rules = st.db.load_all_rules();
+    let models: Vec<serde_json::Value> = models
+        .into_iter()
+        .map(|mut m| {
+            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let src = rules
+                .iter()
+                .find(|r| simple_wildcard(&r.model_pattern, model))
+                .map(|r| format!("{:?}", r.source).to_ascii_lowercase())
+                .unwrap_or_else(|| "builtin_catalog".into());
+            m["pricing_source"] = serde_json::json!(src);
+            m
+        })
+        .collect();
     Json(serde_json::json!({ "models": models })).into_response()
 }
 
@@ -469,49 +517,208 @@ pub(crate) async fn list_models(
 ) -> Response {
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter(&p);
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(&format!(
-        "SELECT model, MAX(provider),
-            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
-            COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id)
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok(serde_json::json!({
-                "model": r.get::<_, String>(0)?,
-                "provider": r.get::<_, String>(1)?,
-                "input_tokens": r.get::<_, i64>(2)?,
-                "output_tokens": r.get::<_, i64>(3)?,
-                "estimated_traffic_bytes": r.get::<_, i64>(4)?,
-                "model_calls": r.get::<_, i64>(5)?,
-                "sessions": r.get::<_, i64>(6)?,
-                "clients": r.get::<_, i64>(7)?,
-                "nodes": r.get::<_, i64>(8)?,
-            }))
-        },)
-    );
-    let models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+    let models: Vec<serde_json::Value> = {
+        // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
+        let c = st.db.conn();
+        let mut stmt = q!(c.prepare(&format!(
+            "SELECT model, MAX(provider),
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
+                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id)
+             FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
+        )));
+        let rows = q!(
+            stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+                Ok(serde_json::json!({
+                    "model": r.get::<_, String>(0)?,
+                    "provider": r.get::<_, String>(1)?,
+                    "input_tokens": r.get::<_, i64>(2)?,
+                    "output_tokens": r.get::<_, i64>(3)?,
+                    "estimated_traffic_bytes": r.get::<_, i64>(4)?,
+                    "model_calls": r.get::<_, i64>(5)?,
+                    "sessions": r.get::<_, i64>(6)?,
+                    "clients": r.get::<_, i64>(7)?,
+                    "nodes": r.get::<_, i64>(8)?,
+                }))
+            },)
+        );
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    // 附带每个模型的定价来源（命中用户规则 / 内置目录）
+    let rules = st.db.load_all_rules();
+    let models: Vec<serde_json::Value> = models
+        .into_iter()
+        .map(|mut m| {
+            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            let src = rules
+                .iter()
+                .find(|r| simple_wildcard(&r.model_pattern, model))
+                .map(|r| format!("{:?}", r.source).to_ascii_lowercase())
+                .unwrap_or_else(|| "builtin_catalog".into());
+            m["pricing_source"] = serde_json::json!(src);
+            m
+        })
+        .collect();
     Json(serde_json::json!({ "models": models })).into_response()
 }
 
 pub(crate) async fn model_detail(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(p): Query<RangeParams>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT model_raw, provider_raw, COUNT(*) as cnt FROM model_calls WHERE model_normalized = ?1 GROUP BY model_raw, provider_raw ORDER BY cnt DESC",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "model_raw": r.get::<_, Option<String>>(0)?,
-            "provider": r.get::<_, Option<String>>(1)?,
-            "calls": r.get::<_, i64>(2)?,
-        }))
-    }));
-    let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "model": id, "raw_names": raws })).into_response()
+    let (from, to) = parse_range(&p);
+    // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
+    let (raws, summary, recent_sessions) = {
+        let c = st.db.conn();
+        // raw 名称 + provider 分布
+        let mut stmt = q!(c.prepare(
+            "SELECT model_raw, provider_raw, COUNT(*) as cnt FROM model_calls WHERE model_normalized = ?1 GROUP BY model_raw, provider_raw ORDER BY cnt DESC",
+        ));
+        let rows = q!(stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "model_raw": r.get::<_, Option<String>>(0)?,
+                "provider": r.get::<_, Option<String>>(1)?,
+                "calls": r.get::<_, i64>(2)?,
+            }))
+        }));
+        let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+
+        // 汇总（Token/Cost/Traffic/Cache Hit）
+        let summary = c
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                        COALESCE(SUM(reasoning_tokens),0),
+                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(session_count),0)
+                 FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3",
+                params![id, from.to_rfc3339(), to.to_rfc3339()],
+                |r| {
+                    Ok(serde_json::json!({
+                        "input_tokens": r.get::<_, i64>(0)?,
+                        "output_tokens": r.get::<_, i64>(1)?,
+                        "cache_read_tokens": r.get::<_, i64>(2)?,
+                        "cache_write_tokens": r.get::<_, i64>(3)?,
+                        "reasoning_tokens": r.get::<_, i64>(4)?,
+                        "cost_micro_usd": r.get::<_, i64>(5)?,
+                        "estimated_total_bytes": r.get::<_, i64>(6)?,
+                        "model_calls": r.get::<_, i64>(7)?,
+                        "sessions": r.get::<_, i64>(8)?,
+                    }))
+                },
+            )
+            .unwrap_or(serde_json::json!({}));
+
+        // 最近 sessions / calls
+        let recent_sessions: Vec<serde_json::Value> = {
+            let mut st = q!(c.prepare(
+                "SELECT id, source_session_id, client_id, title, started_at, model_call_count, estimated_total_bytes
+                 FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3
+                 ORDER BY started_at DESC LIMIT 20",
+            ));
+            let r = q!(
+                st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_session_id": r.get::<_, String>(1)?,
+                        "client_id": r.get::<_, String>(2)?,
+                        "title": r.get::<_, Option<String>>(3)?,
+                        "started_at": r.get::<_, String>(4)?,
+                        "model_call_count": r.get::<_, i64>(5)?,
+                        "estimated_total_bytes": r.get::<_, Option<i64>>(6)?,
+                    }))
+                },)
+            );
+            r.filter_map(|x| x.ok()).collect()
+        };
+
+        (raws, summary, recent_sessions)
+    };
+
+    // 匹配的定价规则
+    let rules: Vec<serde_json::Value> = st
+        .db
+        .list_pricing_rules()
+        .into_iter()
+        .filter(|r| {
+            let pat = r
+                .get("model_pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            pat == id || pat == "*" || (pat.contains('*') && wildcard_match(pat, &id))
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "model": id,
+        "raw_names": raws,
+        "summary": summary,
+        "pricing_rules": rules,
+        "recent_sessions": recent_sessions,
+    }))
+    .into_response()
+}
+
+/// 简单通配符匹配：`*` 匹配任意子串（用于模型名匹配展示）。
+fn simple_wildcard(pattern: &str, s: &str) -> bool {
+    if pattern == "*" || pattern == s {
+        return true;
+    }
+    if pattern.contains('*') {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut rest = s;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            match rest.find(part) {
+                Some(pos) => {
+                    if i == 0 && pos != 0 {
+                        return false; // 前缀必须精确
+                    }
+                    rest = &rest[pos + part.len()..];
+                }
+                None => return false,
+            }
+        }
+        // 后缀必须精确
+        if !pattern.ends_with('*') {
+            let last = parts.last().unwrap_or(&"");
+            if !s.ends_with(last) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// 通配符匹配：`*` 任意长度（用于 pricing 规则匹配展示）。
+fn wildcard_match(pattern: &str, s: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = s.chars().collect();
+    let (mut pi, mut si, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while si < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 pub(crate) async fn list_calls(
@@ -1039,10 +1246,82 @@ pub(crate) async fn data_quality(
         })
         .unwrap_or(0);
 
+    // 来源错误明细（S3.8）
+    let source_errors: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT id, source_id, phase, severity, pattern, sample_count, first_seen_at, last_seen_at, last_message
+             FROM source_errors ORDER BY last_seen_at DESC LIMIT 100",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "source_id": r.get::<_, String>(1)?,
+                    "phase": r.get::<_, String>(2)?,
+                    "severity": r.get::<_, String>(3)?,
+                    "pattern": r.get::<_, String>(4)?,
+                    "sample_count": r.get::<_, i64>(5)?,
+                    "first_seen_at": r.get::<_, String>(6)?,
+                    "last_seen_at": r.get::<_, String>(7)?,
+                    "last_message": r.get::<_, String>(8)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
+    // 来源扫描状态（S3.8）：总数/健康/最近扫描
+    let source_scan = c
+        .query_row(
+            "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
+                COALESCE(MAX(last_scan_at),''),
+                COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+             FROM sources",
+            [],
+            |r| {
+                Ok(serde_json::json!({
+                    "total": r.get::<_, i64>(0)?,
+                    "healthy": r.get::<_, i64>(1)?,
+                    "last_scan_at": r.get::<_, String>(2)?,
+                    "with_errors": r.get::<_, i64>(3)?,
+                }))
+            },
+        )
+        .unwrap_or(serde_json::json!({}));
+
+    // 时钟偏移告警（S3.8）：|skew| > 60s 视为异常
+    let clock_skew_warns: Vec<serde_json::Value> = {
+        let st = c.prepare(
+            "SELECT id, node_id, clock_skew_seconds, last_heartbeat_at
+             FROM collectors WHERE ABS(clock_skew_seconds) > 60 ORDER BY ABS(clock_skew_seconds) DESC LIMIT 50",
+        );
+        let mut out = Vec::new();
+        if let Ok(mut st) = st {
+            if let Ok(rows) = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "collector_id": r.get::<_, String>(0)?,
+                    "node_id": r.get::<_, String>(1)?,
+                    "clock_skew_seconds": r.get::<_, i64>(2)?,
+                    "last_heartbeat_at": r.get::<_, String>(3)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
     Json(serde_json::json!({
         "usage_distribution": usage_dist,
         "traffic_distribution": traffic_dist,
         "parse_warnings": parse_warnings,
+        "source_errors": source_errors,
+        "source_scan": source_scan,
+        "clock_skew_warnings": clock_skew_warns,
     }))
     .into_response()
 }

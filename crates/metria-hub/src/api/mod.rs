@@ -79,6 +79,7 @@ macro_rules! q {
 
 /// 构建应用路由。
 pub fn app_router(state: AppState) -> Router {
+    // 原始请求体上限：解压前最多 16MiB；解压后由 handler 检查 8MiB 上限
     Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/auth/login", post(login))
@@ -162,6 +163,7 @@ pub fn app_router(state: AppState) -> Router {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_mw))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
 }
 
 /// 认证中间件：查询端点要求 admin 会话；collector 端点要求 collector token。

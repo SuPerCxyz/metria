@@ -76,6 +76,76 @@ export function DataQuality() {
               <td>解析告警数（source_errors）</td>
               <td>{d.parse_warnings ?? 0}</td>
             </tr>
+            <tr>
+              <td>来源总数 / 健康</td>
+              <td>
+                {d.source_scan?.total ?? 0} / {d.source_scan?.healthy ?? 0}（错误 {d.source_scan?.with_errors ?? 0}）
+              </td>
+            </tr>
+            <tr>
+              <td>最后扫描</td>
+              <td>{d.source_scan?.last_scan_at || t('common.notAvailable')}</td>
+            </tr>
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('dataQuality.sourceScan')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>{t('common.status')}</th>
+              <th>Pattern</th>
+              <th>{t('dataQuality.samples')}</th>
+              <th>最近</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.source_errors || []).map((e: any) => (
+              <tr key={e.id}>
+                <td>{e.phase}</td>
+                <td>
+                  <span class={`badge badge-${e.severity === 'fatal' ? 'err' : 'warn'}`}>{e.severity}</span>
+                </td>
+                <td class="mono">{e.pattern}</td>
+                <td>{e.sample_count}</td>
+                <td>{e.last_seen_at}</td>
+              </tr>
+            ))}
+            {(d.source_errors || []).length === 0 && (
+              <tr>
+                <td colSpan={5}>{t('common.empty')}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title={t('dataQuality.clockSkew')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Collector</th>
+              <th>Node</th>
+              <th>{t('nodes.clockSkew')}</th>
+              <th>{t('nodes.lastHeartbeat')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(d.clock_skew_warnings || []).map((w: any) => (
+              <tr key={w.collector_id}>
+                <td class="mono">{w.collector_id}</td>
+                <td>{w.node_id}</td>
+                <td class={Math.abs(w.clock_skew_seconds) > 300 ? 'err-text' : ''}>{w.clock_skew_seconds}s</td>
+                <td>{w.last_heartbeat_at}</td>
+              </tr>
+            ))}
+            {(d.clock_skew_warnings || []).length === 0 && (
+              <tr>
+                <td colSpan={4}>{t('common.empty')}</td>
+              </tr>
+            )}
           </tbody>
         </table>
       </Card>

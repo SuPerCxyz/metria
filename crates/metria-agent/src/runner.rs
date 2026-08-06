@@ -166,7 +166,7 @@ fn scanner_loop(
     }
 
     let reconcile = Duration::from_secs(cfg.reconcile_interval_seconds);
-    let debounce = Duration::from_secs(1);
+    let debounce = Duration::from_millis(500); // S2.3 debounce 500ms
 
     // 初始扫描
     let t = scanner.scan_all(&mut spool);

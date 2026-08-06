@@ -77,6 +77,42 @@ export function NodeDetail({ id }: { id: string }) {
         <Card title={t('nodes.lastHeartbeat')}>{fmtDateTime(n.last_seen_at)}</Card>
       </div>
 
+      <Card title={t('nodes.collectors')}>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>{t('nodes.collectorId')}</th>
+              <th>Agent 版本</th>
+              <th>{t('common.status')}</th>
+              <th>{t('nodes.lastHeartbeat')}</th>
+              <th>{t('nodes.lastUpload')}</th>
+              <th>Spool</th>
+              <th>{t('nodes.clockSkew')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(n.collectors || []).map((col: any) => (
+              <tr key={col.id}>
+                <td class="mono">{col.id}</td>
+                <td>{col.agent_version}</td>
+                <td>
+                  <Badge text={col.status} tone={statusTone(col.status)} />
+                </td>
+                <td>{fmtDateTime(col.last_heartbeat_at)}</td>
+                <td>{col.last_upload_at ? fmtDateTime(col.last_upload_at) : '—'}</td>
+                <td>{col.spool_pending_events} ev / {fmtBytes(col.spool_size_bytes)}</td>
+                <td>{col.clock_skew_seconds}s</td>
+              </tr>
+            ))}
+            {(n.collectors || []).length === 0 && (
+              <tr>
+                <td colSpan={7}>{t('common.empty')}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </Card>
+
       <Card title={t('nodes.detected')}>
         {(sources.data?.sources || []).length === 0 && <Empty text={t('client.sources')} />}
         <table class="table">

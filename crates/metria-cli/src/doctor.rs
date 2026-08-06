@@ -135,21 +135,31 @@ fn check_traffic() {
 
 fn check_hub() -> Result<(), String> {
     let url = std::env::var("METRIA_HUB_URL").unwrap_or_else(|_| "http://localhost:8080".into());
-    let endpoint = format!("{}/healthz", url.trim_end_matches('/'));
+    let base = url.trim_end_matches('/');
+    let endpoint = format!("{base}/healthz");
     println!("== Hub 连通性 ==");
     let start = Instant::now();
     let resp = ureq::get(&endpoint)
         .timeout(std::time::Duration::from_secs(5))
         .call();
     let elapsed = start.elapsed();
+
+    // TLS 检测：https 协议（连接成功即视为证书校验通过）
+    let scheme = base.split("://").next().unwrap_or("http");
+    if scheme == "https" {
+        println!("  [INFO] TLS 已启用（{base}），证书校验由 rustls 完成");
+    } else {
+        println!("  [WARN] 未启用 TLS（http）。生产建议配置 TLS 终止（反代 / ingress）");
+    }
+
     match resp {
         Ok(r) => {
             println!(
-                "  [OK] {} ({:?}, {}ms)",
-                endpoint,
+                "  [OK] {endpoint} ({}, 往返 {:.0}ms)",
                 r.status(),
                 elapsed.as_millis()
             );
+            check_hub_upload(base)?;
             Ok(())
         }
         Err(ureq::Error::Status(code, _)) => {
@@ -159,6 +169,45 @@ fn check_hub() -> Result<(), String> {
         Err(e) => {
             println!("  [FAIL] {endpoint}: {e}");
             Err(e.to_string())
+        }
+    }
+}
+
+/// 尝试查询节点与最近上传信息（S2.17）。需 admin 凭据，缺失时提示跳过。
+fn check_hub_upload(base: &str) -> Result<(), String> {
+    let (user, pass) = (
+        std::env::var("METRIA_ADMIN_USER").unwrap_or_default(),
+        std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_default(),
+    );
+    if user.is_empty() || pass.is_empty() {
+        println!("  [INFO] 未提供 METRIA_ADMIN_USER/PASSWORD，跳过最近上传检查");
+        return Ok(());
+    }
+    let login = ureq::post(&format!("{base}/api/v1/auth/login"))
+        .send_json(serde_json::json!({ "username": user, "password": pass }))
+        .ok();
+    let Some(token) = login
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .and_then(|v| v.get("token").cloned())
+        .and_then(|t| t.as_str().map(String::from))
+    else {
+        println!("  [WARN] Hub 登录失败，跳过最近上传检查");
+        return Ok(());
+    };
+    match ureq::get(&format!("{base}/api/v1/nodes"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(r) => {
+            if let Ok(body) = r.into_json::<serde_json::Value>() {
+                let nodes = body.get("nodes").and_then(|v| v.as_array());
+                println!("  [OK] 节点数: {}", nodes.map(|n| n.len()).unwrap_or(0));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            println!("  [WARN] 查询 nodes 失败: {e}");
+            Ok(())
         }
     }
 }

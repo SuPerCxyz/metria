@@ -679,3 +679,5 @@ label {
 .vcell.sorted {
   color: var(--accent);
 }
+
+.err-text { color: var(--danger, #dc2626); }
