@@ -2,26 +2,27 @@ import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtTokens } from '../lib/format'
+import { t } from '../lib/i18n'
 
 export function Models() {
   const range = getRange()
   const params = { from: range.from, to: range.to, timezone: range.timezone }
   const models = useQuery<any>(`models${q(params)}`, () => api(`/models${q(params)}`))
   if (models.error) return <ErrorBox error={models.error} onRetry={models.refresh} />
-  if (models.loading) return <Empty text="加载中…" />
+  if (models.loading) return <Empty text={t('common.loading')} />
 
   return (
     <div class="page">
-      <h2>模型</h2>
+      <h2>{t('nav.models')}</h2>
       <Card>
         <table class="table">
           <thead>
             <tr>
-              <th>模型</th>
+              <th>{t('common.model')}</th>
               <th>Provider</th>
               <th>Input</th>
               <th>Output</th>
-              <th>估算流量</th>
+              <th>{t('common.estimatedTraffic')}</th>
               <th>Calls</th>
               <th>Sessions</th>
               <th>Clients</th>

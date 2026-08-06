@@ -1,5 +1,6 @@
 import { useEffect } from 'preact/hooks'
 import { getToken, setToken } from '../api/client'
+import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 import { fmtBytes, fmtUsd } from '../lib/format'
 
@@ -34,21 +35,21 @@ export function StatCard({
   )
 }
 
-export function Loading({ text = '加载中…' }: { text?: string }) {
-  return <div class="state-box">{text}</div>
+export function Loading({ text }: { text?: string }) {
+  return <div class="state-box">{text ?? t('common.loading')}</div>
 }
 
-export function Empty({ text = '暂无数据' }: { text?: string }) {
-  return <div class="state-box">{text}</div>
+export function Empty({ text }: { text?: string }) {
+  return <div class="state-box">{text ?? t('common.empty')}</div>
 }
 
 export function ErrorBox({ error, onRetry }: { error?: string; onRetry?: () => void }) {
   return (
     <div class="state-box error">
-      <span>加载失败：{error || '未知错误'}</span>
+      <span>{t('common.error')}: {error || t('common.unknown')}</span>
       {onRetry && (
         <button type="button" class="btn" onClick={onRetry}>
-          重试
+          {t('common.retry')}
         </button>
       )}
     </div>
@@ -102,7 +103,7 @@ export function Table({
           {rows.length === 0 && (
             <tr>
               <td colSpan={columns.length} class="table-empty">
-                暂无数据
+                {t('common.empty')}
               </td>
             </tr>
           )}

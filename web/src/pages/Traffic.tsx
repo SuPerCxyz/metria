@@ -3,11 +3,12 @@ import { Card, ErrorBox, Empty, StatCard } from '../components/ui'
 import { TimeSeries } from '../components/TimeSeries'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes } from '../lib/format'
+import { t } from '../lib/i18n'
 
 const DIM_LABELS: Record<string, string> = {
   node_id: 'Node',
-  client_id: 'Agent 工具',
-  model: '模型',
+  client_id: t('sessions.client'),
+  model: t('common.model'),
   provider: 'Provider',
 }
 
@@ -20,7 +21,7 @@ export function Traffic() {
   const byDim = useQuery<any>(`traffic-by${dim}${q(params)}`, () => api(`/traffic/by-${dim}${q(params)}`))
 
   if (summary.error) return <ErrorBox error={summary.error} onRetry={summary.refresh} />
-  if (summary.loading) return <Empty text="加载中…" />
+  if (summary.loading) return <Empty text={t('common.loading')} />
   const s = summary.data || {}
 
   const trafficSeries = {
@@ -30,20 +31,20 @@ export function Traffic() {
 
   return (
     <div class="page">
-      <h2>估算流量</h2>
+      <h2>{t('common.estimatedTraffic')}</h2>
       <p class="page-note">
         这些数据是根据客户端日志和 Token 估算，不代表网卡真实流量或云厂商计费流量。
       </p>
       <div class="stat-grid">
-        <StatCard label="估算请求流量" value={fmtBytes(s.estimated_request_bytes)} />
-        <StatCard label="估算响应流量" value={fmtBytes(s.estimated_response_bytes)} />
-        <StatCard label="估算总流量" value={fmtBytes(s.estimated_total_bytes)} accent="#2563eb" />
-        <StatCard label="下界" value={fmtBytes(s.lower_bound_bytes)} />
-        <StatCard label="上界" value={fmtBytes(s.upper_bound_bytes)} />
+        <StatCard label={t('traffic.request')} value={fmtBytes(s.estimated_request_bytes)} />
+        <StatCard label={t('traffic.response')} value={fmtBytes(s.estimated_response_bytes)} />
+        <StatCard label={t('traffic.total')} value={fmtBytes(s.estimated_total_bytes)} accent="#2563eb" />
+        <StatCard label={t('traffic.lower')} value={fmtBytes(s.lower_bound_bytes)} />
+        <StatCard label={t('traffic.upper')} value={fmtBytes(s.upper_bound_bytes)} />
         <StatCard label="Model Calls" value={String(s.model_calls ?? 0)} />
       </div>
 
-      <Card title="估算流量时间序列">
+      <Card title={t('overview.trafficSeries')}>
         {trafficSeries.data?.length ? <TimeSeries data={trafficSeries.data} height={200} /> : <Empty />}
       </Card>
 
@@ -62,11 +63,11 @@ export function Traffic() {
             <tr>
               <th>{DIM_LABELS[dim] || dim}</th>
               <th>Calls</th>
-              <th>请求流量</th>
-              <th>响应流量</th>
-              <th>总流量</th>
-              <th>下界</th>
-              <th>上界</th>
+              <th>{t('traffic.request')}</th>
+              <th>{t('traffic.response')}</th>
+              <th>{t('traffic.total')}</th>
+              <th>{t('traffic.lower')}</th>
+              <th>{t('traffic.upper')}</th>
             </tr>
           </thead>
           <tbody>

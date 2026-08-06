@@ -294,6 +294,18 @@ fn process_entry(
                         if let (Some(id), Some(name)) = (b.id.clone(), b.name.clone()) {
                             builder.add_tool_use(id.clone(), name.clone(), b.input.as_ref(), at);
                             tool_uses.push(id);
+                            // Claude 子代理：Task tool_use 的 input 含 leafUuid / sessionId
+                            if name == "Task" {
+                                if let Some(input) = &b.input {
+                                    let leaf =
+                                        input.get("leafUuid").and_then(|v| v.as_str()).or_else(
+                                            || input.get("sessionId").and_then(|v| v.as_str()),
+                                        );
+                                    if let Some(leaf) = leaf {
+                                        builder.note_subagent_leaf(leaf);
+                                    }
+                                }
+                            }
                         }
                     }
                     _ => {}

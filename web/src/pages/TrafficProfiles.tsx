@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { useQuery } from '../hooks/useQuery'
 import { fmtBytes } from '../lib/format'
+import { t } from '../lib/i18n'
 
 export function TrafficProfiles() {
   const profiles = useQuery<any>('/traffic/profiles', () => api('/traffic/profiles'))
@@ -81,11 +82,11 @@ export function TrafficProfiles() {
 
   return (
     <div class="page">
-      <h2>Traffic Profiles</h2>
+      <h2>{t('nav.trafficProfiles')}</h2>
       <p class="page-note">版本化 bytes-per-token 配置；学习 profile 由样本聚合，用户 profile 可自定义。</p>
       {msg && <div class="state-box">{msg}</div>}
 
-      <Card title="Profile 列表">
+      <Card title={t('profiles.list')}>
         <div class="dim-switch">
           <button type="button" class="btn small" onClick={learn}>
             聚合学习样本
@@ -94,7 +95,7 @@ export function TrafficProfiles() {
             历史重新估算
           </button>
         </div>
-        {(profiles.data?.profiles || []).length === 0 && <Empty text="暂无 profile" />}
+        {(profiles.data?.profiles || []).length === 0 && <Empty text={t('profiles.empty')} />}
         <table class="table">
           <thead>
             <tr>
@@ -134,7 +135,7 @@ export function TrafficProfiles() {
       </Card>
 
       <div class="grid-2">
-        <Card title="新增用户 Profile">
+        <Card title={t('profiles.newUser')}>
           <div class="form-grid">
             <label>
               Client 匹配
@@ -170,7 +171,7 @@ export function TrafficProfiles() {
           </button>
         </Card>
 
-        <Card title="匹配测试">
+        <Card title={t('profiles.test')}>
           <div class="form-grid">
             <label>
               Client

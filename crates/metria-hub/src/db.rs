@@ -121,16 +121,25 @@ impl HubDb {
         Ok((collector_id, existed == 0))
     }
 
-    /// 校验 collector token（仅存哈希）。
+    /// Collector token 默认有效期（秒）：7 天。
+    pub const TOKEN_TTL_SECONDS: i64 = 7 * 24 * 3600;
+
+    /// 校验 collector token（仅存哈希，检查有效期）。
     pub fn verify_collector_token(&self, token: &str) -> Option<(String, String)> {
         let c = self.conn();
         let hash = blake3_hex(token);
+        let now = Utc::now().to_rfc3339();
         c.query_row(
-            "SELECT t.collector_id, c.node_id FROM collector_tokens t JOIN collectors c ON c.id = t.collector_id WHERE t.token_hash = ?1 AND t.status = 'active'",
+            "SELECT t.collector_id, c.node_id, t.expires_at FROM collector_tokens t JOIN collectors c ON c.id = t.collector_id WHERE t.token_hash = ?1 AND t.status = 'active'",
             [&hash],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?)),
         )
         .ok()
+        .filter(|(_, _, expires_at)| match expires_at {
+            None => true, // 迁移前遗留 token 视为永久有效
+            Some(exp) => exp.as_str() > now.as_str(),
+        })
+        .map(|(cid, nid, _)| (cid, nid))
     }
 
     pub fn upsert_collector_token(
@@ -141,9 +150,19 @@ impl HubDb {
         let c = self.conn();
         let hash = blake3_hex(token);
         let now = Utc::now().to_rfc3339();
+        let expires_at =
+            (Utc::now() + chrono::Duration::seconds(Self::TOKEN_TTL_SECONDS)).to_rfc3339();
         c.execute(
-            "INSERT OR IGNORE INTO collector_tokens (id, collector_id, token_hash, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
-            params![format!("tok-{}", &hash[..12]), collector_id, hash, now],
+            "INSERT INTO collector_tokens (id, collector_id, token_hash, status, created_at, expires_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET status='active', expires_at=excluded.expires_at",
+            params![
+                format!("tok-{}", &hash[..12]),
+                collector_id,
+                hash,
+                now,
+                expires_at
+            ],
         )
         .map_err(StorageError::from)?;
         Ok(())

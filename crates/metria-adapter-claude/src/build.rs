@@ -38,6 +38,8 @@ pub struct SessionBuilder {
     pub traffic: Vec<TrafficEstimate>,
     current_turn: Option<Id>,
     tool_map: HashMap<String, usize>,
+    /// 由 Task tool_use 记录的待关联子会话（source session id）。
+    pending_subagent_leaves: Vec<String>,
     running_text: String,
     running_bytes: usize,
     last_activity: Option<DateTime<Utc>>,
@@ -99,6 +101,7 @@ impl SessionBuilder {
             traffic: Vec::new(),
             current_turn: None,
             tool_map: HashMap::new(),
+            pending_subagent_leaves: Vec::new(),
             running_text: String::new(),
             running_bytes: 0,
             last_activity: Some(started_at),
@@ -464,6 +467,13 @@ impl SessionBuilder {
         }
     }
 
+    /// 记录由 Task tool_use 派生的子会话 source id（leafUuid）。
+    pub fn note_subagent_leaf(&mut self, leaf: &str) {
+        if !leaf.is_empty() && !self.pending_subagent_leaves.iter().any(|s| s == leaf) {
+            self.pending_subagent_leaves.push(leaf.to_string());
+        }
+    }
+
     /// 结束构建。
     #[allow(clippy::type_complexity)]
     pub fn finish(
@@ -485,6 +495,20 @@ impl SessionBuilder {
         for t in &mut self.turns {
             if t.ended_at.is_none() {
                 t.ended_at = self.last_activity;
+            }
+        }
+        // 由 Task tool_use 推导子代理关系（child 为 source session id）
+        for leaf in &self.pending_subagent_leaves {
+            if let Ok(child_id) = Id::parse(leaf) {
+                self.session.subagent_count += 1;
+                self.subagents.push(SubagentRelation {
+                    id: Id::new(),
+                    session_id: self.session.id.clone(),
+                    parent_model_call_id: None,
+                    child_session_id: child_id,
+                    relation: "task".into(),
+                    created_at: Utc::now(),
+                });
             }
         }
         (

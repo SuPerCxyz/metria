@@ -2,6 +2,7 @@ import { useEffect, useState } from 'preact/hooks'
 import { api, getToken } from './api/client'
 import { RangePicker } from './components/RangePicker'
 import { LogoutButton } from './components/ui'
+import { t, getLocale, setLocale } from './lib/i18n'
 import { useRoute, nav } from './lib/router'
 import { Login } from './pages/Login'
 import { Overview } from './pages/Overview'
@@ -18,18 +19,18 @@ import { Settings } from './pages/Settings'
 import { Shares } from './pages/Shares'
 
 const NAV = [
-  ['overview', '总览'],
-  ['nodes', 'Nodes'],
-  ['clients', 'Agent 工具'],
-  ['models', '模型'],
-  ['sessions', '会话'],
-  ['calls', '调用'],
-  ['traffic', '流量'],
-  ['traffic-profiles', 'Traffic Profiles'],
-  ['pricing', '价格'],
-  ['data-quality', '数据质量'],
-  ['shares', '分享'],
-  ['settings', '设置'],
+  ['overview', t('nav.overview')],
+  ['nodes', t('nav.nodes')],
+  ['clients', t('nav.clients')],
+  ['models', t('nav.models')],
+  ['sessions', t('nav.sessions')],
+  ['calls', t('nav.calls')],
+  ['traffic', t('nav.traffic')],
+  ['traffic-profiles', t('nav.trafficProfiles')],
+  ['pricing', t('nav.pricing')],
+  ['data-quality', t('nav.dataQuality')],
+  ['shares', t('nav.shares')],
+  ['settings', t('nav.settings')],
 ] as const
 
 function Page() {
@@ -97,12 +98,20 @@ export function App() {
     if (s === 'light' || s === 'dark') return s
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
   })
+  const [localeTick, setLocaleTick] = useState(0)
 
   useEffect(() => {
     localStorage.setItem('metria-theme', theme)
   }, [theme])
 
-  if (authed === null) return <div class="state-box">加载中…</div>
+  useEffect(() => {
+    const onLocale = () => setLocaleTick((x) => x + 1)
+    window.addEventListener('metria:locale', onLocale)
+    return () => window.removeEventListener('metria:locale', onLocale)
+  }, [])
+  void localeTick
+
+  if (authed === null) return <div class="state-box">{t('common.loading')}</div>
   if (!authed) {
     return (
       <div data-theme={theme}>
@@ -135,7 +144,14 @@ export function App() {
               class="btn"
               onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
             >
-              {theme === 'light' ? '暗色' : '亮色'}
+              {theme === 'light' ? t('common.theme.dark') : t('common.theme.light')}
+            </button>
+            <button
+              type="button"
+              class="btn"
+              onClick={() => setLocale(getLocale() === 'zh' ? 'en' : 'zh')}
+            >
+              {getLocale() === 'zh' ? 'EN' : '中文'}
             </button>
             <LogoutButton />
           </div>

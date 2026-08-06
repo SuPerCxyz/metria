@@ -2,13 +2,14 @@ import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtTokens, pct } from '../lib/format'
+import { t } from '../lib/i18n'
 
 export function DataQuality() {
   const range = getRange()
   const params = { from: range.from, to: range.to, timezone: range.timezone }
   const dq = useQuery<any>(`dq${q(params)}`, () => api(`/data-quality${q(params)}`))
   if (dq.error) return <ErrorBox error={dq.error} onRetry={dq.refresh} />
-  if (dq.loading) return <Empty text="加载中…" />
+  if (dq.loading) return <Empty text={t('common.loading')} />
   const d = dq.data || {}
 
   const usage = (d.usage_distribution || []).filter((x: any) => x.usage_source)
@@ -18,11 +19,11 @@ export function DataQuality() {
 
   return (
     <div class="page">
-      <h2>数据质量</h2>
+      <h2>{t('dataQuality.title')}</h2>
       <p class="page-note">帮助判断任意统计数字的可靠程度。</p>
       <div class="grid-2">
-        <Card title="Usage 数据来源分布（按 Calls）">
-          {usage.length === 0 && <Empty text="暂无数据" />}
+        <Card title={t('dataQuality.usageDist')}>
+          {usage.length === 0 && <Empty text={t('common.empty')} />}
           <table class="table">
             <thead>
               <tr>
@@ -42,8 +43,8 @@ export function DataQuality() {
             </tbody>
           </table>
         </Card>
-        <Card title="流量估算来源分布（按字节）">
-          {traffic.length === 0 && <Empty text="暂无数据" />}
+        <Card title={t('traffic.sourceDist')}>
+          {traffic.length === 0 && <Empty text={t('common.empty')} />}
           <table class="table">
             <thead>
               <tr>
@@ -64,7 +65,7 @@ export function DataQuality() {
           </table>
         </Card>
       </div>
-      <Card title="概览">
+      <Card title={t('overview.title')}>
         <table class="table">
           <tbody>
             <tr>

@@ -2,6 +2,7 @@ import { api, q } from '../api/client'
 import { Card, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes } from '../lib/format'
+import { t } from '../lib/i18n'
 
 /** 设置：导出、数据概览与运维信息。 */
 export function Settings() {
@@ -17,9 +18,9 @@ export function Settings() {
 
   return (
     <div class="page">
-      <h2>设置</h2>
+      <h2>{t('nav.settings')}</h2>
       <div class="grid-2">
-        <Card title="数据导出">
+        <Card title={t('settings.export')}>
           <p class="page-note">导出当前时间范围内的数据（JSON / NDJSON / CSV）。</p>
           <div class="dim-switch">
             <a class="btn small" href={dl('sessions', 'json')}>
@@ -37,7 +38,7 @@ export function Settings() {
           </div>
         </Card>
 
-        <Card title="数据概览（当前时间范围）">
+        <Card title={t('settings.dataOverview')}>
           {overview.data ? (
             <div class="kv-grid">
               {[
@@ -45,7 +46,7 @@ export function Settings() {
                 ['Sessions', String(overview.data.sessions ?? 0)],
                 ['Input Tokens', String(overview.data.input_tokens ?? 0)],
                 ['Output Tokens', String(overview.data.output_tokens ?? 0)],
-                ['估算流量', fmtBytes(overview.data.estimated_total_bytes)],
+                [t('common.estimatedTraffic'), fmtBytes(overview.data.estimated_total_bytes)],
                 ['Nodes', String(overview.data.nodes ?? 0)],
               ].map(([k, v]) => (
                 <div class="kv" key={k}>
@@ -55,11 +56,11 @@ export function Settings() {
               ))}
             </div>
           ) : (
-            <Empty text="加载中…" />
+            <Empty text={t('common.loading')} />
           )}
         </Card>
 
-        <Card title="数据保留策略">
+        <Card title={t('settings.retention')}>
           <p class="page-note">
             默认全量保留原始事件与 rollup。备份 / 恢复 / 升级 / 回滚见
             <code> docs/operations.md</code>。
@@ -72,7 +73,7 @@ export function Settings() {
           </ul>
         </Card>
 
-        <Card title="MCP 只读查询">
+        <Card title={t('settings.mcp')}>
           <p class="page-note">
             通过 <code>metria mcp</code> 提供 stdio 只读查询工具：
             overview / list_nodes / list_models / list_sessions / get_session / list_calls / traffic_summary。

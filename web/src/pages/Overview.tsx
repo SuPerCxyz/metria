@@ -4,6 +4,7 @@ import { TimeSeries } from '../components/TimeSeries'
 import { getRange } from '../hooks/useQuery'
 import { useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtTokens, fmtUsd, fmtDateTime } from '../lib/format'
+import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
 export function Overview() {
@@ -23,7 +24,7 @@ export function Overview() {
   )
 
   if (overview.error) return <ErrorBox error={overview.error} onRetry={overview.refresh} />
-  if (overview.loading) return <Empty text="加载中…" />
+  if (overview.loading) return <Empty text={t('common.loading')} />
   const o = overview.data || {}
 
   const tokSeries = {
@@ -41,7 +42,7 @@ export function Overview() {
 
   return (
     <div class="page">
-      <h2>总览</h2>
+      <h2>{t('overview.title')}</h2>
       <div class="stat-grid">
         <StatCard label="Input Tokens" value={fmtTokens(o.input_tokens)} />
         <StatCard label="Output Tokens" value={fmtTokens(o.output_tokens)} />
@@ -51,31 +52,31 @@ export function Overview() {
         <StatCard label="Reported Cost" value={fmtUsd(o.reported_cost_micro_usd)} />
         <StatCard label="Calculated Cost" value={fmtUsd(o.calculated_cost_micro_usd)} />
         <StatCard label="Estimated Cost" value={fmtUsd(o.estimated_cost_micro_usd)} />
-        <StatCard label="估算流量" value={fmtBytes(o.estimated_total_bytes)} sub={o.traffic_lower_bound_bytes != null ? `范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}` : undefined} accent="#2563eb" />
+        <StatCard label={t("common.estimatedTraffic")} value={fmtBytes(o.estimated_total_bytes)} sub={o.traffic_lower_bound_bytes != null ? `范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}` : undefined} accent="#2563eb" />
         <StatCard label="Model Calls" value={fmtTokens(o.model_calls)} />
         <StatCard label="Sessions" value={fmtTokens(o.sessions)} />
-        <StatCard label="活跃 Nodes" value={String(o.nodes)} />
-        <StatCard label="活跃 Collectors" value={String(o.collectors)} />
+        <StatCard label={t("overview.activeNodes")} value={String(o.nodes)} />
+        <StatCard label={t("overview.activeCollectors")} value={String(o.collectors)} />
       </div>
 
       <div class="grid-2">
-        <Card title="Token 时间序列">
+        <Card title={t('overview.tokenSeries')}>
           {tokSeries.data?.length ? <TimeSeries data={tokSeries.data} /> : <Empty />}
         </Card>
-        <Card title="Cost 时间序列">
+        <Card title={t('overview.costSeries')}>
           {costSeries.data?.length ? <TimeSeries data={costSeries.data} /> : <Empty />}
         </Card>
-        <Card title="估算流量时间序列">
+        <Card title={t('overview.trafficSeries')}>
           {trafficSeries.data?.length ? <TimeSeries data={trafficSeries.data} /> : <Empty />}
         </Card>
-        <Card title="按 Node 汇总">
+        <Card title={t('traffic.byNode')}>
           <table class="table">
             <thead>
               <tr>
                 <th>Node</th>
                 <th>Input</th>
                 <th>Output</th>
-                <th>估算流量</th>
+                <th>{t('common.estimatedTraffic')}</th>
                 <th>Calls</th>
               </tr>
             </thead>
@@ -94,15 +95,15 @@ export function Overview() {
         </Card>
       </div>
 
-      <Card title="最近 Session">
+      <Card title={t('overview.recentSessions')}>
         <table class="table">
           <thead>
             <tr>
-              <th>标题</th>
-              <th>Agent 工具</th>
+              <th>{t('sessions.titleColumn')}</th>
+              <th>{t('sessions.client')}</th>
               <th>开始</th>
               <th>Calls</th>
-              <th>估算流量</th>
+              <th>{t('common.estimatedTraffic')}</th>
             </tr>
           </thead>
           <tbody>

@@ -2,6 +2,7 @@ import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtTokens, fmtUsd } from '../lib/format'
+import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
 export function Clients() {
@@ -9,11 +10,11 @@ export function Clients() {
   const params = { from: range.from, to: range.to, timezone: range.timezone }
   const clients = useQuery<any>(`clients${q(params)}`, () => api(`/clients${q(params)}`))
   if (clients.error) return <ErrorBox error={clients.error} onRetry={clients.refresh} />
-  if (clients.loading) return <Empty text="加载中…" />
+  if (clients.loading) return <Empty text={t('common.loading')} />
 
   return (
     <div class="page">
-      <h2>Agent 工具</h2>
+      <h2>{t('nav.clients')}</h2>
       <Card>
         <table class="table">
           <thead>
@@ -21,10 +22,10 @@ export function Clients() {
               <th>Client</th>
               <th>Input</th>
               <th>Output</th>
-              <th>估算流量</th>
+              <th>{t('common.estimatedTraffic')}</th>
               <th>Calls</th>
               <th>Sessions</th>
-              <th>费用</th>
+              <th>{t('common.cost')}</th>
             </tr>
           </thead>
           <tbody>

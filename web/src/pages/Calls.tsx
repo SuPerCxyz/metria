@@ -2,6 +2,7 @@ import { api, q } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { getRange, useQuery } from '../hooks/useQuery'
 import { fmtBytes, fmtDateTime, fmtTokens, fmtUsd } from '../lib/format'
+import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
 export function Calls() {
@@ -9,24 +10,24 @@ export function Calls() {
   const params = { from: range.from, to: range.to, timezone: range.timezone }
   const calls = useQuery<any>(`calls${q(params)}`, () => api(`/calls${q(params)}`))
   if (calls.error) return <ErrorBox error={calls.error} onRetry={calls.refresh} />
-  if (calls.loading) return <Empty text="加载中…" />
+  if (calls.loading) return <Empty text={t('common.loading')} />
 
   return (
     <div class="page">
-      <h2>Model Calls</h2>
+      <h2>{t('calls.title')}</h2>
       <Card>
         <table class="table">
           <thead>
             <tr>
               <th>时间</th>
               <th>Client</th>
-              <th>模型</th>
+              <th>{t('common.model')}</th>
               <th>Provider</th>
-              <th>状态</th>
+              <th>{t('common.status')}</th>
               <th>Input</th>
               <th>Output</th>
               <th>Cache</th>
-              <th>费用</th>
+              <th>{t('common.cost')}</th>
             </tr>
           </thead>
           <tbody>
@@ -53,9 +54,9 @@ export function Calls() {
 export function CallDetail({ id }: { id: string }) {
   const call = useQuery<any>(`call${id}`, () => api(`/calls/${encodeURIComponent(id)}`))
   if (call.error) return <ErrorBox error={call.error} onRetry={call.refresh} />
-  if (call.loading) return <Empty text="加载中…" />
+  if (call.loading) return <Empty text={t('common.loading')} />
   const c = call.data?.call || {}
-  const t = call.data?.traffic || {}
+  const tr = call.data?.traffic || {}
 
   return (
     <div class="page">
@@ -67,11 +68,11 @@ export function CallDetail({ id }: { id: string }) {
         {[
           ['Client', c.client_id],
           ['Session', c.session_id || '—'],
-          ['模型', c.model_raw || c.model || '—'],
+          [t('common.model'), c.model_raw || c.model || '—'],
           ['Provider', c.provider_raw || c.provider || '—'],
           ['开始', fmtDateTime(c.started_at)],
           ['完成', c.completed_at ? fmtDateTime(c.completed_at) : '—'],
-          ['状态', c.status],
+          [t('common.status'), c.status],
           ['粒度', c.call_granularity],
           ['Input', fmtTokens(c.input_tokens)],
           ['Output', fmtTokens(c.output_tokens)],
@@ -87,22 +88,22 @@ export function CallDetail({ id }: { id: string }) {
         ))}
       </div>
 
-      <Card title="估算流量">
+      <Card title={t('common.estimatedTraffic')}>
         <div class="traffic-display">
           <div class="traffic-main">
-            估算流量：{fmtBytes(t.estimated_total_wire_bytes)}
+            估算流量：{fmtBytes(tr.estimated_total_wire_bytes)}
             <span class="traffic-range">
-              估算范围：{fmtBytes(t.lower_bound_bytes)} ~ {fmtBytes(t.upper_bound_bytes)}
+              估算范围：{fmtBytes(tr.lower_bound_bytes)} ~ {fmtBytes(tr.upper_bound_bytes)}
             </span>
           </div>
           <div class="kv-grid">
             {[
-              ['请求流量', fmtBytes(t.estimated_request_wire_bytes)],
-              ['响应流量', fmtBytes(t.estimated_response_wire_bytes)],
-              ['可信度', t.confidence != null ? `${Math.round(t.confidence * 100)}%` : '—'],
-              ['估算来源', t.estimation_source],
-              ['上下文传输', t.context_transport_mode],
-              ['Cache 行为', t.cache_transport_behavior],
+              [t('traffic.request'), fmtBytes(tr.estimated_request_wire_bytes)],
+              [t('traffic.response'), fmtBytes(tr.estimated_response_wire_bytes)],
+              ['可信度', tr.confidence != null ? `${Math.round(tr.confidence * 100)}%` : '—'],
+              ['估算来源', tr.estimation_source],
+              ['上下文传输', tr.context_transport_mode],
+              ['Cache 行为', tr.cache_transport_behavior],
             ].map(([label, value]) => (
               <div class="kv" key={label}>
                 <span class="kv-label">{label}</span>

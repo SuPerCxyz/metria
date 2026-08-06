@@ -499,6 +499,97 @@ label {
   color: var(--success);
 }
 
+/* ---- 每次调用流量瀑布 ---- */
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.wf-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.wf-time {
+  width: 110px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.wf-bar-wrap {
+  flex: 1;
+  height: 16px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.wf-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  min-width: 1px;
+}
+
+.wf-model {
+  width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.wf-val {
+  width: 90px;
+  text-align: right;
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.wf-switch {
+  margin-left: 2px;
+  color: var(--warn, #b45309);
+  font-size: 11px;
+}
+
+/* ---- 子代理树 ---- */
+.subagent-tree {
+  padding: 6px 0;
+}
+
+.sa-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-left: 2px solid var(--border);
+  margin-left: 8px;
+  font-size: 13px;
+}
+
+.sa-relation {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.sa-child {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.sa-empty {
+  color: var(--fg-muted);
+  font-size: 13px;
+  padding: 8px 0;
+}
+
+
 /* ---- 流量 ---- */
 .traffic-display {
   display: flex;

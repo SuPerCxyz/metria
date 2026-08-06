@@ -303,12 +303,24 @@ fn heartbeat_loop(
     cfg: AgentConfig,
     spool: Spool,
     client: HubClient,
-    identity: ScanIdentity,
+    mut identity: ScanIdentity,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut last_register = std::time::Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
+        }
+        // 定期重新注册，续期 Hub 侧 collector token（默认 6 天 < 7 天有效期）
+        if last_register.elapsed() >= Duration::from_secs(cfg.token_refresh_interval_seconds) {
+            match register(&cfg, identity.node_id.clone(), &client) {
+                Ok(id) => {
+                    identity = id;
+                    last_register = std::time::Instant::now();
+                    tracing::info!("collector token 已续期");
+                }
+                Err(e) => tracing::warn!("collector token 续期失败: {e}"),
+            }
         }
         let req = HeartbeatRequest {
             schema_version: metria_protocol::limits::SCHEMA_VERSION,

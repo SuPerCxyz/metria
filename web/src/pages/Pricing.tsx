@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import { Card, ErrorBox, Empty } from '../components/ui'
 import { useQuery } from '../hooks/useQuery'
 import { fmtUsd } from '../lib/format'
+import { t } from '../lib/i18n'
 
 export function Pricing() {
   const catalogs = useQuery<any>('/pricing/catalogs', () => api('/pricing/catalogs'))
@@ -97,16 +98,16 @@ export function Pricing() {
 
   return (
     <div class="page">
-      <h2>价格</h2>
+      <h2>{t('nav.pricing')}</h2>
       <p class="page-note">内置价格为近似参考；OpenRouter 等第三方目录在后续版本同步。</p>
 
       {msg && <div class="state-box">{msg}</div>}
 
-      <Card title="价格目录">
+      <Card title={t('pricing.catalogs')}>
         <p class="page-note">
           OpenRouter 价格标记渠道 openrouter（非厂商直连）；LiteLLM 为第三方维护数据，可能存在延迟或误差。
         </p>
-        {(catalogs.data?.catalogs || []).length === 0 && <Empty text="暂无目录" />}
+        {(catalogs.data?.catalogs || []).length === 0 && <Empty text={t('catalog.empty')} />}
         <table class="table">
           <thead>
             <tr>
@@ -139,8 +140,8 @@ export function Pricing() {
         </table>
       </Card>
 
-      <Card title="价格快照">
-        {(snapshots.data?.snapshots || []).length === 0 && <Empty text="暂无快照" />}
+      <Card title={t('pricing.snapshots')}>
+        {(snapshots.data?.snapshots || []).length === 0 && <Empty text={t('snapshots.empty')} />}
         <table class="table">
           <thead>
             <tr>
@@ -169,7 +170,7 @@ export function Pricing() {
       </Card>
 
       <div class="grid-2">
-        <Card title="价格规则">
+        <Card title={t('pricing.rules')}>
           <table class="table">
             <thead>
               <tr>
@@ -194,7 +195,7 @@ export function Pricing() {
           </table>
         </Card>
 
-        <Card title="新增用户规则">
+        <Card title={t('pricing.newUserRule')}>
           <div class="form-grid">
             <label>
               Provider 匹配
@@ -235,7 +236,7 @@ export function Pricing() {
           {saved && <div class="state-box">{saved}</div>}
         </Card>
 
-        <Card title="规则测试">
+        <Card title={t('pricing.test')}>
           <div class="form-grid">
             <label>
               模型

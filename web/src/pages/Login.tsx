@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks'
 import { api, setToken } from '../api/client'
+import { t } from '../lib/i18n'
 import { nav } from '../lib/router'
 
 export function Login() {
@@ -33,16 +34,16 @@ export function Login() {
         <h1>Metria</h1>
         <p class="login-sub">AI 编程 Agent 用量监控 · 费用分析 · 流量估算</p>
         <label>
-          用户名
+          {t('login.username')}
           <input value={username} onInput={(e) => setUsername((e.target as HTMLInputElement).value)} />
         </label>
         <label>
-          密码
+          {t('login.password')}
           <input type="password" value={password} onInput={(e) => setPassword((e.target as HTMLInputElement).value)} />
         </label>
         {error && <div class="login-error">{error}</div>}
         <button type="submit" class="btn primary" disabled={busy}>
-          {busy ? '登录中…' : '登录'}
+          {busy ? t('common.loading') : t('login.submit')}
         </button>
       </form>
     </div>

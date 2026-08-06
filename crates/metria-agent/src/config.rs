@@ -26,6 +26,8 @@ pub struct AgentConfig {
     pub reconcile_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
     pub upload_interval_seconds: u64,
+    /// token 刷新间隔：定期重新注册以续期 Hub 侧 collector token（默认 6 天，短于 7 天有效期）。
+    pub token_refresh_interval_seconds: u64,
     pub log_filter: String,
 }
 
@@ -76,6 +78,8 @@ impl AgentConfig {
             heartbeat_interval_seconds: optional_int("METRIA_HEARTBEAT_INTERVAL")?.unwrap_or(60)
                 as u64,
             upload_interval_seconds: optional_int("METRIA_UPLOAD_INTERVAL")?.unwrap_or(15) as u64,
+            token_refresh_interval_seconds: optional_int("METRIA_TOKEN_REFRESH_INTERVAL")?
+                .unwrap_or(6 * 24 * 3600) as u64,
             log_filter,
         })
     }

@@ -18,6 +18,18 @@
 | M6 分享/导出/MCP/备份恢复 | ✅ 完成 | 2026-08-05 |
 | M7 基准/运维文档 | ✅ 完成 | 2026-08-05 |
 | 生产完善：CI 多架构构建修复/验证、设置与分享页 | ✅ 完成 | 2026-08-06 |
+| 收尾：token 7 天有效期、Claude 子代理、Web Waterfall/子代理树/模型切换、i18n | ✅ 完成 | 2026-08-06 |
+
+### 收尾完成记录（2026-08-06）
+
+- Collector token 7 天有效期（migration 007）：`collector_tokens.expires_at`；注册 upsert 刷新有效期；
+  鉴权拒绝过期 token；Agent 每 6 天重新注册续期（`METRIA_TOKEN_REFRESH_INTERVAL`，默认 6 天 < 7 天）。
+- Claude 子代理关联：`Task` tool_use 的 `leafUuid`/`sessionId` → 派生 `SubagentRelation` + subagent_count；
+  新增 fixture `subagent.jsonl` 与单测。
+- Hub API：`session_calls` 增加 `estimated_total_bytes`；新增 `GET /sessions/{id}/subagents`
+  （relations + 子会话摘要，按 id / source_session_id 解析）。
+- Web：Session Detail 增加「每次调用估算流量」Waterfall（含模型切换标记）、子代理树、
+  Model Switch 高亮；i18n 抽象（`web/src/lib/i18n.ts`，zh/en key-value + 插值 + 语言切换，默认中文）。
 
 ### S2 完成记录（2026-08-05）
 
@@ -64,7 +76,7 @@
 - fixtures：claude（golden_full/missing_usage/malformed/non_utf8/truncated_tail）、codex（golden_full/missing_usage/malformed）。
 - 门禁：fmt/clippy(-D warnings)/test(98)/web build/docker build/compose config 全绿。
 
-已知限制：adapter 尚不产出 traffic_profile_samples（自动学习在 S2/M2）；Claude 未做子代理关联（isSidechain 无父引用）；Codex 会话级 model 聚合以 message/agent 为粒度。
+已知限制：adapter 尚不产出 traffic_profile_samples（自动学习在 S2/M2）；Codex 会话级 model 聚合以 message/agent 为粒度。（Claude 子代理关联已修复：Task tool_use 的 leafUuid 推导 SubagentRelation，见 2026-08-06 记录。）
 
 ### S0 完成记录（2026-08-05）
 

@@ -105,6 +105,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/calls", get(session_calls))
         .route("/api/v1/sessions/{id}/tools", get(session_tools))
+        .route("/api/v1/sessions/{id}/subagents", get(session_subagents))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
         .route("/api/v1/traffic/summary", get(traffic_summary))
         .route("/api/v1/traffic/by-node", get(traffic_by_node))
@@ -1593,8 +1594,8 @@ async fn session_detail(State(st): State<AppState>, AxumPath(id): AxumPath<Strin
 async fn session_calls(State(st): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(
-        "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, calculated_cost_micro_usd
-         FROM model_calls WHERE session_id = ?1 ORDER BY started_at",
+        "SELECT m.id, m.model_normalized, m.provider_normalized, m.started_at, m.status, m.input_tokens, m.output_tokens, m.cache_read_tokens, m.reasoning_tokens, m.calculated_cost_micro_usd, t.estimated_total_wire_bytes
+         FROM model_calls m LEFT JOIN traffic_estimates t ON t.model_call_id = m.id WHERE m.session_id = ?1 ORDER BY m.started_at",
     ));
     let rows = q!(stmt.query_map([&id], |r| {
         Ok(serde_json::json!({
@@ -1608,6 +1609,7 @@ async fn session_calls(State(st): State<AppState>, AxumPath(id): AxumPath<String
             "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
             "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
             "calculated_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
+            "estimated_total_bytes": r.get::<_, Option<i64>>(10)?,
         }))
     }));
     let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -1634,6 +1636,68 @@ async fn session_tools(State(st): State<AppState>, AxumPath(id): AxumPath<String
     }));
     let tools: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
     Json(serde_json::json!({ "tools": tools })).into_response()
+}
+
+async fn session_subagents(State(st): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    let c = st.db.conn();
+    let mut stmt = q!(c.prepare(
+        "SELECT id, child_session_id, relation, created_at
+         FROM subagent_relations WHERE session_id = ?1 ORDER BY created_at",
+    ));
+    let rows = q!(stmt.query_map([&id], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "child_session_id": r.get::<_, String>(1)?,
+            "relation": r.get::<_, String>(2)?,
+            "created_at": r.get::<_, String>(3)?,
+        }))
+    }));
+    let rels: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+
+    // 解析子会话摘要（按 id 或 source_session_id 匹配）
+    let child_ids: Vec<String> = rels
+        .iter()
+        .filter_map(|r| {
+            r.get("child_session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    let children: Vec<serde_json::Value> = if child_ids.is_empty() {
+        Vec::new()
+    } else {
+        let placeholders = child_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, source_session_id, title, primary_model_normalized, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+             FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})"
+        );
+        let mut params: Vec<&str> = Vec::new();
+        for id in &child_ids {
+            params.push(id);
+        }
+        for id in &child_ids {
+            params.push(id);
+        }
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(
+            stmt.query_map(params_from_iter(params.iter().copied()), |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "source_session_id": r.get::<_, String>(1)?,
+                    "title": r.get::<_, Option<String>>(2)?,
+                    "model": r.get::<_, Option<String>>(3)?,
+                    "message_count": r.get::<_, i64>(4)?,
+                    "model_call_count": r.get::<_, i64>(5)?,
+                    "input_tokens": r.get::<_, Option<i64>>(6)?,
+                    "output_tokens": r.get::<_, Option<i64>>(7)?,
+                    "estimated_total_bytes": r.get::<_, Option<i64>>(8)?,
+                }))
+            })
+        );
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    Json(serde_json::json!({ "relations": rels, "children": children })).into_response()
 }
 
 async fn session_timeline(State(st): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {

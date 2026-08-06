@@ -350,3 +350,51 @@ async fn unknown_token_rejected() {
         .unwrap_err();
     assert!(matches!(resp, ureq::Error::Status(401, _)));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn collector_token_has_seven_day_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, state) = spawn_hub(dir.path()).await;
+    // 注册写入 token（有效期 7 天）
+    let resp = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "tok-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 未过期 token 可鉴权
+    let ok = state.db.verify_collector_token("testtok");
+    assert!(ok.is_some(), "未过期 token 应有效");
+
+    // 手工将 token 置为过期 → 鉴权失败
+    {
+        let c = state.db.conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        c.execute(
+            "UPDATE collector_tokens SET expires_at = ?1 WHERE status = 'active'",
+            [&now],
+        )
+        .unwrap();
+    }
+    assert!(
+        state.db.verify_collector_token("testtok").is_none(),
+        "过期 token 应失效"
+    );
+
+    // 过期后重新注册 → 刷新有效期（upsert 语义）
+    let resp2 = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(
+            json!({"schema_version": 1, "node_id": "tok-node", "node_name": "n",
+            "agent_version": "0.1.0", "protocol_version": 1}),
+        )
+        .unwrap();
+    assert_eq!(resp2.status(), 200);
+    assert!(
+        state.db.verify_collector_token("testtok").is_some(),
+        "重新注册应刷新有效期"
+    );
+}

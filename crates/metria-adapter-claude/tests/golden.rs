@@ -182,3 +182,18 @@ fn identity_flow_into_events() {
         assert_eq!(u.node_id, "node-99");
     }
 }
+
+#[test]
+fn task_tool_use_emits_subagent_relation() {
+    let adapter = ClaudeCodeAdapter;
+    let s = scan_fixture(&adapter, &fixture_dir(), "subagent.jsonl");
+    assert_eq!(s.batch.sessions.len(), 1);
+    let session = &s.batch.sessions[0];
+    assert_eq!(session.subagent_count, 1, "Task tool_use 应计数子代理");
+    assert_eq!(s.batch.subagent_relations.len(), 1);
+    let rel = &s.batch.subagent_relations[0];
+    assert_eq!(rel.relation, "task");
+    assert_eq!(rel.child_session_id.as_str(), "sub-child-0002");
+    assert_eq!(rel.session_id, session.id);
+    assert_eq!(session.model_call_count, 1);
+}
