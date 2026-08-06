@@ -26,7 +26,7 @@ ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates \
     && if [ "$TARGETARCH" = "arm64" ]; then \
-         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
+         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
          && rustup target add aarch64-unknown-linux-gnu; \
        fi \
     && rm -rf /var/lib/apt/lists/*
