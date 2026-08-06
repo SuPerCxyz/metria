@@ -72,9 +72,6 @@ jobs:
       - name: npm ci
         run: cd web && npm ci
 
-      - name: typecheck
-        run: cd web && npm run typecheck
-
       - name: build
         run: cd web && npm run build
 

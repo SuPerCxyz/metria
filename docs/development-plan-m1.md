@@ -23,6 +23,32 @@
 | 全量补齐：allocation_mode/cursor 分页/排序/虚拟滚动、Agent Tools Detail、argon2+签名 token、token 轮换/吊销、Pricing 编辑、Overview 汇总、jitter、TOML 合并、incremental_vacuum、Node 分布 | ✅ 完成 | 2026-08-06 |
 | UI 增强与质量修复：Models Detail、Node Collector 信息、Data Quality 增强、doctor --hub 增强、body limit 修复、handler 自死锁修复 | ✅ 完成 | 2026-08-06 |
 | 计划缺口全量修复：pricing 编辑/删除 bug、CLI export、分享落地页、doctor 最近上传、ingest 关系校验、参数统一、Web spec 字段补齐 | ✅ 完成 | 2026-08-06 |
+| Web 前端重构：基于 Mosaic Lite 模板（React/Vite/Tailwind/Chart.js），6 阶段渐进式重建 | ✅ 完成 | 2026-08-06 |
+
+### Web 前端重构完成记录（2026-08-06）
+
+基于 Cruip Mosaic Lite（https://github.com/cruip/tailwind-dashboard-template）重建 Web 前端，
+技术栈 React 19 + Vite + Tailwind CSS 4 + React Router 7 + Chart.js，替换原 Preact 实现。
+
+- 阶段1 模板清理：删除销售/电商示例页与组件，保留布局骨架（Sidebar/Header/主题/css/图表配置）；
+  建立 Metria 路由（总览/使用分析/会话/节点/Agents/模型/费用/网络流量/设置）、API 对接层
+  （services/api.js）、统一数据格式化（services/format.js：数字缩写/Token/费用/流量/时长/时间）、
+  全局时间范围（useTimeRange，跨页保持 + 快捷项）。
+- 阶段2 总览：4 核心指标卡（总费用/总Token/网络流量/活跃会话）+ 主趋势图（Token/费用/流量/请求
+  切换，降采样）+ 模型/Agent 双排行 + 需要关注区块。
+- 阶段3 核心列表：会话（默认 8 列/分页/搜索/排序）、节点（含 usage 汇总）、Agents、模型
+  （含价格未配置标记）。通用 DataTable 组件（排序/分页/行点击）。
+- 阶段4 详情页：会话详情（摘要/趋势图/Token 构成/模型调用列表/错误异常）、节点详情、
+  Agent 详情、模型详情、调用详情（估算区间/Profile/缺失说明）。
+- 阶段5 专项分析：使用分析（Token/请求/缓存/延迟标签）、费用页、网络流量页。
+- 阶段6 体验：错误边界、加载骨架、空/错误状态、深浅色、响应式（指标卡自适应列数、
+  移动端侧边栏抽屉）、URL 下钻（排行→详情页）。
+- 可复用组件：MetricCard/TrendChart/RankingList/DataTable/TimeRangePicker/FilterBar/
+  StatusBadge/EmptyState/ErrorState/LoadingSkeleton/DataQualityBadge/PageHeader/DetailSummary。
+- 修复：SessionDetail 的 useMemo 位于条件 return 之后导致 React hooks 数量不一致
+  （error #310），hooks 全部移到顶层；前端登录后 RequireAuth 监听器注册问题。
+- 部署：vite base=/static/（rust-embed 集成）、HashRouter（兼容 SPA fallback）、
+  docker 镜像内嵌新前端。
 
 ### 计划缺口全量修复完成记录（2026-08-06）
 
