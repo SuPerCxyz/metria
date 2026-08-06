@@ -113,7 +113,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "tags=${{ env.IMAGE }}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${{ env.IMAGE }}:main,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
+            echo "tags=${{ env.IMAGE }}:latest,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 构建并推送镜像
