@@ -14,14 +14,14 @@ function Calendar({
   return (
     <DayPicker
       showOutsideDays={showOutsideDays}
-      className={cn("p-3 text-gray-600 dark:text-gray-100", className)}
+      className={cn("p-3 text-gray-600 dark:text-gray-100 relative", className)}
       classNames={{
         months: "flex flex-col sm:flex-row space-y-4 sm:space-y-0",
-        month_caption: "flex justify-center pt-1 pb-3 relative items-center",
+        month_caption: "flex justify-center pt-1 pb-3 relative items-center px-3",
         caption_label: "text-sm font-medium",
-        nav: "absolute flex items-center justify-between gap-1 inset-x-3 top-3",
-        button_previous: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100 z-50",
-        button_next: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100 z-50",
+        nav: "absolute flex items-center justify-between top-1 left-0 right-0",
+        button_previous: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100",
+        button_next: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100",
         month_grid: "w-full border-collapse space-y-1",
         weekdays: "flex",
         weekday:

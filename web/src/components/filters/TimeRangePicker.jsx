@@ -70,37 +70,41 @@ export default function TimeRangePicker({ className }) {
           </button>
         </PopoverTrigger>
         <PopoverContent className="w-auto p-3" align="end">
-          <div className="flex flex-col gap-3 min-w-[280px]">
-            {/* 快捷范围整行置顶，避免与日历导航重叠 */}
-            <div className="flex flex-wrap items-center gap-1">
+          <div className="flex flex-col sm:flex-row gap-4">
+            {/* 快捷范围列（左侧） */}
+            <div className="flex flex-col gap-0.5 w-32 shrink-0">
+              <div className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide px-2 pb-1">快捷范围</div>
               {PRESETS.map((p) => (
                 <button
                   key={p.key}
                   type="button"
                   onClick={() => applyPreset(p.key)}
-                  className="text-xs text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/40 rounded-lg px-2.5 py-1.5"
+                  className="text-left text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/40 rounded-lg px-2 py-1.5"
                 >
                   {p.label}
                 </button>
               ))}
             </div>
-            <Calendar mode="range" defaultMonth={fromDate} selected={fromDate && toDate ? { from: fromDate, to: toDate } : undefined} onSelect={onSelect} />
-            <div className="flex items-center justify-between border-t border-gray-100 dark:border-gray-700/60 pt-3">
-              {fromDate && toDate ? (
-                <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
-                  {format(fromDate, 'MM/dd HH:mm')} ~ {format(toDate, 'MM/dd HH:mm')}
-                </span>
-              ) : (
-                <span className="text-xs text-gray-400 dark:text-gray-500">选择起止日期</span>
-              )}
-              <button
-                type="button"
-                onClick={clear}
-                className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
-              >
-                清除选择
-              </button>
+            {/* 日历（右侧，箭头约束在自身边界） */}
+            <div className="relative">
+              <Calendar mode="range" defaultMonth={fromDate} selected={fromDate && toDate ? { from: fromDate, to: toDate } : undefined} onSelect={onSelect} />
             </div>
+          </div>
+          <div className="flex items-center justify-between border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3">
+            {fromDate && toDate ? (
+              <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
+                {format(fromDate, 'MM/dd HH:mm')} ~ {format(toDate, 'MM/dd HH:mm')}
+              </span>
+            ) : (
+              <span className="text-xs text-gray-400 dark:text-gray-500">选择起止日期</span>
+            )}
+            <button
+              type="button"
+              onClick={clear}
+              className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
+            >
+              清除选择
+            </button>
           </div>
         </PopoverContent>
       </Popover>
