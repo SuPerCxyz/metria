@@ -145,24 +145,29 @@ export default function TimeRangePicker({ className }) {
               <Calendar mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
             </div>
           </div>
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3">
-            <div className="flex items-center gap-2 flex-wrap">
+          <div className="border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3 space-y-3">
+            {/* 第一行：起始/结束时间 + 预览 */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
               {draft?.from && draft?.to ? (
                 <>
-                  <span className="text-xs text-gray-400 dark:text-gray-500">起始</span>
-                  <input
-                    type="time"
-                    value={format(draft.from, 'HH:mm')}
-                    onChange={(e) => setDraftTime('from', e.target.value)}
-                    className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
-                  />
-                  <span className="text-xs text-gray-400 dark:text-gray-500">结束</span>
-                  <input
-                    type="time"
-                    value={format(draft.to, 'HH:mm')}
-                    onChange={(e) => setDraftTime('to', e.target.value)}
-                    className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
-                  />
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="text-xs text-gray-400 dark:text-gray-500">起始</span>
+                    <input
+                      type="time"
+                      value={format(draft.from, 'HH:mm')}
+                      onChange={(e) => setDraftTime('from', e.target.value)}
+                      className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
+                    />
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="text-xs text-gray-400 dark:text-gray-500">结束</span>
+                    <input
+                      type="time"
+                      value={format(draft.to, 'HH:mm')}
+                      onChange={(e) => setDraftTime('to', e.target.value)}
+                      className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
+                    />
+                  </span>
                   <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
                     {format(draft.from, 'MM/dd HH:mm')} ~ {format(draft.to, 'MM/dd HH:mm')}
                   </span>
@@ -171,7 +176,8 @@ export default function TimeRangePicker({ className }) {
                 <span className="text-xs text-gray-400 dark:text-gray-500">在日历选择日期范围</span>
               )}
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+            {/* 第二行：操作按钮 */}
+            <div className="flex items-center gap-2 justify-end">
               <button
                 type="button"
                 onClick={clear}
