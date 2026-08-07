@@ -140,16 +140,14 @@ export default function TimeRangePicker({ className }) {
                 </button>
               ))}
             </div>
-            {/* 日历（右侧） */}
-            <div className="relative">
-              <Calendar mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
-            </div>
-          </div>
-          <div className="border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3 space-y-3">
-            {/* 第一行：起始/结束时间 + 预览 */}
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            {/* 日历（右侧，时间输入在日历下方） */}
+            <div className="flex flex-col gap-3">
+              <div className="relative">
+                <Calendar mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
+              </div>
+              {/* 起始/结束时间输入（日历下方） */}
               {draft?.from && draft?.to ? (
-                <>
+                <div className="flex items-center justify-center gap-2 border-t border-gray-100 dark:border-gray-700/60 pt-3">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-xs text-gray-400 dark:text-gray-500">起始</span>
                     <input
@@ -168,38 +166,44 @@ export default function TimeRangePicker({ className }) {
                       className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
                     />
                   </span>
-                  <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
-                    {format(draft.from, 'MM/dd HH:mm')} ~ {format(draft.to, 'MM/dd HH:mm')}
-                  </span>
-                </>
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3">
+            {/* 操作行：预览在左、按钮在右 */}
+            <div className="flex items-center justify-between gap-3">
+              {draft?.from && draft?.to ? (
+                <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
+                  {format(draft.from, 'MM/dd HH:mm')} ~ {format(draft.to, 'MM/dd HH:mm')}
+                </span>
               ) : (
                 <span className="text-xs text-gray-400 dark:text-gray-500">在日历选择日期范围</span>
               )}
-            </div>
-            {/* 第二行：操作按钮 */}
-            <div className="flex items-center gap-2 justify-end">
-              <button
-                type="button"
-                onClick={clear}
-                className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
-              >
-                清除选择
-              </button>
-              <button
-                type="button"
-                onClick={cancel}
-                className="text-xs text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={confirm}
-                disabled={!draft?.from || !draft?.to}
-                className="text-xs text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg px-3 py-1.5 disabled:opacity-50"
-              >
-                确认
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={clear}
+                  className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
+                >
+                  清除选择
+                </button>
+                <button
+                  type="button"
+                  onClick={cancel}
+                  className="text-xs text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={confirm}
+                  disabled={!draft?.from || !draft?.to}
+                  className="text-xs text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg px-3 py-1.5 disabled:opacity-50"
+                >
+                  确认
+                </button>
+              </div>
             </div>
           </div>
         </PopoverContent>
