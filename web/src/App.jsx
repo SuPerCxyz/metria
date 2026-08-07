@@ -8,6 +8,7 @@ import './charts/ChartjsConfig'
 import AppLayout from './components/layout/AppLayout'
 import ErrorBoundary from './components/common/ErrorBoundary'
 import { TimeRangeProvider } from './hooks/useTimeRange'
+import { PageMetaProvider } from './hooks/usePageMeta'
 import { getToken, api } from './services/api'
 
 import Login from './pages/Login'
@@ -72,26 +73,28 @@ function App() {
 
   return (
     <TimeRangeProvider>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route element={<RequireAuth><AppLayout /></RequireAuth>}>
-          <Route path="/" element={<ErrorBoundary><Overview /></ErrorBoundary>} />
-          <Route path="/analytics" element={<ErrorBoundary><Analytics /></ErrorBoundary>} />
-          <Route path="/sessions" element={<ErrorBoundary><Sessions /></ErrorBoundary>} />
-          <Route path="/sessions/:id" element={<ErrorBoundary><SessionDetail /></ErrorBoundary>} />
-          <Route path="/nodes" element={<ErrorBoundary><Nodes /></ErrorBoundary>} />
-          <Route path="/nodes/:id" element={<ErrorBoundary><NodeDetail /></ErrorBoundary>} />
-          <Route path="/agents" element={<ErrorBoundary><Agents /></ErrorBoundary>} />
-          <Route path="/agents/:id" element={<ErrorBoundary><AgentDetail /></ErrorBoundary>} />
-          <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
-          <Route path="/models/:id" element={<ErrorBoundary><ModelDetail /></ErrorBoundary>} />
-          <Route path="/costs" element={<ErrorBoundary><Costs /></ErrorBoundary>} />
-          <Route path="/traffic" element={<ErrorBoundary><Traffic /></ErrorBoundary>} />
-          <Route path="/calls/:id" element={<ErrorBoundary><CallDetail /></ErrorBoundary>} />
-          <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
-        </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+      <PageMetaProvider>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route element={<RequireAuth><AppLayout /></RequireAuth>}>
+            <Route path="/" element={<ErrorBoundary><Overview /></ErrorBoundary>} />
+            <Route path="/analytics" element={<ErrorBoundary><Analytics /></ErrorBoundary>} />
+            <Route path="/sessions" element={<ErrorBoundary><Sessions /></ErrorBoundary>} />
+            <Route path="/sessions/:id" element={<ErrorBoundary><SessionDetail /></ErrorBoundary>} />
+            <Route path="/nodes" element={<ErrorBoundary><Nodes /></ErrorBoundary>} />
+            <Route path="/nodes/:id" element={<ErrorBoundary><NodeDetail /></ErrorBoundary>} />
+            <Route path="/agents" element={<ErrorBoundary><Agents /></ErrorBoundary>} />
+            <Route path="/agents/:id" element={<ErrorBoundary><AgentDetail /></ErrorBoundary>} />
+            <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
+            <Route path="/models/:id" element={<ErrorBoundary><ModelDetail /></ErrorBoundary>} />
+            <Route path="/costs" element={<ErrorBoundary><Costs /></ErrorBoundary>} />
+            <Route path="/traffic" element={<ErrorBoundary><Traffic /></ErrorBoundary>} />
+            <Route path="/calls/:id" element={<ErrorBoundary><CallDetail /></ErrorBoundary>} />
+            <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </PageMetaProvider>
     </TimeRangeProvider>
   )
 }
