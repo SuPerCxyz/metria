@@ -48,20 +48,26 @@ export default function Analytics() {
 
   const cacheHitRate = o.input_tokens > 0 ? o.cache_read_tokens / (o.input_tokens + o.cache_read_tokens) : 0
 
-  const modelItems = (byModel.data?.by || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
-  const agentItems = (byAgent.data?.by || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
-  const nodeItems = (byNode.data?.by || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
+  const modelItems = (byModel.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
+  const agentItems = (byAgent.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
+  const nodeItems = (byNode.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: m.input_tokens + m.output_tokens }))
 
   return (
     <>
       <PageHeader title="使用分析" subtitle="深入分析 Token、请求、缓存与延迟" />
-      <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-700/40 p-0.5 mb-6">
+      <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-700/40 p-1 mb-6">
         {TABS.map((t) => (
           <button
             key={t.key}
             type="button"
             onClick={() => setTab(t.key)}
-            className={`px-4 py-2 text-sm font-medium rounded-md ${tab === t.key ? 'bg-white dark:bg-gray-600 shadow-xs text-gray-800 dark:text-gray-100' : 'text-gray-500 dark:text-gray-400'}`}
+            className={`px-5 py-2.5 text-base font-medium rounded-md ${tab === t.key ? 'bg-white dark:bg-gray-600 shadow-xs text-gray-800 dark:text-gray-100' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'}`}
           >
             {t.label}
           </button>
@@ -129,10 +135,14 @@ export default function Analytics() {
 }
 
 function RankingCard({ title, items, onClick }) {
+  const count = (items || []).length
   return (
     <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-      <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">{title}</h2>
-      <RankingList items={items} valueKey="value" labelKey="name" format={fmtTokensShort} limit={5} onItemClick={onClick} />
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">{title}</h2>
+        <span className="text-xs text-gray-400 dark:text-gray-500">共 {count} 项</span>
+      </div>
+      <RankingList items={items} valueKey="value" labelKey="name" format={fmtTokensShort} limit={count || 1} onItemClick={onClick} />
     </div>
   )
 }

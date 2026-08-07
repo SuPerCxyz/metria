@@ -27,19 +27,19 @@ function Calendar({
         weekday:
           "text-gray-400 dark:text-gray-500 font-medium rounded-md w-9 text-[0.8rem]",
         week: "flex w-full mt-2",
-        day: "h-9 w-9 text-center text-sm p-0 relative [&:has([aria-selected].day-range-end)]:rounded-r-md [&:has([aria-selected].day-outside)]:bg-green-500/50 [&:has([aria-selected])]:bg-violet-500 first:[&:has([aria-selected])]:rounded-l-md last:[&:has([aria-selected])]:rounded-r-md focus-within:relative focus-within:z-20",
-        day_button: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 hover:bg-violet-500 hover:text-white h-9 w-9 p-0 aria-selected:opacity-100",
-        range_start:
-          "rounded-l-lg",
-        range_end: "day-range-end rounded-r-lg",
+        // 选中范围使用半透明条，起止用圆点，避免大紫色圆角矩形重叠
+        day: "h-9 w-9 text-center text-sm p-0 relative [&:has([aria-selected].day-range-end)]:rounded-r-full [&:has([aria-selected].day-range-start)]:rounded-l-full first:[&:has([aria-selected])]:rounded-l-full last:[&:has([aria-selected])]:rounded-r-full focus-within:relative focus-within:z-20",
+        day_button: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0 hover:bg-violet-100 dark:hover:bg-violet-400/20 h-9 w-9 p-0",
+        range_start: "rounded-l-full",
+        range_end: "day-range-end rounded-r-full",
         selected:
           "bg-violet-500 text-white hover:bg-violet-500 hover:text-white focus:bg-violet-500 focus:text-white",
-        today: "bg-violet-500 text-white",
+        today: "font-bold text-violet-600 dark:text-violet-400",
         outside:
           "day-outside text-gray-400 dark:text-gray-500 aria-selected:bg-violet-500/50 aria-selected:text-gray-400 dark:text-gray-500",
         disabled: "text-gray-400 dark:text-gray-500 opacity-50",
         range_middle:
-          "aria-selected:bg-violet-500/70 aria-selected:text-white",
+          "aria-selected:bg-violet-100 dark:aria-selected:bg-violet-400/20 aria-selected:text-gray-700 dark:aria-selected:text-gray-200 aria-selected:rounded-none",
         hidden: "invisible",
         ...classNames,
       }}
