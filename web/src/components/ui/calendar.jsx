@@ -19,9 +19,9 @@ function Calendar({
         months: "flex flex-col sm:flex-row space-y-4 sm:space-y-0",
         month_caption: "flex justify-center pt-1 pb-3 relative items-center px-3",
         caption_label: "text-sm font-medium",
-        nav: "absolute flex items-center justify-between top-1 left-0 right-0",
-        button_previous: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100",
-        button_next: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-7 bg-transparent p-0 opacity-50 hover:opacity-100",
+        nav: "absolute flex items-center justify-between top-3 left-0 right-0 h-9",
+        button_previous: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-9 bg-transparent p-0 opacity-60 hover:opacity-100",
+        button_next: "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none size-9 bg-transparent p-0 opacity-60 hover:opacity-100",
         month_grid: "w-full border-collapse space-y-1",
         weekdays: "flex",
         weekday:
@@ -46,9 +46,9 @@ function Calendar({
       components={{
         Chevron: (props) => {
           if (props.orientation === "left") {
-            return <svg className="fill-current" width="7" height="11" viewBox="0 0 7 11"><path d="M5.4 10.8l1.4-1.4-4-4 4-4L5.4 0 0 5.4z" /></svg>;
+            return <svg className="fill-current" width="10" height="16" viewBox="0 0 10 16"><path d="M8.4 16 0 8l8.4-8L10 1.4 2.8 8l7.2 6.6L8.4 16Z" /></svg>;
           }
-          return <svg className="fill-current" width="7" height="11" viewBox="0 0 7 11"><path d="M1.4 10.8L0 9.4l4-4-4-4L1.4 0l5.4 5.4z" /></svg>;
+          return <svg className="fill-current" width="10" height="16" viewBox="0 0 10 16"><path d="M1.6 16 0 14.6 7.2 8 0 1.4 1.6 0 10 8l-8.4 8Z" /></svg>;
         }
       }}
       {...props}
