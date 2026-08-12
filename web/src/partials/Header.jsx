@@ -5,17 +5,25 @@ import { useNavigate } from 'react-router-dom'
 import ThemeToggle from '../components/ThemeToggle'
 import TimeRangePicker from '../components/filters/TimeRangePicker'
 import { usePageMeta } from '../hooks/usePageMeta'
+import { useTimeRange } from '../hooks/useTimeRange'
 import { getToken, setToken } from '../services/api'
 
 function Header({ sidebarOpen, setSidebarOpen }) {
   const navigate = useNavigate()
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const { title, subtitle } = usePageMeta()
+  const { refreshRange } = useTimeRange()
 
   const logout = () => {
     setToken(null)
     window.dispatchEvent(new CustomEvent('metria:unauth'))
     navigate('/login')
+  }
+
+  const refreshPage = () => {
+    // 先通知查询记录旧 key，再重算快捷范围；自定义范围不会被改写。
+    window.dispatchEvent(new CustomEvent('metria:refresh'))
+    refreshRange()
   }
 
   return (
@@ -39,6 +47,20 @@ function Header({ sidebarOpen, setSidebarOpen }) {
           </div>
 
           <div className="flex items-center space-x-3 shrink-0">
+            <button
+              type="button"
+              onClick={refreshPage}
+              className="w-8 h-8 flex items-center justify-center rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-700/60"
+              aria-label="刷新页面"
+              title="刷新当前页面数据"
+            >
+              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
+                <path d="M21 3v5h-5" />
+                <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />
+                <path d="M3 21v-5h5" />
+              </svg>
+            </button>
             <TimeRangePicker />
             <ThemeToggle />
             <hr className="w-px h-6 bg-gray-200 dark:bg-gray-700/60 border-none" />

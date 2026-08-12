@@ -1,33 +1,33 @@
-// 全局时间范围：跨页面保持，支持 URL 参数持久化。
+// 全局时间范围：打开页面时固定为「今天凌晨 → 当前时间」，不沿用上次保存的范围。
 
-import React, { createContext, useContext, useMemo, useState } from 'react'
-import { quickRange } from '../services/format'
+import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
+import {
+  createPresetRange,
+  DEFAULT_PRESET_KEY,
+  isSameTimeRange,
+  normalizeTimeRange,
+  refreshPresetRange,
+} from './timeRangeState'
 
 const TimeRangeContext = createContext(null)
 
-const KEY = 'metria-range'
-
 function readInitial() {
-  try {
-    const raw = sessionStorage.getItem(KEY)
-    if (raw) {
-      const p = JSON.parse(raw)
-      if (p.from && p.to) return p
-    }
-  } catch { /* ignore */ }
-  return quickRange('7d')
+  return createPresetRange(DEFAULT_PRESET_KEY)
 }
 
 export function TimeRangeProvider({ children }) {
   const [range, setRange] = useState(readInitial)
 
-  const set = (r) => {
-    const next = { from: r.from, to: r.to, timezone: r.timezone || undefined }
-    setRange(next)
-    try { sessionStorage.setItem(KEY, JSON.stringify(next)) } catch { /* ignore */ }
-  }
+  const set = useCallback((next) => setRange(normalizeTimeRange(next)), [])
 
-  const value = useMemo(() => ({ range, setRange: set }), [range])
+  const refreshRange = useCallback(() => {
+    const next = refreshPresetRange(range)
+    if (!next || isSameTimeRange(range, next)) return false
+    setRange(next)
+    return true
+  }, [range])
+
+  const value = useMemo(() => ({ range, setRange: set, refreshRange }), [range, set, refreshRange])
   return <TimeRangeContext.Provider value={value}>{children}</TimeRangeContext.Provider>
 }
 

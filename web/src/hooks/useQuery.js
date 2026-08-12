@@ -8,6 +8,13 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
   const [error, setError] = useState(null)
   const keyRef = useRef(key)
   const enabledRef = useRef(enabled)
+  const fetcherRef = useRef(fetcher)
+  const runRef = useRef(null)
+  const refreshTimerRef = useRef(null)
+
+  keyRef.current = key
+  enabledRef.current = enabled
+  fetcherRef.current = fetcher
 
   const run = useCallback(() => {
     if (!enabledRef.current) {
@@ -17,7 +24,7 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
     let cancelled = false
     setLoading(true)
     setError(null)
-    fetcher()
+    fetcherRef.current()
       .then((d) => {
         if (!cancelled) {
           setData(d)
@@ -33,10 +40,29 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
     return () => { cancelled = true }
   }, [key]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  runRef.current = run
+
   useEffect(() => {
     const cleanup = run()
     return cleanup
   }, [key, enabled])
+
+  // 等时间范围状态落稳后再刷新；范围 key 已变化的查询由上面的 effect 执行，避免重复请求。
+  useEffect(() => {
+    const onRefresh = () => {
+      const keyAtRefresh = keyRef.current
+      if (refreshTimerRef.current !== null) window.clearTimeout(refreshTimerRef.current)
+      refreshTimerRef.current = window.setTimeout(() => {
+        refreshTimerRef.current = null
+        if (keyRef.current === keyAtRefresh) runRef.current?.()
+      }, 0)
+    }
+    window.addEventListener('metria:refresh', onRefresh)
+    return () => {
+      window.removeEventListener('metria:refresh', onRefresh)
+      if (refreshTimerRef.current !== null) window.clearTimeout(refreshTimerRef.current)
+    }
+  }, [])
 
   const refresh = useCallback(() => run(), [run])
   return { data, loading, error, refresh }

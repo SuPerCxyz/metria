@@ -11,8 +11,13 @@ import { useTimeRange } from '../../hooks/useTimeRange'
 const PRESETS = [
   { key: 'today', label: '今天' },
   { key: 'yesterday', label: '昨天' },
+  { key: '1h', label: '最近 1 小时' },
+  { key: '3h', label: '最近 3 小时' },
+  { key: '6h', label: '最近 6 小时' },
+  { key: '12h', label: '最近 12 小时' },
   { key: '24h', label: '最近 24 小时' },
   { key: '7d', label: '最近 7 天' },
+  { key: '14d', label: '最近 14 天' },
   { key: '30d', label: '最近 30 天' },
 ]
 

@@ -108,20 +108,25 @@ export function fmtRelative(iso) {
   return `${d}d ago`
 }
 
-/** 计算时间范围（快捷项） */
-export function quickRange(key) {
-  const now = new Date()
+/** 计算时间范围（快捷项）；now 参数用于刷新时重算与确定性测试。 */
+export function quickRange(key, nowValue = new Date()) {
+  const now = new Date(nowValue)
   const to = new Date(now)
   const from = new Date(now)
   switch (key) {
     case 'today': from.setHours(0, 0, 0, 0); break
     case 'yesterday': { from.setDate(now.getDate() - 1); from.setHours(0, 0, 0, 0); to.setDate(now.getDate() - 1); to.setHours(23, 59, 59, 999); break }
+    case '1h': from.setTime(now.getTime() - 3600 * 1000); break
+    case '3h': from.setTime(now.getTime() - 3 * 3600 * 1000); break
+    case '6h': from.setTime(now.getTime() - 6 * 3600 * 1000); break
+    case '12h': from.setTime(now.getTime() - 12 * 3600 * 1000); break
     case '24h': from.setTime(now.getTime() - 24 * 3600 * 1000); break
     case '7d': from.setTime(now.getTime() - 7 * 24 * 3600 * 1000); break
+    case '14d': from.setTime(now.getTime() - 14 * 24 * 3600 * 1000); break
     case '30d': from.setTime(now.getTime() - 30 * 24 * 3600 * 1000); break
     default: from.setTime(now.getTime() - 7 * 24 * 3600 * 1000)
   }
-  return { from: from.toISOString(), to: to.toISOString() }
+  return { from: from.toISOString(), to: to.toISOString(), presetKey: key }
 }
 
 /** 状态色映射 */
