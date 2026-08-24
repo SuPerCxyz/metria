@@ -131,3 +131,23 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  windows:
+    name: Windows Agent 编译
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端
+        run: cd web && npm ci && npm audit --audit-level=high && npm test && npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 构建 Windows Agent
+        run: cargo build --release --workspace --bin metria

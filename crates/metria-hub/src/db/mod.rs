@@ -325,6 +325,7 @@ impl HubDb {
 
     /// 创建节点并预建 collector 与专属 token（同一事务）。
     /// 返回 (node_id, collector_id, 明文 token)。明文 token 仅此一次返回。
+    #[allow(clippy::too_many_arguments)]
     pub fn create_node(
         &self,
         name: &str,
@@ -332,6 +333,8 @@ impl HubDb {
         labels: Vec<String>,
         ip: Option<&str>,
         hub_url: Option<&str>,
+        platform: &str,
+        architecture: &str,
         now: DateTime<Utc>,
     ) -> Result<(String, String, String), StorageError> {
         let node_id = format!("node-{}", metria_core::model::Id::new());
@@ -343,9 +346,19 @@ impl HubDb {
             .map_err(|e| StorageError::Serde(format!("labels 序列化失败: {e}")))?;
         let tx = c.unchecked_transaction().map_err(StorageError::from)?;
         tx.execute(
-            "INSERT INTO nodes (id, name, description, labels, ip, hub_url, status, first_seen_at, last_seen_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7, ?7, ?7)",
-            params![node_id, name, description, labels_json, ip, hub_url, ts],
+            "INSERT INTO nodes (id, name, description, labels, ip, hub_url, platform, architecture, status, first_seen_at, last_seen_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?9, ?9, ?9)",
+            params![
+                node_id,
+                name,
+                description,
+                labels_json,
+                ip,
+                hub_url,
+                platform,
+                architecture,
+                ts
+            ],
         )
         .map_err(StorageError::from)?;
         tx.execute(
@@ -382,6 +395,8 @@ impl HubDb {
         labels: Vec<String>,
         ip: Option<&str>,
         hub_url: Option<&str>,
+        platform: Option<&str>,
+        architecture: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<bool, StorageError> {
         let c = self.conn();
@@ -389,8 +404,18 @@ impl HubDb {
             .map_err(|e| StorageError::Serde(format!("labels 序列化失败: {e}")))?;
         let n = c
             .execute(
-                "UPDATE nodes SET name = ?1, description = ?2, labels = ?3, ip = ?4, hub_url = ?5, updated_at = ?6 WHERE id = ?7",
-                params![name, description, labels_json, ip, hub_url, now.to_rfc3339(), node_id],
+                "UPDATE nodes SET name = ?1, description = ?2, labels = ?3, ip = ?4, hub_url = ?5, platform = COALESCE(?6, platform), architecture = COALESCE(?7, architecture), updated_at = ?8 WHERE id = ?9",
+                params![
+                    name,
+                    description,
+                    labels_json,
+                    ip,
+                    hub_url,
+                    platform,
+                    architecture,
+                    now.to_rfc3339(),
+                    node_id
+                ],
             )
             .map_err(StorageError::from)?;
         Ok(n > 0)

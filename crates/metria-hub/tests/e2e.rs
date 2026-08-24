@@ -285,6 +285,32 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(overview["calculated_cost_micro_usd"], 33218 + 11100);
     assert_eq!(overview["estimated_total_bytes"], 7000 + 4000);
 
+    // 图表图例隐藏维度后，汇总与时间序列都应排除对应 Agent/模型。
+    let excluded_overview: Value = ureq::get(&format!(
+        "{base}/api/v1/overview?from={from}&to={to}&exclude_client_ids=claude-code"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(excluded_overview["model_calls"], 0);
+    assert_eq!(excluded_overview["input_tokens"], 0);
+
+    let excluded_series: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/timeseries?from={from}&to={to}&dim=model&exclude_models=claude-sonnet-4.5"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(excluded_series["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|point| point["model_calls"] == 0));
+
     // sessions 列表
     let sessions: Value = ureq::get(&format!("{base}/api/v1/sessions?from={from}&to={to}"))
         .set("Authorization", &format!("Bearer {token}"))
@@ -807,9 +833,35 @@ async fn node_management_lifecycle() {
     assert!(docker_cmd.contains(node_id.as_str()));
     assert!(docker_cmd.contains("METRIA_AGENT_TOKEN="));
     assert!(docker_cmd.contains("ghcr.io/supercxyz/metria"));
-    assert!(docker_cmd.contains("METRIA_HUB_URL=http://203.0.113.10:8080"));
-    assert!(native_cmd.contains("api/v1/agent/download"));
+    assert!(docker_cmd.contains("METRIA_HUB_URL='http://203.0.113.10:8080'"));
+    assert!(native_cmd.contains(&format!("/api/v1/nodes/{node_id}/agent/download")));
+    assert!(!native_cmd.contains("Authorization"));
     assert!(inst["token"].as_str().unwrap().starts_with("mct-"));
+
+    // 前端环境地址可覆盖历史节点配置，下载命令不包含 token。
+    let dynamic: Value = ureq::get(&format!(
+        "{base}/api/v1/nodes/{node_id}/install?hub_url=http%3A%2F%2Ffrontend.example%3A8080"
+    ))
+    .set("Authorization", &auth)
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(dynamic["hub_url"], "http://frontend.example:8080");
+    assert!(dynamic["native_command"]
+        .as_str()
+        .unwrap()
+        .contains("http://frontend.example:8080"));
+
+    // 节点专属下载地址公开可读，按节点架构选择当前测试二进制。
+    let resp = ureq::get(&format!("{base}/api/v1/nodes/{node_id}/agent/download"))
+        .call()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/octet-stream")
+    );
 
     // 4) 用专属 token 注册 → 节点在线且名称保持为创建时设置值
     let reg: Value = ureq::post(&format!("{base}/api/v1/collectors/register"))
@@ -877,7 +929,7 @@ async fn node_management_lifecycle() {
         inst2["docker_command"]
             .as_str()
             .unwrap()
-            .contains("METRIA_HUB_URL=http://hub.internal:9090"),
+            .contains("METRIA_HUB_URL='http://hub.internal:9090'"),
         "显式 hub_url 应优先于节点 IP"
     );
 
@@ -999,9 +1051,7 @@ async fn node_management_errors() {
 async fn agent_download_returns_binary() {
     let dir = tempfile::tempdir().unwrap();
     let (base, _) = spawn_hub(dir.path()).await;
-    let token = admin_token(&base);
     let resp = ureq::get(&format!("{base}/api/v1/agent/download"))
-        .set("Authorization", &format!("Bearer {token}"))
         .call()
         .unwrap();
     assert_eq!(resp.status(), 200);

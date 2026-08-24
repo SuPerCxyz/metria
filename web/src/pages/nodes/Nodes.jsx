@@ -24,6 +24,7 @@ export default function Nodes() {
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const installPath = (id) => `/nodes/${encodeURIComponent(id)}/install?hub_url=${encodeURIComponent(window.location.origin)}`
 
   const query = useQuery('nodes-list', () => api('/nodes'))
   const usage = useQuery(`nodes-usage${q({ ...params, dim: 'node' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'node' })}`))
@@ -139,9 +140,9 @@ export default function Nodes() {
   function openInstall(r) {
     setBusy(true)
     setError(null)
-    api(`/nodes/${encodeURIComponent(r.id)}/install`)
+    api(installPath(r.id))
       .then((data) => {
-        setCreated({ node_id: data.node_id, name: data.name, token: data.token, hub_url: data.hub_url, docker_command: data.docker_command, native_command: data.native_command })
+        setCreated({ node_id: data.node_id, name: data.name, token: data.token, hub_url: data.hub_url, platform: data.platform, architecture: data.architecture, agent_asset: data.agent_asset, docker_command: data.docker_command, native_command: data.native_command })
       })
       .catch((e) => setError(e.message))
       .finally(() => setBusy(false))
@@ -151,7 +152,7 @@ export default function Nodes() {
     // 创建响应仅含一次性 token；命令由 install 端点生成（内含新签发的 active token）。
     setBusy(true)
     setError(null)
-    api(`/nodes/${encodeURIComponent(data.node_id)}/install`)
+    api(installPath(data.node_id))
       .then((inst) => {
         setCreated({ ...data, ...inst })
         setShowCreate(false)
@@ -187,6 +188,15 @@ function TextInput(props) {
   )
 }
 
+function SelectInput(props) {
+  return (
+    <select
+      {...props}
+      className="w-full text-sm rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-2 text-gray-800 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40"
+    />
+  )
+}
+
 function DialogShell({ title, onClose, children }) {
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-gray-900/50 backdrop-blur-sm px-4 py-8">
@@ -216,6 +226,8 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
   const [labels, setLabels] = useState('')
   const [nodeIp, setNodeIp] = useState('')
   const [hubUrl, setHubUrl] = useState(window.location.origin)
+  const [platform, setPlatform] = useState('linux')
+  const [architecture, setArchitecture] = useState('amd64')
 
   const submit = (e) => {
     e.preventDefault()
@@ -231,6 +243,8 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
         hub_url: hubUrl.trim() || undefined,
+        platform,
+        architecture,
       }),
     })
       .then((data) => onCreated(data))
@@ -262,7 +276,23 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
           <div>
             <Label>Hub 地址</Label>
             <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} placeholder="http://hub-host:8080" />
-            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">安装命令中的 Hub 地址，目标机需能访问。默认取当前页面地址（同源部署时正确）；若前端与 Hub 不同机（如开发模式 http://localhost:5173），请改为 Hub 后端实际地址（如 http://hub-host:8080）。留空则使用节点 IP 拼接 http://{'{ip}'}:8080。</p>
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">默认使用当前前端访问地址，安装命令会动态带入该地址；目标机必须能访问。</p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <Label>Agent 平台 *</Label>
+              <SelectInput value={platform} onChange={(e) => { setPlatform(e.target.value); if (e.target.value === 'windows') setArchitecture('amd64') }}>
+                <option value="linux">Linux</option>
+                <option value="windows">Windows</option>
+              </SelectInput>
+            </div>
+            <div>
+              <Label>Agent 架构 *</Label>
+              <SelectInput value={architecture} onChange={(e) => setArchitecture(e.target.value)}>
+                <option value="amd64">amd64 / x86_64</option>
+                {platform === 'linux' && <option value="arm64">arm64 / aarch64</option>}
+              </SelectInput>
+            </div>
           </div>
         </div>
         <FormError error={error} />
@@ -282,9 +312,12 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
 // ---------- 安装命令展示 ----------
 
 function InstallDialog({ data, onClose }) {
-  const [tab, setTab] = useState('docker')
+  const [tab, setTab] = useState(data.platform === 'windows' ? 'native' : 'docker')
   const [copied, setCopied] = useState(false)
   const command = tab === 'docker' ? data.docker_command : data.native_command
+  const tabs = data.platform === 'windows'
+    ? [{ key: 'native', label: 'PowerShell 安装' }]
+    : [{ key: 'docker', label: 'Docker 安装' }, { key: 'native', label: '原生安装' }]
 
   const copy = () => {
     const done = () => {
@@ -317,13 +350,10 @@ function InstallDialog({ data, onClose }) {
     <DialogShell title={`安装 Agent · ${data.name || data.node_id}`} onClose={onClose}>
       <div className="space-y-4">
         <div className="text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-400/10 rounded-lg px-3 py-2">
-          节点名称：<strong>{data.name || data.node_id}</strong> · 专属 Token 仅本次展示，请立即复制保存。
+          节点名称：<strong>{data.name || data.node_id}</strong> · 目标：{data.platform || 'linux'} / {data.architecture || 'amd64'} · 专属 Token 仅本次展示，请立即复制保存。
         </div>
         <div className="flex items-center gap-2">
-          {[
-            { key: 'docker', label: 'Docker 安装' },
-            { key: 'native', label: '原生安装' },
-          ].map((t) => (
+          {tabs.map((t) => (
             <button
               key={t.key}
               type="button"
@@ -341,7 +371,7 @@ function InstallDialog({ data, onClose }) {
           {command}
         </pre>
         <p className="text-xs text-gray-400 dark:text-gray-500">
-          目标机需可访问 <code className="font-mono">{data.hub_url}</code>，并确保客户端目录（Claude/Codex/OpenCode）只读可访问。
+          目标机需可访问 <code className="font-mono">{data.hub_url}</code>；二进制下载公开，无需 Token，Agent 启动后仍需使用专属 Token 注册 Hub。
         </p>
       </div>
     </DialogShell>
@@ -356,6 +386,8 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
   const [labels, setLabels] = useState(parseLabels(node.labels))
   const [nodeIp, setNodeIp] = useState(node.ip || '')
   const [hubUrl, setHubUrl] = useState(node.hub_url || window.location.origin)
+  const [platform, setPlatform] = useState(node.platform || 'linux')
+  const [architecture, setArchitecture] = useState(node.architecture === 'aarch64' ? 'arm64' : (node.architecture || 'amd64'))
 
   function parseLabels(v) {
     if (!v) return ''
@@ -381,6 +413,8 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
         hub_url: hubUrl.trim() || undefined,
+        platform,
+        architecture,
       }),
     })
       .then(() => onSaved())
@@ -411,6 +445,22 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
           <div>
             <Label>Hub 地址</Label>
             <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <Label>Agent 平台 *</Label>
+              <SelectInput value={platform} onChange={(e) => { setPlatform(e.target.value); if (e.target.value === 'windows') setArchitecture('amd64') }}>
+                <option value="linux">Linux</option>
+                <option value="windows">Windows</option>
+              </SelectInput>
+            </div>
+            <div>
+              <Label>Agent 架构 *</Label>
+              <SelectInput value={architecture} onChange={(e) => setArchitecture(e.target.value)}>
+                <option value="amd64">amd64 / x86_64</option>
+                {platform === 'linux' && <option value="arm64">arm64 / aarch64</option>}
+              </SelectInput>
+            </div>
           </div>
         </div>
         <FormError error={error} />

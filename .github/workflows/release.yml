@@ -1,7 +1,7 @@
 # Metria Release：打 tag（v*）时构建发布产物
 #
 # - 执行完整质量门禁并校验 tag 与 workspace 版本
-# - 编译 linux/amd64 与 linux/arm64 二进制并生成 SHA256SUMS
+# - 编译 linux/amd64、linux/arm64 与 Windows amd64 二进制并生成 SHA256SUMS
 # - 构建并推送多架构镜像到 ghcr.io/supercxyz/metria:<tag> 与 :latest
 # - 生成 SBOM（buildx provenance）
 
@@ -95,10 +95,35 @@ jobs:
           path: target/aarch64-unknown-linux-gnu/release/metria
           if-no-files-found: error
 
-      - name: 准备 arm64 发布文件并生成校验和
+      - name: 准备 arm64 发布文件
         run: |
           install -m 0755 target/aarch64-unknown-linux-gnu/release/metria dist/metria-linux-arm64
-          sha256sum dist/metria-linux-amd64 dist/metria-linux-arm64 > dist/SHA256SUMS
+
+      # ---- Windows amd64 二进制（交叉编译） ----
+      - name: 安装 Windows 交叉编译链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: 构建 Windows amd64 发布二进制
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo build --release --workspace --bin metria --target x86_64-pc-windows-gnu
+
+      - name: 上传 Windows amd64 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: metria-windows-amd64
+          path: target/x86_64-pc-windows-gnu/release/metria.exe
+          if-no-files-found: error
+
+      - name: 准备 Windows 发布文件并生成校验和
+        run: |
+          install -m 0755 target/x86_64-pc-windows-gnu/release/metria.exe dist/metria-windows-amd64.exe
+          sha256sum dist/metria-linux-amd64 dist/metria-linux-arm64 dist/metria-windows-amd64.exe > dist/SHA256SUMS
 
       - name: 上传校验和
         uses: actions/upload-artifact@v4
@@ -145,5 +170,6 @@ jobs:
           files: |
             dist/metria-linux-amd64
             dist/metria-linux-arm64
+            dist/metria-windows-amd64.exe
             dist/SHA256SUMS
           generate_release_notes: true

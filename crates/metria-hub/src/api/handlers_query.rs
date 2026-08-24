@@ -9,7 +9,9 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValue};
 
-use crate::api::{json_err, parse_range, range_args, range_filter, AppState, RangeParams};
+use crate::api::{
+    add_exclusions, json_err, parse_range, range_args, range_filter, AppState, RangeParams,
+};
 use crate::q;
 
 /// 会话闲置阈值：最后活跃超过该分钟数视为闲置。
@@ -373,6 +375,18 @@ fn range_filter_usage(p: &RangeParams) -> (String, Vec<SqlValue>) {
         args.push(v.clone().into());
         parts.push(format!("model_normalized = ?{}", args.len() + 2));
     }
+    add_exclusions(
+        &mut parts,
+        &mut args,
+        "client_id",
+        p.exclude_client_ids.as_deref(),
+    );
+    add_exclusions(
+        &mut parts,
+        &mut args,
+        "model_normalized",
+        p.exclude_models.as_deref(),
+    );
     if let Some(v) = &p.provider {
         args.push(v.clone().into());
         parts.push(format!("provider_normalized = ?{}", args.len() + 2));
@@ -392,7 +406,9 @@ fn prefix_usage_filter(filter: &str) -> String {
     filter
         .replace("node_id = ", "u.node_id = ")
         .replace("client_id = ", "u.client_id = ")
+        .replace("client_id NOT IN", "u.client_id NOT IN")
         .replace("model_normalized = ", "u.model_normalized = ")
+        .replace("model_normalized NOT IN", "u.model_normalized NOT IN")
         .replace("provider_normalized = ", "u.provider_normalized = ")
 }
 

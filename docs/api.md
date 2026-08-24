@@ -1,6 +1,6 @@
 # Hub API 参考
 
-所有 API 前缀 `/api/v1`。除 `/healthz`、`/api/v1/auth/login`、`/api/v1/share/{slug}` 外均需认证。
+所有 API 前缀 `/api/v1`。除 `/healthz`、`/api/v1/auth/login`、`/api/v1/share/{slug}` 和 Agent 二进制下载接口外均需认证。
 
 ## 认证
 
@@ -26,6 +26,8 @@
 ## 查询
 
 通用参数：`from/to/timezone/granularity/allocation_mode` + 维度过滤 + 分页（`limit`）。
+分析图表支持用逗号分隔的 `exclude_client_ids` / `exclude_models` 排除多个 Agent 或模型；
+适用于 `/overview`、`/usage/timeseries`、`/usage/breakdown` 和 `/usage/latency*`，用于图例隐藏后的联动统计。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -33,6 +35,9 @@
 | GET | `/usage/timeseries` | Token/Cost/Traffic 时间序列 |
 | GET | `/usage/breakdown` | 按 Node 汇总 |
 | GET | `/nodes` `/nodes/{id}` | Node 列表 / 详情 |
+| GET | `/nodes/{id}/install` | Admin 生成节点专属 Token、动态 Hub 地址和平台安装命令；可传 `hub_url` 查询参数覆盖当前地址 |
+| GET | `/nodes/{id}/agent/download` | 公开下载该节点平台/架构对应的 Agent 二进制，不接收 Token；当前 Hub 未配置目标资产时返回 501 |
+| GET | `/agent/download` | 公开下载当前 Hub 架构的 Agent 二进制（兼容入口） |
 | GET | `/nodes/{id}/clients` `/sessions` `/calls` | Node 下的来源/会话/调用 |
 | GET | `/clients` `/clients/{id}` `/clients/{id}/models` | Client 列表/详情/模型 |
 | GET | `/models` `/models/{id}` | 模型列表/详情 |

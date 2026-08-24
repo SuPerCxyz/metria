@@ -117,6 +117,10 @@ pub fn app_router(state: AppState) -> Router {
         )
         .route("/api/v1/nodes/{id}/install", get(node_install))
         .route("/api/v1/agent/download", get(agent_download))
+        .route(
+            "/api/v1/nodes/{id}/agent/download",
+            get(agent_download_for_node),
+        )
         .route("/api/v1/nodes", post(node_create))
         .route("/api/v1/nodes/{id}/clients", get(node_clients))
         .route("/api/v1/nodes/{id}/sessions", get(node_sessions))
@@ -194,7 +198,13 @@ async fn auth_mw(
     // 忽略 next 的显式绑定：Next 通过闭包调用保持生命周期正确
     let _ = &next;
     let path = req.uri().path().to_string();
-    if path == "/healthz" || path == "/api/v1/auth/login" || path.starts_with("/api/v1/share/") {
+    let public_agent_download = path == "/api/v1/agent/download"
+        || (path.starts_with("/api/v1/nodes/") && path.ends_with("/agent/download"));
+    if path == "/healthz"
+        || path == "/api/v1/auth/login"
+        || path.starts_with("/api/v1/share/")
+        || public_agent_download
+    {
         return next.run(req).await;
     }
     let headers = req.headers().clone();
@@ -390,6 +400,9 @@ pub struct RangeParams {
     pub node_id: Option<String>,
     pub client_id: Option<String>,
     pub model: Option<String>,
+    /// 以逗号分隔的 Agent/模型排除列表，用于分析图表图例隐藏维度后的联动统计。
+    pub exclude_client_ids: Option<String>,
+    pub exclude_models: Option<String>,
     pub provider: Option<String>,
     pub project_id: Option<String>,
     pub limit: Option<i64>,
@@ -433,6 +446,13 @@ pub(crate) fn range_filter(p: &RangeParams) -> (String, Vec<SqlValue>) {
         args.push(v.clone().into());
         parts.push(format!("model = ?{}", args.len() + 2));
     }
+    add_exclusions(
+        &mut parts,
+        &mut args,
+        "client_id",
+        p.exclude_client_ids.as_deref(),
+    );
+    add_exclusions(&mut parts, &mut args, "model", p.exclude_models.as_deref());
     if let Some(v) = &p.provider {
         args.push(v.clone().into());
         parts.push(format!("provider = ?{}", args.len() + 2));
@@ -443,6 +463,32 @@ pub(crate) fn range_filter(p: &RangeParams) -> (String, Vec<SqlValue>) {
         format!(" AND {}", parts.join(" AND "))
     };
     (cond, args)
+}
+
+pub(crate) fn add_exclusions(
+    parts: &mut Vec<String>,
+    args: &mut Vec<SqlValue>,
+    column: &str,
+    values: Option<&str>,
+) {
+    let values: Vec<&str> = values
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+    let placeholders = values
+        .iter()
+        .map(|value| {
+            args.push((*value).to_string().into());
+            format!("?{}", args.len() + 2)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    parts.push(format!("{column} NOT IN ({placeholders})"));
 }
 
 pub(crate) fn range_args(
@@ -1142,5 +1188,20 @@ mod auth_tests {
         // 篡改 token 应校验失败
         assert_eq!(verify_session(&format!("{tok}x")), None);
         assert_eq!(verify_session("sess.garbage"), None);
+    }
+
+    #[test]
+    fn excluded_dimensions_use_parameterized_not_in_filters() {
+        let params = RangeParams {
+            exclude_client_ids: Some("codex, opencode".into()),
+            exclude_models: Some("model-a,model-b".into()),
+            ..RangeParams::default()
+        };
+        let (filter, args) = range_filter(&params);
+        assert!(filter.contains("client_id NOT IN (?3, ?4)"));
+        assert!(filter.contains("model NOT IN (?5, ?6)"));
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "codex".to_string().into());
+        assert_eq!(args[3], "model-b".to_string().into());
     }
 }

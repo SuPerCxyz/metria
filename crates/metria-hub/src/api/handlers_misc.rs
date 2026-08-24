@@ -1,8 +1,8 @@
 //! 补充 handlers：Traffic Profiles / Pricing / Share / Export。
 
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -572,6 +572,105 @@ pub(crate) async fn export_data(
 
 // ============ 节点管理（前端创建 / 安装命令 / 编辑 / 删除） ============
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentTarget {
+    pub platform: &'static str,
+    pub architecture: &'static str,
+    pub asset: &'static str,
+}
+
+/// 归一化节点安装目标，避免把 x86_64/arm64 等别名直接拼进资产名。
+pub(crate) fn normalize_agent_target(
+    platform: Option<&str>,
+    architecture: Option<&str>,
+) -> Result<AgentTarget, String> {
+    let platform = platform.unwrap_or("linux").trim().to_ascii_lowercase();
+    let architecture = architecture.unwrap_or("amd64").trim().to_ascii_lowercase();
+    let architecture = match architecture.as_str() {
+        "amd64" | "x86_64" | "x64" => "amd64",
+        "arm64" | "aarch64" => "arm64",
+        other => return Err(format!("不支持的 Agent 架构: {other}")),
+    };
+    match platform.as_str() {
+        "linux" => Ok(AgentTarget {
+            platform: "linux",
+            architecture,
+            asset: match architecture {
+                "amd64" => "metria-linux-amd64",
+                "arm64" => "metria-linux-arm64",
+                _ => unreachable!(),
+            },
+        }),
+        "windows" | "win" => {
+            if architecture != "amd64" {
+                return Err("Windows Agent 当前仅支持 amd64".into());
+            }
+            Ok(AgentTarget {
+                platform: "windows",
+                architecture: "amd64",
+                asset: "metria-windows-amd64.exe",
+            })
+        }
+        other => Err(format!("不支持的 Agent 平台: {other}")),
+    }
+}
+
+fn current_agent_target() -> AgentTarget {
+    normalize_agent_target(Some(std::env::consts::OS), Some(std::env::consts::ARCH))
+        .expect("当前构建目标必须是受支持的 Agent 平台")
+}
+
+fn target_from_node(node: &serde_json::Value) -> Result<AgentTarget, String> {
+    normalize_agent_target(
+        node.get("platform").and_then(|v| v.as_str()),
+        node.get("architecture").and_then(|v| v.as_str()),
+    )
+}
+
+fn normalize_hub_url(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn hub_url_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if let Some(origin) = normalize_hub_url(origin) {
+            return Some(origin);
+        }
+    }
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| matches!(*v, "http" | "https"))
+        .unwrap_or("http");
+    normalize_hub_url(&format!("{scheme}://{host}"))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// 创建节点请求。
 #[derive(Deserialize)]
 pub(crate) struct NodeCreateRequest {
@@ -584,6 +683,10 @@ pub(crate) struct NodeCreateRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub hub_url: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub architecture: Option<String>,
 }
 
 /// 更新节点请求。
@@ -598,6 +701,10 @@ pub(crate) struct NodeUpdateRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub hub_url: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub architecture: Option<String>,
 }
 
 /// 校验节点 IP：合法 IPv4/IPv6（含端口）、或常见主机名（字母数字、点、横线）。
@@ -658,13 +765,33 @@ pub(crate) async fn node_create(
     if req.labels.len() > 50 {
         return json_err(StatusCode::BAD_REQUEST, "bad_labels", "labels 数量过多");
     }
+    let hub_url = match req.hub_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => match normalize_hub_url(value) {
+            Some(value) => Some(value),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_hub_url",
+                    "Hub 地址必须是合法的 http/https 地址",
+                )
+            }
+        },
+        _ => None,
+    };
+    let target = match normalize_agent_target(req.platform.as_deref(), req.architecture.as_deref())
+    {
+        Ok(target) => target,
+        Err(message) => return json_err(StatusCode::BAD_REQUEST, "bad_agent_target", &message),
+    };
     let now = Utc::now();
     match st.db.create_node(
         name,
         req.description.as_deref(),
         req.labels,
         Some(ip),
-        req.hub_url.as_deref(),
+        hub_url.as_deref(),
+        target.platform,
+        target.architecture,
         now,
     ) {
         Ok((node_id, collector_id, token)) => Json(serde_json::json!({
@@ -674,7 +801,9 @@ pub(crate) async fn node_create(
             "name": name,
             "token": token,
             "ip": ip,
-            "hub_url": req.hub_url,
+            "hub_url": hub_url,
+            "platform": target.platform,
+            "architecture": target.architecture,
         }))
         .into_response(),
         Err(e) => json_err(
@@ -706,13 +835,36 @@ pub(crate) async fn node_update(
             "节点 IP 必须为合法 IPv4/IPv6 或主机名",
         );
     }
+    let hub_url = match req.hub_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => match normalize_hub_url(value) {
+            Some(value) => Some(value),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_hub_url",
+                    "Hub 地址必须是合法的 http/https 地址",
+                )
+            }
+        },
+        _ => None,
+    };
+    let target = if req.platform.is_some() || req.architecture.is_some() {
+        match normalize_agent_target(req.platform.as_deref(), req.architecture.as_deref()) {
+            Ok(target) => Some(target),
+            Err(message) => return json_err(StatusCode::BAD_REQUEST, "bad_agent_target", &message),
+        }
+    } else {
+        None
+    };
     match st.db.update_node(
         &id,
         name,
         req.description.as_deref(),
         req.labels,
         Some(ip),
-        req.hub_url.as_deref(),
+        hub_url.as_deref(),
+        target.map(|value| value.platform),
+        target.map(|value| value.architecture),
         Utc::now(),
     ) {
         Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -742,16 +894,46 @@ pub(crate) async fn node_delete(
 }
 
 /// 生成 Docker 安装命令模板（含 node_id / hub_url / token / 客户端只读挂载）。
-fn docker_install_command(node_id: &str, hub_url: &str, token: &str) -> String {
+fn docker_install_command(
+    node_id: &str,
+    hub_url: &str,
+    token: &str,
+    target: AgentTarget,
+) -> String {
+    if target.platform == "windows" {
+        return "Windows Agent 请使用“原生安装”PowerShell 命令；当前 Docker Agent 镜像仅支持 Linux。".into();
+    }
     format!(
-        "docker run -d --name metria-agent --restart unless-stopped\n  -e METRIA_NODE_ID={node_id}\n  -e METRIA_HUB_URL={hub_url}\n  -e METRIA_AGENT_TOKEN={token}\n  -e METRIA_CLAUDE_PATH=/sources/claude\n  -e METRIA_CODEX_PATH=/sources/codex\n  -e METRIA_OPENCODE_PATH=/sources/opencode\n  -v $HOME/.claude:/sources/claude:ro\n  -v $HOME/.codex:/sources/codex:ro\n  -v $HOME/.local/share/opencode:/sources/opencode:ro\n  -v metria-agent-data:/data\n  ghcr.io/supercxyz/metria:latest agent"
+        "docker run -d --name metria-agent --restart unless-stopped\n  -e METRIA_NODE_ID={}\n  -e METRIA_HUB_URL={}\n  -e METRIA_AGENT_TOKEN={}\n  -e METRIA_CLAUDE_PATH=/sources/claude\n  -e METRIA_CODEX_PATH=/sources/codex\n  -e METRIA_OPENCODE_PATH=/sources/opencode\n  -v $HOME/.claude:/sources/claude:ro\n  -v $HOME/.codex:/sources/codex:ro\n  -v $HOME/.local/share/opencode:/sources/opencode:ro\n  -v metria-agent-data:/data\n  ghcr.io/supercxyz/metria:latest agent",
+        shell_quote(node_id),
+        shell_quote(hub_url),
+        shell_quote(token)
     )
 }
 
-/// 生成原生安装命令模板：下载 Hub 自供二进制 + 后台运行。
-fn native_install_command(node_id: &str, hub_url: &str, token: &str) -> String {
+/// 生成原生安装命令模板：公开下载对应节点平台/架构的二进制，运行时仍需 Agent Token。
+fn native_install_command(
+    node_id: &str,
+    hub_url: &str,
+    token: &str,
+    target: AgentTarget,
+) -> String {
+    let download_url = format!("{hub_url}/api/v1/nodes/{node_id}/agent/download");
+    if target.platform == "windows" {
+        return format!(
+            "$ErrorActionPreference = 'Stop'\n\n# 1) 下载 Windows Agent（公开下载，无需 Token）\nInvoke-WebRequest -UseBasicParsing -Uri {} -OutFile 'metria.exe'\n\n# 2) 配置并启动 Agent\n$env:METRIA_NODE_ID = {}\n$env:METRIA_HUB_URL = {}\n$env:METRIA_AGENT_TOKEN = {}\n$env:METRIA_CLAUDE_PATH = \"$env:USERPROFILE\\.claude\"\n$env:METRIA_CODEX_PATH = \"$env:USERPROFILE\\.codex\"\n$env:METRIA_OPENCODE_PATH = \"$env:LOCALAPPDATA\\opencode\"\nStart-Process -FilePath '.\\metria.exe' -ArgumentList 'agent' -NoNewWindow\n\n# 运行时 Token 仅用于 Agent 注册和上传，不用于下载",
+            powershell_quote(&download_url),
+            powershell_quote(node_id),
+            powershell_quote(hub_url),
+            powershell_quote(token)
+        );
+    }
     format!(
-        "# 1) 下载 metria 二进制（需 Admin 会话；或直接 docker cp 自镜像提取）\ncurl -fsSL {hub_url}/api/v1/agent/download -o metria && chmod +x metria\n\n# 2) 后台运行 Agent\nMETRIA_NODE_ID={node_id} \\\n  METRIA_HUB_URL={hub_url} \\\n  METRIA_AGENT_TOKEN={token} \\\n  METRIA_CLAUDE_PATH=$HOME/.claude \\\n  METRIA_CODEX_PATH=$HOME/.codex \\\n  METRIA_OPENCODE_PATH=$HOME/.local/share/opencode \\\n  nohup ./metria agent >> metria-agent.log 2>&1 &\n\n# 生产建议：使用 systemd 服务管理（见 docs/deployment.md）"
+        "# 1) 下载 Linux Agent（公开下载，无需 Token）\ncurl -fsSL {} -o metria && chmod +x metria\n\n# 2) 配置并后台运行 Agent\nexport METRIA_NODE_ID={}\nexport METRIA_HUB_URL={}\nexport METRIA_AGENT_TOKEN={}\nexport METRIA_CLAUDE_PATH=\"$HOME/.claude\"\nexport METRIA_CODEX_PATH=\"$HOME/.codex\"\nexport METRIA_OPENCODE_PATH=\"$HOME/.local/share/opencode\"\nnohup ./metria agent >> metria-agent.log 2>&1 &\n\n# 运行时 Token 仅用于 Agent 注册和上传，不用于下载\n# 生产建议：使用 systemd 服务管理（见 docs/deployment.md）",
+        shell_quote(&download_url),
+        shell_quote(node_id),
+        shell_quote(hub_url),
+        shell_quote(token)
     )
 }
 
@@ -759,6 +941,8 @@ fn native_install_command(node_id: &str, hub_url: &str, token: &str) -> String {
 pub(crate) async fn node_install(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<NodeInstallQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(node) = st.db.get_node(&id) else {
         return json_err(StatusCode::NOT_FOUND, "not_found", "节点不存在");
@@ -776,53 +960,90 @@ pub(crate) async fn node_install(
             );
         }
     };
-    // hub_url：优先使用创建/编辑节点时持久化的 hub_url；否则用节点 ip 拼接
-    // （支持 Hub 在内网、公网 Agent 回连场景）；两者皆缺省用占位提示。
-    let hub_url = node
-        .get("hub_url")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            node.get("ip")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|ip| format!("http://{ip}:8080"))
-        })
-        .unwrap_or_else(|| "http://<hub-host>:8080".to_string());
+    let target = match target_from_node(&node) {
+        Ok(target) => target,
+        Err(message) => return json_err(StatusCode::CONFLICT, "bad_agent_target", &message),
+    };
+    // 前端传入当前环境 origin 优先，避免节点历史配置或占位 host 生成不可用命令。
+    let hub_url = if let Some(value) = query.hub_url.as_deref() {
+        match normalize_hub_url(value) {
+            Some(value) => Some(value),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_hub_url",
+                    "Hub 地址必须是合法的 http/https 地址",
+                )
+            }
+        }
+    } else {
+        node.get("hub_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .and_then(normalize_hub_url)
+            .or_else(|| {
+                node.get("ip")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|ip| format!("http://{ip}:8080"))
+            })
+            .or_else(|| hub_url_from_headers(&headers))
+    };
+    let Some(hub_url) = hub_url else {
+        return json_err(
+            StatusCode::CONFLICT,
+            "hub_url_unavailable",
+            "无法确定 Hub 地址，请从当前 Hub 页面重新生成安装命令",
+        );
+    };
     Json(serde_json::json!({
         "node_id": id,
         "name": node.get("name"),
         "hub_url": hub_url,
+        "platform": target.platform,
+        "architecture": target.architecture,
+        "agent_asset": target.asset,
         "token": token,
-        "docker_command": docker_install_command(&id, &hub_url, &token),
-        "native_command": native_install_command(&id, &hub_url, &token),
+        "docker_command": docker_install_command(&id, &hub_url, &token, target),
+        "native_command": native_install_command(&id, &hub_url, &token, target),
     }))
     .into_response()
 }
 
-/// 下载 Hub 自身二进制（metria 单二进制，含 agent 子命令）。
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct NodeInstallQuery {
+    pub hub_url: Option<String>,
+}
+
+fn binary_response(bytes: Vec<u8>, filename: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| {
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "download_failed",
+                &e.to_string(),
+            )
+        })
+}
+
+fn binary_from_configured_dir(asset: &str) -> Option<Vec<u8>> {
+    let dir = std::env::var("METRIA_AGENT_BINARIES_DIR").ok()?;
+    std::fs::read(std::path::Path::new(&dir).join(asset)).ok()
+}
+
+/// 下载 Hub 当前架构二进制（公开接口，兼容旧命令）。
 pub(crate) async fn agent_download(State(_st): State<AppState>) -> Response {
+    let target = current_agent_target();
     match std::env::current_exe() {
         Ok(path) => match std::fs::read(&path) {
-            Ok(bytes) => {
-                let body = axum::body::Body::from(bytes);
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
-                    .header(
-                        axum::http::header::CONTENT_DISPOSITION,
-                        "attachment; filename=\"metria\"",
-                    )
-                    .body(body)
-                    .unwrap_or_else(|e| {
-                        json_err(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "download_failed",
-                            &e.to_string(),
-                        )
-                    })
-            }
+            Ok(bytes) => binary_response(bytes, target.asset),
             Err(e) => json_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "download_failed",
@@ -837,9 +1058,61 @@ pub(crate) async fn agent_download(State(_st): State<AppState>) -> Response {
     }
 }
 
+/// 根据节点登记的平台/架构下载对应 Agent 二进制；接口公开但只读节点元数据。
+pub(crate) async fn agent_download_for_node(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Some(node) = st.db.get_node(&id) else {
+        return json_err(StatusCode::NOT_FOUND, "not_found", "节点不存在");
+    };
+    let target = match target_from_node(&node) {
+        Ok(target) => target,
+        Err(message) => return json_err(StatusCode::CONFLICT, "bad_agent_target", &message),
+    };
+    let current = current_agent_target();
+    if target == current {
+        return match std::env::current_exe() {
+            Ok(path) => match std::fs::read(path) {
+                Ok(bytes) => binary_response(bytes, target.asset),
+                Err(e) => json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "download_failed",
+                    &e.to_string(),
+                ),
+            },
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "download_failed",
+                &e.to_string(),
+            ),
+        };
+    }
+    if let Some(bytes) = binary_from_configured_dir(target.asset) {
+        return binary_response(bytes, target.asset);
+    }
+    if let Ok(base) = std::env::var("METRIA_AGENT_DOWNLOAD_BASE_URL") {
+        let base = base.trim_end_matches('/');
+        if !base.is_empty() {
+            return Redirect::temporary(&format!("{base}/{}", target.asset)).into_response();
+        }
+    }
+    json_err(
+        StatusCode::NOT_IMPLEMENTED,
+        "agent_binary_unavailable",
+        &format!(
+            "当前 Hub 未配置目标架构二进制 `{}`；请设置 METRIA_AGENT_BINARIES_DIR 或 METRIA_AGENT_DOWNLOAD_BASE_URL",
+            target.asset
+        ),
+    )
+}
+
 #[cfg(test)]
 mod pricing_rule_validation_tests {
-    use super::validate_pricing_rule;
+    use super::{
+        docker_install_command, native_install_command, normalize_agent_target,
+        validate_pricing_rule,
+    };
     use serde_json::json;
 
     #[test]
@@ -866,5 +1139,57 @@ mod pricing_rule_validation_tests {
     fn update_can_change_only_enabled_state() {
         let result = validate_pricing_rule(&json!({"enabled": false}), false, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn normalizes_supported_agent_targets() {
+        assert_eq!(
+            normalize_agent_target(Some("linux"), Some("x86_64"))
+                .unwrap()
+                .asset,
+            "metria-linux-amd64"
+        );
+        assert_eq!(
+            normalize_agent_target(Some("linux"), Some("aarch64"))
+                .unwrap()
+                .asset,
+            "metria-linux-arm64"
+        );
+        assert_eq!(
+            normalize_agent_target(Some("windows"), Some("amd64"))
+                .unwrap()
+                .asset,
+            "metria-windows-amd64.exe"
+        );
+        assert!(normalize_agent_target(Some("windows"), Some("arm64")).is_err());
+    }
+
+    #[test]
+    fn install_commands_keep_download_public_and_runtime_token_private() {
+        let target = normalize_agent_target(Some("linux"), Some("amd64")).unwrap();
+        let native = native_install_command(
+            "node-test",
+            "https://hub.example",
+            "mct-runtime-token",
+            target,
+        );
+        assert!(native.contains("/api/v1/nodes/node-test/agent/download"));
+        assert!(!native.contains("Authorization"));
+        assert!(native.contains("METRIA_AGENT_TOKEN"));
+
+        let windows = normalize_agent_target(Some("windows"), Some("amd64")).unwrap();
+        let powershell = native_install_command(
+            "node-win",
+            "https://hub.example",
+            "mct-runtime-token",
+            windows,
+        );
+        assert!(powershell.contains("Invoke-WebRequest"));
+        assert!(powershell.contains("metria.exe"));
+        assert!(!powershell.contains("Authorization"));
+        assert!(
+            docker_install_command("node-win", "https://hub.example", "token", windows)
+                .contains("PowerShell")
+        );
     }
 }

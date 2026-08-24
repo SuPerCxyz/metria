@@ -144,4 +144,9 @@
     border-color: var(--color-gray-200, currentColor);
   }
 }
+
+/* 内容高度在页面、Tab 或异步数据切换时变化，始终保留滚动条槽位，避免横向布局跳动。 */
+.app-scroll-container {
+  scrollbar-gutter: stable;
+}
 /* build-cache-test */

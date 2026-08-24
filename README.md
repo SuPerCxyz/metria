@@ -34,7 +34,7 @@ AI 编程 Agent（Claude Code / Codex / OpenCode）的 Token、费用和网络�
 
 ## 快速开始
 
-前置：Linux amd64/arm64 + Docker + Docker Compose。
+前置：Hub 使用 Linux amd64/arm64 + Docker + Docker Compose；Agent 原生运行支持 Linux amd64/arm64 与 Windows amd64。
 
 ```bash
 # 1. 准备环境变量（含 Admin 初始密码与可选客户端目录）
@@ -54,7 +54,7 @@ docker compose -f docker/compose.agent.yaml up -d
 
 ### 在 Web 端添加节点（推荐）
 
-节点页点击「添加节点」，填写名称与 Hub 地址后，页面生成一次性专属 Token 与 **Docker / 原生** 两种安装命令；在目标机运行命令即可接入（Token 仅本次展示，Hub 只存哈希）。节点信息可在 Web 端编辑/删除，历史用量数据保留。详见 `docs/deployment.md`。
+节点页点击「添加节点」，填写名称、平台、架构与 Hub 地址后，页面生成一次性专属 Token 与 **Docker / 原生** 安装命令；二进制公开下载，Token 仅用于 Agent 注册和上传。节点信息可在 Web 端编辑/删除，历史用量数据保留。详见 `docs/deployment.md`。
 
 ## 容器
 

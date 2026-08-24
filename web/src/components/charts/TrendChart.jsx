@@ -15,7 +15,7 @@ function downsample(data, maxPoints = 240) {
 
 const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
 
-export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图' }) {
+export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
 
@@ -25,7 +25,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
     if (chartRef.current) chartRef.current.destroy()
 
     const ds = datasets
-      ? datasets.map((d, i) => ({ label: d.label || '', values: d.values || [], color: d.color || PALETTE[i % PALETTE.length], fill: d.fill ?? true }))
+      ? datasets.map((d, i) => ({ label: d.label || '', values: d.values || [], color: d.color || PALETTE[i % PALETTE.length], fill: d.fill ?? true, hidden: d.hidden ?? false }))
       : [{ label: '', values: values || [], color, fill: true }]
 
     // 按下采样后的索引对齐 labels 与所有数据集
@@ -39,6 +39,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
         borderColor: d.color,
         backgroundColor: `${d.color}18`,
         fill: d.fill,
+        hidden: d.hidden,
         tension: 0.3,
         borderWidth: 2,
         pointRadius: 0,
@@ -58,6 +59,15 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
           legend: {
             display: ds.length > 1 || ds.some((d) => d.label),
             labels: { color: '#9ca3af', boxWidth: 12, font: { size: 11 }, usePointStyle: true, padding: 12 },
+            ...(onLegendClick ? {
+              onClick: (_event, legendItem, legend) => {
+                const datasetIndex = legendItem.datasetIndex
+                const dataset = ds[datasetIndex]
+                legend.chart.setDatasetVisibility(datasetIndex, !legend.chart.isDatasetVisible(datasetIndex))
+                legend.chart.update()
+                if (dataset?.label) onLegendClick(dataset.label)
+              },
+            } : {}),
           },
           tooltip: {
             callbacks: {
@@ -83,7 +93,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
     })
     chartRef.current = chart
     return () => { if (chartRef.current) chartRef.current.destroy() }
-  }, [labels, datasets, values, tooltipLabels, color, height]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [labels, datasets, values, tooltipLabels, color, height, onLegendClick])
 
   return <div style={{ height }}><canvas ref={ref} role="img" aria-label={`${ariaLabel}，共 ${labels?.length || 0} 个数据点`} /></div>
 }

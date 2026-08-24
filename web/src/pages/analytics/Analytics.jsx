@@ -1,6 +1,6 @@
 // 使用分析：Token / 请求 / 缓存 / 延迟 标签切换。
 
-import React, { useMemo, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
@@ -19,6 +19,8 @@ const TABS = [
   { key: 'requests', label: '请求' },
   { key: 'cache', label: '缓存' },
   { key: 'latency', label: '延迟' },
+  { key: 'agent-detail', label: '按 Agent' },
+  { key: 'model-detail', label: '按模型' },
 ]
 
 export default function Analytics() {
@@ -26,15 +28,34 @@ export default function Analytics() {
   const navigate = useNavigate()
   const params = rangeParams(range)
   const [tab, setTab] = useState('tokens')
-  const [trendTab, setTrendTab] = useState('tokens')
+  const trendTab = 'tokens'
+  const [hiddenByDimension, setHiddenByDimension] = useState({ client: [], model: [] })
+  const [detailMetric, setDetailMetric] = useState('tokens')
+  const detailMode = tab === 'agent-detail' || tab === 'model-detail'
+  const detailDimension = tab === 'agent-detail' ? 'client' : 'model'
+  const hiddenDimensions = hiddenByDimension[detailDimension]
+  const excludedParams = detailMode
+    ? detailDimension === 'client'
+      ? { exclude_client_ids: hiddenDimensions.join(',') || undefined }
+      : { exclude_models: hiddenDimensions.join(',') || undefined }
+    : {}
+  const scopedParams = detailMode
+    ? { ...params, ...excludedParams }
+    : params
+  const detailSeriesParams = { ...params, dim: detailDimension }
 
-  const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
-  const series = useQuery(`ts${q(params)}`, () => api(`/usage/timeseries${q(params)}`))
+  const overview = useQuery(`overview${q(scopedParams)}`, () => api(`/overview${q(scopedParams)}`))
+  const series = useQuery(`ts${q(scopedParams)}`, () => api(`/usage/timeseries${q(scopedParams)}`))
   const byModel = useQuery(`breakdown${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`bclient${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
   const byNode = useQuery(`bnode${q({ ...params, dim: 'node' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'node' })}`))
-  const latency = useQuery(`latency${q(params)}`, () => api(`/usage/latency${q(params)}`))
-  const latencySeries = useQuery(`latency-ts${q(params)}`, () => api(`/usage/latency/timeseries${q(params)}`))
+  const detailSeries = useQuery(
+    `detail-ts${q(detailSeriesParams)}`,
+    () => api(`/usage/timeseries${q(detailSeriesParams)}`),
+    { enabled: detailMode }
+  )
+  const latency = useQuery(`latency${q(scopedParams)}`, () => api(`/usage/latency${q(scopedParams)}`))
+  const latencySeries = useQuery(`latency-ts${q(scopedParams)}`, () => api(`/usage/latency/timeseries${q(scopedParams)}`))
   const nodeNames = useNodeNames()
 
   const latencyTrend = useMemo(() => {
@@ -61,8 +82,44 @@ export default function Analytics() {
     }
   }, [series.data, trendTab])
 
-  if (overview.error) return <ErrorState error={overview.error} onRetry={overview.refresh} />
-  if (overview.loading) return <LoadingSkeleton rows={6} />
+  const detailTrend = useMemo(() => {
+    const points = detailSeries.data?.series || []
+    const labels = [...new Set(points.map((p) => p.bucket))]
+    const dimensions = [...new Set(points.map((p) => p.dimension).filter(Boolean))].slice(0, 8)
+    const valueOf = (point) => {
+      switch (detailMetric) {
+        case 'requests': return point?.model_calls ?? 0
+        case 'cost': return point?.cost_micro_usd ?? 0
+        case 'traffic': return point?.estimated_traffic_bytes ?? 0
+        default: return (point?.input_tokens ?? 0) + (point?.output_tokens ?? 0) + (point?.cache_read_tokens ?? 0)
+      }
+    }
+    const pointMap = new Map(points.map((point) => [String(point.dimension) + '|' + String(point.bucket), point]))
+    return {
+      labels,
+      datasets: dimensions.map((dimension, index) => ({
+        label: dimension,
+        values: labels.map((label) => valueOf(pointMap.get(String(dimension) + '|' + String(label)))),
+        color: DETAIL_COLORS[index % DETAIL_COLORS.length],
+        hidden: hiddenDimensions.includes(dimension),
+      })),
+    }
+  }, [detailMetric, detailSeries.data, hiddenDimensions])
+
+  const toggleHiddenDimension = useCallback((dimension) => {
+    setHiddenByDimension((current) => {
+      const hidden = current[detailDimension] || []
+      return {
+        ...current,
+        [detailDimension]: hidden.includes(dimension)
+          ? hidden.filter((item) => item !== dimension)
+          : [...hidden, dimension],
+      }
+    })
+  }, [detailDimension])
+
+  if (overview.error && !overview.data) return <ErrorState error={overview.error} onRetry={overview.refresh} />
+  if (overview.loading && !overview.data) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
 
   const cacheHitRate = o.input_tokens > 0 ? o.cache_read_tokens / (o.input_tokens + o.cache_read_tokens) : 0
@@ -134,6 +191,21 @@ export default function Analytics() {
         </>
       )}
 
+      {detailMode && (
+        <DetailAnalysis
+          tab={tab}
+          metric={detailMetric}
+          onMetricChange={setDetailMetric}
+          overview={o}
+          loading={detailSeries.loading}
+          error={detailSeries.error}
+          onRetry={detailSeries.refresh}
+          trend={detailTrend}
+          latency={latency.data}
+          onToggleDimension={toggleHiddenDimension}
+        />
+      )}
+
       {tab === 'latency' && (
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">延迟分析</h2>
@@ -171,6 +243,70 @@ export default function Analytics() {
           )}
         </div>
       )}
+    </>
+  )
+}
+
+const DETAIL_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
+
+function DetailAnalysis({
+  tab,
+  metric,
+  onMetricChange,
+  overview,
+  loading,
+  error,
+  onRetry,
+  trend,
+  latency,
+  onToggleDimension,
+}) {
+  const metricItems = [
+    { key: 'tokens', label: 'Token' },
+    { key: 'requests', label: '请求' },
+    { key: 'cost', label: '费用' },
+    { key: 'traffic', label: '流量' },
+  ]
+  const formatY = metric === 'cost'
+    ? fmtUsd
+    : metric === 'traffic'
+      ? fmtBytes
+      : metric === 'requests'
+        ? (value) => value.toLocaleString()
+        : fmtTokensShort
+  const title = tab === 'agent-detail' ? '按 Agent 详细分析' : '按模型详细分析'
+  const chartTitle = tab === 'agent-detail' ? 'Agent 趋势对比' : '模型趋势对比'
+
+  return (
+    <>
+      <div className="grid grid-cols-12 gap-6">
+        <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />
+        <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} sub={`会话 ${fmtTokensShort(overview.sessions)}`} />
+        <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} sub="当前范围" />
+        <MetricCard label="平均延迟" value={latency?.avg_ms != null ? fmtDuration(latency.avg_ms) : '—'} sub="有记录的请求" />
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-gray-200 bg-white p-6 shadow-xs dark:border-gray-700/60 dark:bg-gray-800">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">{title}</h2>
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{chartTitle} · 最多展示 8 个维度</p>
+          </div>
+          <Segmented items={metricItems} value={metric} onChange={onMetricChange} />
+        </div>
+        {loading ? <LoadingSkeleton rows={4} /> : error ? <ErrorState error={error} onRetry={onRetry} /> : trend.datasets.length > 0 ? (
+          <TrendChart
+            labels={trend.labels}
+            datasets={trend.datasets}
+            height={340}
+            formatY={formatY}
+            ariaLabel={`${chartTitle}，点击图例可隐藏或恢复维度`}
+            onLegendClick={onToggleDimension}
+          />
+        ) : (
+          <EmptyState title="暂无分析数据" desc="当前时间范围和筛选条件下没有可展示的数据。" />
+        )}
+      </div>
     </>
   )
 }
