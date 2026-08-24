@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
-## [Unreleased]
+## [0.2.0] - 2026-08-24
 
 ### Added
 
@@ -16,11 +16,13 @@
 - CI 的开发镜像改用 `master` 与 commit 标签，不再覆盖 `latest`。
 - Release 校验 Tag 与 workspace 版本，并分别发布 amd64/arm64 二进制。
 - Agent 保持只读采集，不包含代理、客户端配置改写或请求拦截能力。
+- Agent 原生发布增加 Windows amd64，节点安装命令支持 Linux/Windows 平台与动态 Hub 地址。
 
 ### Fixed
 
 - 修复 GitHub Release 两个同名二进制资产冲突。
 - 修复文档中的技术栈、默认凭据、仓库地址与质量门禁描述不一致。
+- 修复 Agent 二进制下载命令的认证和架构选择问题，下载接口改为公开节点专属地址。
 
 ## [0.1.0] - 2026-08-05
 

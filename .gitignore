@@ -35,3 +35,7 @@ logs/
 
 # Generated docs
 docs/generated/
+
+# Local agent tooling (not part of the product)
+/.agents/
+/openspec/
