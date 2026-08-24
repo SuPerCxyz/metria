@@ -62,9 +62,10 @@ docker compose -f docker/compose.agent.yaml up -d
 # 构建
 docker build -f docker/Dockerfile --target hub -t metria:dev .
 
-# 多架构（amd64 + arm64）
+# 多架构（amd64 + arm64），VERSION 替换为实际 tag（如 v0.2.0）
+VERSION=v0.2.0
 docker buildx build --platform linux/amd64,linux/arm64 --target hub \
-  -t ghcr.io/SuPerCxyz/metria:0.1.0 --push .
+  -t "ghcr.io/SuPerCxyz/metria:$VERSION" --push .
 
 # 健康检查
 docker run --rm metria:dev healthcheck
