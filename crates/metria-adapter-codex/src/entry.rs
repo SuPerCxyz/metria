@@ -112,6 +112,30 @@ pub struct ReasoningPayload {
     pub encrypted_content: Option<String>,
 }
 
+/// turn_context payload（含当前模型名）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnContextPayload {
+    pub model: Option<serde_json::Value>,
+}
+
+/// 从 turn_context.model 提取模型名（支持对象 {name} 或字符串）。
+pub fn model_name_from(v: &Option<serde_json::Value>) -> Option<String> {
+    let v = v.as_ref()?;
+    if let Some(s) = v.as_str() {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    } else {
+        v.get("name")
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+}
+
 /// 解析 RFC3339 时间戳。
 pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)

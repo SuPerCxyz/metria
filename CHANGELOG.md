@@ -11,6 +11,17 @@
 - M6 分享 / 导出（JSON/NDJSON/CSV）/ MCP 只读查询 / 备份恢复。
 - M7 性能基准（10 万/100 万事件）与运维文档（保留策略/备份/升级/回滚）。
 
+### Changed
+
+- CI 的开发镜像改用 `master` 与 commit 标签，不再覆盖 `latest`。
+- Release 校验 Tag 与 workspace 版本，并分别发布 amd64/arm64 二进制。
+- Agent 保持只读采集，不包含代理、客户端配置改写或请求拦截能力。
+
+### Fixed
+
+- 修复 GitHub Release 两个同名二进制资产冲突。
+- 修复文档中的技术栈、默认凭据、仓库地址与质量门禁描述不一致。
+
 ## [0.1.0] - 2026-08-05
 
 ### Added
@@ -23,28 +34,20 @@
 - `metria doctor`：--adapter / --traffic / --hub 检查。
 - 真机冒烟：Codex 真实目录导入 14876 次调用验证。
 
-## [0.1.0] - 2026-08-05
-
-### Added
-
 - 线协议（metria-protocol）：注册/心跳/批传/状态/配置 + 上限校验。
 - 价格引擎（metria-pricing）：内置目录 + 用户规则，reported > 用户 > builtin 优先级。
 - Agent（metria-agent）：本地 Spool（幂等/断网积压/满则停止采集+告警）、notify 增量扫描 + 5 分钟 reconcile、zstd 批传 + 指数退避 + 部分成功、心跳、Node ID 优先级解析。
 - Hub（metria-hub）：完整 SQLite schema（27 表）、认证中间件（admin/collector 分离）、幂等 ingest + 增量 hourly/daily rollup、查询 API 子集、SSE、e2e 集成测试。
-- Web（Preact+TS+uPlot）：登录、总览、Nodes(+Detail)、Agent 工具、模型、会话(+Detail)、调用(+Detail)、流量、数据质量、时间范围选择器、Light/Dark、SSE。
+- Web（React+Vite+Tailwind+Chart.js）：登录、总览、Nodes(+Detail)、Agent 工具、模型、会话(+Detail)、调用(+Detail)、流量、数据质量、时间范围选择器、Light/Dark、SSE。
 - Demo 模式：`metria hub --demo` 确定性合成数据。
 - `metria doctor` --spool/--database 补全。
-
-## [0.1.0] - 2026-08-05
-
-### Added
 
 - Rust workspace：12 个 crate（core/protocol/storage/pricing/traffic/adapter-api/三个 adapter/agent/hub/cli）。
 - `metria` CLI 骨架：hub/agent/import/doctor/config/export/backup/restore/mcp/healthcheck/version 子命令。
 - metria-core：配置（ContentMode/timezone/env 解析）、分层错误类型、tracing 日志初始化。
 - metria-storage：SQLite 打开与 PRAGMA（WAL/foreign_keys/busy_timeout）、版本化迁移框架（rust-embed 嵌入 `migrations/`）、Repository 抽象。
 - metria-hub：axum 服务骨架（healthz + 前端静态资源 rust-embed + SPA fallback + 优雅退出）、迁移应用、容器 healthcheck。
-- Web：Preact + TypeScript + Vite 骨架，light/dark 主题 CSS Variables，PWA manifest。
+- Web：React + Vite + Tailwind + Chart.js，light/dark 主题与 PWA manifest。
 - Docker：多阶段构建（Node 构建期 / Rust 构建期 / 非 root 运行时，运行时无 Node.js）。
 - Docker Compose：hub 单服务、agent 单服务、hub+agent+demo 完整示例。
 - 质量门禁脚本 `scripts/check.sh`。

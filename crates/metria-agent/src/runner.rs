@@ -35,7 +35,6 @@ pub fn run(cfg: AgentConfig) -> Result<()> {
     // 持久化 collector_id 便于重启复用
     let _ = spool.meta_set("collector_id", &identity.collector_id);
     tracing::info!(node = %identity.node_id, collector = %identity.collector_id, "Agent 注册完成");
-
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     std::thread::spawn(move || {
@@ -61,9 +60,10 @@ pub fn run(cfg: AgentConfig) -> Result<()> {
     let up_cfg = cfg.clone();
     let up_spool = reopen_spool(&cfg)?;
     let up_client = client.clone();
+    let up_identity = identity.clone();
     let up_stop = stop.clone();
     std::thread::spawn(move || {
-        if let Err(e) = uploader_loop(up_cfg, up_spool, up_client, up_stop) {
+        if let Err(e) = uploader_loop(up_cfg, up_spool, up_client, up_identity, up_stop) {
             tracing::error!("上传线程退出: {e}");
         }
     });
@@ -233,6 +233,7 @@ fn uploader_loop(
     cfg: AgentConfig,
     mut spool: Spool,
     client: HubClient,
+    identity: ScanIdentity,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(5);
@@ -252,8 +253,8 @@ fn uploader_loop(
                 let batch = UploadBatch {
                     schema_version: metria_protocol::limits::SCHEMA_VERSION,
                     batch_id: batch_id.clone(),
-                    node_id: "".into(), // 由 hub 从事件校验；此处占位
-                    collector_id: "".into(),
+                    node_id: identity.node_id.clone(),
+                    collector_id: identity.collector_id.clone(),
                     agent_version: metria_core::VERSION.to_string(),
                     events: events
                         .iter()

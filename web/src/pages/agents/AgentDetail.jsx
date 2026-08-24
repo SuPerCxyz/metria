@@ -10,7 +10,8 @@ import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedba
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime } from '../../services/format'
+import { useNodeNames } from '../../hooks/useNodeNames'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtDateTime, fmtSessionTitle, sumTokens, cacheHitRate } from '../../services/format'
 
 const AGENT_LABELS = {
   'claude-code': 'Claude Code',
@@ -23,6 +24,7 @@ export default function AgentDetail() {
   const navigate = useNavigate()
   const { range } = useTimeRange()
   const params = rangeParams(range)
+  const nodeNames = useNodeNames()
 
   const query = useQuery(`agent-detail-${id}${q(params)}`, () => api(`/clients/${encodeURIComponent(id)}${q(params)}`))
   const models = useQuery(`agent-models-${id}`, () => api(`/clients/${encodeURIComponent(id)}/models`))
@@ -30,10 +32,10 @@ export default function AgentDetail() {
 
   const trend = useMemo(() => ({
     labels: (series.data?.series || []).map((p) => p.bucket),
-    values: (series.data?.series || []).map((p) => p.input_tokens + p.output_tokens),
+    values: (series.data?.series || []).map((p) => sumTokens(p)),
   }), [series.data])
 
-  if (query.error) return <ErrorState error={query.error} />
+  if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={8} />
   const d = query.data || {}
 
@@ -49,29 +51,30 @@ export default function AgentDetail() {
         items={[
           { label: '费用', value: fmtUsd(d.calculated_cost_micro_usd) },
           { label: '网络流量', value: fmtBytes(d.estimated_total_bytes) },
+          { label: '缓存命中率', value: cacheHitRate(d) != null ? fmtPct100(cacheHitRate(d)) : '—' },
           { label: 'Source 健康', value: d.source_health ? `${d.source_health.healthy ?? 0}/${d.source_health.total ?? 0}` : '—' },
           { label: '版本数', value: String((d.version_dist || []).length) },
         ]}
       />
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">使用趋势</h2>
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={fmtTokensShort} />}
       </div>
 
-      <div className="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-6">
+      <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">模型分布</h2>
           <RankingList items={(models.data?.models || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
         </div>
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">节点分布</h2>
-          <RankingList items={(d.by_node || []).map((n) => ({ id: n.node_id, name: n.node_id, value: n.model_calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(n) => navigate(`/nodes/${encodeURIComponent(n.id)}`)} />
+          <RankingList items={(d.by_node || []).map((n) => ({ id: n.node_id, name: nodeNames[n.node_id] || n.node_id, value: n.model_calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(n) => navigate(`/nodes/${encodeURIComponent(n.id)}`)} />
         </div>
       </div>
 
       {d.version_dist?.length > 0 && (
-        <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+        <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">版本分布</h2>
           <div className="flex flex-wrap gap-2">
             {d.version_dist.map((v) => (
@@ -83,13 +86,13 @@ export default function AgentDetail() {
         </div>
       )}
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">最近会话</h2>
         <div className="space-y-2">
           {(d.recent_sessions || []).length === 0 && <EmptyState title="暂无会话" />}
           {(d.recent_sessions || []).slice(0, 8).map((s) => (
             <button key={s.id} type="button" onClick={() => navigate(`/sessions/${encodeURIComponent(s.id)}`)} className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 text-left">
-              <span className="text-sm text-gray-700 dark:text-gray-200 truncate">{s.title || s.source_session_id}</span>
+              <span className="text-sm text-gray-700 dark:text-gray-200 truncate">{fmtSessionTitle(s.title, s.started_at) || s.source_session_id}</span>
               <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">{fmtDateTime(s.started_at)} · {fmtTokensShort(s.input_tokens)} tokens</span>
             </button>
           ))}

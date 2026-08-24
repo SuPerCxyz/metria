@@ -27,8 +27,8 @@ step "cargo test"
 cargo test --workspace
 
 if [ "$SKIP_WEB" -eq 0 ]; then
-  step "web typecheck + build"
-  (cd web && npm run typecheck && npm run build)
+  step "web test + build"
+  (cd web && npm test && npm run build)
 fi
 
 if [ "$SKIP_DOCKER" -eq 0 ]; then

@@ -32,6 +32,25 @@ pub struct BuildCtx {
 /// 累积正文上限。
 const RUNNING_TEXT_CAP: usize = 512 * 1024;
 
+/// 会话标题最大长度。
+const TITLE_MAX_CHARS: usize = 50;
+
+/// 会话标题候选的过滤规则：命中则视为系统注入内容，跳过。
+fn looks_like_system_content(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    // Codex 会话开头常注入 AGENTS.md / 系统指令 / 环境上下文，不作为标题。
+    let lower = t.to_lowercase();
+    lower.starts_with("# agents.md")
+        || lower.starts_with("<instructions>")
+        || lower.starts_with("<skills_instructions>")
+        || lower.starts_with("<environment_context>")
+        || lower.starts_with("you are `")
+        || t.starts_with('#')
+}
+
 /// Codex 会话构建状态。
 #[derive(Debug)]
 pub struct SessionBuilder {
@@ -54,13 +73,17 @@ pub struct SessionBuilder {
     message_seq: i64,
     turn_seq: i64,
     last_usage_key: Option<UsageKey>,
+    current_model_raw: Option<String>,
+    current_model_normalized: Option<String>,
     pub warnings: Vec<String>,
 }
 
 impl SessionBuilder {
     pub fn new(ctx: BuildCtx, source_session_id: String, started_at: DateTime<Utc>) -> Self {
+        // 用 source_session_id 作为会话 id，保证 call/usage/traffic 的 session_id
+        // 与 hub sessions 表 source_session_id 一致，可被 hub 正确关联（跨批次）。
         let session = Session {
-            id: Id::new(),
+            id: Id::parse(&source_session_id).unwrap_or_else(|_| Id::new()),
             source_session_id,
             node_id: ctx.node_id.clone(),
             collector_id: ctx.collector_id.clone(),
@@ -118,6 +141,8 @@ impl SessionBuilder {
             message_seq: 0,
             turn_seq: 0,
             last_usage_key: None,
+            current_model_raw: None,
+            current_model_normalized: None,
             warnings: Vec::new(),
         }
     }
@@ -145,6 +170,20 @@ impl SessionBuilder {
     pub fn mark_stateful_reference(&mut self) {
         self.context_transport_mode = ContextTransportMode::StatefulReference;
         self.cache_transport_behavior = CacheTransportBehavior::ReferenceOnly;
+    }
+
+    /// 记录当前模型（turn_context.model），供调用与会话主模型使用。
+    pub fn set_model(&mut self, model: Option<&str>) {
+        let Some(m) = model else {
+            return;
+        };
+        let normalized = normalize_model(m);
+        if self.session.primary_model_raw.is_none() {
+            self.session.primary_model_raw = Some(m.to_string());
+            self.session.primary_model_normalized = Some(normalized.clone());
+        }
+        self.current_model_raw = Some(m.to_string());
+        self.current_model_normalized = Some(normalized);
     }
 
     /// 新用户消息 → 开新回合。
@@ -211,6 +250,23 @@ impl SessionBuilder {
         content: Option<String>,
         at: DateTime<Utc>,
     ) {
+        // Codex 不提供标题，从首条真实用户消息截取作为标题。
+        if self.session.title.is_none()
+            && role == "user"
+            && matches!(content_type, "input_text" | "text")
+        {
+            if let Some(text) = &content {
+                let clean = text.trim();
+                if !looks_like_system_content(clean) {
+                    let cut = clean
+                        .char_indices()
+                        .nth(TITLE_MAX_CHARS)
+                        .map(|(i, _)| i)
+                        .unwrap_or(clean.len());
+                    self.session.title = Some(clean[..cut].to_string());
+                }
+            }
+        }
         self.message_seq += 1;
         let (content_length, utf8_bytes, content_hash) = match &content {
             Some(c) => {
@@ -276,7 +332,11 @@ impl SessionBuilder {
         }
         self.last_usage_key = Some(key);
 
-        let model_norm = model.map(normalize_model);
+        // 优先显式模型，否则回退到 turn_context 记录的本会话模型
+        let model_raw = model
+            .map(|s| s.to_string())
+            .or_else(|| self.current_model_raw.clone());
+        let model_norm = self.current_model_normalized.clone();
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(format!(
@@ -293,8 +353,8 @@ impl SessionBuilder {
             turn_id: Some(turn_id.clone()),
             provider_raw: None,
             provider_normalized: None,
-            model_raw: model.map(|s| s.to_string()),
-            model_normalized: model_norm.clone(),
+            model_raw: model_raw.clone(),
+            model_normalized: model_norm,
             started_at: at,
             first_response_at: Some(at),
             completed_at: Some(at),
@@ -321,8 +381,8 @@ impl SessionBuilder {
         };
 
         if self.session.primary_model_raw.is_none() {
-            self.session.primary_model_raw = model.map(|s| s.to_string());
-            self.session.primary_model_normalized = model_norm.clone();
+            self.session.primary_model_raw = model_raw.clone();
+            self.session.primary_model_normalized = call.model_normalized.clone();
         }
 
         let usage_event = UsageEvent {
@@ -341,7 +401,7 @@ impl SessionBuilder {
             provider_raw: self.session.provider_raw.clone(),
             provider_normalized: self.session.provider_normalized.clone(),
             model_raw: call.model_raw.clone(),
-            model_normalized: model_norm.clone(),
+            model_normalized: call.model_normalized.clone(),
             usage: metria_core::model::Usage {
                 input,
                 output,

@@ -1,6 +1,7 @@
 # Metria Release：打 tag（v*）时构建发布产物
 #
-# - 编译 linux/amd64 与 linux/arm64 二进制（上传为 release artifacts）
+# - 执行完整质量门禁并校验 tag 与 workspace 版本
+# - 编译 linux/amd64 与 linux/arm64 二进制并生成 SHA256SUMS
 # - 构建并推送多架构镜像到 ghcr.io/supercxyz/metria:<tag> 与 :latest
 # - 生成 SBOM（buildx provenance）
 
@@ -34,8 +35,30 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: 构建前端
-        run: cd web && npm ci && npm run build
+      - name: 校验发布版本
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "metria-cli"))')"
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "tag v$tag_version 与 workspace 版本 $workspace_version 不一致" >&2
+            exit 1
+          fi
+
+      - name: 构建并测试前端
+        run: cd web && npm ci && npm audit --audit-level=high && npm test && npm run build
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: 创建发布目录
+        run: mkdir -p dist
 
       # ---- amd64 二进制 ----
       - name: 构建 linux/amd64 发布二进制
@@ -46,6 +69,10 @@ jobs:
         with:
           name: metria-linux-amd64
           path: target/release/metria
+          if-no-files-found: error
+
+      - name: 准备 amd64 发布文件
+        run: install -m 0755 target/release/metria dist/metria-linux-amd64
 
       # ---- arm64 二进制（交叉编译） ----
       - name: 安装 arm64 交叉编译链
@@ -66,6 +93,19 @@ jobs:
         with:
           name: metria-linux-arm64
           path: target/aarch64-unknown-linux-gnu/release/metria
+          if-no-files-found: error
+
+      - name: 准备 arm64 发布文件并生成校验和
+        run: |
+          install -m 0755 target/aarch64-unknown-linux-gnu/release/metria dist/metria-linux-arm64
+          sha256sum dist/metria-linux-amd64 dist/metria-linux-arm64 > dist/SHA256SUMS
+
+      - name: 上传校验和
+        uses: actions/upload-artifact@v4
+        with:
+          name: metria-sha256sums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
 
       # ---- 多架构镜像 + SBOM ----
       - name: Set up QEMU
@@ -103,6 +143,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
-            target/release/metria
-            target/aarch64-unknown-linux-gnu/release/metria
+            dist/metria-linux-amd64
+            dist/metria-linux-arm64
+            dist/SHA256SUMS
           generate_release_notes: true

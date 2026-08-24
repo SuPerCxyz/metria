@@ -415,6 +415,138 @@ impl HubDb {
         }
         Ok(rebuilt)
     }
+
+    /// 重建 usage 派生的费用 rollup：先删后插（幂等）。
+    ///
+    /// 重新计价后调用，使 Overview/费用页按最新价格反映费用。仅处理
+    /// usage/pricing 相关行（`pricing_source` 或 `usage_source` 非空），
+    /// 不影响 session/call/traffic 行。
+    pub fn rebuild_usage_rollups(&self, days: i64) -> Result<usize, StorageError> {
+        let since = Utc::now() - chrono::Duration::days(days);
+
+        let c = self.conn();
+        c.execute(
+            "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
+            [since.to_rfc3339()],
+        )
+        .map_err(StorageError::from)?;
+        c.execute(
+            "DELETE FROM daily_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
+            [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
+        )
+        .map_err(StorageError::from)?;
+        drop(c);
+
+        let events: Vec<Value> = {
+            let c = self.conn();
+            let mut stmt = c
+                .prepare(
+                    "SELECT node_id, collector_id, client_id, source_id, provider_normalized, model_normalized,
+                            timestamp, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                            reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
+                            estimated_cost_micro_usd, usage_source, usage_granularity
+                     FROM usage_events WHERE timestamp >= ?1",
+                )
+                .map_err(StorageError::from)?;
+            let rows = stmt
+                .query_map([since.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "node_id": r.get::<_, String>(0)?,
+                        "collector_id": r.get::<_, String>(1)?,
+                        "client_id": r.get::<_, String>(2)?,
+                        "source_id": r.get::<_, String>(3)?,
+                        "provider_normalized": r.get::<_, Option<String>>(4)?,
+                        "model_normalized": r.get::<_, Option<String>>(5)?,
+                        "timestamp": r.get::<_, String>(6)?,
+                        "usage": {
+                            "input": r.get::<_, Option<i64>>(7)?,
+                            "output": r.get::<_, Option<i64>>(8)?,
+                            "cache_read": r.get::<_, Option<i64>>(9)?,
+                            "cache_write": r.get::<_, Option<i64>>(10)?,
+                            "reasoning": r.get::<_, Option<i64>>(11)?,
+                        },
+                        "cost": {
+                            "reported_micro_usd": r.get::<_, Option<i64>>(12)?,
+                            "calculated_micro_usd": r.get::<_, Option<i64>>(13)?,
+                            "estimated_micro_usd": r.get::<_, Option<i64>>(14)?,
+                        },
+                        "quality": {
+                            "usage_source": r.get::<_, Option<String>>(15)?,
+                            "granularity": r.get::<_, Option<String>>(16)?,
+                        },
+                    }))
+                })
+                .map_err(StorageError::from)?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut rebuilt = 0usize;
+        for e in &events {
+            self.rollup_event("usage", e)?;
+            rebuilt += 1;
+        }
+        Ok(rebuilt)
+    }
+
+    /// 重建流量估算 rollup：先删后插（幂等）。
+    ///
+    /// 从 `traffic_estimates` 重放 traffic 事件，恢复 `hourly/daily_rollups`
+    /// 的 `estimated_*_bytes` 等列。`rebuild_drift` 只重放 session/call，
+    /// 会删除 traffic 行却不恢复，导致维护重建后流量归零，故必须单独重建。
+    pub fn rebuild_traffic_rollups(&self, days: i64) -> Result<usize, StorageError> {
+        let since = Utc::now() - chrono::Duration::days(days);
+
+        let c = self.conn();
+        c.execute(
+            "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
+            [since.to_rfc3339()],
+        )
+        .map_err(StorageError::from)?;
+        c.execute(
+            "DELETE FROM daily_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
+            [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
+        )
+        .map_err(StorageError::from)?;
+        drop(c);
+
+        let events: Vec<Value> = {
+            let c = self.conn();
+            let mut stmt = c
+                .prepare(
+                    "SELECT node_id, client_id, provider, model,
+                            estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes,
+                            lower_bound_bytes, upper_bound_bytes, estimation_source, confidence, calculated_at
+                     FROM traffic_estimates WHERE calculated_at >= ?1",
+                )
+                .map_err(StorageError::from)?;
+            let rows = stmt
+                .query_map([since.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "node_id": r.get::<_, String>(0)?,
+                        "client_id": r.get::<_, String>(1)?,
+                        "provider": r.get::<_, Option<String>>(2)?,
+                        "model": r.get::<_, Option<String>>(3)?,
+                        "estimated_request_wire_bytes": r.get::<_, Option<i64>>(4)?,
+                        "estimated_response_wire_bytes": r.get::<_, Option<i64>>(5)?,
+                        "estimated_total_wire_bytes": r.get::<_, Option<i64>>(6)?,
+                        "lower_bound_bytes": r.get::<_, Option<i64>>(7)?,
+                        "upper_bound_bytes": r.get::<_, Option<i64>>(8)?,
+                        "estimation_source": r.get::<_, Option<String>>(9)?,
+                        "confidence": r.get::<_, Option<f64>>(10)?,
+                        "calculated_at": r.get::<_, String>(11)?,
+                    }))
+                })
+                .map_err(StorageError::from)?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let mut rebuilt = 0usize;
+        for e in &events {
+            self.rollup_event("traffic", e)?;
+            rebuilt += 1;
+        }
+        Ok(rebuilt)
+    }
 }
 
 /// 对账报告摘要。
@@ -516,11 +648,24 @@ mod tests {
         })
     }
 
+    fn traffic_json(ts: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("traffic-{ts}"), "timestamp": ts, "calculated_at": ts,
+            "node_id": "n1", "client_id": "claude-code", "provider": "anthropic",
+            "model": "claude-sonnet-4.5",
+            "estimated_request_wire_bytes": 5000, "estimated_response_wire_bytes": 7000,
+            "estimated_total_wire_bytes": 12000, "lower_bound_bytes": 8000,
+            "upper_bound_bytes": 16000, "estimation_source": "partial_reconstruction",
+            "confidence": 0.5,
+        })
+    }
+
     #[test]
     fn reconcile_reports_no_drift_after_clean_ingest() {
         let db = test_db("reconcile");
-        let sess = sess_json("sess-a", "2026-08-06T01:30:00Z");
-        let call = call_json("2026-08-06T01:35:00Z");
+        let now = Utc::now();
+        let sess = sess_json("sess-a", &(now - chrono::Duration::hours(2)).to_rfc3339());
+        let call = call_json(&(now - chrono::Duration::hours(1)).to_rfc3339());
         db.upsert_session(&sess).unwrap();
         db.insert_call(&call, "n1:sess-a").unwrap();
         db.rollup_event("session", &sess).unwrap();
@@ -534,8 +679,9 @@ mod tests {
     #[test]
     fn rebuild_drift_rebuilds_rollup() {
         let db = test_db("rebuild");
-        let sess = sess_json("sess-b", "2026-08-06T02:30:00Z");
-        let call = call_json("2026-08-06T02:35:00Z");
+        let now = Utc::now();
+        let sess = sess_json("sess-b", &(now - chrono::Duration::hours(2)).to_rfc3339());
+        let call = call_json(&(now - chrono::Duration::hours(1)).to_rfc3339());
         db.upsert_session(&sess).unwrap();
         db.insert_call(&call, "n1:sess-b").unwrap();
         db.rollup_event("session", &sess).unwrap();
@@ -544,16 +690,39 @@ mod tests {
         // 人为制造漂移：删掉 rollup 行
         {
             let c = db.conn();
-            c.execute(
-                "DELETE FROM hourly_rollups WHERE bucket LIKE '2026-08-06%'",
-                [],
-            )
-            .unwrap();
+            c.execute("DELETE FROM hourly_rollups", []).unwrap();
         }
         let rebuilt = db.rebuild_drift(1).unwrap();
         assert!(rebuilt >= 2, "应重建 session+call: {rebuilt}");
         let report = db.reconcile_rollups(1).unwrap();
         assert!(report.drift_buckets == 0, "重建后应无漂移: {report:?}");
+    }
+
+    #[test]
+    fn rebuild_traffic_rollups_restores_bytes() {
+        let db = test_db("traffic");
+        let now = Utc::now();
+        let t = traffic_json(&(now - chrono::Duration::hours(2)).to_rfc3339());
+        db.insert_traffic(&t).unwrap();
+        db.rollup_event("traffic", &t).unwrap();
+
+        // 人为制造漂移：删掉全部 rollup 行（模拟维护任务 rebuild_drift 删除 traffic 行）
+        {
+            let c = db.conn();
+            c.execute("DELETE FROM hourly_rollups", []).unwrap();
+        }
+        let rebuilt = db.rebuild_traffic_rollups(1).unwrap();
+        assert!(rebuilt >= 1, "应重建 traffic 事件: {rebuilt}");
+
+        let total: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(estimated_total_bytes),0) FROM hourly_rollups WHERE traffic_estimation_source != ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 12000, "traffic 重建后字节应恢复");
     }
 
     #[test]

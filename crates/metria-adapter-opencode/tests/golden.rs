@@ -178,6 +178,16 @@ fn golden_full_reads_session_usage_tools_subagents() {
     assert!(te.lower_bound_bytes.unwrap() < te.estimated_total_wire_bytes.unwrap());
     assert!(te.upper_bound_bytes.unwrap() > te.estimated_total_wire_bytes.unwrap());
 
+    // 时长与状态：m2 的 time.created→completed 差值应写入 duration_ms；finish 非 error 应记 success
+    let call = batch
+        .model_calls
+        .iter()
+        .find(|c| c.source_call_id.as_deref() == Some("m2"))
+        .expect("应有 m2 的模型调用");
+    assert_eq!(call.duration_ms, Some(1000));
+    assert_eq!(call.status, "success");
+    assert_eq!(call.status_code, Some(200));
+
     // 游标增量
     let second = adapter
         .scan(&source, summary.new_cursor.as_ref(), &ScanIdentity::test())
@@ -250,4 +260,40 @@ fn db_lock_tolerated() {
     let _ = health;
     let _ = adapter.scan(&source, None, &ScanIdentity::test());
     lock_conn.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn error_finish_maps_to_error_status() {
+    let dir = temp_dir("err-finish");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','err', '1.0', 1000, 2000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',2000,2000, ?1)",
+        [r#"{"role":"assistant","time":{"created":2000,"completed":3500},"modelID":"deepseek-v4","providerID":"opencode","tokens":{"total":120,"input":100,"output":20,"cache":{"write":0,"read":0}},"finish":"error"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = summary
+        .batch
+        .model_calls
+        .iter()
+        .find(|c| c.source_call_id.as_deref() == Some("m2"))
+        .expect("应有 m2 的模型调用");
+    assert_eq!(call.status, "error");
+    assert_eq!(call.status_code, Some(400));
+    assert_eq!(call.duration_ms, Some(1500));
 }

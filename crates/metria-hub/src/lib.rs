@@ -149,9 +149,10 @@ fn seed_catalogs(db: &db::HubDb) {
     let c = db.conn();
     for (id, name, kind, priority, url, auth) in defs {
         let enabled = match kind {
+            // OpenRouter 默认启用（官方公开价格目录），可用 METRIA_PRICING_OPENROUTER_ENABLED=false 关闭
             "openrouter" => std::env::var("METRIA_PRICING_OPENROUTER_ENABLED")
                 .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+                .unwrap_or(true),
             "litellm" => std::env::var("METRIA_PRICING_LITELLM_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -187,6 +188,16 @@ fn spawn_catalog_sync(db: db::HubDb) {
                     }
                 }
             }
+            // 每轮按最新目录增量重新计价（未计价事件），并重建费用 rollup，
+            // 使新上传的调用也能按 OpenRouter 官方价格计算费用。
+            match catalog::reprice_from_rules(&db, true) {
+                Ok(n) => {
+                    if n > 0 {
+                        info!("增量重新计价完成（{} 条）", n);
+                    }
+                }
+                Err(e) => warn!("增量重新计价失败: {e}"),
+            }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     });
@@ -212,9 +223,21 @@ fn spawn_maintenance(db: db::HubDb) {
                             drift = report.drift_buckets,
                             "rollup 对账发现漂移，触发重建"
                         );
+                        // 先重建 session/call/traffic 计数，再重建 usage 的 token/cost
+                        // （rebuild_drift 只重建 session/call，token 与 traffic 为 0；
+                        //  必须补 usage 与 traffic 重建，否则维护任务会清空既有
+                        //  usage token / 流量数据）
                         match db.rebuild_drift(1) {
                             Ok(rebuilt) => info!("rollup 重建完成: {rebuilt} 条"),
                             Err(e) => warn!("rollup 重建失败: {e}"),
+                        }
+                        match db.rebuild_usage_rollups(1) {
+                            Ok(rebuilt) => info!("usage rollup 重建完成: {rebuilt} 条"),
+                            Err(e) => warn!("usage rollup 重建失败: {e}"),
+                        }
+                        match db.rebuild_traffic_rollups(1) {
+                            Ok(rebuilt) => info!("traffic rollup 重建完成: {rebuilt} 条"),
+                            Err(e) => warn!("traffic rollup 重建失败: {e}"),
                         }
                     }
                 }
@@ -233,7 +256,7 @@ fn spawn_maintenance(db: db::HubDb) {
 
 fn ensure_admin(db: &db::HubDb) {
     let user = std::env::var("METRIA_ADMIN_USER").unwrap_or_else(|_| "admin".into());
-    let pass = std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_else(|_| "metria-admin".into());
+    let pass = std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_else(|_| "change-me-please".into());
     // argon2 哈希（与 api::verify_password 配套）；旧库 prehash 兼容校验
     let hash = api::hash_password(&pass);
     let now = chrono::Utc::now().to_rfc3339();

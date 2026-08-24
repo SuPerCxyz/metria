@@ -10,10 +10,10 @@
 #   - metria-agent : 采集器（可选，可注释掉整段后仅运行 Hub + Demo）
 services:
   metria-hub:
-    image: ghcr.io/supercxyz/metria:latest
+    image: ${METRIA_IMAGE:-ghcr.io/supercxyz/metria:latest}
     container_name: metria-hub
     command: ["hub"]
-    restart: unless-stopped
+    restart: always
     ports:
       - "${METRIA_HTTP_PORT:-8080}:8080"
     volumes:
@@ -23,6 +23,7 @@ services:
       METRIA_LISTEN: 0.0.0.0:8080
       METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
       METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      METRIA_SESSION_SECRET: ${METRIA_SESSION_SECRET:-change-me-session-secret}
       METRIA_ADMIN_USER: ${METRIA_ADMIN_USER:-admin}
       METRIA_ADMIN_PASSWORD: ${METRIA_ADMIN_PASSWORD:-change-me-please}
     healthcheck:
@@ -45,6 +46,7 @@ services:
       METRIA_LISTEN: 0.0.0.0:8081
       METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
       METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
+      METRIA_SESSION_SECRET: ${METRIA_SESSION_SECRET:-change-me-session-secret}
     healthcheck:
       test: ["CMD", "/app/metria", "healthcheck"]
       interval: 30s

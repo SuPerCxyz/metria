@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use metria_core::config::{optional_bool, optional_int, var_opt, ContentMode};
+use metria_core::config::{optional_int, var_opt, ContentMode};
 use metria_core::error::ConfigError;
 
 /// Agent 配置。
@@ -98,10 +98,4 @@ impl AgentConfig {
 /// 读取 Agent token（环境或文件）。
 pub fn resolve_token(cfg: &AgentConfig) -> Option<String> {
     cfg.token.clone()
-}
-
-/// 调试开关（保留给后续）。
-#[allow(dead_code)]
-fn _debug_env() -> Result<Option<bool>, ConfigError> {
-    optional_bool("METRIA_DEBUG")
 }

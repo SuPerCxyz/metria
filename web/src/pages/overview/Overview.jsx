@@ -6,11 +6,12 @@ import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
 import TrendChart from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
+import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, sumTokensWithReasoning, cacheHitRate } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -19,28 +20,90 @@ const TREND_TABS = [
   { key: 'requests', label: '请求数' },
 ]
 
+const DIMS = [
+  { key: 'all', label: '汇总' },
+  { key: 'model', label: '按模型' },
+  { key: 'client', label: '按 Agent' },
+]
+
+// x 轴显示时分（HH:mm）；tooltip 显示完整 MM/dd HH:mm
+function fmtX(iso) {
+  const d = new Date(iso)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+function fmtXFull(iso) {
+  const d = new Date(iso)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 export default function Overview() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
   const [trendTab, setTrendTab] = useState('tokens')
+  const [dim, setDim] = useState('all')
   const [costTab, setCostTab] = useState('cost')
 
   const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
-  const series = useQuery(`ts${q(params)}`, () => api(`/usage/timeseries${q(params)}`))
+  const dimParam = dim === 'all' ? undefined : dim
+  const series = useQuery(`ts${q({ ...params, dim: dimParam })}`, () => api(`/usage/timeseries${q({ ...params, dim: dimParam })}`))
   const byDim = useQuery(`breakdown-cost${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`breakdown-client${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
+  const quality = useQuery('overview-quality', () => api('/data-quality'))
+
+  const metricOf = (p, tab) => {
+    switch (tab) {
+      case 'tokens': return (p.input_tokens || 0) + (p.output_tokens || 0) + (p.cache_read_tokens || 0)
+      case 'cost': return p.cost_micro_usd
+      case 'traffic': return p.estimated_traffic_bytes
+      default: return p.model_calls
+    }
+  }
 
   const trendData = useMemo(() => {
     const pts = series.data?.series || []
-    switch (trendTab) {
-      case 'tokens': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.input_tokens + p.output_tokens) }
-      case 'cost': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.cost_micro_usd) }
-      case 'traffic': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.estimated_traffic_bytes) }
-      case 'requests': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.model_calls) }
-      default: return { labels: [], values: [] }
+    if (pts.length === 0) return { labels: [], datasets: [], tooltipLabels: [] }
+    const sorted = pts.slice().sort((a, b) => (a.bucket < b.bucket ? -1 : 1))
+
+    if (dim === 'all') {
+      const labels = sorted.map((p) => fmtX(p.bucket))
+      const tooltipLabels = sorted.map((p) => fmtXFull(p.bucket))
+      if (trendTab === 'tokens') {
+        return {
+          labels,
+          tooltipLabels,
+          datasets: [
+            { label: '输入', values: sorted.map((p) => p.input_tokens) },
+            { label: '输出', values: sorted.map((p) => p.output_tokens) },
+            { label: '缓存读取', values: sorted.map((p) => p.cache_read_tokens) },
+          ],
+        }
+      }
+      return { labels, tooltipLabels, datasets: [{ label: '', values: sorted.map((p) => metricOf(p, trendTab)) }] }
     }
-  }, [series.data, trendTab])
+
+    // 按维度拆分：每维度一条线（按指标总量取 Top5）
+    const byDimMap = {}
+    for (const p of pts) {
+      const k = p.dimension || '(未知)'
+      ;(byDimMap[k] = byDimMap[k] || []).push(p)
+    }
+    const dims = Object.keys(byDimMap)
+      .map((k) => ({ k, total: byDimMap[k].reduce((s, p) => s + metricOf(p, trendTab), 0) }))
+      .filter((d) => d.total > 0)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 5)
+    const buckets = [...new Set(pts.map((p) => p.bucket))].sort()
+    const labels = buckets.map(fmtX)
+    const tooltipLabels = buckets.map(fmtXFull)
+    const datasets = dims.map(({ k }) => {
+      const map = {}
+      for (const p of byDimMap[k]) map[p.bucket] = metricOf(p, trendTab)
+      return { label: k, values: buckets.map((b) => map[b] || 0) }
+    })
+    return { labels, tooltipLabels, datasets }
+  }, [series.data, trendTab, dim])
 
   const formatY = (v) => {
     if (trendTab === 'tokens') return fmtTokensShort(v)
@@ -49,94 +112,195 @@ export default function Overview() {
     return v.toLocaleString()
   }
 
-  // 关注事件：从已有数据推导
+  // 关注事件：失败调用 + 采集异常（source_errors）+ 高调用模型
   const alerts = useMemo(() => {
     const list = []
     const o = overview.data || {}
-    const topCalls = (byDim.data?.by || []).slice(0, 5)
+    const qd = quality.data || {}
+    const failed = o.failed_calls ?? 0
+    if (failed > 0) list.push({ type: 'error', text: `范围内 ${failed} 次调用失败（状态非成功）`, ts: null })
+    for (const se of (qd.source_errors || []).slice(0, 5)) {
+      list.push({ type: 'warning', text: `${se.source_id} 采集异常（${se.severity}）：${se.pattern || se.last_message || '未知'}`, ts: se.last_seen_at })
+    }
+    const topCalls = (byDim.data?.by || []).slice(0, 3)
     for (const m of topCalls) {
       if (m.model_calls > 0) list.push({ type: 'cost', text: `${m.dimension} 模型调用 ${m.model_calls} 次`, ts: null })
     }
-    return list.slice(0, 5)
-  }, [overview.data, byDim.data])
+    return list.slice(0, 8)
+  }, [overview.data, byDim.data, quality.data])
 
   if (overview.error) return <ErrorState error={overview.error} onRetry={overview.refresh} />
   if (overview.loading) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
 
-  const costItems = (byDim.data?.by || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.model_calls }))
-  const agentItems = (byAgent.data?.by || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.model_calls }))
+  const costItems = (byDim.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: m.model_calls }))
+    .filter((m) => m.value > 0)
+  const modelTokenItems = (byDim.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: (m.input_tokens || 0) + (m.output_tokens || 0) + (m.cache_read_tokens || 0) }))
+    .filter((m) => m.value > 0)
+  const agentItems = (byAgent.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: m.model_calls }))
+    .filter((m) => m.value > 0)
+  const agentTokenItems = (byAgent.data?.by || [])
+    .filter((m) => m.dimension && m.dimension !== '')
+    .map((m) => ({ id: m.dimension, name: m.dimension, value: (m.input_tokens || 0) + (m.output_tokens || 0) + (m.cache_read_tokens || 0) }))
+    .filter((m) => m.value > 0)
+
+  const modelCalls = o.model_calls ?? 0
+  const failed = o.failed_calls ?? 0
+  const successRate = modelCalls > 0 ? ((modelCalls - failed) / modelCalls) * 100 : null
 
   return (
     <>
       <PageHeader title="总览" subtitle="AI 编程 Agent 用量、费用与流量概览" />
 
-      {/* 第一行：4 核心指标 */}
-      <div className="grid grid-cols-12 gap-6">
-        <MetricCard
-          label="总费用"
-          value={fmtUsd(o.calculated_cost_micro_usd ?? o.estimated_cost_micro_usd)}
-          sub="估算费用"
-          hint="按 Token 与价格目录估算"
-        />
-        <MetricCard
-          label="总 Token"
-          value={fmtTokens((o.input_tokens ?? 0) + (o.output_tokens ?? 0))}
-          sub={
-            <span className="tabular-nums">
-              <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(o.output_tokens)} · 缓存 {fmtTokensShort(o.cache_read_tokens)}</span>
-            </span>
-          }
-        />
-        <MetricCard
-          label="网络流量"
-          value={fmtBytes(o.estimated_total_bytes)}
-          sub="估算流量（含上下界）"
-          hint={`范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}`}
-        />
-        <MetricCard
-          label="活跃会话"
-          value={String(o.sessions ?? 0)}
-          sub={`${o.model_calls ?? 0} 次模型调用`}
-          hint={`${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器`}
-        />
+      {/* 第一行：用量 */}
+      <div className="mt-0">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard
+            span="xl:col-span-4"
+            label="总 Token"
+            value={fmtTokens(sumTokensWithReasoning(o))}
+            sub={
+              <span className="tabular-nums">
+                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(o.output_tokens)} · 缓存 {fmtTokensShort(o.cache_read_tokens)} · 推理 {fmtTokensShort(o.reasoning_tokens)}</span>
+              </span>
+            }
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="缓存命中率"
+            value={cacheHitRate(o) != null ? fmtPct100(cacheHitRate(o)) : '—'}
+            sub="缓存读取 / (输入 + 缓存)"
+            hint="缓存读取 Token 占请求上下文比例"
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="调用时长"
+            value={o.duration_p50_ms != null ? fmtDuration(o.duration_p50_ms) : '—'}
+            sub={
+              o.duration_p50_ms != null ? (
+                <span className="tabular-nums">
+                  P50 {fmtDuration(o.duration_p50_ms)} · P95 {fmtDuration(o.duration_p95_ms)} · P99 {fmtDuration(o.duration_p99_ms)}
+                </span>
+              ) : undefined
+            }
+            hint="整次调用时长分布（从发起到完成，非首 token 延迟）；客户端日志缺失时长则显示 —"
+          />
+        </div>
+      </div>
+
+      {/* 第二行：成本与流量 */}
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本与流量</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard
+            span="xl:col-span-4"
+            label="总费用"
+            value={fmtUsd(o.calculated_cost_micro_usd ?? o.estimated_cost_micro_usd)}
+            sub="估算费用"
+            hint="按 Token 与价格目录估算"
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="网络流量"
+            value={fmtBytes(o.estimated_total_bytes)}
+            sub="估算流量（含上下界）"
+            hint={`范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}`}
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="缓存节省费用"
+            value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'}
+            sub="按缓存读取单价估算"
+            hint="缓存命中带来的成本节省"
+          />
+        </div>
+      </div>
+
+      {/* 第三行：活动与健康 */}
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard
+            span="xl:col-span-3"
+            label="请求数"
+            value={String(modelCalls)}
+            sub="模型调用次数"
+            hint={`涉及 ${o.models ?? 0} 个模型`}
+          />
+          <MetricCard
+            span="xl:col-span-3"
+            label="成功率"
+            value={successRate != null ? fmtPct100(successRate) : '—'}
+            sub={`失败 ${failed} 次`}
+            hint="成功请求占全部请求比例"
+          />
+          <MetricCard
+            span="xl:col-span-3"
+            label="新建会话"
+            value={String(o.sessions ?? 0)}
+            sub={`${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器`}
+            hint="当前 Agent 新建的会话数"
+          />
+          <MetricCard
+            span="xl:col-span-3"
+            label="节点在线"
+            value={`${o.collectors_online ?? 0} / ${o.collectors ?? 0}`}
+            sub={`${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目`}
+            hint="在线采集器 / 总数"
+          />
+        </div>
       </div>
 
       {/* 第二行：主趋势图 */}
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+      <div className="mt-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-3">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">使用趋势</h2>
-          <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-700/40 p-0.5">
-            {TREND_TABS.map((t) => (
-              <button
-                key={t.key}
-                type="button"
-                onClick={() => setTrendTab(t.key)}
-                className={`px-3 py-1.5 text-sm font-medium rounded-md ${trendTab === t.key ? 'bg-white dark:bg-gray-600 shadow-xs text-gray-800 dark:text-gray-100' : 'text-gray-500 dark:text-gray-400'}`}
-              >
-                {t.label}
-              </button>
-            ))}
+          <div className="flex items-center gap-2 flex-wrap">
+            <Segmented items={DIMS} value={dim} onChange={setDim} />
+            <Segmented items={TREND_TABS} value={trendTab} onChange={setTrendTab} />
           </div>
         </div>
-        {trendData.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trendData.labels} values={trendData.values} height={340} formatY={formatY} />}
+        {trendData.labels.length === 0 ? (
+          <EmptyState title="当前范围无数据" />
+        ) : (
+          <TrendChart labels={trendData.labels} datasets={trendData.datasets} tooltipLabels={trendData.tooltipLabels} height={320} formatY={formatY} />
+        )}
       </div>
 
-      {/* 第三行：双排行 */}
-      <div className="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">模型调用排行</h2>
+      {/* 第三行：模型排行（Token / 调用） */}
+      <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">模型 Token 排行</h2>
+          <RankingList items={modelTokenItems} valueKey="value" labelKey="name" format={fmtTokensShort} limit={5} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
+        </div>
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">模型调用排行</h2>
           <RankingList items={costItems} valueKey="value" labelKey="name" format={fmtTokensShort} limit={5} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
         </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Agent 使用分布</h2>
+      </div>
+
+      {/* 第四行：Agent 排行（使用分布 / Token） */}
+      <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">Agent 使用分布</h2>
           <RankingList items={agentItems} valueKey="value" labelKey="name" format={fmtTokensShort} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />
+        </div>
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">Agent Token 排行</h2>
+          <RankingList items={agentTokenItems} valueKey="value" labelKey="name" format={fmtTokensShort} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />
         </div>
       </div>
 
       {/* 第四行：关注事件 */}
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <div className="flex items-center justify-between mb-4">
+      <div className="mt-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+        <div className="flex items-center justify-between mb-3">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">需要关注</h2>
         </div>
         {alerts.length === 0 ? (
@@ -145,7 +309,7 @@ export default function Overview() {
           <ul className="space-y-2">
             {alerts.map((a, i) => (
               <li key={i} className="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-700/30 text-sm">
-                <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" />
+                <span className={`w-2 h-2 rounded-full shrink-0 ${a.type === 'error' ? 'bg-red-500' : a.type === 'warning' ? 'bg-amber-500' : 'bg-indigo-500'}`} />
                 <span className="text-gray-700 dark:text-gray-200">{a.text}</span>
               </li>
             ))}

@@ -1,7 +1,7 @@
 // 单次模型调用详情：全字段 + 估算区间 + 缺失说明。
 
 import React from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useLocation, useParams } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
 import StatusBadge from '../../components/common/StatusBadge'
@@ -12,9 +12,10 @@ import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration } from '../.
 
 export default function CallDetail() {
   const { id } = useParams()
+  const location = useLocation()
   const query = useQuery(`call-detail-${id}`, () => api(`/calls/${encodeURIComponent(id)}`))
 
-  if (query.error) return <ErrorState error={query.error} />
+  if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={6} />
   const c = query.data?.call || {}
   const tr = query.data?.traffic || {}
@@ -27,7 +28,7 @@ export default function CallDetail() {
   return (
     <>
       <PageHeader
-        back={<Link to="/sessions" className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">← 返回</Link>}
+        back={<Link to={location.state?.from || '/sessions'} className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">← 返回</Link>}
         title={`模型调用 ${c.id}`}
         subtitle={<StatusBadge status={c.status} />}
       />
@@ -42,11 +43,11 @@ export default function CallDetail() {
           { label: '输入 Token', value: fmtTokensShort(c.input_tokens) },
           { label: '输出 Token', value: fmtTokensShort(c.output_tokens) },
           { label: '缓存 Token', value: fmtTokensShort(c.cache_read_tokens) },
-          { label: '费用', value: fmtUsd(c.calculated_cost_micro_usd ?? c.estimated_cost_micro_usd) },
+          { label: '费用', value: fmtUsd(c.reported_cost_micro_usd ?? c.calculated_cost_micro_usd ?? c.estimated_cost_micro_usd) },
         ]}
       />
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">估算流量</h2>
         <div className="flex items-baseline gap-4 flex-wrap">
           <span className="text-3xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtBytes(tr.estimated_total_wire_bytes)}</span>
@@ -74,7 +75,7 @@ export default function CallDetail() {
       </div>
 
       {missing.length > 0 && (
-        <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-amber-200 dark:border-amber-800/60 p-6">
+        <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-amber-200 dark:border-amber-800/60 p-6">
           <h2 className="text-lg font-bold text-amber-600 dark:text-amber-400 mb-2">缺失说明</h2>
           <ul className="space-y-1">
             {missing.map((m, i) => <li key={i} className="text-sm text-gray-600 dark:text-gray-300">· {m}</li>)}

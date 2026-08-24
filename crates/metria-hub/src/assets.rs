@@ -33,6 +33,12 @@ pub fn lookup(static_path: &str) -> Option<(&'static str, Vec<u8>)> {
     if let Some(f) = Assets::get(static_path) {
         return Some((guess_mime(static_path), f.data.into_owned()));
     }
+    // Vite 的 public/static 目录会原样输出到 dist/static，而 Hub 的 URL
+    // 前缀本身已经是 /static/；兼容这类资源，避免字体等文件回退为 HTML。
+    let nested_path = format!("static/{static_path}");
+    if let Some(f) = Assets::get(&nested_path) {
+        return Some((guess_mime(static_path), f.data.into_owned()));
+    }
     // SPA fallback：非资源路径均返回 index.html，由前端路由接管。
     if let Some(idx) = Assets::get("index.html") {
         return Some(("text/html; charset=utf-8", idx.data.into_owned()));

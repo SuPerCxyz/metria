@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react'
 
-export default function FilterBar({ searchPlaceholder, onSearch, primary, moreFields }) {
+export default function FilterBar({ searchPlaceholder, onSearch, primary, moreFields, actions }) {
   const [search, setSearch] = useState('')
   const [moreOpen, setMoreOpen] = useState(false)
 
@@ -13,7 +13,7 @@ export default function FilterBar({ searchPlaceholder, onSearch, primary, moreFi
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-3 mb-6">
+    <div className="flex flex-wrap items-center gap-3 mb-4">
       {primary}
       <div className="relative flex-1 min-w-[200px] max-w-xs">
         <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 fill-current text-gray-400" viewBox="0 0 16 16">
@@ -37,6 +37,7 @@ export default function FilterBar({ searchPlaceholder, onSearch, primary, moreFi
           {moreOpen && <div className="w-full">{moreFields}</div>}
         </>
       )}
+      {actions && <div className="flex-none">{actions}</div>}
     </div>
   )
 }

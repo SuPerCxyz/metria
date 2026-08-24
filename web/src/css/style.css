@@ -1,7 +1,13 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=fallback');
-
 @import 'tailwindcss';
 @import './additional-styles/utility-patterns.css' layer(components);
+
+@font-face {
+  font-family: 'MapleMono';
+  src: url('/static/fonts/MapleMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
 
 @plugin "@tailwindcss/forms" {
   strategy: base;
@@ -11,6 +17,8 @@
 @custom-variant sidebar-expanded (&:is(.sidebar-expanded *));
 
 @theme {
+  --font-maple: "MapleMono", ui-monospace, monospace;
+
   --shadow-sm: 0 1px 1px 0 rgb(0 0 0 / 0.05), 0 1px 2px 0 rgb(0 0 0 / 0.02);
 
   --color-gray-50: #f9fafb;
@@ -136,3 +144,4 @@
     border-color: var(--color-gray-200, currentColor);
   }
 }
+/* build-cache-test */

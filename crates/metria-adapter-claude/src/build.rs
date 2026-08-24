@@ -224,9 +224,15 @@ impl SessionBuilder {
         output: Option<i64>,
         cache_read: Option<i64>,
         cache_write: Option<i64>,
+        duration_ms: Option<i64>,
+        status: &str,
         response_text: Option<String>,
     ) {
         let model_norm = model_raw.as_deref().map(normalize_model);
+        let status_code = match status {
+            "error" | "cancelled" | "aborted" => Some(400),
+            _ => Some(200),
+        };
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(source_call_id),
@@ -244,9 +250,9 @@ impl SessionBuilder {
             started_at: at,
             first_response_at: Some(at),
             completed_at: Some(at),
-            duration_ms: None,
-            status: "success".into(),
-            status_code: Some(200),
+            duration_ms,
+            status: status.to_string(),
+            status_code,
             streaming: false,
             stream_completed: Some(true),
             client_aborted: false,

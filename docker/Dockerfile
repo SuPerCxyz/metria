@@ -15,7 +15,7 @@
 FROM --platform=$BUILDPLATFORM node:24-alpine AS web
 WORKDIR /build
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 COPY web/ ./
 RUN npm run build
 
@@ -23,6 +23,10 @@ RUN npm run build
 FROM --platform=$BUILDPLATFORM rust:1.96-slim AS build
 WORKDIR /src
 ARG TARGETARCH
+# 构建 profile：本地开发默认 release 也缓存复用；需要快速迭代时
+#   docker build --build-arg PROFILE=dev ...
+# 即用 dev profile（无 LTO/低优化），显著加快编译；正式发布保持 release 全量 LTO。
+ARG PROFILE=release
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates \
     && if [ "$TARGETARCH" = "arm64" ]; then \
@@ -34,14 +38,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
 COPY --from=web /build/dist ./web/dist
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
+# cargo 缓存挂载：registry（依赖只下/编一次）+ target（增量编译，源码变更不触发全量）。
+# target 通过 CARGO_TARGET_DIR 指向缓存挂载，避免其内容进入层快照导致 COPY 拿不到二进制；
+# 最终产物显式拷贝到层内 /src/target/release/metria，供 hub 阶段 COPY。
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/cargo-target \
+    profile="$PROFILE"; target_dir=release; [ "$profile" = "dev" ] && target_dir=debug; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      CARGO_TARGET_DIR=/cargo-target \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
       CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-      cargo build --release --workspace --bin metria --target aarch64-unknown-linux-gnu \
+      cargo build --profile "$profile" --workspace --bin metria --target aarch64-unknown-linux-gnu \
       && mkdir -p target/release \
-      && cp target/aarch64-unknown-linux-gnu/release/metria target/release/metria; \
+      && cp "/cargo-target/aarch64-unknown-linux-gnu/$target_dir/metria" target/release/metria; \
     else \
-      cargo build --release --workspace --bin metria; \
+      CARGO_TARGET_DIR=/cargo-target \
+      cargo build --profile "$profile" --workspace --bin metria \
+      && mkdir -p target/release \
+      && cp "/cargo-target/$target_dir/metria" target/release/metria; \
     fi
 
 # ---- Runtime（目标平台） ----

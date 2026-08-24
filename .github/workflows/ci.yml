@@ -1,7 +1,7 @@
 # Metria CI：质量门禁 + 前端构建 + 多架构容器镜像
 #
-# 触发：push 到 main、pull request。
-# main 分支会构建并推送 amd64/arm64 镜像到 ghcr.io/supercxyz/metria:main 与 :<sha>。
+# 触发：push 到 master、pull request。
+# master 分支推送 :master 与 :<sha>，正式版本的 :latest 由 Release 工作流维护。
 
 name: CI
 
@@ -72,6 +72,12 @@ jobs:
       - name: npm ci
         run: cd web && npm ci
 
+      - name: npm audit
+        run: cd web && npm audit --audit-level=high
+
+      - name: test
+        run: cd web && npm test
+
       - name: build
         run: cd web && npm run build
 
@@ -98,6 +104,7 @@ jobs:
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -110,7 +117,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "tags=${{ env.IMAGE }}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${{ env.IMAGE }}:latest,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
+            echo "tags=${{ env.IMAGE }}:master,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 构建并推送镜像
@@ -120,7 +127,7 @@ jobs:
           file: docker/Dockerfile
           target: hub
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

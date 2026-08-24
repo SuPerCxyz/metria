@@ -200,3 +200,20 @@ pub fn known_catalogs() -> Vec<(&'static str, &'static str)> {
         ("litellm", "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"),
     ]
 }
+
+/// 用当前全部启用规则重新计价，并重建费用 rollup（返回重计价条数）。
+///
+/// `only_unpriced = true` 时仅处理尚无费用的事件（后台周期增量），否则全量重算。
+pub fn reprice_from_rules(db: &HubDb, only_unpriced: bool) -> Result<i64, String> {
+    let rules = db.load_all_rules();
+    let mut engine = metria_pricing::PricingEngine::new();
+    for r in rules {
+        engine.add_rule(r);
+    }
+    let n = db
+        .reprice_all(&engine, only_unpriced)
+        .map_err(|e| e.to_string())?;
+    // 重建最近 31 天费用 rollup，使 Overview/费用页按最新价格反映
+    db.rebuild_usage_rollups(31).map_err(|e| e.to_string())?;
+    Ok(n)
+}

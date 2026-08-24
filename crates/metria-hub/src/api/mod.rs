@@ -85,7 +85,9 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
+        .route("/api/v1/auth/profile", get(profile).put(update_profile))
         .route("/api/v1/auth/change-password", post(change_password))
+        .route("/api/v1/system/info", get(system_info))
         .route("/api/v1/collectors/register", post(register))
         .route("/api/v1/collectors/heartbeat", post(heartbeat))
         .route("/api/v1/collectors/status", get(collector_status))
@@ -103,8 +105,19 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/usage/timeseries", get(usage_timeseries))
         .route("/api/v1/usage/breakdown", get(usage_breakdown))
+        .route("/api/v1/usage/latency", get(usage_latency))
+        .route(
+            "/api/v1/usage/latency/timeseries",
+            get(usage_latency_timeseries),
+        )
         .route("/api/v1/nodes", get(list_nodes))
-        .route("/api/v1/nodes/{id}", get(node_detail))
+        .route(
+            "/api/v1/nodes/{id}",
+            get(node_detail).put(node_update).delete(node_delete),
+        )
+        .route("/api/v1/nodes/{id}/install", get(node_install))
+        .route("/api/v1/agent/download", get(agent_download))
+        .route("/api/v1/nodes", post(node_create))
         .route("/api/v1/nodes/{id}/clients", get(node_clients))
         .route("/api/v1/nodes/{id}/sessions", get(node_sessions))
         .route("/api/v1/nodes/{id}/calls", get(node_calls))
@@ -147,6 +160,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/traffic/profiles/test", post(traffic_profiles_test))
         .route("/api/v1/traffic/reestimate", post(traffic_reestimate))
         .route("/api/v1/pricing/catalogs", get(pricing_catalogs))
+        .route(
+            "/api/v1/pricing/catalogs/{id}",
+            axum::routing::put(pricing_catalog_update),
+        )
         .route(
             "/api/v1/pricing/catalogs/{id}/refresh",
             post(pricing_catalog_refresh),
@@ -479,6 +496,13 @@ struct ChangePasswordRequest {
     new_password: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProfileUpdateRequest {
+    display_name: Option<String>,
+    avatar_text: Option<String>,
+    avatar_color: Option<String>,
+}
+
 fn session_secret() -> Vec<u8> {
     use sha2::Digest;
     let secret = std::env::var("METRIA_SESSION_SECRET")
@@ -530,13 +554,71 @@ fn verify_session(token: &str) -> Option<String> {
 
 fn admin_hash() -> (String, String) {
     let user = std::env::var("METRIA_ADMIN_USER").unwrap_or_else(|_| "admin".into());
-    let pass = std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_else(|_| "metria-admin".into());
+    let pass = std::env::var("METRIA_ADMIN_PASSWORD").unwrap_or_else(|_| "change-me-please".into());
     (user, hash_password(&pass))
 }
 
 async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
-    let (user, hash) = admin_hash();
-    if req.username != user || !verify_password(&req.password, &hash) {
+    let stored = match st.db.user_credentials(&req.username) {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &e.to_string(),
+            )
+        }
+    };
+    let valid = if let Some((hash, must_change)) = stored {
+        if verify_password(&req.password, &hash) {
+            true
+        } else if must_change {
+            let (user, env_hash) = admin_hash();
+            let valid = req.username == user && verify_password(&req.password, &env_hash);
+            if valid {
+                if let Err(e) = st.db.update_user_password(&req.username, &env_hash) {
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "db_error",
+                        &e.to_string(),
+                    );
+                }
+            }
+            valid
+        } else {
+            // 兼容早期版本：旧库可能已将内置初始密码标记为已完成修改，
+            // 但部署环境密码随后发生变化。仅当数据库仍保存内置默认密码时，
+            // 允许用当前环境密码完成一次凭据同步；自定义密码不会走此分支。
+            let (user, env_hash) = admin_hash();
+            let legacy_valid = req.username == user
+                && req.password != "metria-admin"
+                && verify_password("metria-admin", &hash);
+            if legacy_valid {
+                if let Err(e) = st.db.update_user_password(&req.username, &env_hash) {
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "db_error",
+                        &e.to_string(),
+                    );
+                }
+            }
+            legacy_valid
+        }
+    } else {
+        let (user, hash) = admin_hash();
+        let valid = req.username == user && verify_password(&req.password, &hash);
+        if valid {
+            if let Err(e) = st.db.update_user_password(&req.username, &hash) {
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_error",
+                    &e.to_string(),
+                );
+            }
+        }
+        valid
+    };
+    if !valid {
         return json_err(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
@@ -559,21 +641,167 @@ async fn logout(State(st): State<AppState>, headers: axum::http::HeaderMap) -> R
 }
 
 async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
-    match auth_user(&st, &headers) {
-        Some(u) => Json(serde_json::json!({ "username": u, "ok": true })).into_response(),
-        None => json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录"),
+    let Some(username) = auth_user(&st, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
+    };
+    match st.db.user_profile(&username) {
+        Ok(Some(p)) => Json(serde_json::json!({
+            "username": p.username,
+            "display_name": p.display_name,
+            "avatar_text": p.avatar_text,
+            "avatar_color": p.avatar_color,
+            "role": p.role,
+            "ok": true
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "username": username,
+            "display_name": null,
+            "avatar_text": null,
+            "avatar_color": "indigo",
+            "role": "admin",
+            "ok": true
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_error",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn profile(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    me(State(st), headers).await
+}
+
+async fn update_profile(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ProfileUpdateRequest>,
+) -> Response {
+    let Some(username) = auth_user(&st, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
+    };
+    let display_name = req.display_name.map(|v| v.trim().to_string());
+    if display_name
+        .as_ref()
+        .is_some_and(|v| v.chars().count() > 64)
+    {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_profile",
+            "显示名称不能超过 64 个字符",
+        );
+    }
+    let avatar_text = req.avatar_text.map(|v| v.trim().to_string());
+    if avatar_text.as_ref().is_some_and(|v| v.chars().count() > 2) {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_profile",
+            "头像文字最多 2 个字符",
+        );
+    }
+    let allowed_colors = ["indigo", "emerald", "amber", "rose", "sky", "violet"];
+    let avatar_color = req.avatar_color.unwrap_or_else(|| "indigo".into());
+    if !allowed_colors.contains(&avatar_color.as_str()) {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_profile",
+            "头像颜色不受支持",
+        );
+    }
+    let display_name = display_name.filter(|v| !v.is_empty());
+    let avatar_text = avatar_text.filter(|v| !v.is_empty());
+    match st.db.update_user_profile(
+        &username,
+        display_name.as_deref(),
+        avatar_text.as_deref(),
+        &avatar_color,
+    ) {
+        Ok(true) => me(State(st), headers).await,
+        Ok(false) => json_err(StatusCode::NOT_FOUND, "user_not_found", "用户不存在"),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_error",
+            &e.to_string(),
+        ),
     }
 }
 
 async fn change_password(
     State(st): State<AppState>,
     headers: axum::http::HeaderMap,
-    _req: Json<ChangePasswordRequest>,
+    Json(req): Json<ChangePasswordRequest>,
 ) -> Response {
+    let Some(username) = auth_user(&st, &headers) else {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
+    };
+    if req.new_password.chars().count() < 8 {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "weak_password",
+            "新密码至少需要 8 个字符",
+        );
+    }
+    let stored = match st.db.user_password_hash(&username) {
+        Ok(hash) => hash,
+        Err(e) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &e.to_string(),
+            )
+        }
+    };
+    let old_valid = if let Some(hash) = stored {
+        verify_password(&req.old_password, &hash)
+    } else {
+        let (user, hash) = admin_hash();
+        username == user && verify_password(&req.old_password, &hash)
+    };
+    if !old_valid {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_old_password",
+            "旧密码不正确",
+        );
+    }
+    let hash = hash_password(&req.new_password);
+    if let Err(e) = st.db.update_user_password(&username, &hash) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_error",
+            &e.to_string(),
+        );
+    }
+    st.sessions
+        .lock()
+        .unwrap()
+        .retain(|_, session_user| session_user != &username);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn system_info(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
     if auth_user(&st, &headers).is_none() {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
     }
-    Json(serde_json::json!({ "ok": true })).into_response()
+    let (content_mode, content_mode_label) = match st.cfg.content_mode {
+        metria_core::ContentMode::None => ("none", "不保存正文"),
+        metria_core::ContentMode::Metadata => ("metadata", "仅保存元数据"),
+        metria_core::ContentMode::Full => ("full", "保存完整正文"),
+    };
+    Json(serde_json::json!({
+        "content_mode": content_mode,
+        "content_mode_label": content_mode_label,
+        "timezone": st.cfg.timezone.name(),
+        "retention": {
+            "automatic_cleanup": false,
+            "retention_days": null,
+            "label": "全量保留（未启用自动清理）"
+        }
+    }))
+    .into_response()
 }
 
 // ============ Collector 协议 ============

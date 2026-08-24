@@ -7,10 +7,10 @@
 # 首次登录凭据通过环境变量注入（见 .env.example）。
 services:
   metria-hub:
-    image: ghcr.io/supercxyz/metria:latest
+    image: ${METRIA_IMAGE:-ghcr.io/supercxyz/metria:latest}
     container_name: metria-hub
     command: ["hub"]
-    restart: unless-stopped
+    restart: always
     ports:
       - "${METRIA_HTTP_PORT:-8080}:8080"
     volumes:
@@ -20,7 +20,8 @@ services:
       METRIA_LISTEN: 0.0.0.0:8080
       METRIA_TIMEZONE: ${METRIA_TIMEZONE:-Asia/Shanghai}
       METRIA_CONTENT_MODE: ${METRIA_CONTENT_MODE:-metadata}
-      # 单 Admin 初始凭据（首次登录后强制改密）
+      METRIA_SESSION_SECRET: ${METRIA_SESSION_SECRET:-change-me-session-secret}
+      # 单 Admin 初始凭据，部署后请立即修改
       METRIA_ADMIN_USER: ${METRIA_ADMIN_USER:-admin}
       METRIA_ADMIN_PASSWORD: ${METRIA_ADMIN_PASSWORD:-change-me-please}
     healthcheck:

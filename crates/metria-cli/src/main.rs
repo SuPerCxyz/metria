@@ -6,7 +6,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
-const NOT_IMPLEMENTED: &str = "not implemented in M1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -156,6 +155,13 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Config => match run_config() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("配置读取失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Backup { out } => match run_backup(out.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -196,10 +202,6 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        other => {
-            eprintln!("{NOT_IMPLEMENTED}: {other:?}");
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -207,6 +209,54 @@ fn hub_db_url() -> Result<String, String> {
     Ok(metria_hub::HubConfig::from_env()
         .map_err(|e| e.to_string())?
         .database_url)
+}
+
+fn run_config() -> Result<(), String> {
+    let hub = metria_hub::HubConfig::from_env().map_err(|e| e.to_string())?;
+    let agent = metria_agent::AgentConfig::from_env().map_err(|e| e.to_string())?;
+    println!("version: {PKG_VERSION}");
+    println!("hub.listen: {}", hub.listen);
+    println!("hub.database_url: {}", hub.database_url);
+    println!("hub.content_mode: {:?}", hub.content_mode);
+    println!("hub.timezone: {}", hub.timezone);
+    println!("agent.node_id: {}", display_or_default(&agent.node_id));
+    println!("agent.node_name: {}", agent.node_name);
+    println!("agent.hub_url: {}", agent.hub_url);
+    println!("agent.data_dir: {}", agent.data_dir.display());
+    println!(
+        "agent.token: {}",
+        if agent.token.is_some() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+    println!(
+        "agent.claude_path: {}",
+        display_path(agent.claude_path.as_deref())
+    );
+    println!(
+        "agent.codex_path: {}",
+        display_path(agent.codex_path.as_deref())
+    );
+    println!(
+        "agent.opencode_path: {}",
+        display_path(agent.opencode_path.as_deref())
+    );
+    Ok(())
+}
+
+fn display_or_default(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "<auto>"
+    } else {
+        value
+    }
+}
+
+fn display_path(path: Option<&std::path::Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".to_string())
 }
 
 fn run_backup(out: Option<&str>) -> Result<(), String> {

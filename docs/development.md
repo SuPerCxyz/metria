@@ -21,7 +21,7 @@ crates/
 ├── metria-hub           Hub（api/db/rollup/catalog/demo/share/export）
 └── metria-cli           CLI（hub/agent/import/doctor/config/export/backup/restore/mcp/healthcheck/version）
 
-web/                      Preact+TS+Vite+uPlot（dist 由 hub embed）
+web/                      React+Vite+Tailwind+Chart.js（dist 由 hub embed）
 migrations/               SQLite 版本化 migration
 fixtures/                 claude/ codex/ opencode/ malformed/ traffic/
 docker/                   Dockerfile + compose.*.yaml + .env.example
@@ -41,10 +41,10 @@ cargo run -p metria-cli -- hub --demo        # 演示 Hub（合成数据）
 # Web（需 Hub 运行在 8080）
 cd web && npm install
 npm run dev                                    # Vite dev server
-npm run typecheck && npm run build
+npm test && npm run build
 
 # 前端单测
-npm test                                       # vitest run
+npm test                                       # Node.js 内置测试运行器
 ```
 
 ## 4. 质量门禁（提交前必须全绿）
@@ -53,7 +53,7 @@ npm test                                       # vitest run
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
-cd web && npm run typecheck && npm run build && npm test
+cd web && npm test && npm run build
 docker build -f docker/Dockerfile --target hub -t metria:dev .
 docker compose -f docker/compose.full.yaml config
 ```

@@ -10,6 +10,7 @@ import { ErrorState, LoadingSkeleton, DataQualityNote } from '../../components/f
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeNames } from '../../hooks/useNodeNames'
 import { fmtBytes, fmtTokensShort } from '../../services/format'
 
 export default function Traffic() {
@@ -22,6 +23,7 @@ export default function Traffic() {
   const byModel = useQuery(`tm${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`ta${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
   const byNode = useQuery(`tn${q({ ...params, dim: 'node' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'node' })}`))
+  const nodeNames = useNodeNames()
 
   const trend = useMemo(() => ({
     labels: (series.data?.series || []).map((p) => p.bucket),
@@ -32,7 +34,7 @@ export default function Traffic() {
   if (overview.loading) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
 
-  const rank = (arr) => (arr || []).map((m) => ({ id: m.dimension, name: m.dimension, value: m.estimated_traffic_bytes ?? 0 }))
+  const rank = (arr) => (arr || []).map((m) => ({ id: m.dimension, name: nodeNames[m.dimension] || m.dimension, value: m.estimated_traffic_bytes ?? 0 }))
 
   return (
     <>
@@ -46,12 +48,12 @@ export default function Traffic() {
         <MetricCard label="平均单会话流量" value={o.sessions > 0 ? fmtBytes((o.estimated_total_bytes ?? 0) / o.sessions) : '—'} />
       </div>
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">流量趋势</h2>
-        <TrendChart labels={trend.labels} values={trend.values} height={340} formatY={fmtBytes} />
+        <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={fmtBytes} />
       </div>
 
-      <div className="mt-6 grid grid-cols-1 xl:grid-cols-3 gap-6">
+      <div className="mt-4 grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Agent 流量排行</h2>
           <RankingList items={rank(byAgent.data?.by)} valueKey="value" labelKey="name" format={fmtBytes} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />

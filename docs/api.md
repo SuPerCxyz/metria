@@ -5,7 +5,7 @@
 ## 认证
 
 - **Admin**：`POST /auth/login` `{username, password}` → `{token}`；之后 `Authorization: Bearer <token>`。
-  `logout` / `me` / `change-password`。单 Admin，凭据由 `METRIA_ADMIN_USER` / `METRIA_ADMIN_PASSWORD` 注入。
+  `logout` / `me` / `profile` / `change-password`。首次初始化凭据由 `METRIA_ADMIN_USER` / `METRIA_ADMIN_PASSWORD` 注入，修改密码后以 SQLite users 记录为准。
 - **Collector**：`Authorization: Bearer <collector-token>`。token 仅存哈希，默认有效期 7 天
   （`collector_tokens.expires_at`，过期需重新注册）。也可通过 `METRIA_COLLECTOR_TOKEN` 配置共享 bootstrap token。
 - **SSE**：`/stream` 因 EventSource 无法带 Header，允许 `?token=` 传会话 token。
@@ -41,7 +41,10 @@
 | GET | `/sessions/{id}/calls` `/tools` `/timeline` `/subagents` | 会话明细 |
 | GET | `/traffic/summary` `/traffic/by-node|client|model|provider` | 流量汇总与分维 |
 | GET | `/data-quality` | 数据来源分布与解析告警 |
+| GET | `/system/info` | 当前内容保存模式、时区和数据保留状态（只读） |
 | GET | `/export` | 导出（JSON/NDJSON/CSV） |
+
+账户资料：`GET/PUT /auth/profile` 读取或更新显示名称、头像文字和头像颜色；`POST /auth/change-password` 校验旧密码并更新密码哈希。密码修改成功后现有会话失效。
 
 ## Traffic Profiles / Pricing / Share
 

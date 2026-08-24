@@ -20,8 +20,8 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.85"
-homepage = "https://github.com/metria/metria"
-repository = "https://github.com/metria/metria"
+homepage = "https://github.com/SuPerCxyz/metria"
+repository = "https://github.com/SuPerCxyz/metria"
 
 [profile.release]
 lto = true

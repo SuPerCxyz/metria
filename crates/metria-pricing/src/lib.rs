@@ -190,23 +190,7 @@ impl PricingEngine {
             });
         }
 
-        // 找到最佳规则：source_order 优先，其次 rule.priority
-        let mut ranked: Vec<&PricingRule> = self
-            .rules
-            .iter()
-            .filter(|r| r.effective_at(at))
-            .filter(|r| model_is_match(r, model))
-            .filter(|r| provider_is_match(r, provider))
-            .filter(|r| has_price(r))
-            .collect();
-        ranked.sort_by(|a, b| {
-            (source_order(b.source), b.priority).cmp(&(source_order(a.source), a.priority))
-        });
-        let rule: Option<PricingRule> = match ranked.into_iter().next() {
-            Some(r) => Some(r.clone()),
-            None if self.builtin_enabled => self.builtin_rule(model, provider, at),
-            None => None,
-        };
+        let rule = self.resolve_rule(model, provider, at);
 
         let Some(rule) = rule else {
             // 无价格 → 不硬造
@@ -254,6 +238,72 @@ impl PricingEngine {
         })
     }
 
+    /// 返回模型当前实际使用的价格来源，供 Hub 查询 API 与费用页面复用。
+    pub fn pricing_source(
+        &self,
+        model: Option<&str>,
+        provider: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        self.resolve_rule(model, provider, at).map(|rule| {
+            if rule
+                .metadata
+                .get("automatic_free")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                "free_model".to_string()
+            } else {
+                pricing_source_name(rule.source).to_string()
+            }
+        })
+    }
+
+    fn resolve_rule(
+        &self,
+        model: Option<&str>,
+        provider: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<PricingRule> {
+        // 用户覆盖优先于自动 free 规则与目录规则。
+        let mut user_rules: Vec<&PricingRule> = self
+            .rules
+            .iter()
+            .filter(|r| r.source == PricingSource::UserOverride)
+            .filter(|r| r.effective_at(at))
+            .filter(|r| model_is_match(r, model))
+            .filter(|r| provider_is_match(r, provider))
+            .filter(|r| has_price(r))
+            .collect();
+        user_rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+        if let Some(rule) = user_rules.into_iter().next() {
+            return Some(rule.clone());
+        }
+
+        if model.is_some_and(is_free_model) {
+            return Some(free_rule(at));
+        }
+
+        // 其他来源：source_order 优先，其次 rule.priority。
+        let mut ranked: Vec<&PricingRule> = self
+            .rules
+            .iter()
+            .filter(|r| r.source != PricingSource::UserOverride)
+            .filter(|r| r.effective_at(at))
+            .filter(|r| model_is_match(r, model))
+            .filter(|r| provider_is_match(r, provider))
+            .filter(|r| has_price(r))
+            .collect();
+        ranked.sort_by(|a, b| {
+            (source_order(b.source), b.priority).cmp(&(source_order(a.source), a.priority))
+        });
+        match ranked.into_iter().next() {
+            Some(rule) => Some(rule.clone()),
+            None if self.builtin_enabled => self.builtin_rule(model, provider, at),
+            None => None,
+        }
+    }
+
     fn builtin_rule(
         &self,
         model: Option<&str>,
@@ -262,7 +312,7 @@ impl PricingEngine {
     ) -> Option<PricingRule> {
         let model = model?;
         for b in BUILTIN {
-            if !pattern_match(b.model_pattern, model) {
+            if !model_matches_pattern(b.model_pattern, model) {
                 continue;
             }
             if let Some(p) = provider {
@@ -336,16 +386,123 @@ impl PricingEngine {
 
 fn model_is_match(rule: &PricingRule, model: Option<&str>) -> bool {
     match model {
-        Some(m) => pattern_match(&rule.model_pattern, m),
+        Some(m) => model_matches_pattern(&rule.model_pattern, m),
         None => rule.model_pattern == "*",
     }
 }
 
-fn provider_is_match(rule: &PricingRule, provider: Option<&str>) -> bool {
-    match provider {
-        Some(p) => pattern_match(&rule.provider_pattern, p),
-        None => rule.provider_pattern == "*",
+/// 返回模型匹配候选：原始名、`/` 后缀，以及去掉 exact `free` 段的形式。
+/// 仅用于价格匹配，不修改事件中的 raw/model_normalized 字段。
+pub fn model_match_candidates(model: &str) -> Vec<String> {
+    let raw = model.trim().to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    let mut add = |candidate: String| {
+        if !candidate.is_empty() && !candidates.iter().any(|v| v == &candidate) {
+            candidates.push(candidate);
+        }
+    };
+    add(raw.clone());
+    if let Some((_, suffix)) = raw.rsplit_once('/') {
+        add(suffix.to_string());
     }
+    add(remove_free_segment(&raw));
+    if let Some((_, suffix)) = raw.rsplit_once('/') {
+        add(remove_free_segment(suffix));
+    }
+    candidates
+}
+
+/// 判断价格规则是否匹配模型名（大小写不敏感，支持 `*` / `?`）。
+pub fn model_matches_pattern(pattern: &str, model: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let pattern = if pattern == ".*" {
+        "*"
+    } else {
+        pattern.as_str()
+    };
+    model_match_candidates(model)
+        .iter()
+        .any(|candidate| pattern_match(pattern, candidate))
+}
+
+/// 判断模型名是否包含独立的 `free` 段。
+pub fn is_free_model(model: &str) -> bool {
+    model
+        .to_ascii_lowercase()
+        .split('/')
+        .any(|part| part.split('-').any(|segment| segment == "free"))
+}
+
+fn remove_free_segment(model: &str) -> String {
+    model
+        .split('/')
+        .map(|part| {
+            part.split('-')
+                .filter(|segment| *segment != "free")
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn free_rule(at: chrono::DateTime<chrono::Utc>) -> PricingRule {
+    PricingRule {
+        id: Id::new(),
+        snapshot_id: None,
+        source: PricingSource::BuiltinCatalog,
+        channel: PricingChannel::VendorDirect,
+        provider_pattern: "*".to_string(),
+        model_pattern: "*".to_string(),
+        client_pattern: "*".to_string(),
+        region_pattern: None,
+        service_tier: None,
+        currency: "usd".to_string(),
+        unit: "per_million_tokens".to_string(),
+        input_price: Some(0),
+        output_price: Some(0),
+        cache_read_price: Some(0),
+        cache_write_price: Some(0),
+        reasoning_price: Some(0),
+        request_price: Some(0),
+        effective_from: None,
+        effective_to: None,
+        priority: i64::MAX,
+        enabled: true,
+        metadata: serde_json::json!({"automatic_free": true}),
+        created_at: at,
+        updated_at: at,
+    }
+}
+
+fn pricing_source_name(source: PricingSource) -> &'static str {
+    match source {
+        PricingSource::ClientReported => "client_reported",
+        PricingSource::UserOverride => "user_override",
+        PricingSource::OpenRouterCatalog => "openrouter_catalog",
+        PricingSource::LiteLlmCatalog => "litellm_catalog",
+        PricingSource::BuiltinCatalog => "builtin_catalog",
+        PricingSource::CustomHttpCatalog => "custom_http_catalog",
+    }
+}
+
+fn provider_is_match(rule: &PricingRule, provider: Option<&str>) -> bool {
+    // 外部目录中的 provider 是真实供应商，而事件中的 provider 可能是
+    // relay/custom 名称；目录价格按模型匹配，避免中继名称挡住有效目录价。
+    if rule.source != PricingSource::UserOverride {
+        return true;
+    }
+    let pattern = rule.provider_pattern.trim();
+    if pattern.is_empty() || pattern == "*" || pattern == ".*" {
+        return true;
+    }
+    let Some(provider) = provider else {
+        return false;
+    };
+    pattern_match(
+        &pattern.to_ascii_lowercase(),
+        &provider.to_ascii_lowercase(),
+    )
 }
 
 fn has_price(rule: &PricingRule) -> bool {
@@ -489,5 +646,130 @@ mod tests {
         let calc = r.calculated_micro_usd.unwrap();
         // 1000*1 + 2000*2 = 5000
         assert_eq!(calc, 5_000);
+    }
+
+    #[test]
+    fn relay_and_free_aliases_match_without_rewriting_raw_name() {
+        assert!(model_matches_pattern(
+            "deepseek-v4-flash",
+            "opencode-go/deepseek-v4-flash"
+        ));
+        assert!(model_matches_pattern("mimo-v2.5", "mimo-v2.5-free"));
+        assert!(!is_free_model("mimo-v2.5-freeform"));
+        assert!(is_free_model("mimo-v2.5-free"));
+    }
+
+    #[test]
+    fn free_model_is_zero_priced() {
+        let e = PricingEngine::new();
+        let r = e
+            .compute(
+                &usage(),
+                Some("mimo-v2.5-free"),
+                Some("opencode-go"),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.calculated_micro_usd, Some(0));
+        assert!(r.pricing_available);
+        assert_eq!(
+            e.pricing_source(Some("mimo-v2.5-free"), Some("opencode-go"), Utc::now()),
+            Some("free_model".into())
+        );
+    }
+
+    #[test]
+    fn catalog_price_ignores_relay_provider_name() {
+        let mut e = PricingEngine::new();
+        e.add_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::OpenRouterCatalog,
+            channel: PricingChannel::OpenRouter,
+            provider_pattern: "deepseek".into(),
+            model_pattern: "deepseek-v4-flash".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: Some(1_000_000),
+            output_price: Some(2_000_000),
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 0,
+            enabled: true,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let r = e
+            .compute(
+                &usage(),
+                Some("opencode-go/deepseek-v4-flash"),
+                Some("relay-opencode-go"),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.calculated_micro_usd, Some(5_000));
+        assert_eq!(
+            e.pricing_source(
+                Some("opencode-go/deepseek-v4-flash"),
+                Some("relay-opencode-go"),
+                Utc::now()
+            ),
+            Some("openrouter_catalog".into())
+        );
+    }
+
+    #[test]
+    fn user_rule_overrides_free_zero_price() {
+        let mut e = PricingEngine::new();
+        e.add_user_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "mimo-v2.5".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: Some(1_000_000),
+            output_price: Some(2_000_000),
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let r = e
+            .compute(
+                &usage(),
+                Some("mimo-v2.5-free"),
+                Some("opencode-go"),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.calculated_micro_usd, Some(5_000));
+        assert_eq!(
+            e.pricing_source(Some("mimo-v2.5-free"), Some("opencode-go"), Utc::now()),
+            Some("user_override".into())
+        );
     }
 }

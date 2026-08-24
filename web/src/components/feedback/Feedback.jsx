@@ -21,13 +21,13 @@ export function EmptyState({ title = '暂无数据', desc, icon }) {
 export function ErrorState({ error, onRetry }) {
   const msg = error?.message || String(error || '加载失败')
   return (
-    <div className="flex flex-col items-center justify-center py-12 text-center">
+    <div role="alert" className="flex flex-col items-center justify-center py-12 text-center">
       <div className="w-12 h-12 mb-3 flex items-center justify-center text-red-400">
         <svg className="w-8 h-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
           <path d="M12 9v4m0 4h.01M10.3 3.9 2.4 17a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </div>
-      <div className="text-sm font-medium text-gray-600 dark:text-gray-300">{msg}</div>
+      <div className="max-w-full break-words text-sm font-medium text-gray-600 dark:text-gray-300">{msg}</div>
       {onRetry && (
         <button type="button" onClick={onRetry} className="mt-3 text-sm text-indigo-600 dark:text-indigo-400 hover:underline">
           重试
@@ -39,7 +39,8 @@ export function ErrorState({ error, onRetry }) {
 
 export function LoadingSkeleton({ rows = 5 }) {
   return (
-    <div className="space-y-3 animate-pulse">
+    <div role="status" aria-live="polite" aria-busy="true" className="space-y-3 animate-pulse">
+      <span className="sr-only">正在加载</span>
       {Array.from({ length: rows }).map((_, i) => (
         <div key={i} className="h-10 bg-gray-100 dark:bg-gray-700/40 rounded-lg" />
       ))}

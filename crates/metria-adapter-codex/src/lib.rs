@@ -5,7 +5,8 @@ pub mod build;
 pub mod entry;
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use metria_adapter_api::types::{
@@ -19,12 +20,15 @@ use metria_core::model::{
 
 use build::{entry_time, jsonl_cursor, BuildCtx, SessionBuilder};
 use entry::{
-    MessagePayload, RawEvent, ReasoningPayload, SessionMeta, TokenCount, ToolCallOutputPayload,
-    ToolCallPayload, UserMessagePayload,
+    model_name_from, MessagePayload, RawEvent, ReasoningPayload, SessionMeta, TokenCount,
+    ToolCallOutputPayload, ToolCallPayload, TurnContextPayload, UserMessagePayload,
 };
 
 /// 单行上限。
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 从游标前恢复模型上下文时的初始回看窗口。
+const CONTEXT_LOOKBACK_BYTES: u64 = 1024 * 1024;
 
 /// Codex Adapter。
 #[derive(Debug, Default, Clone)]
@@ -108,6 +112,8 @@ impl SourceAdapter for CodexAdapter {
         let mut tolerance = ScanTolerance::default();
         let mut state = ScanState::new();
         let mut entry_warnings: Vec<String> = Vec::new();
+
+        bootstrap_incremental_context(path, offset as u64, &mut state, &ctx, &mut entry_warnings)?;
 
         let new_offset = scan_jsonl_file(
             path,
@@ -196,6 +202,114 @@ impl SourceAdapter for CodexAdapter {
     }
 }
 
+/// 增量游标通常已经越过 `session_meta` 和最近的 `turn_context`。在读取新增尾部前，
+/// 仅恢复解析所需的会话与模型状态，不重新生成已经消费过的业务事件。
+fn bootstrap_incremental_context(
+    path: &Path,
+    offset: u64,
+    state: &mut ScanState,
+    ctx: &BuildCtx,
+    warnings: &mut Vec<String>,
+) -> Result<(), AdapterError> {
+    if offset == 0 {
+        return Ok(());
+    }
+
+    let file = File::open(path).map_err(|e| AdapterError::NotReadable {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::with_capacity(16 * 1024);
+    let mut found_session = false;
+
+    // rollout 的 session_meta 位于文件头。只读到第一条有效 session_meta 即停止。
+    while reader.stream_position()? < offset {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 || !buf.ends_with(b"\n") {
+            break;
+        }
+        if let Some(event) = parse_bootstrap_event(path, &buf, warnings) {
+            if event.event_type == "session_meta" {
+                if let Err(e) = process_event(state, ctx, &event) {
+                    warnings.push(e);
+                }
+                found_session = state.current.is_some();
+                break;
+            }
+        }
+    }
+
+    if !found_session {
+        warnings.push(format!(
+            "{}: 增量扫描未找到 session_meta，尾部事件将保持未关联",
+            path.display()
+        ));
+        return Ok(());
+    }
+
+    // 从游标前恢复最新 turn_context。窗口从行中间开始时先丢弃残行。
+    // 窗口内若无 turn_context，向前扩展窗口继续回溯，直到找到该会话的
+    // turn_context（长会话尾部可能超过初始 1MiB 窗口）或到达文件头。
+    let mut lookback = CONTEXT_LOOKBACK_BYTES;
+    loop {
+        let start = offset.saturating_sub(lookback);
+        reader.seek(SeekFrom::Start(start))?;
+        if start > 0 {
+            buf.clear();
+            let _ = reader.read_until(b'\n', &mut buf)?;
+        }
+        let mut found_turn = false;
+        while reader.stream_position()? < offset {
+            let line_start = reader.stream_position()?;
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 || !buf.ends_with(b"\n") || line_start + n as u64 > offset {
+                break;
+            }
+            if let Some(event) = parse_bootstrap_event(path, &buf, warnings) {
+                if event.event_type == "turn_context" {
+                    found_turn = true;
+                    if let Err(e) = process_event(state, ctx, &event) {
+                        warnings.push(e);
+                    }
+                }
+            }
+        }
+        if found_turn || start == 0 {
+            break;
+        }
+        // 窗口内无 turn_context：扩大到整个已读区间继续回溯。
+        lookback = offset;
+    }
+    Ok(())
+}
+
+fn parse_bootstrap_event(
+    path: &Path,
+    line_with_newline: &[u8],
+    warnings: &mut Vec<String>,
+) -> Option<RawEvent> {
+    let mut line = &line_with_newline[..line_with_newline.len().saturating_sub(1)];
+    if line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    if line.is_empty() || line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    match serde_json::from_slice(line) {
+        Ok(event) => Some(event),
+        Err(e) => {
+            warnings.push(format!(
+                "{}: 上下文恢复时 JSON 解析失败: {e}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
 /// 扫描状态：一个 rollout 文件对应一个会话，session_meta 后事件路由到当前会话。
 #[derive(Debug, Default)]
 struct ScanState {
@@ -262,8 +376,18 @@ fn process_event(state: &mut ScanState, ctx: &BuildCtx, event: &RawEvent) -> Res
     match event.event_type.as_str() {
         "event_msg" => process_event_msg(builder, event, at),
         "response_item" => process_response_item(builder, event, at),
+        "turn_context" => process_turn_context(builder, event),
         _ => Ok(()),
     }
+}
+
+/// turn_context：记录当前回合使用的模型（Codex 模型名来自该事件）。
+fn process_turn_context(builder: &mut SessionBuilder, event: &RawEvent) -> Result<(), String> {
+    let payload = event.payload.clone().unwrap_or(serde_json::json!({}));
+    let p: TurnContextPayload =
+        serde_json::from_value(payload).map_err(|e| format!("turn_context 解析失败: {e}"))?;
+    builder.set_model(model_name_from(&p.model).as_deref());
+    Ok(())
 }
 
 fn process_event_msg(

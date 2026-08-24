@@ -29,17 +29,22 @@ pub struct MessageData {
     pub role: Option<String>,
     pub agent: Option<String>,
     pub model: Option<MessageModel>,
+    #[serde(alias = "modelID")]
     pub model_id: Option<String>,
+    #[serde(alias = "providerID")]
     pub provider_id: Option<String>,
     pub tokens: Option<MessageTokens>,
     pub cost: Option<f64>,
     pub finish: Option<String>,
+    pub error: Option<serde_json::Value>,
     pub time: Option<MessageTime>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MessageModel {
+    #[serde(alias = "providerID")]
     pub provider_id: Option<String>,
+    #[serde(alias = "modelID")]
     pub model_id: Option<String>,
     pub variant: Option<String>,
 }
@@ -123,10 +128,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.role.as_deref(), Some("assistant"));
+        // camelCase modelID/providerID 必须能反序列化到 model_id/provider_id
+        assert_eq!(d.model_id.as_deref(), Some("deepseek-v4-flash-free"));
+        assert_eq!(d.provider_id.as_deref(), Some("opencode"));
         let t = d.tokens.unwrap();
         assert_eq!(t.input, Some(35528));
         assert_eq!(t.reasoning, Some(233));
         assert_eq!(t.cache.unwrap().read, Some(10));
+    }
+
+    #[test]
+    fn parse_message_model_object() {
+        let d: MessageData = serde_json::from_str(
+            r#"{"role":"assistant","model":{"providerID":"relay-huoshan","modelID":"huoshan/glm-5.2"}}"#,
+        )
+        .unwrap();
+        let m = d.model.unwrap();
+        assert_eq!(m.model_id.as_deref(), Some("huoshan/glm-5.2"));
+        assert_eq!(m.provider_id.as_deref(), Some("relay-huoshan"));
     }
 
     #[test]

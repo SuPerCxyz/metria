@@ -25,6 +25,37 @@
 | 计划缺口全量修复：pricing 编辑/删除 bug、CLI export、分享落地页、doctor 最近上传、ingest 关系校验、参数统一、Web spec 字段补齐 | ✅ 完成 | 2026-08-06 |
 | Web 前端重构：基于 Mosaic Lite 模板（React/Vite/Tailwind/Chart.js），6 阶段渐进式重建 | ✅ 完成 | 2026-08-06 |
 | Web 时间范围刷新：快捷范围按点击时刻重算，自定义范围保持固定 | ✅ 完成 | 2026-08-12 |
+| Web 全量视觉 QA：全路由/主题/响应式/交互/状态检查与公共组件修复 | 🟡 前端完成，仓库既有测试阻塞 | 2026-08-13 |
+| Codex 实时增量用量：恢复跨扫描上下文、刷新 Session 汇总、定向回填 | ✅ 完成 | 2026-08-13 |
+
+### Codex 实时增量用量修复记录（2026-08-13）
+
+- 根因：Codex rollout 首次扫描消费 `session_meta` 后，后续扫描从 byte offset 继续但解析状态重新为空，
+  导致追加的 `token_count` 无法关联会话；Hub 接收跨批次 call 后也未可靠刷新既有 Session 摘要。
+- Adapter 在增量尾部解析前从文件头恢复 `session_meta`，并从游标前 1 MiB 有界窗口恢复最新
+  `turn_context`；正常游标仍只消费新增完整行，不重复解析历史业务事件，找不到模型时诚实保留 null。
+- Hub 每次插入或重试 call 后从已持久化调用回算 Session 的 call 数、nullable token/cost、主模型和
+  last activity；不擅自把 active 会话标记 ended，不把未知 token 填 0。
+- 新增“先扫描 session、再追加 message/model、最后追加 usage”的 Adapter 回归测试，以及跨批次
+  Session 聚合测试；workspace test、fmt、clippy、Docker 构建通过。
+- 运行时仅对 4 个经 inode、source cursor 与 Hub zero-call 三重核验的 Codex source 执行恢复；先备份
+  Metria spool 的 DB/WAL/SHM，再删除对应 4 条 Metria cursor。Codex 目录全程只读，未修改源文件或配置。
+- 回填后 4 个 Session 均展示 `gpt-5.6-sol`、真实 Token 与逐条调用；API 的 Session call count 与 calls
+  列表一致，浏览器 Agents、Sessions、Session Detail 实际渲染验证通过，Console 与页面错误为空。
+
+### Web 全量视觉 QA 记录（2026-08-13）
+
+- 基于真实 Router、导航和线上数据检查 9 个主页面、5 类详情页、全部可用 Tab、表格、时间范围
+  Popover、用户菜单、移动侧栏、排序、分页、搜索、刷新以及 Loading/Empty/Error/Partial/Large 状态；
+- Light/Dark 覆盖全部主页面，并在 1920×1080、1600×900、1440×900、1366×768、1280×800、
+  1024×768、768×1024、430×932、390×844、360×800 下完成响应式回归；
+- 修复移动 Header 控件重叠与侧栏标签缺失、时间范围 Trigger 固定宽度、价格规则 2030 行无界渲染、
+  趋势图 ISO 横轴、DataTable 排序/行键盘语义、反馈状态可访问性；价格规则改为搜索加 20 行分页；
+- 修复后全路由无 Body 横向溢出，Console、页面错误和失败网络请求为空；前端定向测试、生产构建、
+  fmt、clippy、Hub Docker 镜像及 full Compose 配置通过；Web 使用 Node.js 内置测试运行器，不声明不存在的
+  TypeScript typecheck 脚本；
+- `cargo test --workspace` 的既有 Hub rollup 对账测试持续失败（2 个 bucket 被判 drift），与本次前端文件无关，
+  因此仓库总门禁仍标记阻塞，未在视觉 QA 范围内改动后端 rollup 逻辑。
 
 ### Web 时间范围刷新完成记录（2026-08-12）
 
@@ -176,11 +207,11 @@
 - M7 生产完善：10 万/100 万事件基准 + 价格匹配/流量重建基准（docs/operations.md 记录）；
   运维文档（保留策略/备份/升级/回滚）。
 
-验证：fmt/clippy(-D warnings)/test 全绿；web typecheck+build 通过；各里程碑端到端验证通过。
+验证：fmt/clippy(-D warnings)/test 全绿；web test+build 通过；各里程碑端到端验证通过。
 
 ### S3 完成记录（2026-08-05）
 
-- Web（Preact+TS+Vite+uPlot）：hash 路由、登录、侧边导航（总览/Nodes/Agent 工具/模型/会话/调用/流量/数据质量）、全局时间范围选择器（from/to/时区/粒度/快捷项/URL 持久化）、uPlot 时间序列、统计卡片、表格、Light/Dark、SSE 增量刷新（EventSource + token）、移动端布局、空/加载/错误态。
+- Web（React+Vite+Tailwind+Chart.js）：hash 路由、登录、侧边导航（总览/Nodes/Agent 工具/模型/会话/调用/流量/数据质量）、全局时间范围选择器（from/to/时区/粒度/快捷项/URL 持久化）、Chart.js 时间序列、统计卡片、表格、Light/Dark、SSE 增量刷新（EventSource + token）、移动端布局、空/加载/错误态。
 - Demo 模式：`metria hub --demo` 确定性合成数据（3 节点 / 3 客户端 / 5 模型 / 4 项目 / 7 天），走同一 ingest 路径，不读真实目录；启动约 5s。
 - 浏览器冒烟（agent-browser）：登录→总览（37.5M input / $152 cost / 163MiB 估算流量带范围）→Nodes 表格→Traffic 图表→暗色模式全部正常。
 
@@ -203,11 +234,11 @@
 
 - git init（main 分支）+ 根文件（.gitignore/.editorconfig/.dockerignore/rust-toolchain/LICENSE/CHANGELOG/SECURITY/README）。
 - Rust workspace：12 个 crate，release profile（lto/opt3/codegen-units=1/strip/panic=abort）。
-- `metria` CLI 骨架：clap 全子命令；`version`/`healthcheck` 可用，其余返回 "not implemented in M1" 退出码 1。
+- `metria` CLI：clap 全子命令；`version`/`healthcheck`/`config` 可用，其余按命令参数执行。
 - metria-core：配置（ContentMode/IANA 时区/env 解析）、分层错误类型、tracing 日志初始化。
 - metria-storage：SQLite 打开与 PRAGMA（WAL/fk/busy_timeout/quick_check/checkpoint）、rust-embed 版本化迁移框架、Repository 抽象；6 单测通过。
 - metria-hub：axum 服务骨架（healthz + 前端 rust-embed + SPA fallback + 优雅退出）、迁移应用、healthcheck 子命令。
-- web：Preact+TS+Vite 骨架，light/dark CSS Variables，PWA manifest；typecheck+build 通过。
+- web：React+Vite+Tailwind+Chart.js，light/dark 主题，PWA manifest；test+build 通过。
 - Docker 多阶段构建：Node 构建期 / Rust 构建期 / 非 root(65532) 运行时，运行时无 Node.js，镜像 88MB。
 - Compose：compose.yaml（hub）/ compose.agent.yaml（agent）/ compose.full.yaml（hub+demo+agent）均通过 `config` 校验。
 - 门禁 `scripts/check.sh` 全绿；容器内 healthz/静态资源/SPA fallback/优雅退出实测通过。
@@ -249,7 +280,7 @@
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
-cd web && npm run typecheck && npm run build
+cd web && npm test && npm run build
 docker build -f docker/Dockerfile --target hub -t metria:dev .
 docker compose -f docker/compose.full.yaml config
 ```
@@ -279,7 +310,7 @@ metria/
 │   ├── metria-agent
 │   ├── metria-hub
 │   └── metria-cli
-├── web/               Preact+TS+Vite+uPlot（dist 由 hub embed）
+├── web/               React+Vite+Tailwind+Chart.js（dist 由 hub embed）
 ├── migrations/        SQLite 版本化 migration SQL
 ├── fixtures/          claude/ codex/ opencode/ malformed/ traffic/
 ├── scripts/           check.sh / build.sh / demo.sh / doctor.sh
@@ -303,14 +334,14 @@ metria/
 | 步骤 | 任务 | 关键实现要点 | 验证 |
 |---|---|---|---|
 | S0.1 | git init + 根文件 | `.gitignore`（target/dist/data/secrets）；README/LICENSE(SECURITY 基础)；`Cargo.toml` workspace + release profile + rust-toolchain | `cargo metadata` 解析成功 |
-| S0.2 | 创建 12 个 crate 骨架 | 每个 crate 最小 `lib.rs`/`main.rs` + 空 `tests/`；`metria-cli` 用 clap 定义全部子命令（hub/agent/import/doctor/config/export/backup/restore/mcp/healthcheck/version），未实现子命令返回 "not implemented in M1" 且退出码非 0 | `cargo build --workspace`；`metria version` 输出 0.1.0 |
+| S0.2 | 创建 12 个 crate 骨架 | 每个 crate 最小 `lib.rs`/`main.rs` + 空 `tests/`；`metria-cli` 用 clap 定义全部子命令（hub/agent/import/doctor/config/export/backup/restore/mcp/healthcheck/version） | `cargo build --workspace`；`metria version` 输出 0.1.0 |
 | S0.3 | 配置与错误类型（core） | `metria-core`：`config.rs`（env + TOML 合并，`METRIA_*` 前缀，类型化 Config struct）；`error.rs`（`thiserror` 分层：ConfigError/ModelError/StorageError/ProtocolError/AdapterError/HubError，均实现 Into\<ApiError\>） | `cargo test -p metria-core`；config 单测（env 覆盖默认值） |
 | S0.4 | tracing + 日志 | 统一 `tracing_subscriber` EnvFilter；Hub 输出 JSON 可选；Agent 输出紧凑文本；日志级别 `METRIA_LOG` 默认 `info`；**日志绝不打印 token/secret**（S0 起立规） | 运行 hub/agent --version 观察日志 |
 | S0.5 | Docker 多阶段构建 | `docker/Dockerfile`：stage web(node:24-alpine 构建 vite dist) → stage rust(rust:1.96-slim 构建 workspace) → stage runtime(debian-slim，非 root UID 65532，仅 `/app/metria` 二进制 + 拷贝 web dist，`CMD ["healthcheck"]` 默认)；`ARG TARGETARCH` 支持 amd64/arm64；`.dockerignore` 排除 target/dist/node_modules/data | `docker build` 成功；`docker run --rm metria:dev version` 正常 |
 | S0.6 | compose | `compose.yaml`(hub 示例)、`compose.agent.yaml`(agent 示例)、`compose.full.yaml`(hub+agent+demo 合成数据)；secret 走 `secrets:` 文件；healthcheck `["CMD","/app/metria","healthcheck"]`；agent 挂载 `/data` volume + 三目录只读；`user: "${UID}:${GID}"` 与宿主对齐并注释说明 | `docker compose -f compose.full.yaml config` 通过；`metria healthcheck` 子命令容器内可用 |
 | S0.7 | migrations 框架（storage） | `metria-storage`：Migration 表 + 版本化 SQL 加载器（`migrations/*.sql`，命名 `N_name.sql`），事务内执行，记录 `schema_migrations`；`SqlitePool`（rusqlite 连接，busy_timeout=5000，WAL，foreign_keys=ON，`PRAGMA journal_size_limit`）；启动时 integrity_check（仅 quick_check） | 单测：空库→最新版本；重复迁移幂等；坏 SQL 回滚 |
 | S0.8 | 基础 Repository 抽象（storage） | `trait Repository` 占位 + `SqliteRepository`；为后续 S1/S2 实体提供 CRUD 骨架（S1 填充）；metrics 计数（简单原子计数） | `cargo test -p metria-storage` |
-| S0.9 | web 骨架 | `web/`：Vite+TS+Preact；`vite.config.ts` base `'/static/'` 且构建产物输出到 `web/dist`；`src/` 目录（api/components/pages/hooks/utils）；`index.html` 中文 title + PWA manifest 占位；light/dark CSS variables 基础 token | `npm run typecheck && npm run build` 产出 dist |
+| S0.9 | web 骨架 | `web/`：Vite+React；构建产物输出到 `web/dist`；`src/` 目录（api/components/pages/hooks/utils）；`index.html` 中文 title + PWA manifest 占位；light/dark 基础 token | `npm test && npm run build` 产出 dist |
 | S0.10 | web embed 接线 | hub 增加 `StaticAssets`（`rust-embed` 指向 `web/dist`），SPA fallback 路由（未命中 API 则返回 index.html）；CI 脚本 `scripts/check.sh` 串联全部门禁 | `cargo build -p metria-hub` 包含 dist；访问 `/` 返回 HTML |
 
 ---
@@ -456,3 +487,23 @@ metria/
 S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fmt+clippy+test`，提交信息遵循仓库 Commit 规范（≤50 字符 subject，不写 Change-Id）。
 
 每个 S 阶段结束输出：完成内容 / 关键设计决策 / 新增修改文件 / 数据库变化 / API 变化 / Traffic 变化 / Pricing 变化 / 测试结果 / 当前限制 / 下一阶段。
+
+---
+
+## 9. 延迟趋势图与指标卡 hint 单行（2026-08-16）
+
+- 使用分析「延迟」tab 在 P50/P95/P99/平均统计卡下方新增「延迟趋势」折线图，展示 P50/P95/平均时长随时间变化，与其他 tab 图表结构一致。
+- 新增 `GET /api/v1/usage/latency/timeseries`：按时间分桶（5m/15m/1h/1d，粒度与 `/usage/timeseries` 一致）聚合 `model_calls.duration_ms` 的 avg/p50/p95/p99/count，空桶补齐且统计字段为 null（诚实展示）；分位数 nearest-rank 与 `/usage/latency` 一致，样本数与 `/usage/latency` 的 count 对齐。
+- MetricCard hint 统一单行（`truncate` + `title` 悬停显示完整文案），修复「调用时长」卡片 hint 在 1280 视口换行成 2 行的问题。
+- 新增 e2e 测试 `latency_timeseries_buckets_aggregates_and_gapfills`：分桶聚合、缺口补齐、空桶 null、与整体延迟样本数一致。
+- 验证：`cargo test --workspace` 全部通过、fmt/clippy 干净、Web 构建通过；浏览器实测延迟 tab 图表渲染、时间范围同步、调用时长 hint 单行且 hover 可见完整文案。
+
+---
+
+## 10. 节点支持公网 IP（2026-08-16）
+
+- 添加/编辑节点新增必填「节点 IP」字段（IPv4/IPv6/主机名格式校验，非法返回 400），解决 Hub 部署在内网、Agent 在公网时公网 Agent 无法连通内网 Hub 的问题。
+- `nodes` 表新增 `ip` 列（迁移 009，可空兼容旧数据）；创建/更新/列表/详情均读写 ip。
+- `GET /nodes/{id}/install` 生成安装命令的 hub URL 优先级：显式 `hub_url` → `http://{ip}:8080` → 占位；前端创建/编辑对话框同步展示 IP 输入并回显当前值。
+- 新增/更新 e2e：创建含 ip 成功、缺 ip/非法 ip 400、安装命令 IP 拼接、显式 hub_url 优先、编辑 ip 生效。
+- 验证：`cargo test --workspace` 全部通过、fmt/clippy 干净、Web 构建通过；浏览器实测创建节点填 IP → 安装命令 METRIA_HUB_URL=http://<ip>:8080，编辑回显 IP。

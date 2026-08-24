@@ -1,12 +1,14 @@
 // 全局时间范围选择：快捷项联动预览 + 日历选择需确认生效。
 
 import React from 'react'
-import { format } from 'date-fns'
+import { format, isSameDay } from 'date-fns'
 import { cn } from '../../lib/utils'
 import { Calendar } from '../ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
+import TimePicker from '../ui/TimePicker'
 import { quickRange } from '../../services/format'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { createPresetRange } from '../../hooks/timeRangeState'
 
 const PRESETS = [
   { key: 'today', label: '今天' },
@@ -33,8 +35,12 @@ export default function TimeRangePicker({ className }) {
   const openPicker = (o) => {
     setOpen(o)
     if (o) {
-      // 打开时日历默认选中当前范围
-      setDraft(fromDate && toDate ? { from: fromDate, to: toDate } : { from: new Date(), to: new Date() })
+      // 打开时默认只选中今天（单点）
+      const from = new Date()
+      from.setHours(0, 0, 0, 0)
+      const to = new Date(from)
+      to.setHours(23, 59, 59, 999)
+      setDraft({ from, to })
     }
   }
 
@@ -46,31 +52,29 @@ export default function TimeRangePicker({ className }) {
 
   // 快捷范围：点击立即生效并关闭
   const applyPreset = (key) => {
-    const r = quickRange(key)
-    setRange(r)
+    setRange(createPresetRange(key))
     setOpen(false)
   }
 
-  // 日历选择：第一击设起点（保留当前 to 作为临时终点），第二击定终点；均不立即生效
-  const onSelect = (sel) => {
+  // 日历选择：已有完整范围时点击任意日期 → 仅选中该日期单点；否则按 react-day-picker 结果
+  const onSelect = (sel, triggerDate) => {
+    if (!triggerDate) return
+    const hasFullRange = draft?.from && draft?.to && !isSameDay(new Date(draft.from), new Date(draft.to))
+    if (hasFullRange) {
+      // 已有范围：点击 → 只选中该日期单点
+      const from = new Date(triggerDate)
+      from.setHours(0, 0, 0, 0)
+      const to = new Date(from)
+      to.setHours(23, 59, 59, 999)
+      setDraft({ from, to })
+      return
+    }
     if (!sel?.from) return
     const from = new Date(sel.from)
     from.setHours(0, 0, 0, 0)
-    if (sel.to) {
-      // 第二击：完成范围
-      const to = new Date(sel.to)
-      to.setHours(23, 59, 59, 999)
-      setDraft({ from, to })
-    } else {
-      // 第一击：选起点，终点沿用之前范围的 to（若有），否则单日
-      const prevTo = draft?.to
-      if (prevTo) {
-        const to = new Date(prevTo)
-        setDraft({ from, to })
-      } else {
-        setDraft({ from, to: new Date(from) })
-      }
-    }
+    const to = sel.to ? new Date(sel.to) : new Date(from)
+    to.setHours(23, 59, 59, 999)
+    setDraft({ from, to })
   }
 
   // 起始/结束时间调整（HH:mm），只改时分保留日期
@@ -100,7 +104,7 @@ export default function TimeRangePicker({ className }) {
 
   // 清除：回退默认最近 7 天
   const clear = () => {
-    setRange(quickRange('7d'))
+    setRange(createPresetRange('7d'))
     setOpen(false)
   }
 
@@ -111,28 +115,30 @@ export default function TimeRangePicker({ className }) {
   const selected = draft ? { from: draft.from, to: draft.to } : undefined
 
   return (
-    <div className={cn('grid gap-2', className)}>
+    <div className={cn('relative', className)}>
       <Popover open={open} onOpenChange={openPicker}>
         <PopoverTrigger asChild>
           <button
             type="button"
-            className="btn px-2.5 min-w-[16rem] bg-white border-gray-200 hover:border-gray-300 dark:border-gray-700/60 dark:hover:border-gray-600 dark:bg-gray-800 text-gray-600 hover:text-gray-800 dark:text-gray-300 dark:hover:text-gray-100 font-medium text-left justify-start"
+            className="btn w-full min-w-0 px-2.5 sm:min-w-[16rem] bg-white border-gray-200 hover:border-gray-300 dark:border-gray-700/60 dark:hover:border-gray-600 dark:bg-gray-800 text-gray-600 hover:text-gray-800 dark:text-gray-300 dark:hover:text-gray-100 font-medium text-left justify-start whitespace-nowrap"
+            aria-label={`时间范围：${label}`}
+            title={label}
           >
-            <svg className="fill-current text-gray-400 dark:text-gray-500 ml-1 mr-2" width="16" height="16" viewBox="0 0 16 16">
+            <svg className="fill-current text-gray-400 dark:text-gray-500 ml-1 mr-2 shrink-0" width="16" height="16" viewBox="0 0 16 16">
               <path d="M5 4a1 1 0 0 0 0 2h6a1 1 0 1 0 0-2H5Z" />
               <path d="M4 0a4 4 0 0 0-4 4v8a4 4 0 0 0 4 4h8a4 4 0 0 0 4-4V4a4 4 0 0 0-4-4H4ZM2 4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4Z" />
             </svg>
-            <span className="tabular-nums">{label}</span>
-            <svg className="fill-current text-gray-400 dark:text-gray-500 ml-auto mr-1" width="12" height="12" viewBox="0 0 12 12">
+            <span className="tabular-nums min-w-0 flex-1 truncate">{label}</span>
+            <svg className="fill-current text-gray-400 dark:text-gray-500 ml-2 mr-1 shrink-0" width="12" height="12" viewBox="0 0 12 12">
               <path d="M6 8.8 1.2 4h9.6L6 8.8Z" />
             </svg>
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-auto p-3" align="end">
-          <div className="flex flex-col sm:flex-row gap-4">
-            {/* 快捷范围列（左侧，hover 联动日历） */}
-            <div className="flex flex-col gap-0.5 w-32 shrink-0">
-              <div className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide px-2 pb-1">快捷范围</div>
+        <PopoverContent className="w-[calc(100vw-0.5rem)] max-w-[28rem] max-h-[calc(100vh-0.5rem)] overflow-y-auto px-2 pt-2 pb-3 sm:w-auto sm:max-w-none sm:px-3" align="end">
+          <div className="flex flex-col gap-2 sm:flex-row sm:gap-4">
+            {/* 快捷范围列（左侧，与右侧日历垂直居中） */}
+            <div className="grid w-full shrink-0 grid-cols-2 gap-0.5 sm:flex sm:w-32 sm:flex-col sm:justify-center">
+              <div className="col-span-2 text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide px-2 pb-1">快捷范围</div>
               {PRESETS.map((p) => (
                 <button
                   key={p.key}
@@ -146,38 +152,29 @@ export default function TimeRangePicker({ className }) {
               ))}
             </div>
             {/* 日历（右侧，时间输入在日历下方） */}
-            <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
               <div className="relative">
                 <Calendar mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
               </div>
-              {/* 起始/结束时间输入（日历下方） */}
+              {/* 起始/结束时间选择（日历下方，左右对齐日历） */}
               {draft?.from && draft?.to ? (
-                <div className="flex items-center justify-center gap-2 border-t border-gray-100 dark:border-gray-700/60 pt-3">
+                <div className="flex items-center justify-between border-t border-gray-100 dark:border-gray-700/60 pt-2">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-xs text-gray-400 dark:text-gray-500">起始</span>
-                    <input
-                      type="time"
-                      value={format(draft.from, 'HH:mm')}
-                      onChange={(e) => setDraftTime('from', e.target.value)}
-                      className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
-                    />
+                    <TimePicker value={format(draft.from, 'HH:mm')} onChange={(t) => setDraftTime('from', t)} />
                   </span>
+                  <span className="text-sm text-gray-400 dark:text-gray-500 select-none">~</span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-xs text-gray-400 dark:text-gray-500">结束</span>
-                    <input
-                      type="time"
-                      value={format(draft.to, 'HH:mm')}
-                      onChange={(e) => setDraftTime('to', e.target.value)}
-                      className="text-xs px-1.5 py-1 rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200"
-                    />
+                    <TimePicker value={format(draft.to, 'HH:mm')} onChange={(t) => setDraftTime('to', t)} />
                   </span>
                 </div>
               ) : null}
             </div>
           </div>
-          <div className="border-t border-gray-100 dark:border-gray-700/60 mt-3 pt-3">
+          <div className="border-t border-gray-100 dark:border-gray-700/60 mt-2 pt-2">
             {/* 操作行：预览在左、按钮在右 */}
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
               {draft?.from && draft?.to ? (
                 <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
                   {format(draft.from, 'MM/dd HH:mm')} ~ {format(draft.to, 'MM/dd HH:mm')}
@@ -185,18 +182,18 @@ export default function TimeRangePicker({ className }) {
               ) : (
                 <span className="text-xs text-gray-400 dark:text-gray-500">在日历选择日期范围</span>
               )}
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center justify-end gap-2 shrink-0">
                 <button
                   type="button"
                   onClick={clear}
-                  className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
+                  className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-1.5"
                 >
                   清除选择
                 </button>
                 <button
                   type="button"
                   onClick={cancel}
-                  className="text-xs text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100 border border-gray-200 dark:border-gray-600 rounded-lg px-2.5 py-1.5"
+                  className="text-xs text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100 border border-gray-200 dark:border-gray-600 rounded-lg px-3 py-1.5"
                 >
                   取消
                 </button>

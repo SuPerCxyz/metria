@@ -10,12 +10,21 @@ const toneClass = {
   muted: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-400',
 }
 
+// 会话状态统一中文展示；调用/节点等其他状态保持原样。
+const STATUS_LABELS = {
+  active: '活跃',
+  idle: '闲置',
+  ended: '已结束',
+}
+
 export default function StatusBadge({ status, dot = true }) {
-  const tone = statusTone(status)
+  const raw = String(status ?? '')
+  const label = STATUS_LABELS[raw] ?? raw
+  const tone = statusTone(raw)
   return (
     <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full ${toneClass[tone] || toneClass.muted}`}>
       {dot && <span className={`w-1.5 h-1.5 rounded-full ${tone === 'success' ? 'bg-emerald-500' : tone === 'danger' ? 'bg-red-500' : tone === 'warning' ? 'bg-amber-500' : 'bg-gray-400'}`} />}
-      {status}
+      {label}
     </span>
   )
 }

@@ -5,12 +5,13 @@ import { Link, useParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
 import TrendChart from '../../components/charts/TrendChart'
+import Segmented from '../../components/ui/Segmented'
 import DataTable from '../../components/tables/DataTable'
 import { ErrorState, LoadingSkeleton, EmptyState, DataQualityNote } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, sumTokens } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -29,20 +30,20 @@ export default function ModelDetail() {
   const trend = useMemo(() => {
     const pts = query.data?.series || []
     if (tab === 'cost') return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.cost_micro_usd) }
-    return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.input_tokens + p.output_tokens) }
+    return { labels: pts.map((p) => p.bucket), values: pts.map((p) => sumTokens(p)) }
   }, [query.data, tab])
 
-  if (query.error) return <ErrorState error={query.error} />
+  if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={8} />
   const d = query.data || {}
   const s = d.summary || {}
-  const hasPricing = (d.pricing_rules || []).length > 0
+  const hasPricing = d.pricing_source && d.pricing_source !== 'unavailable'
 
   const recentColumns = [
     { key: 'started_at', label: '时间', render: (r) => fmtDateTime(r.started_at) },
     { key: 'model', label: '模型', render: (r) => r.model || '—' },
     { key: 'client_id', label: 'Agent', render: (r) => r.client_id || '—' },
-    { key: 'input_tokens', label: 'Token', render: (r) => fmtTokensShort((r.input_tokens ?? 0) + (r.output_tokens ?? 0)) },
+    { key: 'input_tokens', label: 'Token', render: (r) => fmtTokensShort(sumTokens(r)) },
     { key: 'estimated_total_bytes', label: '流量', render: (r) => fmtBytes(r.estimated_total_bytes) },
   ]
 
@@ -55,34 +56,27 @@ export default function ModelDetail() {
       />
 
       {!hasPricing && <DataQualityNote kind="missing" text="该模型价格未配置，费用无法精确计算。" />}
+      {d.pricing_source === 'free_model' && <DataQualityNote kind="estimated" text="模型名称包含 free，当前按 0 美元计费；如需覆盖，可在设置中添加用户价格规则。" />}
 
-      <div className="mt-4">
-        <DetailSummary
+      <DetailSummary
           items={[
             { label: '请求数', value: String(s.model_calls ?? 0) },
-            { label: 'Token', value: fmtTokensShort((s.input_tokens ?? 0) + (s.output_tokens ?? 0)) },
+            { label: 'Token', value: fmtTokensShort(sumTokens(s)) },
             { label: '费用', value: fmtUsd(s.cost_micro_usd) },
             { label: '网络流量', value: fmtBytes(s.estimated_total_bytes) },
             { label: '缓存命中率', value: (d.summary && s.input_tokens > 0) ? `${((s.cache_read_tokens ?? 0) / ((s.input_tokens ?? 0) + (s.cache_read_tokens ?? 0)) * 100).toFixed(1)}%` : '—' },
           ]}
         />
-      </div>
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">Token / 费用趋势</h2>
-          <div className="inline-flex rounded-lg bg-gray-100 dark:bg-gray-700/40 p-0.5">
-            {TREND_TABS.map((t) => (
-              <button key={t.key} type="button" onClick={() => setTab(t.key)} className={`px-3 py-1.5 text-sm font-medium rounded-md ${tab === t.key ? 'bg-white dark:bg-gray-600 shadow-xs text-gray-800 dark:text-gray-100' : 'text-gray-500 dark:text-gray-400'}`}>
-                {t.label}
-              </button>
-            ))}
-          </div>
+          <Segmented items={TREND_TABS} value={tab} onChange={setTab} />
         </div>
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={tab === 'cost' ? fmtUsd : fmtTokensShort} />}
       </div>
 
-      <div className="mt-6 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
+      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 p-2">最近会话</h2>
         <DataTable columns={recentColumns} data={d.recent_sessions || []} pageSize={12} onRowClick={(r) => navigate(`/sessions/${encodeURIComponent(r.id)}`)} />
       </div>

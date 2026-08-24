@@ -203,14 +203,26 @@ impl HubDb {
     }
 
     /// 使用给定规则集对历史 usage 重新计价（保留旧 pricing_matches）。
-    pub fn reprice_all(&self, engine: &metria_pricing::PricingEngine) -> Result<i64, StorageError> {
+    ///
+    /// `only_unpriced = true` 时仅处理尚无费用的事件（后台周期增量），
+    /// 否则全量重算。完成后把费用传播到关联的 model_calls，保持列表/详情一致。
+    pub fn reprice_all(
+        &self,
+        engine: &metria_pricing::PricingEngine,
+        only_unpriced: bool,
+    ) -> Result<i64, StorageError> {
         let c = self.conn();
+        let filter = if only_unpriced {
+            " WHERE (calculated_cost_micro_usd IS NULL AND estimated_cost_micro_usd IS NULL)"
+        } else {
+            ""
+        };
         let mut stmt = c
-            .prepare(
+            .prepare(&format!(
                 "SELECT event_id, model_normalized, provider_normalized, timestamp,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
-                 FROM usage_events",
-            )
+                 FROM usage_events{filter}",
+            ))
             .map_err(StorageError::from)?;
         let rows = stmt
             .query_map([], |r| {
@@ -274,6 +286,47 @@ impl HubDb {
             .map_err(StorageError::from)?;
             repriced += 1;
         }
+        drop(upd);
+        // 兼容旧数据：usage 先到时 model_calls 可能还没有 usage_event_id。
+        c.execute(
+            "UPDATE model_calls SET usage_event_id = (
+                SELECT event_id FROM usage_events
+                WHERE model_call_id = model_calls.id
+                ORDER BY timestamp, event_id LIMIT 1
+             )
+             WHERE usage_event_id IS NULL
+               AND EXISTS (SELECT 1 FROM usage_events WHERE model_call_id = model_calls.id)",
+            [],
+        )
+        .map_err(StorageError::from)?;
+        // 把费用传播到关联 model_calls（有费用的 usage 事件）
+        c.execute(
+            "UPDATE model_calls SET
+                reported_cost_micro_usd = (SELECT reported_cost_micro_usd FROM usage_events WHERE event_id = model_calls.usage_event_id),
+                calculated_cost_micro_usd = (SELECT calculated_cost_micro_usd FROM usage_events WHERE event_id = model_calls.usage_event_id),
+                estimated_cost_micro_usd = (SELECT estimated_cost_micro_usd FROM usage_events WHERE event_id = model_calls.usage_event_id)
+             WHERE usage_event_id IS NOT NULL
+               AND usage_event_id IN (
+                   SELECT event_id FROM usage_events
+                   WHERE reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL
+               )",
+            [],
+        )
+        .map_err(StorageError::from)?;
+        let session_ids: Vec<String> = {
+            let mut stmt = c
+                .prepare("SELECT DISTINCT session_id FROM model_calls WHERE session_id != ''")
+                .map_err(StorageError::from)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(StorageError::from)?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            rows
+        };
+        for session_id in session_ids {
+            self.refresh_session_agg(&c, &session_id)?;
+        }
         Ok(repriced)
     }
 
@@ -283,7 +336,7 @@ impl HubDb {
         let c = self.conn();
         let mut out = Vec::new();
         if let Ok(mut stmt) = c.prepare(
-            "SELECT id, name, kind, enabled, priority, base_url, last_success_at, last_error, created_at FROM pricing_catalogs ORDER BY priority",
+            "SELECT id, name, kind, enabled, priority, base_url, authentication_type, last_success_at, last_error, created_at FROM pricing_catalogs ORDER BY priority",
         ) {
             if let Ok(rows) = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
@@ -293,9 +346,10 @@ impl HubDb {
                     "enabled": r.get::<_, i64>(3)? != 0,
                     "priority": r.get::<_, i64>(4)?,
                     "base_url": r.get::<_, Option<String>>(5)?,
-                    "last_success_at": r.get::<_, Option<String>>(6)?,
-                    "last_error": r.get::<_, Option<String>>(7)?,
-                    "created_at": r.get::<_, String>(8)?,
+                    "authentication_type": r.get::<_, Option<String>>(6)?,
+                    "last_success_at": r.get::<_, Option<String>>(7)?,
+                    "last_error": r.get::<_, Option<String>>(8)?,
+                    "created_at": r.get::<_, String>(9)?,
                 }))
             }) {
                 for row in rows.flatten() {
@@ -304,6 +358,32 @@ impl HubDb {
             }
         }
         out
+    }
+
+    /// 更新价格目录（计费模板链接 / 启用状态），供 Web 配置。
+    pub fn update_pricing_catalog(&self, id: &str, v: &Value) -> Result<bool, StorageError> {
+        let c = self.conn();
+        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let n = c
+            .execute(
+                "UPDATE pricing_catalogs SET
+                    base_url = COALESCE(NULLIF(?1,''), base_url),
+                    authentication_type = COALESCE(NULLIF(?2,''), authentication_type),
+                    enabled = COALESCE(?3, enabled),
+                    updated_at = ?4
+                 WHERE id = ?5",
+                params![
+                    g("base_url"),
+                    g("authentication_type"),
+                    v.get("enabled")
+                        .and_then(|x| x.as_bool())
+                        .map(|b| if b { 1 } else { 0 }),
+                    Utc::now().to_rfc3339(),
+                    id,
+                ],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n > 0)
     }
 
     pub fn list_pricing_rules(&self) -> Vec<serde_json::Value> {
@@ -345,16 +425,21 @@ impl HubDb {
     pub fn insert_pricing_rule(&self, v: &Value) -> Result<String, StorageError> {
         let c = self.conn();
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
+        let gn = |k: &str| {
+            v.get(k).and_then(|x| {
+                x.as_i64()
+                    .or_else(|| x.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            })
+        };
         let now = Utc::now().to_rfc3339();
         let id = metria_core::model::Id::new().as_str().to_string();
         let provider = if g("provider_pattern").is_empty() {
-            ".*"
+            "*"
         } else {
             g("provider_pattern")
         };
         let model = if g("model_pattern").is_empty() {
-            ".*"
+            "*"
         } else {
             g("model_pattern")
         };
@@ -388,7 +473,12 @@ impl HubDb {
     pub fn update_pricing_rule(&self, id: &str, v: &Value) -> Result<bool, StorageError> {
         let c = self.conn();
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
+        let gn = |k: &str| {
+            v.get(k).and_then(|x| {
+                x.as_i64()
+                    .or_else(|| x.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            })
+        };
         let en = v.get("enabled").and_then(|x| x.as_bool());
         let n = c
             .execute(

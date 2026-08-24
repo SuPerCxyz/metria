@@ -104,6 +104,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
 
         let mut tolerance = ScanTolerance::default();
         let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
+        let mut last_user_at: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         let mut entry_warnings: Vec<String> = Vec::new();
 
         let new_offset = scan_jsonl_file(
@@ -118,7 +119,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
                         return Ok(());
                     }
                 };
-                if let Err(e) = process_entry(&mut builders, &ctx, &entry) {
+                if let Err(e) = process_entry(&mut builders, &ctx, &entry, &mut last_user_at) {
                     entry_warnings.push(e);
                 }
                 Ok(())
@@ -198,6 +199,7 @@ fn process_entry(
     builders: &mut HashMap<String, SessionBuilder>,
     ctx: &BuildCtx,
     entry: &RawEntry,
+    last_user_at: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) -> Result<(), String> {
     let Some(sid) = entry.session_id.clone() else {
         return Ok(()); // 无 session 的条目忽略
@@ -229,6 +231,7 @@ fn process_entry(
 
     if is_real_user_prompt(entry) {
         let turn = builder.ensure_turn(true, "user", at);
+        last_user_at.insert(sid.clone(), at);
         let msg = entry.message.as_ref().ok_or("user 消息缺失 message")?;
         let source_msg_id = msg.id.clone().or_else(|| entry.uuid.clone());
         match &msg.content {
@@ -322,6 +325,10 @@ fn process_entry(
                     .or_else(|| entry.uuid.clone())
                     .unwrap_or_else(|| Id::new().as_str().to_string());
                 let model = msg.model.clone().or_else(|| entry.model_field.clone());
+                // 时长估算：assistant 时间 - 最近一次真实 user 消息时间（可能缺，返回 None）
+                let duration_ms = last_user_at
+                    .get(&sid)
+                    .map(|u| (at - *u).num_milliseconds().max(0));
                 builder.add_call(
                     turn,
                     call_id,
@@ -333,6 +340,8 @@ fn process_entry(
                     usage
                         .cache_creation_input_tokens
                         .or(usage.cache_write_input_tokens),
+                    duration_ms,
+                    "success",
                     if response_text.is_empty() {
                         None
                     } else {
@@ -348,6 +357,7 @@ fn process_entry(
     // user 消息且含 tool_result / 附件：回填工具结果
     if let Some(msg) = &entry.message {
         if msg.role.as_deref() == Some("user") {
+            last_user_at.insert(sid.clone(), at);
             if let Some(RawContent::Blocks(blocks)) = &msg.content {
                 let turn = builder.ensure_turn(false, "user", at);
                 let source_msg_id = msg.id.clone().or_else(|| entry.uuid.clone());

@@ -1,10 +1,11 @@
-// 主趋势图（Chart.js 折线/面积图）：单主指标，支持数据降采样。
+// 主趋势图（Chart.js 折线/面积图）：支持多条线（datasets），数据降采样保证 ≥30 点。
 
 import React, { useEffect, useRef } from 'react'
 import Chart from 'chart.js/auto'
+import { formatTimeLabel } from './trendChartLabels'
 
-// 数据点过多时降采样：保留 maxPoints 个点
-function downsample(data, maxPoints = 120) {
+// 数据点过多时降采样：保留 maxPoints 个点（≥30）
+function downsample(data, maxPoints = 240) {
   if (data.length <= maxPoints) return data
   const step = Math.ceil(data.length / maxPoints)
   const out = []
@@ -12,7 +13,9 @@ function downsample(data, maxPoints = 120) {
   return out
 }
 
-export default function TrendChart({ labels, values, height = 320, color = '#6366f1', formatY, prefix = '' }) {
+const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
+
+export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图' }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
 
@@ -21,54 +24,66 @@ export default function TrendChart({ labels, values, height = 320, color = '#636
     const ctx = ref.current.getContext('2d')
     if (chartRef.current) chartRef.current.destroy()
 
-    const pts = downsample(values.map((v, i) => ({ v, l: labels[i] })))
+    const ds = datasets
+      ? datasets.map((d, i) => ({ label: d.label || '', values: d.values || [], color: d.color || PALETTE[i % PALETTE.length], fill: d.fill ?? true }))
+      : [{ label: '', values: values || [], color, fill: true }]
+
+    // 按下采样后的索引对齐 labels 与所有数据集
+    const idx = downsample((labels || []).map((_, i) => i))
+    const ttip = tooltipLabels ? idx.map((i) => tooltipLabels[i]) : idx.map((i) => formatTimeLabel(labels[i], true))
+    const data = {
+      labels: idx.map((i) => formatTimeLabel(labels[i])),
+      datasets: ds.map((d) => ({
+        label: d.label,
+        data: idx.map((i) => d.values[i] ?? 0),
+        borderColor: d.color,
+        backgroundColor: `${d.color}18`,
+        fill: d.fill,
+        tension: 0.3,
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        pointBackgroundColor: d.color,
+      })),
+    }
+
     const chart = new Chart(ctx, {
       type: 'line',
-      data: {
-        labels: pts.map((p) => p.l),
-        datasets: [{
-          data: pts.map((p) => p.v),
-          borderColor: color,
-          backgroundColor: `${color}18`,
-          fill: true,
-          tension: 0.3,
-          borderWidth: 2,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          pointBackgroundColor: color,
-        }],
-      },
+      data,
       options: {
         responsive: true,
         maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
         plugins: {
-          legend: { display: false },
+          legend: {
+            display: ds.length > 1 || ds.some((d) => d.label),
+            labels: { color: '#9ca3af', boxWidth: 12, font: { size: 11 }, usePointStyle: true, padding: 12 },
+          },
           tooltip: {
             callbacks: {
-              label: (c) => formatY ? formatY(c.parsed.y) : `${prefix}${c.parsed.y.toLocaleString()}`,
+              title: (items) => {
+                const i = items[0]?.dataIndex
+                return ttip[i] || items[0]?.label || ''
+              },
+              label: (c) => `${c.dataset.label ? `${c.dataset.label}：` : ''}${formatY ? formatY(c.parsed.y) : `${prefix}${c.parsed.y.toLocaleString()}`}`,
             },
           },
         },
         scales: {
           x: {
             grid: { display: false },
-            ticks: { maxTicksLimit: 8, color: '#9ca3af', font: { size: 11 } },
+            ticks: { maxTicksLimit: 10, maxRotation: 0, color: '#9ca3af', font: { size: 11 } },
           },
           y: {
             grid: { color: 'rgba(156,163,175,0.12)' },
-            ticks: {
-              color: '#9ca3af',
-              font: { size: 11 },
-              callback: (v) => formatY ? formatY(v) : v.toLocaleString(),
-            },
+            ticks: { color: '#9ca3af', font: { size: 11 }, callback: (v) => (formatY ? formatY(v) : v.toLocaleString()) },
           },
         },
       },
     })
     chartRef.current = chart
     return () => { if (chartRef.current) chartRef.current.destroy() }
-  }, [labels, values, color, height]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [labels, datasets, values, tooltipLabels, color, height]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  return <div style={{ height }}><canvas ref={ref} /></div>
+  return <div style={{ height }}><canvas ref={ref} role="img" aria-label={`${ariaLabel}，共 ${labels?.length || 0} 个数据点`} /></div>
 }

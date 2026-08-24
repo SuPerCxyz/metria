@@ -5,7 +5,7 @@
 请勿在公开渠道提交安全漏洞细节。请通过以下任一渠道私密报告：
 
 - 私有漏洞报告：联系项目维护者（见 GitHub 仓库联系方式）
-- 邮件：security@metria.example.com
+- GitHub 私密漏洞报告：<https://github.com/SuPerCxyz/metria/security/advisories/new>
 
 预期响应时间：3 个工作日内确认；修复时间取决于严重程度与影响面。
 

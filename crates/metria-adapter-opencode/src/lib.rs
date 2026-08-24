@@ -160,10 +160,6 @@ impl SourceAdapter for OpenCodeAdapter {
         for row in rows {
             let (rowid, msg_id, session_id, ts_ms, data_json) =
                 row.map_err(|e| AdapterError::Other(format!("message 行解析失败: {e}")))?;
-            if rowid > max_rowid {
-                max_rowid = rowid;
-            }
-            let at = from_millis(ts_ms).unwrap_or_else(Utc::now);
             let data: MessageData = match serde_json::from_str(&data_json) {
                 Ok(d) => d,
                 Err(e) => {
@@ -171,6 +167,22 @@ impl SourceAdapter for OpenCodeAdapter {
                     continue;
                 }
             };
+            let at = from_millis(ts_ms).unwrap_or_else(Utc::now);
+            // 未完成消息（assistant、无 finish、tokens 全零）：
+            // opencode 先写入占位（0 token）再在步骤结束时补真实用量，提前记录会把 token 记为 0。
+            // 活跃尾部（最近创建）→ 暂停推进游标，下次扫描重读待补全；
+            // 陈旧未完成（历史遗留）→ 跳过不阻塞历史扫描。
+            if is_incomplete_message(&data) {
+                let recent = Utc::now().signed_duration_since(at) < chrono::Duration::minutes(60);
+                if recent {
+                    max_rowid = rowid - 1;
+                    break;
+                }
+                continue;
+            }
+            if rowid > max_rowid {
+                max_rowid = rowid;
+            }
 
             let builder = builders.entry(session_id.clone()).or_insert_with(|| {
                 let row = session_cache
@@ -289,6 +301,32 @@ impl SourceAdapter for OpenCodeAdapter {
     }
 }
 
+/// 未完成消息：assistant、无 finish、tokens 全零（opencode 先写占位后补真实用量）。
+///
+/// 例外：带 `error` 或已有 `time.completed` 的 assistant 消息表示调用已结束
+/// （失败/中止），opencode 不会再补全 token，应按完成处理，避免游标被永久卡住。
+fn is_incomplete_message(d: &MessageData) -> bool {
+    if d.role.as_deref() != Some("assistant") || d.finish.is_some() || d.error.is_some() {
+        return false;
+    }
+    if let Some(t) = &d.time {
+        if t.completed.is_some() {
+            return false;
+        }
+    }
+    match d.tokens.as_ref() {
+        None => false,
+        Some(t) => {
+            let cache = t.cache.as_ref();
+            t.input.unwrap_or(0) == 0
+                && t.output.unwrap_or(0) == 0
+                && t.reasoning.unwrap_or(0) == 0
+                && cache.map(|c| c.read.unwrap_or(0)).unwrap_or(0) == 0
+                && cache.map(|c| c.write.unwrap_or(0)).unwrap_or(0) == 0
+        }
+    }
+}
+
 fn process_message(
     conn: &Connection,
     builder: &mut SessionBuilder,
@@ -378,6 +416,18 @@ fn process_message(
                     .and_then(|m| m.provider_id.clone())
                     .or_else(|| data.provider_id.clone());
                 let cache = tokens.cache.as_ref().map(|c| (c.read, c.write));
+                let duration_ms = data
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.completed)
+                    .zip(data.time.as_ref().and_then(|t| t.created))
+                    .map(|(c, s)| (c - s).max(0));
+                let status = match data.finish.as_deref() {
+                    Some("error") => "error",
+                    Some("length") => "truncated",
+                    Some("cancelled") | Some("aborted") | Some("canceled") => "cancelled",
+                    _ => "success",
+                };
                 builder.add_call(
                     turn,
                     msg_id.to_string(),
@@ -389,6 +439,8 @@ fn process_message(
                     cache.and_then(|(r, _)| r),
                     cache.and_then(|(_, w)| w),
                     tokens.reasoning,
+                    duration_ms,
+                    status,
                     if response_text.is_empty() {
                         None
                     } else {

@@ -3,6 +3,7 @@ import { useThemeProvider } from "../utils/ThemeContext";
 
 export default function ThemeToggle() {
   const { currentTheme, changeCurrentTheme } = useThemeProvider();
+  const nextThemeLabel = currentTheme === "light" ? "切换深色模式" : "切换浅色模式";
 
   return (
     <div>
@@ -17,6 +18,8 @@ export default function ThemeToggle() {
       <label
         className="flex items-center justify-center cursor-pointer w-8 h-8 hover:bg-gray-100 lg:hover:bg-gray-200 dark:hover:bg-gray-700/50 dark:lg:hover:bg-gray-800 rounded-full"
         htmlFor="light-switch"
+        aria-label={nextThemeLabel}
+        title={nextThemeLabel}
       >
         <svg
           className="dark:hidden fill-current text-gray-500/80 dark:text-gray-400/80"
@@ -39,7 +42,7 @@ export default function ThemeToggle() {
           <path d="M11.875 4.375a.625.625 0 1 0 1.25 0c.001-.69.56-1.249 1.25-1.25a.625.625 0 1 0 0-1.25 1.252 1.252 0 0 1-1.25-1.25.625.625 0 1 0-1.25 0 1.252 1.252 0 0 1-1.25 1.25.625.625 0 1 0 0 1.25c.69.001 1.249.56 1.25 1.25Z" />
           <path d="M7.019 1.985a1.55 1.55 0 0 0-.483-1.36 1.44 1.44 0 0 0-1.53-.277C2.056 1.553 0 4.5 0 7.9 0 12.352 3.648 16 8.1 16c3.407 0 6.246-2.058 7.51-4.963a1.446 1.446 0 0 0-.25-1.55 1.554 1.554 0 0 0-1.372-.502c-4.01.552-7.539-2.987-6.97-7ZM2 7.9C2 5.64 3.193 3.664 4.961 2.6 4.82 7.245 8.72 11.158 13.36 11.04 12.265 12.822 10.341 14 8.1 14 4.752 14 2 11.248 2 7.9Z" />
         </svg>
-        <span className="sr-only">Switch to light / dark version</span>
+        <span className="sr-only">{nextThemeLabel}</span>
       </label>
     </div>
   );

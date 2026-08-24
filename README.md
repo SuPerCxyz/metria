@@ -1,19 +1,36 @@
+<div align="center">
+
+<img src="docs/logo/metria-full.png" alt="Metria" width="500" />
+
 # Metria
 
-**Metria** 是一个轻量、可自托管的 AI 编程 Agent 用量监控、费用分析和网络流量估算平台。
+**轻量、可自托管的 AI 编程 Agent 用量监控 · 费用分析 · 网络流量估算**
 
-统一采集 Claude Code / Codex / OpenCode 的 Token、调用次数、费用与估算流量，多节点汇总展示。**零侵入采集**：不修改节点、客户端或网络链路。
+统一采集 **Claude Code / Codex / OpenCode** 的 Token、调用次数、费用与估算流量，多节点汇总展示。**零侵入采集**，不修改节点、客户端或网络链路。
 
-> 状态：**开发中（M1）**。当前为工程骨架阶段，核心闭环（Adapter + Agent + Hub + Rollup）正在实现。
+[![CI](https://github.com/SuPerCxyz/metria/actions/workflows/ci.yml/badge.svg)](https://github.com/SuPerCxyz/metria/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+</div>
+
+---
+
+## 为什么用 Metria
+
+AI 编程 Agent（Claude Code / Codex / OpenCode）的 Token、费用和网络流量分散在各自本地的日志与数据库中，难以统一查看、汇总与核算。Metria 通过**只读挂载**读取客户端已有的数据源，零侵入地完成：
+
+- **用量监控**：Token（输入/输出/缓存/推理）、调用次数、会话数，按 Node / Collector / Client / Model / 任意时间范围聚合。
+- **费用分析**：三口径并存（`reported` / `calculated` / `estimated`），结合版本化价格目录与重新计价，费用可追溯。
+- **流量估算**：基于消息内容与 Usage 的**估算流量**（含上下界与置信度），明确标注「估算」，绝不以估算冒充实际。
 
 ## 特性
 
-- 统一模型：Node / Collector / Client / Source / Session / Turn / Message / Model Call / Usage Event / Traffic Estimate / Traffic Profile / Pricing。
-- 零侵入：只读挂载读取客户端已有日志与本地数据库，不修改任何配置，不使用代理，不注入 eBPF。
-- 诚实的数据：Token 缺失用 `null` 而非 0；费用三口径（reported / calculated / estimated）并存；流量一律标记「估算流量」并给出范围与可信度。
-- 多节点汇总：每个 Node 下展示检测到的 Client 与 Source。
-- 任意时间范围：所有统计支持明确的 `from/to` + IANA 时区 + 时间粒度。
-- 轻量部署：单一二进制镜像（Hub 运行时无 Node.js），SQLite 存储，Docker Compose 一键起。
+- **零侵入（硬约束）**：只读挂载读取日志/会话/本地数据库；不修改客户端配置，不使用代理，不注入 eBPF，不抓取明文请求。
+- **诚实数据**：Token 缺失用 `null` 而非 0；费用三口径并存；流量一律标记「估算流量」并给出范围与可信度。
+- **多节点汇总**：每个 Node 下展示检测到的 Client 与 Source，跨节点统一视图。
+- **任意时间范围**：所有统计支持 `from/to` + IANA 时区 + 自适应时间粒度。
+- **轻量部署**：单一二进制镜像（Hub 运行时无 Node.js），SQLite 存储，Docker Compose 一键起。
+- **增量采集**：JSONL 按 offset/inode、SQLite 按 rowid 增量扫描，不重复解析历史，每 5 分钟 Reconcile 补偿丢失事件。
 
 ## 快速开始
 
@@ -33,13 +50,21 @@ docker compose -f docker/compose.agent.yaml up -d
 
 `compose.full.yaml` 额外包含 Demo 模式（`hub --demo`，合成数据，不读真实目录）。
 
+> 也可直接跑 `metria hub --demo` 体验界面，无需真实客户端数据。
+
+### 在 Web 端添加节点（推荐）
+
+节点页点击「添加节点」，填写名称与 Hub 地址后，页面生成一次性专属 Token 与 **Docker / 原生** 两种安装命令；在目标机运行命令即可接入（Token 仅本次展示，Hub 只存哈希）。节点信息可在 Web 端编辑/删除，历史用量数据保留。详见 `docs/deployment.md`。
+
 ## 容器
 
 ```bash
 # 构建
 docker build -f docker/Dockerfile --target hub -t metria:dev .
-# 多架构
-docker buildx build --platform linux/amd64,linux/arm64 --target hub -t ghcr.io/supercxyz/metria:0.1.0 --push .
+
+# 多架构（amd64 + arm64）
+docker buildx build --platform linux/amd64,linux/arm64 --target hub \
+  -t ghcr.io/SuPerCxyz/metria:0.1.0 --push .
 
 # 健康检查
 docker run --rm metria:dev healthcheck
@@ -48,13 +73,34 @@ docker run --rm metria:dev healthcheck
 镜像内同一二进制多命令入口：
 
 ```
-metria hub          # Hub 服务
+metria hub          # Hub 服务（Web UI + API）
 metria agent        # Agent（Collector）
 metria import       # 客户端目录导入
 metria doctor       # 环境诊断
 metria healthcheck  # 容器健康检查
 metria version      # 版本信息
 ```
+
+## 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Client 数据源（只读挂载）                                     │
+│  ~/.claude ~/.codex ~/.local/share/opencode ...              │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ 增量扫描（JSONL offset / SQLite rowid）
+┌──────────────────────────▼──────────────────────────────────┐
+│  Agent（Collector，每个 Node 一个）                           │
+│  解析事件 → 归一化 → Spool 缓冲 → 批传上传                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTPS batch（注册/心跳/事件/状态）
+┌──────────────────────────▼──────────────────────────────────┐
+│  Hub                                                         │
+│  SQLite（WAL）· Rollup · 价格目录 · 流量 Profile · Web UI     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+核心概念：[Node / Collector / Client / Source](docs/data-model.md)。术语约定见 [AGENTS.md](AGENTS.md) 第 2 节。
 
 ## 开发
 
@@ -77,7 +123,16 @@ METRIA_DATA_DIR=/tmp/metria-dev METRIA_DATABASE_URL=sqlite:///tmp/metria-dev/h.d
 
 ```
 crates/            Rust workspace（12 个 crate）
-web/               Preact + TypeScript + Vite 前端
+├─ metria-core       领域模型、脱敏、时间分桶
+├─ metria-protocol   线协议（注册/批传/状态）
+├─ metria-storage    SQLite 存储 + 迁移
+├─ metria-pricing    价格目录与计价
+├─ metria-traffic    流量估算 Profile 与重建
+├─ metria-adapter-*  Claude Code / Codex / OpenCode Adapter
+├─ metria-agent      采集 Agent（Collector）
+├─ metria-hub        Hub（API + Rollup + 维护）
+└─ metria-cli        多命令 CLI 入口
+web/               React + Vite + Tailwind + Chart.js 前端
 docker/            Dockerfile 与 Compose 示例
 migrations/        SQLite 版本化迁移
 fixtures/          Adapter 测试夹具（golden / malformed）

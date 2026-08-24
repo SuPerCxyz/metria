@@ -58,6 +58,14 @@ fn golden_full_parses_session_events() {
     assert_eq!(s.batch.tool_events.len(), 2);
     assert_eq!(s.batch.messages.len(), 7);
 
+    // 时长与状态：assistant - 最近 user 的毫秒差值（4000/3500/1000），status 默认 success
+    let durations: Vec<Option<i64>> = s.batch.model_calls.iter().map(|c| c.duration_ms).collect();
+    assert_eq!(durations, vec![Some(4000), Some(3500), Some(1000)]);
+    for c in &s.batch.model_calls {
+        assert_eq!(c.status, "success");
+        assert_eq!(c.status_code, Some(200));
+    }
+
     // 流量估算：每条调用都有估算（部分重建 / token profile）
     assert_eq!(s.batch.traffic_estimates.len(), 3);
     for te in &s.batch.traffic_estimates {

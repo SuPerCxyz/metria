@@ -1,10 +1,11 @@
-// 指标卡片：主数值 + 趋势值 + 辅助说明。桌面每行最多 4 张。
+// 指标卡片：主数值 + 趋势值 + 辅助说明。桌面每行最多 4 张（span 可调）。
 
 import React from 'react'
 
-export default function MetricCard({ label, value, delta, deltaTone, sub, hint }) {
+export default function MetricCard({ label, value, delta, deltaTone, sub, hint, span }) {
+  const spanClass = span || 'xl:col-span-3'
   return (
-    <div className="flex flex-col col-span-full sm:col-span-6 xl:col-span-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+    <div className={`flex flex-col col-span-full sm:col-span-6 ${spanClass} bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5`}>
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400">{label}</h3>
         {delta !== undefined && delta !== null && (
@@ -25,7 +26,11 @@ export default function MetricCard({ label, value, delta, deltaTone, sub, hint }
         {value}
       </div>
       {sub && <div className="mt-1 text-xs text-gray-400 dark:text-gray-500">{sub}</div>}
-      {hint && <div className="mt-1 text-[11px] text-gray-300 dark:text-gray-600">{hint}</div>}
+      {hint && (
+        <div title={hint} className="mt-1 text-xs text-gray-300 dark:text-gray-600 truncate">
+          {hint}
+        </div>
+      )}
     </div>
   )
 }

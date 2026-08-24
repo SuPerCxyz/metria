@@ -10,5 +10,5 @@ repository.workspace = true
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
-rust-embed = "8"
+rust-embed = { version = "8", features = ["debug-embed"] }
 chrono = { version = "0.4", features = ["serde"] }

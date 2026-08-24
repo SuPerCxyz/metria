@@ -11,12 +11,15 @@
 #   `metria doctor --adapter <name>` 可检测目录权限。
 services:
   metria-agent:
-    image: ghcr.io/supercxyz/metria:latest
+    image: ${METRIA_IMAGE:-ghcr.io/supercxyz/metria:latest}
     container_name: metria-agent
     command: ["agent"]
     restart: unless-stopped
     # 与宿主用户对齐，确保能读 700 权限的 home 目录
     user: "${UID:-1000}:${GID:-1000}"
+    # Linux 上 host.docker.internal 需要显式映射到网关
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - metria-agent-data:/data
       - ${CLAUDE_PATH:-/home/example/.claude}:/sources/claude:ro
@@ -48,4 +51,6 @@ secrets:
     file: ./secrets/metria-agent-token
 
 volumes:
+  # 固定卷名，复用现有 spool 数据（兼容手工 docker run 创建的卷）
   metria-agent-data:
+    name: metria-agent-data

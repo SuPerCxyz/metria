@@ -9,7 +9,7 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
 
 const AGENT_LABELS = {
   'claude-code': 'Claude Code',
@@ -37,7 +37,8 @@ export default function Agents() {
 
   const columns = [
     { key: 'dimension', label: 'Agent 名称', sortable: true, render: (r) => AGENT_LABELS[r.dimension] || r.dimension },
-    { key: 'input_tokens', label: 'Token', sortable: true, render: (r) => fmtTokensShort((r.input_tokens ?? 0) + (r.output_tokens ?? 0)) },
+    { key: 'input_tokens', label: 'Token', sortable: true, render: (r) => fmtTokensShort(sumTokens(r)) },
+    { key: 'cache', label: '缓存命中率', render: (r) => cacheHitRate(r) != null ? fmtPct100(cacheHitRate(r)) : '—' },
     { key: 'model_calls', label: '请求数', sortable: true, render: (r) => String(r.model_calls ?? 0) },
     { key: 'sessions', label: '会话数', render: (r) => String(r.sessions ?? 0) },
     { key: 'cost', label: '费用', render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },

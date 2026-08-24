@@ -20,7 +20,7 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Web（Preact + TS + uPlot）  ← rust-embed 进 Hub 镜像   │
+│  Web（React + Vite + Chart.js）  ← rust-embed 进 Hub 镜像 │
 ├─────────────────────────────────────────────────────────┤
 │  Hub（axum + tokio）                                     │
 │  ├─ 认证（单 Admin 会话） / Collector 协议（token）      │
@@ -70,12 +70,12 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 
 - **Agent**：notify + rusqlite + ureq/rustls + zstd + blake3（无 tokio/reqwest）
 - **Hub**：tokio + axum + rusqlite(blocking pool) + rust-embed + SSE
-- **Web**：Preact + TypeScript + Vite + uPlot，rust-embed 进 Hub 二进制
+- **Web**：React 19 + Vite + Tailwind CSS + Chart.js，rust-embed 进 Hub 二进制
 - **依赖约束**：不强制 Redis / Kafka / ClickHouse / PostgreSQL；Hub 镜像不含 Node.js
 
 ## 7. 质量与安全
 
-- 门禁：`cargo fmt` / `clippy -D warnings` / `test` / web typecheck+build / docker build / compose config
+- 门禁：`cargo fmt` / `clippy -D warnings` / `test` / web test+build / docker build / compose config
 - 零侵入硬性约束（详见 README / AGENTS.md §3）：禁止代理、中间人、改网络、挂 Docker Socket 等
 - 隐私：默认 content_mode=metadata，Agent 本地脱敏 + Hub 二次脱敏；
   不上传完整路径、用户名、Hostname、Git Remote、API Key、Authorization、SSH 私钥

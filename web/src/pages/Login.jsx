@@ -34,7 +34,7 @@ export default function Login() {
     <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-900 px-4">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
-          <span className="inline-flex w-12 h-12 rounded-xl bg-indigo-600 dark:bg-indigo-500 items-center justify-center text-white text-xl font-bold mb-4">M</span>
+          <img src="/static/metria-logo.png" alt="Metria" className="w-16 h-16 rounded-2xl object-cover mx-auto mb-4" />
           <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">Metria</h1>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">AI 编程 Agent 用量监控 · 费用分析 · 流量估算</p>
         </div>
@@ -62,7 +62,7 @@ export default function Login() {
             <button
               type="submit"
               disabled={busy}
-              className="w-full py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium disabled:opacity-50"
+              className="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium disabled:opacity-50"
             >
               {busy ? '登录中…' : '登录'}
             </button>
