@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [0.3.0] - 2026-08-25
+
+### Added
+
+- Hub 支持 OIDC 单用户登录（Authorization Code Flow）：discovery、code 换 token、userinfo 身份校验；按 email / subject 白名单匹配唯一允许账号，白名单外明确拒绝。
+- OIDC 回调经一次性交换码换取会话 token（不经过 URL）；授权 state 一次性且 10 分钟过期。
+- Web 登录页「使用 OIDC 登录」入口与回调落地页；设置页显示当前登录方式。
+- 可配置禁用本地密码登录，仅保留 OIDC 入口。
+
+### Changed
+
+- `GET /api/v1/system/info` 新增 `auth_mode` 字段（password / oidc / oidc+password）。
+- OIDC 相关环境变量：`METRIA_OIDC_ISSUER` / `CLIENT_ID` / `CLIENT_SECRET` / `ALLOWED_EMAIL` / `ALLOWED_SUBJECT` / `REDIRECT_URL` / `DISABLE_PASSWORD_LOGIN`。
+
 ## [0.2.0] - 2026-08-24
 
 ### Added
