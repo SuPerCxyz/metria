@@ -33,7 +33,7 @@ docker compose -f docker/compose.full.yaml up -d
 | `METRIA_OIDC_ALLOWED_EMAIL` | 无 | 唯一允许登录的邮箱（忽略大小写；要求 email_verified ≠ false） |
 | `METRIA_OIDC_ALLOWED_SUBJECT` | 无 | 可选：唯一允许登录的 subject（与 ALLOWED_EMAIL 任一命中即可） |
 | `METRIA_OIDC_REDIRECT_URL` | 从请求 Host 推导 | 显式回调地址 `{origin}/api/v1/auth/oidc/callback`；反代场景建议显式配置 |
-| `METRIA_OIDC_DISABLE_PASSWORD_LOGIN` | false | 禁用本地密码登录（仅保留 OIDC 入口） |
+| `METRIA_OIDC_DISABLE_PASSWORD_LOGIN` | true（启用 OIDC 时） | 启用 OIDC 后默认禁用本地密码登录；显式设置 `false` 保留密码作为 IdP 故障后备 |
 | `METRIA_COLLECTOR_TOKEN` | 无 | Collector 共享 bootstrap token |
 | `METRIA_NODE_ID` / `METRIA_NODE_NAME` | 自动 | Agent 节点身份 |
 | `METRIA_HUB_URL` | `http://localhost:8080` | Agent 连接 Hub |
@@ -73,8 +73,8 @@ METRIA_OIDC_CLIENT_SECRET=<secret>
 METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 # 可选：反代后建议显式指定回调地址
 # METRIA_OIDC_REDIRECT_URL=https://metria.example.com/api/v1/auth/oidc/callback
-# 可选：完全禁用密码登录
-# METRIA_OIDC_DISABLE_PASSWORD_LOGIN=true
+# 可选：保留密码登录作为 IdP 故障后备（默认已禁用）
+# METRIA_OIDC_DISABLE_PASSWORD_LOGIN=false
 ```
 
 **行为说明**：
@@ -82,7 +82,7 @@ METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 - 未配置 OIDC 时行为不变（本地密码登录）。
 - 配置后登录页出现「使用 OIDC 登录」按钮；回调成功后 Hub 校验 userinfo 身份并复用既有签名会话机制；OIDC 首次登录自动创建无本地密码的用户记录。
 - 白名单外账号即使通过 IdP 认证也会被明确拒绝。
-- 密码登录默认保留作为后备（IdP 故障时可用）；设置 `METRIA_OIDC_DISABLE_PASSWORD_LOGIN=true` 后仅保留 OIDC 入口。
+- 启用 OIDC 后默认**仅保留 OIDC 入口**（本地密码登录被禁用）；如需 IdP 故障时的应急后备，显式设置 `METRIA_OIDC_DISABLE_PASSWORD_LOGIN=false`。
 - 安全提示：身份校验使用 IdP userinfo 端点（未做本地 JWKS 验签），要求 Issuer 必须走 HTTPS；state 一次性且 10 分钟过期，交换码一次性且 60 秒过期，会话 token 不经过 URL。
 
 ## 5. 升级 / 回滚

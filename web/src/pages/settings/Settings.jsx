@@ -483,20 +483,27 @@ function AccountSettings({ loading, error, profile, profileDraft, setProfileDraf
         </div>
       </form>
 
-      <form onSubmit={changePassword} className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">修改密码</h2>
-        <p className="mt-1 mb-4 text-sm text-gray-500 dark:text-gray-400">修改成功后当前会话会退出，请使用新密码重新登录。</p>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <label><FieldLabel>旧密码</FieldLabel><TextField type="password" value={passwordDraft.old_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, old_password: e.target.value }))} /></label>
-          <label><FieldLabel>新密码</FieldLabel><TextField type="password" value={passwordDraft.new_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, new_password: e.target.value }))} placeholder="至少 8 个字符" /></label>
-          <label><FieldLabel>确认新密码</FieldLabel><TextField type="password" value={passwordDraft.confirm_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, confirm_password: e.target.value }))} /></label>
+      {profile.local_password === false ? (
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">登录方式</h2>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">当前账号通过 OIDC 单点登录，未设置本地密码，无需修改密码。</p>
         </div>
-        <div className="mt-5 flex justify-end">
-          <button type="submit" disabled={passwordSaving} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white hover:bg-indigo-700 disabled:opacity-50">
-            {passwordSaving ? '修改中…' : '修改密码'}
-          </button>
-        </div>
-      </form>
+      ) : (
+        <form onSubmit={changePassword} className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">修改密码</h2>
+          <p className="mt-1 mb-4 text-sm text-gray-500 dark:text-gray-400">修改成功后当前会话会退出，请使用新密码重新登录。</p>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <label><FieldLabel>旧密码</FieldLabel><TextField type="password" value={passwordDraft.old_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, old_password: e.target.value }))} /></label>
+            <label><FieldLabel>新密码</FieldLabel><TextField type="password" value={passwordDraft.new_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, new_password: e.target.value }))} placeholder="至少 8 个字符" /></label>
+            <label><FieldLabel>确认新密码</FieldLabel><TextField type="password" value={passwordDraft.confirm_password} onChange={(e) => setPasswordDraft((d) => ({ ...d, confirm_password: e.target.value }))} /></label>
+          </div>
+          <div className="mt-5 flex justify-end">
+            <button type="submit" disabled={passwordSaving} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white hover:bg-indigo-700 disabled:opacity-50">
+              {passwordSaving ? '修改中…' : '修改密码'}
+            </button>
+          </div>
+        </form>
+      )}
     </div>
   )
 }

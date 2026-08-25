@@ -2,6 +2,13 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [0.3.1] - 2026-08-25
+
+### Changed
+
+- OIDC 默认行为变更：配置启用 OIDC 后自动禁用本地密码登录（仅保留 OIDC 入口）；如需 IdP 故障应急后备，显式设置 `METRIA_OIDC_DISABLE_PASSWORD_LOGIN=false`。
+- `/api/v1/auth/me` 新增 `local_password` 字段；OIDC 账号（无本地密码）在设置页隐藏「修改密码」并显示登录方式说明。
+
 ## [0.3.0] - 2026-08-25
 
 ### Added

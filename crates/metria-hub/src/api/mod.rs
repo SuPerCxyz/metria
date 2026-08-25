@@ -703,6 +703,21 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
     let Some(username) = auth_user(&st, &headers) else {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
     };
+    // 本地密码是否存在：OIDC 用户为非 PHC 占位串，不可用于密码校验
+    let has_local_password = match st.db.user_password_hash(&username) {
+        Ok(Some(hash)) => hash.starts_with("$argon2"),
+        Ok(None) => {
+            let (user, _) = admin_hash();
+            username == user
+        }
+        Err(e) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &e.to_string(),
+            )
+        }
+    };
     match st.db.user_profile(&username) {
         Ok(Some(p)) => Json(serde_json::json!({
             "username": p.username,
@@ -710,6 +725,7 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
             "avatar_text": p.avatar_text,
             "avatar_color": p.avatar_color,
             "role": p.role,
+            "local_password": has_local_password,
             "ok": true
         }))
         .into_response(),
@@ -719,6 +735,7 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
             "avatar_text": null,
             "avatar_color": "indigo",
             "role": "admin",
+            "local_password": has_local_password,
             "ok": true
         }))
         .into_response(),

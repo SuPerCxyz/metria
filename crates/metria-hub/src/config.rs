@@ -74,10 +74,33 @@ impl OidcConfig {
             redirect_url: var_opt("METRIA_OIDC_REDIRECT_URL")?
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| v.trim().to_string()),
-            disable_password_login: var_opt("METRIA_OIDC_DISABLE_PASSWORD_LOGIN")?
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            // 默认行为：启用 OIDC 即禁用本地密码登录；显式设置 false/0 才保留密码后备
+            disable_password_login: parse_disable_password_login(var_opt(
+                "METRIA_OIDC_DISABLE_PASSWORD_LOGIN",
+            )?),
         }))
+    }
+}
+
+/// 解析密码登录开关：未设置或 true/1 → 禁用；显式 false/0 → 保留。
+fn parse_disable_password_login(v: Option<String>) -> bool {
+    match v {
+        Some(v) => !(v == "false" || v == "0"),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disable_password_login_defaults_to_true_and_honors_explicit_false() {
+        assert!(parse_disable_password_login(None));
+        assert!(parse_disable_password_login(Some("true".into())));
+        assert!(parse_disable_password_login(Some("1".into())));
+        assert!(!parse_disable_password_login(Some("false".into())));
+        assert!(!parse_disable_password_login(Some("0".into())));
     }
 }
 
