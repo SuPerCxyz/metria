@@ -39,10 +39,12 @@ COPY crates ./crates
 COPY migrations ./migrations
 COPY --from=web /build/dist ./web/dist
 # cargo 缓存挂载：registry（依赖只下/编一次）+ target（增量编译，源码变更不触发全量）。
+# cache id 按 TARGETARCH 区分：buildx 多平台并行时两个平台的 cargo 会同时
+# 解包 registry 源码，共享同一 cache 产生 File exists 竞态导致随机失败。
 # target 通过 CARGO_TARGET_DIR 指向缓存挂载，避免其内容进入层快照导致 COPY 拿不到二进制；
 # 最终产物显式拷贝到层内 /src/target/release/metria，供 hub 阶段 COPY。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/cargo-target \
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/cargo-target \
     profile="$PROFILE"; target_dir=release; [ "$profile" = "dev" ] && target_dir=debug; \
     if [ "$TARGETARCH" = "arm64" ]; then \
       CARGO_TARGET_DIR=/cargo-target \
