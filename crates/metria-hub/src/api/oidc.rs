@@ -357,6 +357,19 @@ pub async fn oidc_callback(
         let access_token = exchange_code(&cfg, &disc.token_endpoint, code, &redirect)?;
         let ui = fetch_userinfo(&userinfo_endpoint, &access_token)?;
         if !identity_allowed(&cfg, &ui) {
+            // 记录实际收到的身份便于排查 IdP 侧账号/claim 配置错误；
+            // email 为自托管部署者本人可见的日志，sub 仅输出前缀
+            let email_desc = match (&ui.email, ui.email_verified) {
+                (Some(e), Some(false)) => format!("{e}（未验证）"),
+                (Some(e), _) => e.clone(),
+                (None, _) => "<IdP 未返回 email>".to_string(),
+            };
+            let sub_prefix: String = ui.sub.chars().take(8).collect();
+            tracing::warn!(
+                email = %email_desc,
+                sub_prefix = %sub_prefix,
+                "OIDC 登录被拒：身份不在白名单（检查 METRIA_OIDC_ALLOWED_EMAIL/ALLOWED_SUBJECT）"
+            );
             return Err("该账号未被授权访问本系统（单用户模式）".to_string());
         }
         let username = ui.email.clone().unwrap_or_else(|| ui.sub.clone());

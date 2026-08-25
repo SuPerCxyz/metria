@@ -2,6 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [0.3.2] - 2026-08-25
+
+### Added
+
+- OIDC 白名单拒绝时记录 IdP 实际返回的 email（含验证状态）与 subject 前缀，便于排查 IdP 账号/claim 配置不一致。
+
 ## [0.3.1] - 2026-08-25
 
 ### Changed
