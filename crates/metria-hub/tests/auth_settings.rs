@@ -15,6 +15,7 @@ fn test_cfg(dir: &std::path::Path) -> HubConfig {
         timezone: chrono_tz::Tz::UTC,
         log_filter: "error".into(),
         demo: false,
+        oidc: None,
     }
 }
 
@@ -27,6 +28,7 @@ async fn spawn_hub(dir: &std::path::Path) -> String {
         cfg,
         sse: metria_hub::api::SseHub::new(),
         sessions: Default::default(),
+        oidc: Default::default(),
         collector_token: Some("testtok".into()),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

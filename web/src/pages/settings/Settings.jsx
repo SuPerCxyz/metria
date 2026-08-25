@@ -513,6 +513,17 @@ function RetentionSettings({ loading, error, info }) {
         <StatusItem label="自动清理" value={info.retention?.label || '未启用'} />
         <StatusItem label="展示时区" value={info.timezone || '—'} />
       </div>
+      {info.auth_mode && info.auth_mode !== 'password' && (
+        <div className="mt-3">
+          <StatusItem
+            label="登录方式"
+            value={
+              { oidc: 'OIDC（密码登录已禁用）', 'oidc+password': 'OIDC + 密码' }[info.auth_mode] ||
+              info.auth_mode
+            }
+          />
+        </div>
+      )}
       <p className="mt-5 text-xs text-gray-400 dark:text-gray-500">详细保留、备份与恢复说明见项目运维文档 <code className="rounded bg-gray-100 px-1.5 py-0.5 dark:bg-gray-700">docs/operations.md</code>。</p>
     </div>
   )

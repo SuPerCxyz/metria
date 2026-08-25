@@ -89,6 +89,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
         sse: api::SseHub::new(),
         sessions: Default::default(),
         collector_token,
+        oidc: Default::default(),
     };
 
     let app = api::app_router(state)

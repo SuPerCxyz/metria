@@ -1,8 +1,5 @@
 //! Hub HTTP API：认证、Collector 协议、查询、SSE。
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
@@ -15,6 +12,8 @@ use metria_protocol::{
     RegisterResponse, UploadBatch, UploadResponse,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
 
@@ -24,6 +23,7 @@ use metria_storage::rusqlite::types::Value as SqlValue;
 
 pub mod handlers_misc;
 pub mod handlers_query;
+pub mod oidc;
 use handlers_misc::*;
 use handlers_query::*;
 
@@ -35,6 +35,7 @@ pub struct AppState {
     pub sse: SseHub,
     pub sessions: Arc<Mutex<HashMap<String, String>>>,
     pub collector_token: Option<String>,
+    pub oidc: Arc<oidc::OidcRuntime>,
 }
 
 /// SSE 广播。
@@ -87,6 +88,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/profile", get(profile).put(update_profile))
         .route("/api/v1/auth/change-password", post(change_password))
+        .route("/api/v1/auth/oidc/status", get(oidc::oidc_status))
+        .route("/api/v1/auth/oidc/login", get(oidc::oidc_login))
+        .route("/api/v1/auth/oidc/callback", get(oidc::oidc_callback))
+        .route("/api/v1/auth/oidc/exchange", post(oidc::oidc_exchange))
         .route("/api/v1/system/info", get(system_info))
         .route("/api/v1/collectors/register", post(register))
         .route("/api/v1/collectors/heartbeat", post(heartbeat))
@@ -202,6 +207,7 @@ async fn auth_mw(
         || (path.starts_with("/api/v1/nodes/") && path.ends_with("/agent/download"));
     if path == "/healthz"
         || path == "/api/v1/auth/login"
+        || path.starts_with("/api/v1/auth/oidc/")
         || path.starts_with("/api/v1/share/")
         || public_agent_download
     {
@@ -557,7 +563,7 @@ fn session_secret() -> Vec<u8> {
 }
 
 /// 签发签名会话 token：`sess.<username>.<sig>`（sig = HMAC-SHA256(secret, username)）。
-fn sign_session(username: &str) -> String {
+pub(crate) fn sign_session(username: &str) -> String {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     type H = Hmac<sha2::Sha256>;
@@ -605,6 +611,13 @@ fn admin_hash() -> (String, String) {
 }
 
 async fn login(State(st): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    if !oidc::password_login_enabled(&st.cfg) {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "password_login_disabled",
+            "密码登录已禁用，请使用 OIDC 登录",
+        );
+    }
     let stored = match st.db.user_credentials(&req.username) {
         Ok(credentials) => credentials,
         Err(e) => {
@@ -837,10 +850,16 @@ async fn system_info(State(st): State<AppState>, headers: axum::http::HeaderMap)
         metria_core::ContentMode::Metadata => ("metadata", "仅保存元数据"),
         metria_core::ContentMode::Full => ("full", "保存完整正文"),
     };
+    let auth_mode = match &st.cfg.oidc {
+        Some(o) if o.disable_password_login => "oidc",
+        Some(_) => "oidc+password",
+        None => "password",
+    };
     Json(serde_json::json!({
         "content_mode": content_mode,
         "content_mode_label": content_mode_label,
         "timezone": st.cfg.timezone.name(),
+        "auth_mode": auth_mode,
         "retention": {
             "automatic_cleanup": false,
             "retention_days": null,

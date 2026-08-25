@@ -507,3 +507,23 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
 - `GET /nodes/{id}/install` 生成安装命令的 hub URL 优先级：显式 `hub_url` → `http://{ip}:8080` → 占位；前端创建/编辑对话框同步展示 IP 输入并回显当前值。
 - 新增/更新 e2e：创建含 ip 成功、缺 ip/非法 ip 400、安装命令 IP 拼接、显式 hub_url 优先、编辑 ip 生效。
 - 验证：`cargo test --workspace` 全部通过、fmt/clippy 干净、Web 构建通过；浏览器实测创建节点填 IP → 安装命令 METRIA_HUB_URL=http://<ip>:8080，编辑回显 IP。
+
+---
+
+## 11. OIDC 单用户登录（2026-08-25）
+
+- Hub 新增 OIDC Authorization Code Flow 登录（`api/oidc.rs`）：`GET /auth/oidc/status|login|callback`、
+  `POST /auth/oidc/exchange`；discovery + code 换 token（client_secret_post 失败自动降级 basic）
+  + userinfo 身份校验（不本地验签，要求 Issuer 走 HTTPS）；单用户白名单按 email（忽略大小写、
+  要求 email_verified≠false）/ subject 匹配，白名单外账号明确拒绝。
+- 回调向前端传递一次性交换码（60s 过期、单次使用），前端 POST exchange 换既有 HMAC 签名会话，
+  token 不进 URL/浏览器历史；授权 state 一次性且 10 分钟过期。
+- 配置：`METRIA_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET/ALLOWED_EMAIL/ALLOWED_SUBJECT/
+  REDIRECT_URL/DISABLE_PASSWORD_LOGIN`；三元组不完整或缺白名单启动即报错；未配置时行为不变。
+- 密码登录默认保留作后备，可禁用（login 返回 403）；OIDC 首登自动建无本地密码用户
+  （占位 hash 非 PHC 格式不可用于密码校验）；system_info 增加 auth_mode。
+- Web：登录页按 status 渲染「使用 OIDC 登录」按钮（密码禁用时隐藏表单）、回调落地页、
+  设置页显示登录方式；错误经 `/#/login?error=` 回传展示。
+- 测试：单元测试 5 个（白名单匹配/state 与交换码生命周期/redirect_uri 推导）+
+  e2e 5 个（内置 mock IdP：status、全链路签发会话、重放拒绝、非白名单与伪造 state 拒绝、
+  禁用密码登录、未配置 404）。

@@ -616,6 +616,7 @@ mod tests {
             timezone: chrono_tz::Tz::UTC,
             log_filter: "error".into(),
             demo: false,
+            oidc: None,
         };
         let db = HubDb::open(&cfg).unwrap();
         db.apply_migrations().unwrap();

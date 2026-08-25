@@ -16,6 +16,7 @@ fn test_cfg(dir: &std::path::Path) -> HubConfig {
         timezone: chrono_tz::Tz::UTC,
         log_filter: "error".into(),
         demo: false,
+        oidc: None,
     }
 }
 

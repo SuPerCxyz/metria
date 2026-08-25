@@ -12,6 +12,7 @@ import { PageMetaProvider } from './hooks/usePageMeta'
 import { getToken, api } from './services/api'
 
 import Login from './pages/Login'
+import OidcCallback from './pages/OidcCallback'
 import Overview from './pages/overview/Overview'
 import Analytics from './pages/analytics/Analytics'
 import Sessions from './pages/sessions/Sessions'
@@ -76,6 +77,7 @@ function App() {
       <PageMetaProvider>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/oidc-callback" element={<OidcCallback />} />
           <Route element={<RequireAuth><AppLayout /></RequireAuth>}>
             <Route path="/" element={<ErrorBoundary><Overview /></ErrorBoundary>} />
             <Route path="/analytics" element={<ErrorBoundary><Analytics /></ErrorBoundary>} />

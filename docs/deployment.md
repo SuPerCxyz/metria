@@ -28,6 +28,12 @@ docker compose -f docker/compose.full.yaml up -d
 | `METRIA_CONTENT_MODE` | `metadata` | none/metadata/full |
 | `METRIA_SESSION_SECRET` | 无安全默认值 | 会话签名密钥，生产环境必须设置随机高强度值 |
 | `METRIA_ADMIN_USER` / `METRIA_ADMIN_PASSWORD` | admin / change-me-please（Compose） | 初始 Admin 凭据，部署后立即修改 |
+| `METRIA_OIDC_ISSUER` | 无 | OIDC Issuer URL（如 `https://idp.example.com/realms/metria`），与 `CLIENT_ID`/`CLIENT_SECRET` 同时配置即启用 OIDC 登录 |
+| `METRIA_OIDC_CLIENT_ID` / `METRIA_OIDC_CLIENT_SECRET` | 无 | OIDC 客户端凭据（confidential client） |
+| `METRIA_OIDC_ALLOWED_EMAIL` | 无 | 唯一允许登录的邮箱（忽略大小写；要求 email_verified ≠ false） |
+| `METRIA_OIDC_ALLOWED_SUBJECT` | 无 | 可选：唯一允许登录的 subject（与 ALLOWED_EMAIL 任一命中即可） |
+| `METRIA_OIDC_REDIRECT_URL` | 从请求 Host 推导 | 显式回调地址 `{origin}/api/v1/auth/oidc/callback`；反代场景建议显式配置 |
+| `METRIA_OIDC_DISABLE_PASSWORD_LOGIN` | false | 禁用本地密码登录（仅保留 OIDC 入口） |
 | `METRIA_COLLECTOR_TOKEN` | 无 | Collector 共享 bootstrap token |
 | `METRIA_NODE_ID` / `METRIA_NODE_NAME` | 自动 | Agent 节点身份 |
 | `METRIA_HUB_URL` | `http://localhost:8080` | Agent 连接 Hub |
@@ -46,6 +52,38 @@ docker compose -f docker/compose.full.yaml up -d
 - Collector token 仅存哈希；过期后需重新注册（Agent 自动每 6 天续期）。
 - 不在日志输出 token/secret；默认不上传完整路径/用户名/Hostname/Git Remote/密钥。
 - `METRIA_SESSION_SECRET` 修改后已有 Web 会话会失效，需要重新登录。
+
+### 4.1 OIDC 单用户登录
+
+Metria 支持通过任意标准 OIDC Provider（Keycloak / Authentik / Auth0 / Google / Entra 等）登录 Web 控制台，**仅允许一个白名单账号**（单用户模式，不支持多用户）。
+
+**IdP 侧配置**（以 Keycloak 为例）：
+
+1. 创建 confidential client（如 `metria`），启用 Standard Flow（Authorization Code）。
+2. Valid redirect URI：`https://<metria-origin>/api/v1/auth/oidc/callback`。
+3. 记录 Client Secret。
+
+**Hub 侧配置**：
+
+```yaml
+# docker compose 环境变量示例
+METRIA_OIDC_ISSUER=https://idp.example.com/realms/metria
+METRIA_OIDC_CLIENT_ID=metria
+METRIA_OIDC_CLIENT_SECRET=<secret>
+METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
+# 可选：反代后建议显式指定回调地址
+# METRIA_OIDC_REDIRECT_URL=https://metria.example.com/api/v1/auth/oidc/callback
+# 可选：完全禁用密码登录
+# METRIA_OIDC_DISABLE_PASSWORD_LOGIN=true
+```
+
+**行为说明**：
+
+- 未配置 OIDC 时行为不变（本地密码登录）。
+- 配置后登录页出现「使用 OIDC 登录」按钮；回调成功后 Hub 校验 userinfo 身份并复用既有签名会话机制；OIDC 首次登录自动创建无本地密码的用户记录。
+- 白名单外账号即使通过 IdP 认证也会被明确拒绝。
+- 密码登录默认保留作为后备（IdP 故障时可用）；设置 `METRIA_OIDC_DISABLE_PASSWORD_LOGIN=true` 后仅保留 OIDC 入口。
+- 安全提示：身份校验使用 IdP userinfo 端点（未做本地 JWKS 验签），要求 Issuer 必须走 HTTPS；state 一次性且 10 分钟过期，交换码一次性且 60 秒过期，会话 token 不经过 URL。
 
 ## 5. 升级 / 回滚
 

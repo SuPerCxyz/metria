@@ -169,6 +169,32 @@ impl HubDb {
         Ok(())
     }
 
+    /// 确保 OIDC 白名单用户存在（无本地密码，不可用密码登录）。
+    ///
+    /// 已存在时不覆盖密码与 profile；仅在 display_name 为空时回填 IdP 显示名。
+    pub fn ensure_oidc_user(
+        &self,
+        username: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        let now = Utc::now().to_rfc3339();
+        // 占位 hash 非 PHC 格式：verify_password 解析必失败，等效于禁用本地密码登录
+        c.execute(
+            "INSERT OR IGNORE INTO users (id, username, password_hash, must_change_password, role, created_at, updated_at) VALUES (?1, ?2, '!oidc-no-local-password', 0, 'admin', ?3, ?3)",
+            params![format!("user-{username}"), username, now],
+        )
+        .map_err(StorageError::from)?;
+        if let Some(dn) = display_name.filter(|s| !s.trim().is_empty()) {
+            c.execute(
+                "UPDATE users SET display_name = ?1, updated_at = ?2 WHERE username = ?3 AND display_name IS NULL",
+                params![dn, now, username],
+            )
+            .map_err(StorageError::from)?;
+        }
+        Ok(())
+    }
+
     // ---------- 身份 ----------
 
     #[allow(clippy::too_many_arguments)]
