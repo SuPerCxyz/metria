@@ -30,6 +30,17 @@ pub struct CursorUpdate {
     pub cursor_json: String,
 }
 
+/// Pull 模式批次确认结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckResult {
+    /// 已删除对应事件
+    Ok,
+    /// 此前已确认（幂等重放）
+    AlreadyAcked,
+    /// 批次不存在或未处于已拉取状态
+    NotFound,
+}
+
 /// Spool 满信号。
 #[derive(Debug, Clone)]
 pub struct SpoolFull(Arc<AtomicBool>);
@@ -109,6 +120,18 @@ impl Spool {
             CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_events(created_at);
             "#,
         )?;
+        // Pull 模式：pending_events.pulled_batch_id（旧库平滑加列）
+        let has_pulled_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_events') WHERE name = 'pulled_batch_id'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !has_pulled_col {
+            conn.execute_batch("ALTER TABLE pending_events ADD COLUMN pulled_batch_id TEXT;")?;
+        }
         Ok(Self {
             conn,
             max_pending_events,
@@ -119,6 +142,21 @@ impl Spool {
 
     pub fn full_flag(&self) -> SpoolFull {
         self.full.clone()
+    }
+
+    /// 来源健康统计：(总数, 健康数)。
+    pub fn source_stats(&self) -> (i64, i64) {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM source_health", [], |r| r.get(0))
+            .unwrap_or(0);
+        let healthy: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM source_health WHERE ok = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        (total, healthy)
     }
 
     pub fn pending_count(&self) -> i64 {
@@ -241,6 +279,116 @@ impl Spool {
             }
         }
         (batch_id, events)
+    }
+
+    /// Pull 模式：取出待拉取批次。
+    ///
+    /// 幂等：存在「已拉取未确认」批次时重复返回同一批次（同 batch_id 同事件），
+    /// 直到 Hub 确认或事件被处理；否则取新一批并打拉取标记。
+    pub fn collect_batch(
+        &mut self,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Option<(String, Vec<PendingEvent>)>, AgentError> {
+        // 1) 已拉取未确认批次 → 幂等重拉
+        let pulled: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT batch_id FROM upload_batches WHERE status = 'pulled' ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(batch_id) = pulled {
+            let events = self.events_of_batch(&batch_id)?;
+            if !events.is_empty() {
+                return Ok(Some((batch_id, events)));
+            }
+            // 事件已不在 pending（异常残留）→ 关闭该批次继续取新批
+            self.conn.execute(
+                "UPDATE upload_batches SET status = 'accepted' WHERE batch_id = ?1",
+                [&batch_id],
+            )?;
+        }
+
+        // 2) 取新批并打标
+        let (batch_id, events) = self.next_batch(max_events, max_bytes);
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut mark =
+                tx.prepare("UPDATE pending_events SET pulled_batch_id = ?1 WHERE event_id = ?2")?;
+            for e in &events {
+                mark.execute(metria_storage::rusqlite::params![batch_id, e.event_id])?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO upload_batches (batch_id, created_at, status) VALUES (?1, ?2, 'pulled')",
+                metria_storage::rusqlite::params![batch_id, Utc::now().to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some((batch_id, events)))
+    }
+
+    /// Pull 模式批次确认结果。
+    pub fn ack_batch(&mut self, batch_id: &str) -> Result<AckResult, AgentError> {
+        let status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM upload_batches WHERE batch_id = ?1",
+                [batch_id],
+                |r| r.get(0),
+            )
+            .ok();
+        match status.as_deref() {
+            None => Ok(AckResult::NotFound),
+            Some("accepted") => Ok(AckResult::AlreadyAcked),
+            Some("pulled") => {
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM pending_events WHERE pulled_batch_id = ?1",
+                    [batch_id],
+                )?;
+                tx.execute(
+                    "UPDATE upload_batches SET status = 'accepted' WHERE batch_id = ?1",
+                    [batch_id],
+                )?;
+                tx.commit()?;
+                if self.pending_count() < self.max_pending_events / 2 {
+                    self.full.set(false);
+                }
+                Ok(AckResult::Ok)
+            }
+            Some(_) => Ok(AckResult::NotFound),
+        }
+    }
+
+    /// 查询某批次的事件（按打标顺序）。
+    fn events_of_batch(&self, batch_id: &str) -> Result<Vec<PendingEvent>, AgentError> {
+        let mut events = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, kind, payload FROM pending_events WHERE pulled_batch_id = ?1 ORDER BY created_at, event_id",
+        )?;
+        let rows = stmt.query_map([batch_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (id, kind, payload_json) = row;
+            if let Ok(payload) = serde_json::from_str(&payload_json) {
+                events.push(PendingEvent {
+                    event_id: id,
+                    kind,
+                    payload,
+                });
+            }
+        }
+        Ok(events)
     }
 
     /// 上传成功：删除事件并记录批次。
@@ -390,6 +538,52 @@ mod tests {
 
     fn tmp(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+
+    fn ev(id: &str) -> PendingEvent {
+        PendingEvent {
+            event_id: id.into(),
+            kind: "usage".into(),
+            payload: serde_json::json!({"n": 1}),
+        }
+    }
+
+    #[test]
+    fn pull_collect_is_idempotent_until_ack() {
+        let path = std::env::temp_dir().join(format!("spool-pull-{}", std::process::id()));
+        tmp(&path);
+        let mut spool = Spool::open(&path, 1000, 10_000_000).unwrap();
+        spool.insert_batch(&[ev("p1"), ev("p2")], &[]).unwrap();
+
+        // 首次拉取
+        let (batch_id, events) = spool.collect_batch(10, 1_000_000).unwrap().unwrap();
+        assert_eq!(events.len(), 2);
+        // 幂等重拉：同批次同事件
+        let (batch_id2, events2) = spool.collect_batch(10, 1_000_000).unwrap().unwrap();
+        assert_eq!(batch_id2, batch_id);
+        assert_eq!(events2.len(), 2);
+        // 未拉取批次 ack → 404 语义
+        assert_eq!(
+            spool.ack_batch("batch-nonexistent").unwrap(),
+            AckResult::NotFound
+        );
+        // 正确 ack → 删除事件
+        assert_eq!(spool.ack_batch(&batch_id).unwrap(), AckResult::Ok);
+        assert_eq!(spool.pending_count(), 0);
+        // 重复 ack → 幂等
+        assert_eq!(spool.ack_batch(&batch_id).unwrap(), AckResult::AlreadyAcked);
+        // 再次拉取 → 无批次
+        assert!(spool.collect_batch(10, 1_000_000).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pull_collect_empty_returns_none() {
+        let path = std::env::temp_dir().join(format!("spool-pull-empty-{}", std::process::id()));
+        tmp(&path);
+        let mut spool = Spool::open(&path, 1000, 10_000_000).unwrap();
+        assert!(spool.collect_batch(10, 1_000_000).unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

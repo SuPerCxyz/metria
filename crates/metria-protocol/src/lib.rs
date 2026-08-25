@@ -103,6 +103,20 @@ pub struct UploadResponse {
     pub message: Option<String>,
 }
 
+/// Pull 模式批次确认请求（Agent `/ack`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckRequest {
+    pub batch_id: String,
+}
+
+/// Pull 模式批次确认响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AckResponse {
+    pub ok: bool,
+    /// already=true 表示批次此前已确认（幂等重放）
+    pub already: bool,
+}
+
 /// 失败事件明细。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailedEvent {

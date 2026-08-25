@@ -527,3 +527,22 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
 - 测试：单元测试 5 个（白名单匹配/state 与交换码生命周期/redirect_uri 推导）+
   e2e 5 个（内置 mock IdP：status、全链路签发会话、重放拒绝、非白名单与伪造 state 拒绝、
   禁用密码登录、未配置 404）。
+
+---
+
+## 12. Hub 主动拉取（Pull）模式与 Agent 最小化配置（2026-08-25）
+
+- OpenSpec change `hub-pull-agent-mode`（proposal/specs×3/design/tasks 全量落地）。
+- Agent 双模式：配置 `METRIA_HUB_URL` 走 push（行为不变）；仅配置 token 进入 pull 模式——
+  std TcpListener 手写极简 HTTP（零新增依赖），`/collect`（UploadBatch+zstd、X-Batch-Id、
+  空批次 204）、`/ack`（幂等确认删 spool，未拉取 404）、`/status`（版本/来源健康/spool 统计），
+  Bearer 常量时间比较；spool 批次状态机支持幂等重拉（pulled_batch_id 打标）。
+- Hub Pull 调度器：按节点 agent_url 周期拉取（METRIA_PULL_INTERVAL 默认 60s），复用
+  process_batch（自 ingest handler 抽取）校验/幂等/rollup，成功后 ack；单节点失败指数退避
+  不影响他节点；节点级 token AES-256-GCM 加密存储（HKDF 派生自 session secret）。
+- Web：添加/编辑节点「Agent 地址」输入与清除；节点详情 Pull 状态横幅；安装命令按模式生成
+  （pull 形态仅 token + 挂载 + `-p 8090`）。
+- migration 011：nodes 加 agent_url/node_token_enc/last_pull_at/last_pull_error。
+- 测试：agent spool pull 状态机 2 例、pull server HTTP 集成 1 例（认证/幂等重拉/ack 语义）、
+  e2e 全链路 1 例（创建节点→起 Agent→Hub 拉取入库→ack 清空 spool→401 校验）；全量 169 通过。
+- RSS 实测：release 构建 pull 模式空闲 VmRSS ≈9MiB（≤35MiB 预算 ✓）。

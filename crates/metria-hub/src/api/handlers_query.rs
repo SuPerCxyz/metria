@@ -559,7 +559,7 @@ pub(crate) async fn node_detail(
     let c = st.db.conn();
     let node = c
         .query_row(
-            "SELECT id, name, platform, architecture, timezone, status, first_seen_at, last_seen_at FROM nodes WHERE id = ?1",
+            "SELECT id, name, platform, architecture, timezone, status, first_seen_at, last_seen_at, agent_url, last_pull_at, last_pull_error FROM nodes WHERE id = ?1",
             [&id],
             |r| {
                 Ok(serde_json::json!({
@@ -571,6 +571,9 @@ pub(crate) async fn node_detail(
                     "status": r.get::<_, String>(5)?,
                     "first_seen_at": r.get::<_, String>(6)?,
                     "last_seen_at": r.get::<_, String>(7)?,
+                    "agent_url": r.get::<_, Option<String>>(8)?,
+                    "last_pull_at": r.get::<_, Option<String>>(9)?,
+                    "last_pull_error": r.get::<_, Option<String>>(10)?,
                 }))
             },
         )

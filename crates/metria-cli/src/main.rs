@@ -221,7 +221,10 @@ fn run_config() -> Result<(), String> {
     println!("hub.timezone: {}", hub.timezone);
     println!("agent.node_id: {}", display_or_default(&agent.node_id));
     println!("agent.node_name: {}", agent.node_name);
-    println!("agent.hub_url: {}", agent.hub_url);
+    println!(
+        "agent.hub_url: {}",
+        agent.hub_url.as_deref().unwrap_or("(pull mode)")
+    );
     println!("agent.data_dir: {}", agent.data_dir.display());
     println!(
         "agent.token: {}",

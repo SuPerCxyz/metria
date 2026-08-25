@@ -20,17 +20,87 @@ use crate::wire::HubClient;
 /// 运行 Agent（阻塞直至退出信号）。
 pub fn run(cfg: AgentConfig) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let mut spool = Spool::open(
+    let spool = Spool::open(
         &cfg.data_dir.join("spool.db"),
         cfg.max_pending_events,
         cfg.max_spool_bytes,
     )?;
 
-    // Node ID：显式 > 持久化 > 由 Node Name 生成
-    let node_id = resolve_node_id(&cfg, &mut spool)?;
     let token = crate::config::resolve_token(&cfg);
 
-    let client = HubClient::new(&cfg.hub_url, token);
+    // 双模式判定：配置 HUB_URL → push（现状）；仅 token → pull（Hub 主动拉取）
+    match (&cfg.hub_url, &token) {
+        (Some(_), _) => run_push(cfg, spool, token),
+        (None, Some(_)) => run_pull(cfg, token),
+        (None, None) => Err(AgentError::Internal(
+            "pull 模式需要 METRIA_AGENT_TOKEN；或配置 METRIA_HUB_URL 走 push 模式".into(),
+        )),
+    }
+}
+
+/// Pull 模式：本地采集 + 暴露采集 API，Hub 主动拉取；无需注册/上传/心跳出站。
+pub fn run_pull(cfg: AgentConfig, token: Option<String>) -> Result<()> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let token = token.unwrap_or_default();
+    tracing::info!(
+        port = cfg.listen_port,
+        "Agent 以 pull 模式启动（Hub 主动拉取），本地采集照常进行"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::spawn(move || {
+        let _ = ctrlc::set_handler(move || {
+            tracing::info!("收到退出信号（SIGINT/SIGTERM）");
+            stop_thread.store(true, Ordering::Relaxed);
+        });
+    });
+
+    // 扫描线程（与 push 模式共用；identity 使用本地占位，Hub 侧按 token 归属重写）
+    let identity = ScanIdentity {
+        node_id: "pull".into(),
+        collector_id: "pull".into(),
+    };
+    let scan_cfg = cfg.clone();
+    let scan_spool = reopen_spool(&cfg)?;
+    let scan_stop = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = scanner_loop(scan_cfg, scan_spool, identity, scan_stop) {
+            tracing::error!("扫描线程退出: {e}");
+        }
+    });
+
+    // Pull 服务线程
+    let serve_cfg = cfg.clone();
+    let serve_stop = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = crate::pullserver::serve(serve_cfg, token, serve_stop) {
+            tracing::error!("Pull 服务退出: {e}");
+        }
+    });
+
+    // 主线程等待退出
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!("Agent 退出，等待子线程收尾");
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    Ok(())
+}
+
+/// Push 模式（现有行为）：注册 → 扫描/监听 → 上传 → 心跳。
+fn run_push(cfg: AgentConfig, mut spool: Spool, token: Option<String>) -> Result<()> {
+    let hub_url = cfg
+        .hub_url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:8080".into());
+
+    // Node ID：显式 > 持久化 > 由 Node Name 生成
+    let node_id = resolve_node_id(&cfg, &mut spool)?;
+
+    let client = HubClient::new(&hub_url, token);
     let identity = register(&cfg, node_id, &client)?;
     // 持久化 collector_id 便于重启复用
     let _ = spool.meta_set("collector_id", &identity.collector_id);

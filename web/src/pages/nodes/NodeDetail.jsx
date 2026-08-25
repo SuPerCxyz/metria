@@ -48,6 +48,14 @@ export default function NodeDetail() {
         </div>
       )}
 
+      {n.agent_url && (
+        <div className="mb-4 px-4 py-3 rounded-xl border border-gray-200 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/60 text-sm text-gray-600 dark:text-gray-300">
+          <span className="font-medium">Pull 模式</span> · Hub 主动拉取 <code className="font-mono text-xs">{n.agent_url}</code>
+          {n.last_pull_at && <> · 最近拉取 <span title={fmtDateTime(n.last_pull_at)}>{fmtRelative(n.last_pull_at)}</span></>}
+          {n.last_pull_error && <span className="text-red-600 dark:text-red-400"> · 最近失败：{n.last_pull_error}</span>}
+        </div>
+      )}
+
       <DetailSummary
         items={[
           { label: '平台', value: `${n.platform || '—'} / ${n.architecture || '—'}` },

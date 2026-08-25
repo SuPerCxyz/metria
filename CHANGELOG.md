@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [0.4.0] - 2026-08-25
+
+### Added
+
+- Agent 新增 Pull 服务模式：仅需 Token 与客户端路径即可运行（无需 Hub 地址与 Node ID），本地暴露受认证的 `/collect`、`/ack`、`/status` API；适用于 Hub 在内网、Agent 在公网的拓扑。空闲 RSS 实测约 9MiB（≤35MiB 预算）。
+- Hub 新增 Pull 调度器：按节点 Agent 地址（`METRIA_PULL_INTERVAL`，默认 60s）主动拉取批次，复用现有 ingest 校验/幂等/rollup 路径，失败指数退避且不影响其他节点。
+- 节点管理支持「Agent 地址」字段与节点级 Token 加密存储（AES-256-GCM，密钥派生自 session secret）；安装命令按模式自动生成（pull 形态仅含 Token）；节点详情展示最近拉取状态。
+- migration 011：nodes 表新增 agent_url / node_token_enc / last_pull_at / last_pull_error。
+
+### Changed
+
+- Push 模式行为完全不变；未配置 Agent 地址的节点不受任何影响。
+
 ## [0.3.2] - 2026-08-25
 
 ### Added

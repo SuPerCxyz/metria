@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod error;
+pub mod pullserver;
 pub mod runner;
 pub mod scanner;
 pub mod spool;

@@ -627,6 +627,11 @@ fn target_from_node(node: &serde_json::Value) -> Result<AgentTarget, String> {
     )
 }
 
+/// 校验并规范化 Agent 地址（Hub 主动拉取目标）：http(s)://host[:port]。
+fn normalize_agent_url(raw: &str) -> Option<String> {
+    normalize_hub_url(raw)
+}
+
 fn normalize_hub_url(raw: &str) -> Option<String> {
     let value = raw.trim().trim_end_matches('/');
     if value.is_empty() || value.chars().any(char::is_control) {
@@ -684,6 +689,8 @@ pub(crate) struct NodeCreateRequest {
     #[serde(default)]
     pub hub_url: Option<String>,
     #[serde(default)]
+    pub agent_url: Option<String>,
+    #[serde(default)]
     pub platform: Option<String>,
     #[serde(default)]
     pub architecture: Option<String>,
@@ -701,6 +708,8 @@ pub(crate) struct NodeUpdateRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub hub_url: Option<String>,
+    #[serde(default)]
+    pub agent_url: Option<String>,
     #[serde(default)]
     pub platform: Option<String>,
     #[serde(default)]
@@ -778,6 +787,19 @@ pub(crate) async fn node_create(
         },
         _ => None,
     };
+    let agent_url = match req.agent_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => match normalize_agent_url(value) {
+            Some(value) => Some(value),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_agent_url",
+                    "Agent 地址必须是合法的 http/https 地址",
+                )
+            }
+        },
+        _ => None,
+    };
     let target = match normalize_agent_target(req.platform.as_deref(), req.architecture.as_deref())
     {
         Ok(target) => target,
@@ -794,18 +816,31 @@ pub(crate) async fn node_create(
         target.architecture,
         now,
     ) {
-        Ok((node_id, collector_id, token)) => Json(serde_json::json!({
-            "ok": true,
-            "node_id": node_id,
-            "collector_id": collector_id,
-            "name": name,
-            "token": token,
-            "ip": ip,
-            "hub_url": hub_url,
-            "platform": target.platform,
-            "architecture": target.architecture,
-        }))
-        .into_response(),
+        Ok((node_id, collector_id, token)) => {
+            // pull 模式：保存 Agent 地址与节点级加密 token（Hub 调度时解密使用）
+            if agent_url.is_some() {
+                let token_enc = crate::crypto::encrypt_node_token(&token).ok();
+                let _ = st.db.set_node_agent_config(
+                    &node_id,
+                    agent_url.as_deref(),
+                    token_enc.as_deref(),
+                    now,
+                );
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "node_id": node_id,
+                "collector_id": collector_id,
+                "name": name,
+                "token": token,
+                "ip": ip,
+                "hub_url": hub_url,
+                "agent_url": agent_url,
+                "platform": target.platform,
+                "architecture": target.architecture,
+            }))
+            .into_response()
+        }
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "node_create_failed",
@@ -848,6 +883,21 @@ pub(crate) async fn node_update(
         },
         _ => None,
     };
+    let agent_url = match req.agent_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => match normalize_agent_url(value) {
+            Some(value) => Some(value),
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_agent_url",
+                    "Agent 地址必须是合法的 http/https 地址",
+                )
+            }
+        },
+        // 显式传空串表示清除
+        Some(_) => Some(String::new()),
+        None => None,
+    };
     let target = if req.platform.is_some() || req.architecture.is_some() {
         match normalize_agent_target(req.platform.as_deref(), req.architecture.as_deref()) {
             Ok(target) => Some(target),
@@ -867,7 +917,17 @@ pub(crate) async fn node_update(
         target.map(|value| value.architecture),
         Utc::now(),
     ) {
-        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(true) => {
+            if let Some(value) = &agent_url {
+                let _ = st.db.set_node_agent_config(
+                    &id,
+                    if value.is_empty() { None } else { Some(value) },
+                    None,
+                    Utc::now(),
+                );
+            }
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
         Ok(false) => json_err(StatusCode::NOT_FOUND, "not_found", "节点不存在"),
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -908,6 +968,43 @@ fn docker_install_command(
         shell_quote(node_id),
         shell_quote(hub_url),
         shell_quote(token)
+    )
+}
+
+/// Pull 模式 Docker 安装命令：仅 token + 只读挂载（Hub 主动拉取，无需 Hub 地址与 Node ID）。
+fn docker_install_command_pull(token: &str, listen_port: u16, target: AgentTarget) -> String {
+    if target.platform == "windows" {
+        return "Windows Agent 请使用“原生安装”PowerShell 命令；当前 Docker Agent 镜像仅支持 Linux。".into();
+    }
+    format!(
+        "docker run -d --name metria-agent --restart unless-stopped\n  -e METRIA_AGENT_TOKEN={}\n  -e METRIA_LISTEN_PORT={}\n  -e METRIA_CLAUDE_PATH=/sources/claude\n  -e METRIA_CODEX_PATH=/sources/codex\n  -e METRIA_OPENCODE_PATH=/sources/opencode\n  -v $HOME/.claude:/sources/claude:ro\n  -v $HOME/.codex:/sources/codex:ro\n  -v $HOME/.local/share/opencode:/sources/opencode:ro\n  -v metria-agent-data:/data\n  -p {listen_port}:{listen_port}\n  ghcr.io/supercxyz/metria:latest agent\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达",
+        shell_quote(token),
+        listen_port
+    )
+}
+
+/// Pull 模式原生命令：下载二进制后仅配置 token 与客户端路径。
+fn native_install_command_pull(
+    node_id: &str,
+    hub_url: &str,
+    token: &str,
+    listen_port: u16,
+    target: AgentTarget,
+) -> String {
+    let download_url = format!("{hub_url}/api/v1/nodes/{node_id}/agent/download");
+    if target.platform == "windows" {
+        return format!(
+            "$ErrorActionPreference = 'Stop'\n\n# 1) 下载 Windows Agent（公开下载，无需 Token）\nInvoke-WebRequest -UseBasicParsing -Uri {} -OutFile 'metria.exe'\n\n# 2) 配置并启动 Agent（pull 模式：Hub 主动拉取）\n$env:METRIA_AGENT_TOKEN = {}\n$env:METRIA_LISTEN_PORT = '{}'\n$env:METRIA_CLAUDE_PATH = \"$env:USERPROFILE\\.claude\"\n$env:METRIA_CODEX_PATH = \"$env:USERPROFILE\\.codex\"\n$env:METRIA_OPENCODE_PATH = \"$env:LOCALAPPDATA\\opencode\"\nStart-Process -FilePath '.\\metria.exe' -ArgumentList 'agent' -NoNewWindow\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达",
+            powershell_quote(&download_url),
+            powershell_quote(token),
+            listen_port
+        );
+    }
+    format!(
+        "# 1) 下载 Linux Agent（公开下载，无需 Token）\ncurl -fsSL {} -o metria && chmod +x metria\n\n# 2) 配置并后台运行 Agent（pull 模式：Hub 主动拉取）\nexport METRIA_AGENT_TOKEN={}\nexport METRIA_LISTEN_PORT={}\nexport METRIA_CLAUDE_PATH=\"$HOME/.claude\"\nexport METRIA_CODEX_PATH=\"$HOME/.codex\"\nexport METRIA_OPENCODE_PATH=\"$HOME/.local/share/opencode\"\nnohup ./metria agent >> metria-agent.log 2>&1 &\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达\n# 生产建议：使用 systemd 服务管理（见 docs/deployment.md）",
+        shell_quote(&download_url),
+        shell_quote(token),
+        listen_port
     )
 }
 
@@ -960,6 +1057,17 @@ pub(crate) async fn node_install(
             );
         }
     };
+    // pull 模式：同步更新节点级加密 token（Hub 调度时解密向 Agent 认证）
+    let agent_url = node
+        .get("agent_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if agent_url.is_some() {
+        if let Ok(enc) = crate::crypto::encrypt_node_token(&token) {
+            let _ = st.db.set_node_token_enc(&id, &enc);
+        }
+    }
     let target = match target_from_node(&node) {
         Ok(target) => target,
         Err(message) => return json_err(StatusCode::CONFLICT, "bad_agent_target", &message),
@@ -989,6 +1097,31 @@ pub(crate) async fn node_install(
             })
             .or_else(|| hub_url_from_headers(&headers))
     };
+    // pull 模式：hub_url 仅用于二进制下载地址（取当前页面 origin），命令本身不含 METRIA_HUB_URL
+    let download_base = hub_url
+        .clone()
+        .or_else(|| hub_url_from_headers(&headers))
+        .unwrap_or_else(|| "http://localhost:8080".into());
+    if agent_url.is_some() {
+        let listen_port = std::env::var("METRIA_AGENT_LISTEN_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(8090);
+        return Json(serde_json::json!({
+            "node_id": id,
+            "name": node.get("name"),
+            "hub_url": download_base,
+            "agent_url": agent_url,
+            "mode": "pull",
+            "platform": target.platform,
+            "architecture": target.architecture,
+            "agent_asset": target.asset,
+            "token": token,
+            "docker_command": docker_install_command_pull(&token, listen_port, target),
+            "native_command": native_install_command_pull(&id, &download_base, &token, listen_port, target),
+        }))
+        .into_response();
+    }
     let Some(hub_url) = hub_url else {
         return json_err(
             StatusCode::CONFLICT,
@@ -1000,6 +1133,7 @@ pub(crate) async fn node_install(
         "node_id": id,
         "name": node.get("name"),
         "hub_url": hub_url,
+        "mode": "push",
         "platform": target.platform,
         "architecture": target.architecture,
         "agent_asset": target.asset,

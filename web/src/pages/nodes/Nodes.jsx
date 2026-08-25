@@ -142,7 +142,7 @@ export default function Nodes() {
     setError(null)
     api(installPath(r.id))
       .then((data) => {
-        setCreated({ node_id: data.node_id, name: data.name, token: data.token, hub_url: data.hub_url, platform: data.platform, architecture: data.architecture, agent_asset: data.agent_asset, docker_command: data.docker_command, native_command: data.native_command })
+        setCreated({ node_id: data.node_id, name: data.name, token: data.token, hub_url: data.hub_url, agent_url: data.agent_url, mode: data.mode, platform: data.platform, architecture: data.architecture, agent_asset: data.agent_asset, docker_command: data.docker_command, native_command: data.native_command })
       })
       .catch((e) => setError(e.message))
       .finally(() => setBusy(false))
@@ -226,6 +226,7 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
   const [labels, setLabels] = useState('')
   const [nodeIp, setNodeIp] = useState('')
   const [hubUrl, setHubUrl] = useState(window.location.origin)
+  const [agentUrl, setAgentUrl] = useState('')
   const [platform, setPlatform] = useState('linux')
   const [architecture, setArchitecture] = useState('amd64')
 
@@ -243,6 +244,7 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
         hub_url: hubUrl.trim() || undefined,
+        agent_url: agentUrl.trim() || undefined,
         platform,
         architecture,
       }),
@@ -277,6 +279,11 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
             <Label>Hub 地址</Label>
             <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} placeholder="http://hub-host:8080" />
             <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">默认使用当前前端访问地址，安装命令会动态带入该地址；目标机必须能访问。</p>
+          </div>
+          <div>
+            <Label>Agent 地址（Pull 模式，可选）</Label>
+            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://203.0.113.10:8090" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写后 Agent 以 Pull 模式运行：Hub 主动访问该地址拉取数据（适合 Hub 在内网、Agent 在公网）；安装命令将只包含 Token，无需 Hub 地址与 Node ID。留空则使用传统 Push 模式。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
@@ -370,9 +377,15 @@ function InstallDialog({ data, onClose }) {
         <pre className="overflow-x-auto rounded-xl bg-gray-900 dark:bg-black/50 p-4 text-xs text-gray-100 font-mono leading-relaxed whitespace-pre">
           {command}
         </pre>
-        <p className="text-xs text-gray-400 dark:text-gray-500">
-          目标机需可访问 <code className="font-mono">{data.hub_url}</code>；二进制下载公开，无需 Token，Agent 启动后仍需使用专属 Token 注册 Hub。
-        </p>
+        {data.mode === 'pull' ? (
+          <p className="text-xs text-gray-400 dark:text-gray-500">
+            Pull 模式：Hub 将主动访问 Agent 的 <code className="font-mono">{data.agent_url || 'http://<本机>:8090'}</code>（请放行该端口）；命令无需 Hub 地址与 Node ID。二进制下载地址 <code className="font-mono">{data.hub_url}</code> 公开可用。
+          </p>
+        ) : (
+          <p className="text-xs text-gray-400 dark:text-gray-500">
+            目标机需可访问 <code className="font-mono">{data.hub_url}</code>；二进制下载公开，无需 Token，Agent 启动后仍需使用专属 Token 注册 Hub。
+          </p>
+        )}
       </div>
     </DialogShell>
   )
@@ -386,6 +399,7 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
   const [labels, setLabels] = useState(parseLabels(node.labels))
   const [nodeIp, setNodeIp] = useState(node.ip || '')
   const [hubUrl, setHubUrl] = useState(node.hub_url || window.location.origin)
+  const [agentUrl, setAgentUrl] = useState(node.agent_url || '')
   const [platform, setPlatform] = useState(node.platform || 'linux')
   const [architecture, setArchitecture] = useState(node.architecture === 'aarch64' ? 'arm64' : (node.architecture || 'amd64'))
 
@@ -413,6 +427,7 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
         hub_url: hubUrl.trim() || undefined,
+        agent_url: agentUrl.trim() || (node.agent_url ? '' : undefined),
         platform,
         architecture,
       }),
@@ -445,6 +460,11 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
           <div>
             <Label>Hub 地址</Label>
             <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} />
+          </div>
+          <div>
+            <Label>Agent 地址（Pull 模式）</Label>
+            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://203.0.113.10:8090" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写后 Hub 主动拉取该节点（Pull 模式）；清空并保存则切回 Push 模式。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>

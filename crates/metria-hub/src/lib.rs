@@ -5,10 +5,12 @@ pub mod api;
 pub mod assets;
 pub mod catalog;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod demo;
 pub mod export;
 pub mod http;
+pub mod pull;
 pub mod rollup;
 pub mod share;
 
@@ -74,6 +76,8 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     // 后台维护：周期 rollup 对账 + WAL checkpoint
     spawn_maintenance(db.clone());
 
+    // Pull 调度：对配置了 Agent 地址的节点主动拉取（无配置时空转）
+
     // Demo 模式：生成确定性合成数据
     if cfg.demo {
         match demo::seed_demo(&db) {
@@ -91,6 +95,9 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
         collector_token,
         oidc: Default::default(),
     };
+
+    // Pull 调度：对配置了 Agent 地址的节点主动拉取（无配置时仅空转）
+    crate::pull::spawn_pull_scheduler(state.clone());
 
     let app = api::app_router(state)
         .layer(TraceLayer::new_for_http())

@@ -53,7 +53,32 @@ docker compose -f docker/compose.full.yaml up -d
 - 不在日志输出 token/secret；默认不上传完整路径/用户名/Hostname/Git Remote/密钥。
 - `METRIA_SESSION_SECRET` 修改后已有 Web 会话会失效，需要重新登录。
 
-### 4.1 OIDC 单用户登录
+### 4.1 Agent 双模式：Push 与 Pull
+
+Agent 支持两种采集模式（同一镜像/二进制，按环境变量自动判定）：
+
+| | Push 模式（默认） | Pull 模式 |
+|---|---|---|
+| 触发条件 | 配置 `METRIA_HUB_URL` | 仅配置 `METRIA_AGENT_TOKEN`（无 HUB_URL） |
+| 数据流向 | Agent → Hub 主动上报 | Hub → Agent 主动拉取 |
+| 适用拓扑 | Hub 公网可达 | **Hub 在内网、Agent 在公网** |
+| 所需配置 | HUB_URL + NODE_ID + TOKEN | 仅 TOKEN（+ 客户端路径） |
+
+**Pull 模式工作方式**：
+
+1. Web「添加节点」时填写 **Agent 地址**（如 `http://<agent-ip>:8090`）；
+2. 安装命令只包含 Token 与客户端只读挂载（无需 Hub 地址与 Node ID）；
+3. Agent 本地监听 `8090`（`METRIA_LISTEN_PORT` 可调），Hub 按 `METRIA_PULL_INTERVAL`（默认 60s，最小 5s）周期拉取；
+4. Hub 拉取成功后确认，Agent 删除本地暂存；失败自动退避重试，数据不丢失。
+
+**安全提示**：Pull 模式下 Agent 端口若暴露公网，务必注意：API 已要求 Bearer Token 认证，
+但传输默认为明文 HTTP；生产建议在 Agent 节点用 Caddy/Nginx 反代加 TLS（此时 Agent 地址填 https 地址），
+或使用 WireGuard 等隧道。节点 Token 可在 Web 重新生成安装命令时轮换。
+
+> 节点级 Token 使用 `METRIA_SESSION_SECRET` 派生密钥加密存储于 Hub；轮换该密钥后需在 Web
+> 重新生成安装命令以刷新节点 Token。
+
+### 4.2 OIDC 单用户登录
 
 Metria 支持通过任意标准 OIDC Provider（Keycloak / Authentik / Auth0 / Google / Entra 等）登录 Web 控制台，**仅允许一个白名单账号**（单用户模式，不支持多用户）。
 

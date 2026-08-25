@@ -484,7 +484,8 @@ impl HubDb {
         let r = c
             .query_row(
                 "SELECT id, name, description, labels, ip, hub_url, platform, architecture, timezone, status,
-                        first_seen_at, last_seen_at, created_at, updated_at
+                        first_seen_at, last_seen_at, created_at, updated_at,
+                        agent_url, last_pull_at, last_pull_error
                  FROM nodes WHERE id = ?1",
                 [node_id],
                 |r| {
@@ -503,11 +504,115 @@ impl HubDb {
                         "last_seen_at": r.get::<_, String>(11)?,
                         "created_at": r.get::<_, String>(12)?,
                         "updated_at": r.get::<_, String>(13)?,
+                        "agent_url": r.get::<_, Option<String>>(14)?,
+                        "last_pull_at": r.get::<_, Option<String>>(15)?,
+                        "last_pull_error": r.get::<_, Option<String>>(16)?,
                     }))
                 },
             )
             .ok()?;
         Some(r)
+    }
+
+    /// 设置节点 Agent 地址与节点级加密 token（pull 模式身份）。
+    pub fn set_node_agent_config(
+        &self,
+        node_id: &str,
+        agent_url: Option<&str>,
+        token_enc: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        c.execute(
+            "UPDATE nodes SET agent_url = ?1, node_token_enc = COALESCE(?2, node_token_enc), updated_at = ?3 WHERE id = ?4",
+            params![agent_url, token_enc, now.to_rfc3339(), node_id],
+        )
+        .map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    /// 更新节点级加密 token（安装命令重签时同步）。
+    pub fn set_node_token_enc(&self, node_id: &str, token_enc: &str) -> Result<(), StorageError> {
+        let c = self.conn();
+        c.execute(
+            "UPDATE nodes SET node_token_enc = ?1, updated_at = ?2 WHERE id = ?3",
+            params![token_enc, Utc::now().to_rfc3339(), node_id],
+        )
+        .map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    /// 列出配置了 Agent 地址的 pull 节点：(node_id, agent_url, node_token_enc)。
+    pub fn list_pull_nodes(&self) -> Vec<(String, String, Option<String>)> {
+        let c = self.conn();
+        let mut stmt = match c
+            .prepare("SELECT id, agent_url, node_token_enc FROM nodes WHERE agent_url IS NOT NULL AND agent_url != ''")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        });
+        match rows {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 记录一次 pull 结果：成功清空错误并更新在线状态，失败记录原因。
+    pub fn record_pull_result(
+        &self,
+        node_id: &str,
+        error: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        let ts = now.to_rfc3339();
+        c.execute(
+            "UPDATE nodes SET last_pull_at = ?1, last_pull_error = ?2, updated_at = ?1 WHERE id = ?3",
+            params![ts, error, node_id],
+        )
+        .map_err(StorageError::from)?;
+        if error.is_none() {
+            c.execute(
+                "UPDATE nodes SET last_seen_at = ?1, status = 'online', updated_at = ?1 WHERE id = ?2",
+                params![ts, node_id],
+            )
+            .map_err(StorageError::from)?;
+        } else {
+            c.execute(
+                "UPDATE nodes SET status = 'unreachable', updated_at = ?1 WHERE id = ?2",
+                params![ts, node_id],
+            )
+            .map_err(StorageError::from)?;
+        }
+        Ok(())
+    }
+
+    /// 记录 pull 到的 Agent 状态（版本与 spool 统计写入 collector 展示）。
+    pub fn record_pull_agent_status(
+        &self,
+        node_id: &str,
+        collector_id: &str,
+        agent_version: &str,
+        pending: i64,
+        size: i64,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        let ts = now.to_rfc3339();
+        c.execute(
+            "UPDATE collectors SET agent_version = ?1, last_heartbeat_at = ?2, spool_pending_events = ?3, spool_size_bytes = ?4, status = 'online', updated_at = ?2 WHERE id = ?5",
+            params![agent_version, ts, pending, size, collector_id],
+        )
+        .map_err(StorageError::from)?;
+        let _ = node_id;
+        Ok(())
     }
 
     /// 查询节点的 collector_id（最新一个）。

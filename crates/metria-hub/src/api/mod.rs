@@ -1028,52 +1028,9 @@ async fn collector_config(State(_st): State<AppState>) -> Response {
 }
 
 /// 批处理：解压 → 校验 → 幂等落库 → rollup → 部分成功响应。
-async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -> Response {
-    let identity = req.extensions().get::<CollectorIdentity>().cloned();
-    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return json_err(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body_too_large",
-                "请求体过大",
-            )
-        }
-    };
-    let decompressed: Vec<u8> = if body_encoding(body.as_ref()) == "zstd" {
-        match zstd_decode(body.as_ref()) {
-            Ok(d) => d,
-            Err(e) => return json_err(StatusCode::BAD_REQUEST, "decode_failed", &e),
-        }
-    } else {
-        body.to_vec()
-    };
-    if decompressed.len() > metria_protocol::limits::MAX_UNCOMPRESSED_BODY {
-        return json_err(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "解压后超过大小上限",
-        );
-    }
-    let batch: UploadBatch = match serde_json::from_slice(&decompressed) {
-        Ok(b) => b,
-        Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_batch", &e.to_string()),
-    };
-    if let Err(e) = metria_protocol::validate_batch(&batch) {
-        return json_err(StatusCode::BAD_REQUEST, "invalid_batch", &e);
-    }
-
-    // node/collector 关系校验：token 身份与 batch 声明一致（env bootstrap token 跳过）
-    if let Some(identity) = &identity {
-        if identity.node_id != batch.node_id || identity.collector_id != batch.collector_id {
-            return json_err(
-                StatusCode::FORBIDDEN,
-                "identity_mismatch",
-                "batch node/collector 与 token 身份不匹配",
-            );
-        }
-    }
-
+/// 批次处理核心：校验后逐事件入库 + rollup + SSE，返回部分成功响应。
+/// push handler 与 pull 调度共用；调用方需已完成解压/深度校验与身份归属。
+pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> UploadResponse {
     let mut accepted = Vec::new();
     let mut duplicate = Vec::new();
     let mut failed = Vec::new();
@@ -1130,7 +1087,7 @@ async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -
                 if is_new {
                     accepted.push(ev.event_id.clone());
                     let _ = st.db.rollup_event(&ev.kind, v);
-                    publish_ingest(&st, &ev.kind);
+                    publish_ingest(st, &ev.kind);
                 } else {
                     duplicate.push(ev.event_id.clone());
                 }
@@ -1150,18 +1107,66 @@ async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -
         &batch.node_id,
         &batch.collector_id,
         batch.events.len() as i64,
-        decompressed.len() as i64,
+        bytes,
     );
 
-    Json(UploadResponse {
-        batch_id: batch.batch_id,
+    UploadResponse {
+        batch_id: batch.batch_id.clone(),
         ok: failed.is_empty(),
         accepted,
         duplicate,
         failed,
         message: None,
-    })
-    .into_response()
+    }
+}
+
+async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -> Response {
+    let identity = req.extensions().get::<CollectorIdentity>().cloned();
+    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "请求体过大",
+            )
+        }
+    };
+    let decompressed: Vec<u8> = if body_encoding(body.as_ref()) == "zstd" {
+        match zstd_decode(body.as_ref()) {
+            Ok(d) => d,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "decode_failed", &e),
+        }
+    } else {
+        body.to_vec()
+    };
+    if decompressed.len() > metria_protocol::limits::MAX_UNCOMPRESSED_BODY {
+        return json_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "解压后超过大小上限",
+        );
+    }
+    let batch: UploadBatch = match serde_json::from_slice(&decompressed) {
+        Ok(b) => b,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_batch", &e.to_string()),
+    };
+    if let Err(e) = metria_protocol::validate_batch(&batch) {
+        return json_err(StatusCode::BAD_REQUEST, "invalid_batch", &e);
+    }
+
+    // node/collector 关系校验：token 身份与 batch 声明一致（env bootstrap token 跳过）
+    if let Some(identity) = &identity {
+        if identity.node_id != batch.node_id || identity.collector_id != batch.collector_id {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "identity_mismatch",
+                "batch node/collector 与 token 身份不匹配",
+            );
+        }
+    }
+
+    Json(process_batch(&st, &batch, decompressed.len() as i64)).into_response()
 }
 
 // ============ SSE ============

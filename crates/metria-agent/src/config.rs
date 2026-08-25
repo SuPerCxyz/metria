@@ -10,8 +10,11 @@ use metria_core::error::ConfigError;
 pub struct AgentConfig {
     pub node_id: String,
     pub node_name: String,
-    pub hub_url: String,
+    /// Hub 地址；None 且配置了 token 时进入 pull 模式（Hub 主动拉取）。
+    pub hub_url: Option<String>,
     pub token: Option<String>,
+    /// Pull 模式本地监听端口（默认 8090）。
+    pub listen_port: u16,
     pub claude_path: Option<PathBuf>,
     pub codex_path: Option<PathBuf>,
     pub opencode_path: Option<PathBuf>,
@@ -35,7 +38,8 @@ impl AgentConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let node_name = var_opt("METRIA_NODE_NAME")?.unwrap_or_else(|| "node-01".into());
         let node_id = var_opt("METRIA_NODE_ID")?.unwrap_or_default();
-        let hub_url = var_opt("METRIA_HUB_URL")?.unwrap_or_else(|| "http://localhost:8080".into());
+        // 未配置 HUB_URL（或为空）且配置了 token 时进入 pull 模式
+        let hub_url = var_opt("METRIA_HUB_URL")?.filter(|v| !v.trim().is_empty());
         let token = var_opt("METRIA_AGENT_TOKEN")?.or_else(|| {
             var_opt("METRIA_AGENT_TOKEN_FILE")
                 .ok()
@@ -43,6 +47,7 @@ impl AgentConfig {
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|s| s.trim().to_string())
         });
+        let listen_port = optional_int("METRIA_LISTEN_PORT")?.unwrap_or(8090) as u16;
 
         let data_dir = var_opt("METRIA_DATA_DIR")?
             .map(PathBuf::from)
@@ -60,6 +65,7 @@ impl AgentConfig {
             node_name,
             hub_url,
             token,
+            listen_port,
             claude_path: var_opt("METRIA_CLAUDE_PATH")?.map(PathBuf::from),
             codex_path: var_opt("METRIA_CODEX_PATH")?.map(PathBuf::from),
             opencode_path: var_opt("METRIA_OPENCODE_PATH")?.map(PathBuf::from),
