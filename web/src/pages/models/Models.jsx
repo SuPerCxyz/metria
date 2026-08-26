@@ -9,12 +9,15 @@ import { ErrorState, LoadingSkeleton, DataQualityNote } from '../../components/f
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { fmtTokensShort, fmtUsd, fmtPct100, fmtDuration, sumTokens } from '../../services/format'
 
 export default function Models() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
   const [search, setSearch] = useState('')
 
   const query = useQuery(`models${q(params)}`, () => api(`/models${q(params)}`))

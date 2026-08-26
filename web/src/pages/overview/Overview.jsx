@@ -11,6 +11,7 @@ import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedba
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, sumTokensWithReasoning, cacheHitRate } from '../../services/format'
 
 const TREND_TABS = [
@@ -41,6 +42,8 @@ export default function Overview() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
   const [trendTab, setTrendTab] = useState('tokens')
   const [dim, setDim] = useState('all')
   const [costTab, setCostTab] = useState('cost')

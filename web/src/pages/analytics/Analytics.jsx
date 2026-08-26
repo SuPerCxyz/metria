@@ -11,6 +11,7 @@ import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedba
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtDuration, sumTokens } from '../../services/format'
 
@@ -27,6 +28,8 @@ export default function Analytics() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
   const [tab, setTab] = useState('tokens')
   const trendTab = 'tokens'
   const [hiddenByDimension, setHiddenByDimension] = useState({ client: [], model: [] })

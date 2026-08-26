@@ -8,6 +8,7 @@ import './charts/ChartjsConfig'
 import AppLayout from './components/layout/AppLayout'
 import ErrorBoundary from './components/common/ErrorBoundary'
 import { TimeRangeProvider } from './hooks/useTimeRange'
+import { NodeFilterProvider } from './hooks/useNodeFilter'
 import { PageMetaProvider } from './hooks/usePageMeta'
 import { getToken, api } from './services/api'
 
@@ -74,6 +75,7 @@ function App() {
 
   return (
     <TimeRangeProvider>
+      <NodeFilterProvider>
       <PageMetaProvider>
         <Routes>
           <Route path="/login" element={<Login />} />
@@ -97,6 +99,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </PageMetaProvider>
+      </NodeFilterProvider>
     </TimeRangeProvider>
   )
 }

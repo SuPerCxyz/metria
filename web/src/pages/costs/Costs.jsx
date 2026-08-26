@@ -10,6 +10,7 @@ import { ErrorState, LoadingSkeleton, DataQualityNote } from '../../components/f
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { fmtUsd } from '../../services/format'
 
@@ -17,6 +18,8 @@ export default function Costs() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
 
   const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
   const series = useQuery(`ts${q(params)}`, () => api(`/usage/timeseries${q(params)}`))

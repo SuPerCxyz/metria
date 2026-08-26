@@ -9,6 +9,7 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
 
 const AGENT_LABELS = {
@@ -21,6 +22,8 @@ export default function Agents() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
   const [search, setSearch] = useState('')
 
   const query = useQuery(`agents${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))

@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import ThemeToggle from '../components/ThemeToggle'
 import UserAvatar from '../components/common/UserAvatar'
 import TimeRangePicker from '../components/filters/TimeRangePicker'
+import NodeFilterPicker from '../components/filters/NodeFilterPicker'
 import { usePageMeta } from '../hooks/usePageMeta'
 import { useTimeRange } from '../hooks/useTimeRange'
 import { api, setToken } from '../services/api'
@@ -69,6 +70,7 @@ function Header({ sidebarOpen, setSidebarOpen }) {
               </svg>
             </button>
             <TimeRangePicker className="min-w-0 flex-1 sm:flex-none" />
+            <NodeFilterPicker className="min-w-0 flex-1 sm:flex-none" />
             <ThemeToggle />
             <hr className="hidden sm:block w-px h-6 bg-gray-200 dark:bg-gray-700/60 border-none" />
             <div className="relative shrink-0">

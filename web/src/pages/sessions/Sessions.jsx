@@ -10,6 +10,7 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { fmtDateTime, fmtDuration, fmtSessionTitle, fmtTokensShort, fmtUsd, fmtBytes, sumTokens } from '../../services/format'
 
@@ -17,6 +18,8 @@ export default function Sessions() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const params = rangeParams(range)
+  const { nodeId } = useNodeFilter()
+  if (nodeId) params.node_id = nodeId
   const [search, setSearch] = useState('')
   const nodeNames = useNodeNames()
 
