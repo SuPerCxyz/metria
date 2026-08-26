@@ -546,3 +546,9 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
 - 测试：agent spool pull 状态机 2 例、pull server HTTP 集成 1 例（认证/幂等重拉/ack 语义）、
   e2e 全链路 1 例（创建节点→起 Agent→Hub 拉取入库→ack 清空 spool→401 校验）；全量 169 通过。
 - RSS 实测：release 构建 pull 模式空闲 VmRSS ≈9MiB（≤35MiB 预算 ✓）。
+- kvm2 真实环境验证（两台测试 VM 跨机拓扑）：Hub VM（ubuntu24，192.168.100.229，docker v0.4.0）
+  + Agent VM（debian13，192.168.100.228，二进制 + systemd pull 模式）。验证通过：Hub 主动跨机
+  拉取入库、增量会话自动同步（12s 内）、ack 后 spool 清空、Agent 瞬时不可达退避后自动恢复、
+  节点在线状态与最近拉取时间/错误展示。运维注意：bind mount 目录需 chown 65532；VM 根磁盘
+  打满会导致 SQLite 启动失败（disk full）；首次拉取即遇瞬时失败的退避起步偏长（60s×2^n），
+  后续可优化为短起步（记录为改进项，不在本 change 范围）。
