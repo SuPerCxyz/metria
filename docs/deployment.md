@@ -14,7 +14,7 @@ docker compose -f docker/compose.full.yaml up -d
 
 ## 2. 镜像
 
-- Hub 镜像支持 Linux amd64/arm64；Agent 原生发布产物支持 Linux amd64/arm64 与 Windows amd64。master 构建使用 `:master` 与 `:<sha>`；正式版本使用 `:<tag>`，并由 Release 工作流更新 `:latest`。
+- Hub 镜像支持 Linux amd64/arm64；Agent 原生发布产物支持 Linux amd64/arm64 与 Windows amd64。普通分支提交使用 `:dev-latest` 与 `:<sha>`；正式版本使用 `:<tag>`，并由 Release 工作流将 `:latest` 与 `:master` 绑定到最新正式版本。
 - 运行时**不含 Node.js**（前端产物 rust-embed 进 Hub 二进制）。
 - 非 root（UID 65532）运行；`user: "${UID}:${GID}"` 与宿主对齐以读取 700 权限目录。
 

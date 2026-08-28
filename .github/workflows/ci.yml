@@ -1,13 +1,13 @@
 # Metria CI：质量门禁 + 前端构建 + 多架构容器镜像
 #
-# 触发：push 到 master、pull request。
-# master 分支推送 :master 与 :<sha>，正式版本的 :latest 由 Release 工作流维护。
+# 触发：push 到任意分支、pull request。
+# 普通分支推送 :dev-latest 与 :<sha>，正式版本的 :latest / :master 由 Release 工作流维护。
 
 name: CI
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
   pull_request:
     branches: [master]
 
@@ -117,7 +117,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "tags=${{ env.IMAGE }}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tags=${{ env.IMAGE }}:master,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
+            echo "tags=${{ env.IMAGE }}:dev-latest,${{ env.IMAGE }}:$SHA_SHORT" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 构建并推送镜像
