@@ -796,13 +796,17 @@ async fn node_management_lifecycle() {
             "name": "web-node",
             "ip": "203.0.113.10",
             "description": "web server",
-            "labels": ["prod", "app"]
+            "labels": ["prod", "app"],
+            "platform": "linux",
+            "architecture": "amd64"
         }))
         .unwrap()
         .into_json()
         .unwrap();
     assert_eq!(created["ok"], true);
     assert_eq!(created["ip"], "203.0.113.10");
+    assert_eq!(created["platform"], "linux");
+    assert_eq!(created["architecture"], "amd64");
     let node_id = created["node_id"].as_str().unwrap().to_string();
     let plain_tok = created["token"].as_str().unwrap().to_string();
     assert!(
@@ -846,6 +850,9 @@ async fn node_management_lifecycle() {
     assert!(docker_cmd.contains("METRIA_HUB_URL='http://203.0.113.10:8080'"));
     assert!(native_cmd.contains(&format!("/api/v1/nodes/{node_id}/agent/download")));
     assert!(!native_cmd.contains("Authorization"));
+    assert!(native_cmd.contains("systemctl enable --now metria-agent.service"));
+    assert!(native_cmd.contains("EnvironmentFile=/etc/metria/metria-agent.env"));
+    assert!(!native_cmd.contains("nohup"));
     assert!(inst["token"].as_str().unwrap().starts_with("mct-"));
 
     // 前端环境地址可覆盖历史节点配置，下载命令不包含 token。
@@ -1025,6 +1032,18 @@ async fn node_management_errors() {
         .unwrap_err();
     assert!(matches!(err, ureq::Error::Status(400, _)));
 
+    // Windows 仅支持 amd64 → arm64 明确拒绝
+    let err = ureq::post(&format!("{base}/api/v1/nodes"))
+        .set("Authorization", &auth)
+        .send_json(json!({
+            "name": "windows-arm64-node",
+            "ip": "203.0.113.2",
+            "platform": "windows",
+            "architecture": "arm64"
+        }))
+        .unwrap_err();
+    assert!(matches!(err, ureq::Error::Status(400, _)));
+
     // 缺 ip → 400
     let err = ureq::post(&format!("{base}/api/v1/nodes"))
         .set("Authorization", &auth)
@@ -1055,6 +1074,55 @@ async fn node_management_errors() {
         .call()
         .unwrap_err();
     assert!(matches!(err, ureq::Error::Status(404, _)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_install_preserves_windows_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+    let token = admin_token(&base);
+    let auth = format!("Bearer {token}");
+
+    let created: Value = ureq::post(&format!("{base}/api/v1/nodes"))
+        .set("Authorization", &auth)
+        .send_json(json!({
+            "name": "windows-node",
+            "ip": "198.51.100.22",
+            "platform": "windows",
+            "architecture": "amd64"
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(created["platform"], "windows");
+    assert_eq!(created["architecture"], "amd64");
+
+    let node_id = created["node_id"].as_str().unwrap();
+    let install: Value = ureq::get(&format!("{base}/api/v1/nodes/{node_id}/install"))
+        .set("Authorization", &auth)
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(install["platform"], "windows");
+    assert_eq!(install["architecture"], "amd64");
+    assert_eq!(install["agent_asset"], "metria-windows-amd64.exe");
+    assert!(install["native_command"]
+        .as_str()
+        .unwrap()
+        .contains("Invoke-WebRequest"));
+    assert!(install["native_command"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("/api/v1/nodes/{node_id}/agent/download")));
+    assert!(install["native_command"]
+        .as_str()
+        .unwrap()
+        .contains("Register-ScheduledTask"));
+    assert!(install["native_command"]
+        .as_str()
+        .unwrap()
+        .contains("$installDir = Join-Path $env:LOCALAPPDATA 'Metria'"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

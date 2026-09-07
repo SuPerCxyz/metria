@@ -2,9 +2,9 @@
 #
 # Metria 多阶段构建
 #   1. web    : Node 构建前端（仅构建期使用 Node，运行时无 Node.js）
-#   2. build  : Rust 构建 metria 单二进制（web/dist 经 rust-embed 嵌入）。
+#   2. build  : Rust 构建 Hub 与三种原生 Agent 二进制（web/dist 经 rust-embed 嵌入）。
 #               build 阶段固定运行在 BUILDPLATFORM（amd64 原生，无 QEMU），
-#               对 arm64 使用 gcc-aarch64-linux-gnu 交叉编译，显著加速多架构构建。
+#               使用 gcc-aarch64-linux-gnu / MinGW 交叉编译非当前目标资产。
 #   3. hub    : 运行时镜像（TARGETPLATFORM，非 root，无 Node.js）
 #
 # 构建：
@@ -29,10 +29,8 @@ ARG TARGETARCH
 ARG PROFILE=release
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates \
-    && if [ "$TARGETARCH" = "arm64" ]; then \
-         apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
-         && rustup target add aarch64-unknown-linux-gnu; \
-       fi \
+       gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-mingw-w64-x86-64 \
+    && rustup target add aarch64-unknown-linux-gnu x86_64-pc-windows-gnu \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -42,23 +40,44 @@ COPY --from=web /build/dist ./web/dist
 # cache id 按 TARGETARCH 区分：buildx 多平台并行时两个平台的 cargo 会同时
 # 解包 registry 源码，共享同一 cache 产生 File exists 竞态导致随机失败。
 # target 通过 CARGO_TARGET_DIR 指向缓存挂载，避免其内容进入层快照导致 COPY 拿不到二进制；
-# 最终产物显式拷贝到层内 /src/target/release/metria，供 hub 阶段 COPY。
+# 最终产物显式拷贝到层内 /src/target/release/metria 与 /src/agent-binaries，供 hub 阶段 COPY。
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-${TARGETARCH},target=/cargo-target \
     profile="$PROFILE"; target_dir=release; [ "$profile" = "dev" ] && target_dir=debug; \
+    mkdir -p target/release agent-binaries; \
     if [ "$TARGETARCH" = "arm64" ]; then \
       CARGO_TARGET_DIR=/cargo-target \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
       CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
       cargo build --profile "$profile" --workspace --bin metria --target aarch64-unknown-linux-gnu \
-      && mkdir -p target/release \
-      && cp "/cargo-target/aarch64-unknown-linux-gnu/$target_dir/metria" target/release/metria; \
+      && cp "/cargo-target/aarch64-unknown-linux-gnu/$target_dir/metria" target/release/metria \
+      && cp "/cargo-target/aarch64-unknown-linux-gnu/$target_dir/metria" agent-binaries/metria-linux-arm64; \
     else \
       CARGO_TARGET_DIR=/cargo-target \
       cargo build --profile "$profile" --workspace --bin metria \
-      && mkdir -p target/release \
-      && cp "/cargo-target/$target_dir/metria" target/release/metria; \
-    fi
+      && cp "/cargo-target/$target_dir/metria" target/release/metria \
+      && cp "/cargo-target/$target_dir/metria" agent-binaries/metria-linux-amd64; \
+    fi; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      CARGO_TARGET_DIR=/cargo-target \
+      cargo build --profile "$profile" --workspace --bin metria \
+      && cp "/cargo-target/$target_dir/metria" agent-binaries/metria-linux-amd64; \
+    else \
+      CARGO_TARGET_DIR=/cargo-target \
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+      CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+      cargo build --profile "$profile" --workspace --bin metria --target aarch64-unknown-linux-gnu \
+      && cp "/cargo-target/aarch64-unknown-linux-gnu/$target_dir/metria" agent-binaries/metria-linux-arm64; \
+    fi; \
+    CARGO_TARGET_DIR=/cargo-target \
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+    cargo build --profile "$profile" --workspace --bin metria --target x86_64-pc-windows-gnu; \
+    cp "/cargo-target/x86_64-pc-windows-gnu/$target_dir/metria.exe" agent-binaries/metria-windows-amd64.exe; \
+    test -s target/release/metria \
+      && test -s agent-binaries/metria-linux-amd64 \
+      && test -s agent-binaries/metria-linux-arm64 \
+      && test -s agent-binaries/metria-windows-amd64.exe
 
 # ---- Runtime（目标平台） ----
 FROM debian:bookworm-slim AS hub
@@ -69,6 +88,8 @@ RUN apt-get update \
     && mkdir -p /data \
     && chown -R metria:metria /data /home/metria
 COPY --from=build /src/target/release/metria /app/metria
+COPY --from=build /src/agent-binaries /app/agent-binaries
+ENV METRIA_AGENT_BINARIES_DIR=/app/agent-binaries
 VOLUME /data
 WORKDIR /app
 USER metria

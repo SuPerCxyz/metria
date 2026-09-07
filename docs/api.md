@@ -36,7 +36,7 @@
 | GET | `/usage/breakdown` | 按 Node 汇总 |
 | GET | `/nodes` `/nodes/{id}` | Node 列表 / 详情 |
 | GET | `/nodes/{id}/install` | Admin 生成节点专属 Token、动态 Hub 地址和平台安装命令；可传 `hub_url` 查询参数覆盖当前地址 |
-| GET | `/nodes/{id}/agent/download` | 公开下载该节点平台/架构对应的 Agent 二进制，不接收 Token；当前 Hub 未配置目标资产时返回 501 |
+| GET | `/nodes/{id}/agent/download` | 公开下载该节点平台/架构对应的 Agent 二进制，不接收 Token；支持 Linux amd64/arm64 与 Windows amd64 |
 | GET | `/agent/download` | 公开下载当前 Hub 架构的 Agent 二进制（兼容入口） |
 | GET | `/nodes/{id}/clients` `/sessions` `/calls` | Node 下的来源/会话/调用 |
 | GET | `/clients` `/clients/{id}` `/clients/{id}/models` | Client 列表/详情/模型 |

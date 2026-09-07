@@ -70,6 +70,11 @@ export function fmtBytes(b) {
   return `${v} B`
 }
 
+/** Agent 地址：隐藏传输协议，保留主机与端口。 */
+export function fmtAgentAddress(value) {
+  return String(value || '').replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+}
+
 /** 时长：680 毫秒；4.8 秒；12 分 36 秒；超过 1 小时自动折算。 */
 export function fmtDuration(ms) {
   if (ms === null || ms === undefined || Number.isNaN(ms)) return '—'

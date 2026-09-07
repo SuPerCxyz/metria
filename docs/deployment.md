@@ -38,8 +38,8 @@ docker compose -f docker/compose.full.yaml up -d
 | `METRIA_NODE_ID` / `METRIA_NODE_NAME` | 自动 | Agent 节点身份 |
 | `METRIA_HUB_URL` | `http://localhost:8080` | Agent 连接 Hub |
 | `METRIA_AGENT_TOKEN` / `METRIA_AGENT_TOKEN_FILE` | 无 | Agent 认证 token |
-| `METRIA_AGENT_BINARIES_DIR` | 无 | 可选：Hub 本地跨平台 Agent 二进制目录 |
-| `METRIA_AGENT_DOWNLOAD_BASE_URL` | 无 | 可选：跨平台 Agent 二进制 Release 下载根地址 |
+| `METRIA_AGENT_BINARIES_DIR` | `/app/agent-binaries`（Hub 镜像） | Agent 跨平台二进制目录；自定义 Hub 镜像可覆盖 |
+| `METRIA_AGENT_DOWNLOAD_BASE_URL` | 无 | 可选：内置资产缺失时的跨平台 Agent Release 下载回退地址 |
 | `METRIA_CLAUDE_PATH` / `CODEX_PATH` / `OPENCODE_PATH` | 无 | 客户端目录 |
 | `METRIA_SCAN_INTERVAL` / `RECONCILE_INTERVAL` / `HEARTBEAT_INTERVAL` / `UPLOAD_INTERVAL` | 10/300/60/15s | Agent 周期 |
 | `METRIA_TOKEN_REFRESH_INTERVAL` | 6 天 | Agent 重新注册续期周期（< 7 天 token 有效期） |
@@ -66,13 +66,13 @@ Agent 支持两种采集模式（同一镜像/二进制，按环境变量自动�
 
 **Pull 模式工作方式**：
 
-1. Web「添加节点」时填写 **Agent 地址**（如 `http://<agent-ip>:8090`）；
+1. Web「添加节点」时填写 **Agent 地址**（如 `<agent-ip>:8090`，不需要填写协议）；Hub 地址默认使用当前网页地址；
 2. 安装命令只包含 Token 与客户端只读挂载（无需 Hub 地址与 Node ID）；
 3. Agent 本地监听 `8090`（`METRIA_LISTEN_PORT` 可调），Hub 按 `METRIA_PULL_INTERVAL`（默认 60s，最小 5s）周期拉取；
 4. Hub 拉取成功后确认，Agent 删除本地暂存；失败自动退避重试，数据不丢失。
 
 **安全提示**：Pull 模式下 Agent 端口若暴露公网，务必注意：API 已要求 Bearer Token 认证，
-但传输默认为明文 HTTP；生产建议在 Agent 节点用 Caddy/Nginx 反代加 TLS（此时 Agent 地址填 https 地址），
+但传输默认为明文 HTTP；生产建议在 Agent 节点用 Caddy/Nginx 反代加 TLS（已有 HTTPS 配置仍可保留），
 或使用 WireGuard 等隧道。节点 Token 可在 Web 重新生成安装命令时轮换。
 
 > 节点级 Token 使用 `METRIA_SESSION_SECRET` 派生密钥加密存储于 Hub；轮换该密钥后需在 Web
@@ -126,16 +126,17 @@ METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 
 Web 端「节点 → 添加节点」可预先创建节点并生成安装命令，目标机运行命令即接入（Beszel 式流程）：
 
-1. **添加节点**：填写名称/描述/标签、平台（Linux/Windows）、架构（amd64/arm64）与 Hub 地址（默认当前页面 origin，目标机需可访问）。
+1. **添加节点**：填写名称/描述/标签、平台（Linux/Windows）、架构（amd64/arm64）；Hub 地址自动使用当前页面 origin，Pull 模式下再填写 Agent IP/域名及可选端口。
 2. **获取安装命令**：创建后自动展示一次性专属 Token 与两种安装命令（可切换、一键复制）。
 3. **目标机安装**：
    - **Docker**：`docker run -d --name metria-agent ... ghcr.io/supercxyz/metria:latest agent`（命令已注入 node_id/token/hub_url 与客户端只读挂载）。
-   - **原生 Linux**：从节点专属地址 `/api/v1/nodes/{node_id}/agent/download` 公开下载对应架构的 `metria-linux-amd64` 或 `metria-linux-arm64`，无需 Token；Agent 启动时仍需配置专属 Token。生产建议用 systemd 管理。
-   - **原生 Windows**：使用页面生成的 PowerShell 命令下载 `metria-windows-amd64.exe` 并启动 Agent。
+   - **原生 Linux**：页面命令从节点专属地址 `/api/v1/nodes/{node_id}/agent/download` 公开下载对应架构的 `metria-linux-amd64` 或 `metria-linux-arm64`，Hub 镜像已内置资产，无需额外配置或 Token；命令会强制安装 `metria-agent.service`，将配置保存到 root-only 的 `/etc/metria/metria-agent.env`，并通过 systemd 设置开机启动。
+   - **原生 Windows**：页面生成的 PowerShell 命令从当前 Hub 下载内置的 `metria-windows-amd64.exe` 到 `%LOCALAPPDATA%\Metria`，生成持久化启动配置，并注册 `Metria Agent` 登录自启动计划任务。
+   - **命令复制**：Docker 命令预览为带 shell 续行符的多行格式，复制按钮会折叠为单行；原生 Linux/Windows 命令保留多行脚本格式。
 4. **接入确认**：Agent 用专属 token 注册后，节点变为「在线」，名称保持创建/编辑时设置的值。
-5. **节点维护**：列表行支持「编辑」（改名称/描述/标签/Hub 地址）与「删除」（移除身份与令牌，历史用量数据保留）。
+5. **节点维护**：列表行支持「编辑」（改名称/描述/标签/Agent 地址）与「删除」（移除身份与令牌，历史用量数据保留）。
 
-> 说明：二进制下载接口公开，只根据节点 ID 读取平台/架构并选择文件，不接收 Token；专属 Token 明文仅创建或生成安装命令时展示，Hub 只存哈希。Token 过期后可在节点详情重新生成安装命令（自动签发新 token，不吊销正在使用的旧 token）。
+> 说明：二进制下载接口公开，只根据节点 ID 读取平台/架构并选择文件，不接收 Token；Hub 镜像包含 Linux amd64、Linux arm64、Windows amd64 三个资产。专属 Token 明文仅创建或生成安装命令时展示，Hub 只存哈希。Token 过期后可在节点详情重新生成安装命令（自动签发新 token，不吊销正在使用的旧 token）。
 
 ## 8. 规模与性能
 

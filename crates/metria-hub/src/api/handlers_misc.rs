@@ -627,9 +627,31 @@ fn target_from_node(node: &serde_json::Value) -> Result<AgentTarget, String> {
     )
 }
 
-/// 校验并规范化 Agent 地址（Hub 主动拉取目标）：http(s)://host[:port]。
+/// 校验并规范化 Agent 地址（Hub 主动拉取目标）：host[:port]，默认使用 HTTP。
 fn normalize_agent_url(raw: &str) -> Option<String> {
-    normalize_hub_url(raw)
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let candidate = if value.contains("://") {
+        value.to_string()
+    } else if let Ok(IpAddr::V6(_)) = value.parse::<IpAddr>() {
+        format!("http://[{value}]")
+    } else {
+        format!("http://{value}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(candidate)
 }
 
 fn normalize_hub_url(raw: &str) -> Option<String> {
@@ -794,7 +816,7 @@ pub(crate) async fn node_create(
                 return json_err(
                     StatusCode::BAD_REQUEST,
                     "bad_agent_url",
-                    "Agent 地址必须是合法的 http/https 地址",
+                    "Agent 地址必须是合法的 IP/域名[:端口]",
                 )
             }
         },
@@ -890,7 +912,7 @@ pub(crate) async fn node_update(
                 return json_err(
                     StatusCode::BAD_REQUEST,
                     "bad_agent_url",
-                    "Agent 地址必须是合法的 http/https 地址",
+                    "Agent 地址必须是合法的 IP/域名[:端口]",
                 )
             }
         },
@@ -964,7 +986,7 @@ fn docker_install_command(
         return "Windows Agent 请使用“原生安装”PowerShell 命令；当前 Docker Agent 镜像仅支持 Linux。".into();
     }
     format!(
-        "docker run -d --name metria-agent --restart unless-stopped\n  -e METRIA_NODE_ID={}\n  -e METRIA_HUB_URL={}\n  -e METRIA_AGENT_TOKEN={}\n  -e METRIA_CLAUDE_PATH=/sources/claude\n  -e METRIA_CODEX_PATH=/sources/codex\n  -e METRIA_OPENCODE_PATH=/sources/opencode\n  -v $HOME/.claude:/sources/claude:ro\n  -v $HOME/.codex:/sources/codex:ro\n  -v $HOME/.local/share/opencode:/sources/opencode:ro\n  -v metria-agent-data:/data\n  ghcr.io/supercxyz/metria:latest agent",
+        "docker run -d --name metria-agent --restart unless-stopped \\\n  -e METRIA_NODE_ID={} \\\n  -e METRIA_HUB_URL={} \\\n  -e METRIA_AGENT_TOKEN={} \\\n  -e METRIA_CLAUDE_PATH=/sources/claude \\\n  -e METRIA_CODEX_PATH=/sources/codex \\\n  -e METRIA_OPENCODE_PATH=/sources/opencode \\\n  -v $HOME/.claude:/sources/claude:ro \\\n  -v $HOME/.codex:/sources/codex:ro \\\n  -v $HOME/.local/share/opencode:/sources/opencode:ro \\\n  -v metria-agent-data:/data \\\n  ghcr.io/supercxyz/metria:latest agent",
         shell_quote(node_id),
         shell_quote(hub_url),
         shell_quote(token)
@@ -977,13 +999,49 @@ fn docker_install_command_pull(token: &str, listen_port: u16, target: AgentTarge
         return "Windows Agent 请使用“原生安装”PowerShell 命令；当前 Docker Agent 镜像仅支持 Linux。".into();
     }
     format!(
-        "docker run -d --name metria-agent --restart unless-stopped\n  -e METRIA_AGENT_TOKEN={}\n  -e METRIA_LISTEN_PORT={}\n  -e METRIA_CLAUDE_PATH=/sources/claude\n  -e METRIA_CODEX_PATH=/sources/codex\n  -e METRIA_OPENCODE_PATH=/sources/opencode\n  -v $HOME/.claude:/sources/claude:ro\n  -v $HOME/.codex:/sources/codex:ro\n  -v $HOME/.local/share/opencode:/sources/opencode:ro\n  -v metria-agent-data:/data\n  -p {listen_port}:{listen_port}\n  ghcr.io/supercxyz/metria:latest agent\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达",
+        "docker run -d --name metria-agent --restart unless-stopped \\\n  -e METRIA_AGENT_TOKEN={} \\\n  -e METRIA_LISTEN_PORT={} \\\n  -e METRIA_CLAUDE_PATH=/sources/claude \\\n  -e METRIA_CODEX_PATH=/sources/codex \\\n  -e METRIA_OPENCODE_PATH=/sources/opencode \\\n  -v $HOME/.claude:/sources/claude:ro \\\n  -v $HOME/.codex:/sources/codex:ro \\\n  -v $HOME/.local/share/opencode:/sources/opencode:ro \\\n  -v metria-agent-data:/data \\\n  -p {listen_port}:{listen_port} \\\n  ghcr.io/supercxyz/metria:latest agent\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达",
         shell_quote(token),
         listen_port
     )
 }
 
-/// Pull 模式原生命令：下载二进制后仅配置 token 与客户端路径。
+fn linux_env_arg(name: &str, value: &str) -> String {
+    shell_quote(&format!("{name}={}", shell_quote(value)))
+}
+
+fn powershell_config_line(name: &str, value: &str) -> String {
+    powershell_quote(&format!("$env:{name} = {}", powershell_quote(value)))
+}
+
+fn powershell_native_install_command(
+    download_url: &str,
+    config_lines: &[String],
+    summary: &str,
+) -> String {
+    let config_lines = config_lines
+        .iter()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\n# 1) 下载 Windows Agent（公开下载，无需 Token）\n$installDir = Join-Path $env:LOCALAPPDATA 'Metria'\nNew-Item -ItemType Directory -Force -Path $installDir | Out-Null\n$agentPath = Join-Path $installDir 'metria.exe'\n$configPath = Join-Path $installDir 'agent.ps1'\n$dataDir = Join-Path $installDir 'data'\nNew-Item -ItemType Directory -Force -Path $dataDir | Out-Null\nInvoke-WebRequest -UseBasicParsing -Uri {} -OutFile $agentPath\n\n# 2) 写入持久化配置与启动脚本\n$configLines = @(\n{}\n)\nSet-Content -Path $configPath -Value $configLines -Encoding UTF8\n\n# 3) 注册并立即启动登录自启动任务\n$taskAction = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File \"{{0}}\"' -f $configPath) -WorkingDirectory $installDir\n$taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME\n$taskPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType InteractiveToken -RunLevel Limited\n$taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable\nRegister-ScheduledTask -TaskName 'Metria Agent' -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description 'Metria Agent collector' -Force | Out-Null\nStart-ScheduledTask -TaskName 'Metria Agent'\n\n# {}\n# 配置文件：$configPath；任务名：Metria Agent",
+        powershell_quote(download_url),
+        config_lines,
+        summary
+    )
+}
+
+fn linux_native_install_command(env_lines: &[String], download_url: &str, summary: &str) -> String {
+    let env_lines = env_lines.join(" \\\n  ");
+    format!(
+        "# 1) 下载 Linux Agent（公开下载，无需 Token）\ncurl -fsSL {} -o metria && chmod +x metria\n\n# 2) 安装固定路径的 Agent 与持久化数据目录\nsudo install -m 0755 metria /usr/local/bin/metria\nmkdir -p \"$HOME/.local/share/metria\"\n\n# 3) 写入 root-only 运行时配置\nsudo install -d -m 0750 /etc/metria\nsudo install -m 0600 /dev/null /etc/metria/metria-agent.env\nprintf '%s\\n' \\\n  {} | sudo tee /etc/metria/metria-agent.env >/dev/null\n\n# 4) 注册并立即启动 systemd 服务\nsudo tee /etc/systemd/system/metria-agent.service >/dev/null <<EOF\n[Unit]\nDescription=Metria Agent collector\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nWorkingDirectory=$HOME\nEnvironmentFile=/etc/metria/metria-agent.env\nExecStart=/usr/local/bin/metria agent\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\nEOF\nsudo systemctl daemon-reload\nsudo systemctl enable --now metria-agent.service\n\n# {}\n# 配置文件：/etc/metria/metria-agent.env；服务：metria-agent.service",
+        shell_quote(download_url),
+        env_lines,
+        summary
+    )
+}
+
+/// Pull 模式原生命令：下载二进制后配置 token 与客户端路径，并持久化启动。
 fn native_install_command_pull(
     node_id: &str,
     hub_url: &str,
@@ -993,22 +1051,37 @@ fn native_install_command_pull(
 ) -> String {
     let download_url = format!("{hub_url}/api/v1/nodes/{node_id}/agent/download");
     if target.platform == "windows" {
-        return format!(
-            "$ErrorActionPreference = 'Stop'\n\n# 1) 下载 Windows Agent（公开下载，无需 Token）\nInvoke-WebRequest -UseBasicParsing -Uri {} -OutFile 'metria.exe'\n\n# 2) 配置并启动 Agent（pull 模式：Hub 主动拉取）\n$env:METRIA_AGENT_TOKEN = {}\n$env:METRIA_LISTEN_PORT = '{}'\n$env:METRIA_CLAUDE_PATH = \"$env:USERPROFILE\\.claude\"\n$env:METRIA_CODEX_PATH = \"$env:USERPROFILE\\.codex\"\n$env:METRIA_OPENCODE_PATH = \"$env:LOCALAPPDATA\\opencode\"\nStart-Process -FilePath '.\\metria.exe' -ArgumentList 'agent' -NoNewWindow\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达",
-            powershell_quote(&download_url),
-            powershell_quote(token),
-            listen_port
+        let config_lines = vec![
+            powershell_config_line("METRIA_AGENT_TOKEN", token),
+            powershell_config_line("METRIA_LISTEN_PORT", &listen_port.to_string()),
+            powershell_quote("$env:METRIA_CLAUDE_PATH = Join-Path $env:USERPROFILE '.claude'"),
+            powershell_quote("$env:METRIA_CODEX_PATH = Join-Path $env:USERPROFILE '.codex'"),
+            powershell_quote("$env:METRIA_OPENCODE_PATH = Join-Path $env:LOCALAPPDATA 'opencode'"),
+            powershell_quote("$env:METRIA_DATA_DIR = Join-Path $PSScriptRoot 'data'"),
+            powershell_quote("& (Join-Path $PSScriptRoot 'metria.exe') agent"),
+        ];
+        return powershell_native_install_command(
+            &download_url,
+            &config_lines,
+            &format!("配置并启动 Agent（pull 模式：Hub 主动拉取，监听端口 {listen_port}）"),
         );
     }
-    format!(
-        "# 1) 下载 Linux Agent（公开下载，无需 Token）\ncurl -fsSL {} -o metria && chmod +x metria\n\n# 2) 配置并后台运行 Agent（pull 模式：Hub 主动拉取）\nexport METRIA_AGENT_TOKEN={}\nexport METRIA_LISTEN_PORT={}\nexport METRIA_CLAUDE_PATH=\"$HOME/.claude\"\nexport METRIA_CODEX_PATH=\"$HOME/.codex\"\nexport METRIA_OPENCODE_PATH=\"$HOME/.local/share/opencode\"\nnohup ./metria agent >> metria-agent.log 2>&1 &\n\n# Hub 将主动访问 Agent 地址 http://<本机>:{listen_port}，请确保该端口可达\n# 生产建议：使用 systemd 服务管理（见 docs/deployment.md）",
-        shell_quote(&download_url),
-        shell_quote(token),
-        listen_port
+    let env_lines = vec![
+        linux_env_arg("METRIA_AGENT_TOKEN", token),
+        format!("\"METRIA_LISTEN_PORT={listen_port}\""),
+        "\"METRIA_CLAUDE_PATH=$HOME/.claude\"".into(),
+        "\"METRIA_CODEX_PATH=$HOME/.codex\"".into(),
+        "\"METRIA_OPENCODE_PATH=$HOME/.local/share/opencode\"".into(),
+        "\"METRIA_DATA_DIR=$HOME/.local/share/metria\"".into(),
+    ];
+    linux_native_install_command(
+        &env_lines,
+        &download_url,
+        &format!("配置并启动 Agent（pull 模式：Hub 主动拉取，监听端口 {listen_port}）"),
     )
 }
 
-/// 生成原生安装命令模板：公开下载对应节点平台/架构的二进制，运行时仍需 Agent Token。
+/// 生成原生安装命令模板：公开下载对应节点平台/架构的二进制，并持久化运行配置。
 fn native_install_command(
     node_id: &str,
     hub_url: &str,
@@ -1017,21 +1090,32 @@ fn native_install_command(
 ) -> String {
     let download_url = format!("{hub_url}/api/v1/nodes/{node_id}/agent/download");
     if target.platform == "windows" {
-        return format!(
-            "$ErrorActionPreference = 'Stop'\n\n# 1) 下载 Windows Agent（公开下载，无需 Token）\nInvoke-WebRequest -UseBasicParsing -Uri {} -OutFile 'metria.exe'\n\n# 2) 配置并启动 Agent\n$env:METRIA_NODE_ID = {}\n$env:METRIA_HUB_URL = {}\n$env:METRIA_AGENT_TOKEN = {}\n$env:METRIA_CLAUDE_PATH = \"$env:USERPROFILE\\.claude\"\n$env:METRIA_CODEX_PATH = \"$env:USERPROFILE\\.codex\"\n$env:METRIA_OPENCODE_PATH = \"$env:LOCALAPPDATA\\opencode\"\nStart-Process -FilePath '.\\metria.exe' -ArgumentList 'agent' -NoNewWindow\n\n# 运行时 Token 仅用于 Agent 注册和上传，不用于下载",
-            powershell_quote(&download_url),
-            powershell_quote(node_id),
-            powershell_quote(hub_url),
-            powershell_quote(token)
+        let config_lines = vec![
+            powershell_config_line("METRIA_NODE_ID", node_id),
+            powershell_config_line("METRIA_HUB_URL", hub_url),
+            powershell_config_line("METRIA_AGENT_TOKEN", token),
+            powershell_quote("$env:METRIA_CLAUDE_PATH = Join-Path $env:USERPROFILE '.claude'"),
+            powershell_quote("$env:METRIA_CODEX_PATH = Join-Path $env:USERPROFILE '.codex'"),
+            powershell_quote("$env:METRIA_OPENCODE_PATH = Join-Path $env:LOCALAPPDATA 'opencode'"),
+            powershell_quote("$env:METRIA_DATA_DIR = Join-Path $PSScriptRoot 'data'"),
+            powershell_quote("& (Join-Path $PSScriptRoot 'metria.exe') agent"),
+        ];
+        return powershell_native_install_command(
+            &download_url,
+            &config_lines,
+            "配置并启动 Agent（push 模式）",
         );
     }
-    format!(
-        "# 1) 下载 Linux Agent（公开下载，无需 Token）\ncurl -fsSL {} -o metria && chmod +x metria\n\n# 2) 配置并后台运行 Agent\nexport METRIA_NODE_ID={}\nexport METRIA_HUB_URL={}\nexport METRIA_AGENT_TOKEN={}\nexport METRIA_CLAUDE_PATH=\"$HOME/.claude\"\nexport METRIA_CODEX_PATH=\"$HOME/.codex\"\nexport METRIA_OPENCODE_PATH=\"$HOME/.local/share/opencode\"\nnohup ./metria agent >> metria-agent.log 2>&1 &\n\n# 运行时 Token 仅用于 Agent 注册和上传，不用于下载\n# 生产建议：使用 systemd 服务管理（见 docs/deployment.md）",
-        shell_quote(&download_url),
-        shell_quote(node_id),
-        shell_quote(hub_url),
-        shell_quote(token)
-    )
+    let env_lines = vec![
+        linux_env_arg("METRIA_NODE_ID", node_id),
+        linux_env_arg("METRIA_HUB_URL", hub_url),
+        linux_env_arg("METRIA_AGENT_TOKEN", token),
+        "\"METRIA_CLAUDE_PATH=$HOME/.claude\"".into(),
+        "\"METRIA_CODEX_PATH=$HOME/.codex\"".into(),
+        "\"METRIA_OPENCODE_PATH=$HOME/.local/share/opencode\"".into(),
+        "\"METRIA_DATA_DIR=$HOME/.local/share/metria\"".into(),
+    ];
+    linux_native_install_command(&env_lines, &download_url, "配置并启动 Agent（push 模式）")
 }
 
 /// 获取安装命令：为新签发 token 生成 Docker 与原生命令。
@@ -1244,7 +1328,8 @@ pub(crate) async fn agent_download_for_node(
 #[cfg(test)]
 mod pricing_rule_validation_tests {
     use super::{
-        docker_install_command, native_install_command, normalize_agent_target,
+        docker_install_command, docker_install_command_pull, native_install_command,
+        native_install_command_pull, normalize_agent_target, normalize_agent_url,
         validate_pricing_rule,
     };
     use serde_json::json;
@@ -1299,6 +1384,27 @@ mod pricing_rule_validation_tests {
     }
 
     #[test]
+    fn normalizes_agent_addresses_without_scheme() {
+        assert_eq!(
+            normalize_agent_url("203.0.113.10:8090").as_deref(),
+            Some("http://203.0.113.10:8090")
+        );
+        assert_eq!(
+            normalize_agent_url("agent.example.com").as_deref(),
+            Some("http://agent.example.com")
+        );
+        assert_eq!(
+            normalize_agent_url("https://agent.example.com:8443/").as_deref(),
+            Some("https://agent.example.com:8443")
+        );
+        assert_eq!(
+            normalize_agent_url("[2001:db8::1]:8090").as_deref(),
+            Some("http://[2001:db8::1]:8090")
+        );
+        assert!(normalize_agent_url("agent.example.com/path").is_none());
+    }
+
+    #[test]
     fn install_commands_keep_download_public_and_runtime_token_private() {
         let target = normalize_agent_target(Some("linux"), Some("amd64")).unwrap();
         let native = native_install_command(
@@ -1310,6 +1416,20 @@ mod pricing_rule_validation_tests {
         assert!(native.contains("/api/v1/nodes/node-test/agent/download"));
         assert!(!native.contains("Authorization"));
         assert!(native.contains("METRIA_AGENT_TOKEN"));
+        assert!(native.contains("EnvironmentFile=/etc/metria/metria-agent.env"));
+        assert!(native.contains("systemctl enable --now metria-agent.service"));
+        assert!(!native.contains("nohup"));
+
+        let pull = native_install_command_pull(
+            "node-pull",
+            "https://hub.example",
+            "mct-pull-token",
+            8090,
+            target,
+        );
+        assert!(pull.contains("METRIA_LISTEN_PORT"));
+        assert!(pull.contains("systemctl enable --now metria-agent.service"));
+        assert!(!pull.contains("nohup"));
 
         let windows = normalize_agent_target(Some("windows"), Some("amd64")).unwrap();
         let powershell = native_install_command(
@@ -1320,7 +1440,16 @@ mod pricing_rule_validation_tests {
         );
         assert!(powershell.contains("Invoke-WebRequest"));
         assert!(powershell.contains("metria.exe"));
+        assert!(powershell.contains("Register-ScheduledTask"));
+        assert!(powershell.contains("Set-Content"));
+        assert!(!powershell.contains("Start-Process"));
         assert!(!powershell.contains("Authorization"));
+        let docker = docker_install_command("node-test", "https://hub.example", "token", target);
+        assert!(docker.contains("\\\n"));
+        assert!(!docker.ends_with("\\"));
+        let pull_docker = docker_install_command_pull("token", 8090, target);
+        assert!(pull_docker.contains("\\\n"));
+        assert!(!pull_docker.ends_with("\\"));
         assert!(
             docker_install_command("node-win", "https://hub.example", "token", windows)
                 .contains("PowerShell")

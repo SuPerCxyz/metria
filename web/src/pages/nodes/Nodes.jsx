@@ -11,7 +11,14 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtDateTime, fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtRelative, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtDateTime, fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtRelative, fmtAgentAddress, sumTokens, cacheHitRate } from '../../services/format'
+
+function agentUrlForSubmit(value, previous = '') {
+  const address = value.trim()
+  if (!address) return ''
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(address)) return address
+  return `${/^https:\/\//i.test(previous) ? 'https' : 'http'}://${address}`
+}
 
 export default function Nodes() {
   const { range } = useTimeRange()
@@ -225,7 +232,6 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
   const [description, setDescription] = useState('')
   const [labels, setLabels] = useState('')
   const [nodeIp, setNodeIp] = useState('')
-  const [hubUrl, setHubUrl] = useState(window.location.origin)
   const [agentUrl, setAgentUrl] = useState('')
   const [platform, setPlatform] = useState('linux')
   const [architecture, setArchitecture] = useState('amd64')
@@ -243,8 +249,8 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
         ip: nodeIp.trim(),
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
-        hub_url: hubUrl.trim() || undefined,
-        agent_url: agentUrl.trim() || undefined,
+        hub_url: window.location.origin,
+        agent_url: agentUrlForSubmit(agentUrl) || undefined,
         platform,
         architecture,
       }),
@@ -276,14 +282,9 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
             <TextInput value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="可选：用逗号分隔，如 生产, GPU" />
           </div>
           <div>
-            <Label>Hub 地址</Label>
-            <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} placeholder="http://hub-host:8080" />
-            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">默认使用当前前端访问地址，安装命令会动态带入该地址；目标机必须能访问。</p>
-          </div>
-          <div>
             <Label>Agent 地址（Pull 模式，可选）</Label>
-            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://203.0.113.10:8090" />
-            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写后 Agent 以 Pull 模式运行：Hub 主动访问该地址拉取数据（适合 Hub 在内网、Agent 在公网）；安装命令将只包含 Token，无需 Hub 地址与 Node ID。留空则使用传统 Push 模式。</p>
+            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="203.0.113.10:8090" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写 IP 或域名，可选端口（不需要填写 http://）；Hub 将主动访问该地址拉取数据。留空则使用传统 Push 模式。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
@@ -322,6 +323,7 @@ function InstallDialog({ data, onClose }) {
   const [tab, setTab] = useState(data.platform === 'windows' ? 'native' : 'docker')
   const [copied, setCopied] = useState(false)
   const command = tab === 'docker' ? data.docker_command : data.native_command
+  const copyCommand = tab === 'docker' ? command.replace(/\\?\s*\n\s*/g, ' ').trim() : command
   const tabs = data.platform === 'windows'
     ? [{ key: 'native', label: 'PowerShell 安装' }]
     : [{ key: 'docker', label: 'Docker 安装' }, { key: 'native', label: '原生安装' }]
@@ -332,14 +334,14 @@ function InstallDialog({ data, onClose }) {
       setTimeout(() => setCopied(false), 1500)
     }
     if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(command).then(done).catch(() => fallbackCopy())
+      navigator.clipboard.writeText(copyCommand).then(done).catch(() => fallbackCopy())
     } else {
       fallbackCopy()
     }
     function fallbackCopy() {
       try {
         const ta = document.createElement('textarea')
-        ta.value = command
+        ta.value = copyCommand
         ta.style.position = 'fixed'
         ta.style.opacity = '0'
         document.body.appendChild(ta)
@@ -379,7 +381,7 @@ function InstallDialog({ data, onClose }) {
         </pre>
         {data.mode === 'pull' ? (
           <p className="text-xs text-gray-400 dark:text-gray-500">
-            Pull 模式：Hub 将主动访问 Agent 的 <code className="font-mono">{data.agent_url || 'http://<本机>:8090'}</code>（请放行该端口）；命令无需 Hub 地址与 Node ID。二进制下载地址 <code className="font-mono">{data.hub_url}</code> 公开可用。
+            Pull 模式：Hub 将主动访问 Agent 的 <code className="font-mono">{fmtAgentAddress(data.agent_url) || '<本机>:8090'}</code>（请放行该端口）；命令无需 Hub 地址与 Node ID。二进制下载地址 <code className="font-mono">{data.hub_url}</code> 公开可用。
           </p>
         ) : (
           <p className="text-xs text-gray-400 dark:text-gray-500">
@@ -398,8 +400,7 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
   const [description, setDescription] = useState(node.description || '')
   const [labels, setLabels] = useState(parseLabels(node.labels))
   const [nodeIp, setNodeIp] = useState(node.ip || '')
-  const [hubUrl, setHubUrl] = useState(node.hub_url || window.location.origin)
-  const [agentUrl, setAgentUrl] = useState(node.agent_url || '')
+  const [agentUrl, setAgentUrl] = useState(fmtAgentAddress(node.agent_url))
   const [platform, setPlatform] = useState(node.platform || 'linux')
   const [architecture, setArchitecture] = useState(node.architecture === 'aarch64' ? 'arm64' : (node.architecture || 'amd64'))
 
@@ -426,8 +427,8 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
         ip: nodeIp.trim(),
         description: description.trim() || undefined,
         labels: labels.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean),
-        hub_url: hubUrl.trim() || undefined,
-        agent_url: agentUrl.trim() || (node.agent_url ? '' : undefined),
+        hub_url: window.location.origin,
+        agent_url: agentUrlForSubmit(agentUrl, node.agent_url) || (node.agent_url ? '' : undefined),
         platform,
         architecture,
       }),
@@ -458,13 +459,9 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
             <TextInput value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="用逗号分隔" />
           </div>
           <div>
-            <Label>Hub 地址</Label>
-            <TextInput value={hubUrl} onChange={(e) => setHubUrl(e.target.value)} />
-          </div>
-          <div>
             <Label>Agent 地址（Pull 模式）</Label>
-            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="http://203.0.113.10:8090" />
-            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写后 Hub 主动拉取该节点（Pull 模式）；清空并保存则切回 Push 模式。</p>
+            <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="203.0.113.10:8090" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写 IP 或域名，可选端口（不需要填写 http://）；填写后 Hub 主动拉取该节点。清空并保存则切回 Push 模式。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
