@@ -298,6 +298,14 @@ async fn full_ingest_rollup_query_cycle() {
     .unwrap();
     assert_eq!(excluded_overview["model_calls"], 0);
     assert_eq!(excluded_overview["input_tokens"], 0);
+    assert_eq!(excluded_overview["agent_tools"], 0);
+    assert_eq!(excluded_overview["models"], 0);
+    assert_eq!(excluded_overview["failed_calls"], 0);
+    assert!(excluded_overview["duration_p50_ms"].is_null());
+    assert_eq!(excluded_overview["cache_savings_micro_usd"], 0);
+    for field in ["nodes", "collectors", "collectors_online", "projects"] {
+        assert_eq!(excluded_overview[field], overview[field]);
+    }
 
     let excluded_series: Value = ureq::get(&format!(
         "{base}/api/v1/usage/timeseries?from={from}&to={to}&dim=model&exclude_models=claude-sonnet-4.5"

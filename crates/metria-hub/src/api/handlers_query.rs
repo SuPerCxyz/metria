@@ -20,6 +20,7 @@ const IDLE_SESSION_MINUTES: i64 = 30;
 pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangeParams>) -> Response {
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter(&p);
+    let (call_filter, call_fargs) = range_filter_usage(&p);
     let c = st.db.conn();
     let row = c.query_row(
         &format!(
@@ -72,8 +73,10 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     let range_clause = "started_at >= ?1 AND started_at < ?2";
     body["agent_tools"] = c
         .query_row(
-            &format!("SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause}"),
-            [from.to_rfc3339(), to.to_rfc3339()],
+            &format!(
+                "SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause} {call_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -81,9 +84,9 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     body["models"] = c
         .query_row(
             &format!(
-                "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != ''"
+                "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != '' {call_filter}"
             ),
-            [from.to_rfc3339(), to.to_rfc3339()],
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -106,9 +109,9 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     body["failed_calls"] = c
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM model_calls WHERE {range_clause} AND status != 'success' AND status != 'ok' AND status != 'completed'"
+                "SELECT COUNT(*) FROM model_calls WHERE {range_clause} AND status != 'success' AND status != 'ok' AND status != 'completed' {call_filter}"
             ),
-            [from.to_rfc3339(), to.to_rfc3339()],
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -117,9 +120,9 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     body["avg_duration_ms"] = c
         .query_row(
             &format!(
-                "SELECT AVG(duration_ms) FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL"
+                "SELECT AVG(duration_ms) FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL {call_filter}"
             ),
-            [from.to_rfc3339(), to.to_rfc3339()],
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
             |r| r.get::<_, Option<f64>>(0),
         )
         .unwrap_or(None)
@@ -130,9 +133,13 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     {
         let mut durations: Vec<i64> = Vec::new();
         if let Ok(mut stmt) = c.prepare(&format!(
-            "SELECT duration_ms FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL"
+            "SELECT duration_ms FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL {call_filter}"
         )) {
-            if let Ok(mut rows) = stmt.query([from.to_rfc3339(), to.to_rfc3339()]) {
+            if let Ok(mut rows) = stmt.query(params_from_iter(range_args(
+                &from,
+                &to,
+                call_fargs.clone(),
+            ))) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(v) = row.get::<_, i64>(0) {
                         durations.push(v);
@@ -161,14 +168,15 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         let model_cache: Vec<(String, i64)> = {
             let c2 = st.db.conn();
             let mut stmt = q!(c2.prepare(&format!(
-                "SELECT model_normalized, COALESCE(SUM(cache_read_tokens),0) FROM model_calls WHERE {range_clause} AND cache_read_tokens IS NOT NULL AND cache_read_tokens > 0 GROUP BY model_normalized"
+                "SELECT model_normalized, COALESCE(SUM(cache_read_tokens),0) FROM model_calls WHERE {range_clause} AND cache_read_tokens IS NOT NULL AND cache_read_tokens > 0 {call_filter} GROUP BY model_normalized"
             )));
-            let rows = q!(
-                stmt.query_map([from.to_rfc3339(), to.to_rfc3339()], |r| Ok((
+            let rows = q!(stmt.query_map(
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| Ok((
                     r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, i64>(1)?
-                )),)
-            );
+                    r.get::<_, i64>(1)?,
+                )),
+            ));
             rows.filter_map(|r| r.ok()).collect()
         };
         // 加载启用规则（此时未持有 conn 锁）

@@ -1,6 +1,6 @@
-// 总览页：4 核心指标 + 主趋势图 + 双排行 + 关注事件。
+// 总览页：核心指标 + 主趋势图 + 模型/Agent 排行。
 
-import React, { useMemo, useState } from 'react'
+import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
@@ -27,6 +27,8 @@ const DIMS = [
   { key: 'client', label: '按 Agent' },
 ]
 
+const EMPTY_HIDDEN = []
+
 // x 轴显示时分（HH:mm）；tooltip 显示完整 MM/dd HH:mm
 function fmtX(iso) {
   const d = new Date(iso)
@@ -46,14 +48,33 @@ export default function Overview() {
   if (nodeId) params.node_id = nodeId
   const [trendTab, setTrendTab] = useState('tokens')
   const [dim, setDim] = useState('all')
-  const [costTab, setCostTab] = useState('cost')
+  const [hiddenByDimension, setHiddenByDimension] = useState({ model: [], client: [] })
+  const hiddenDimensions = hiddenByDimension[dim] || EMPTY_HIDDEN
+  const excludedParams = dim === 'model'
+    ? { exclude_models: hiddenDimensions.join(',') || undefined }
+    : dim === 'client'
+      ? { exclude_client_ids: hiddenDimensions.join(',') || undefined }
+      : {}
+  const overviewParams = { ...params, ...excludedParams }
+  const seriesParams = { ...params, dim: dim === 'all' ? undefined : dim }
 
-  const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
-  const dimParam = dim === 'all' ? undefined : dim
-  const series = useQuery(`ts${q({ ...params, dim: dimParam })}`, () => api(`/usage/timeseries${q({ ...params, dim: dimParam })}`))
+  const overview = useQuery(`overview${q(overviewParams)}`, () => api(`/overview${q(overviewParams)}`))
+  const series = useQuery(`ts${q(seriesParams)}`, () => api(`/usage/timeseries${q(seriesParams)}`))
   const byDim = useQuery(`breakdown-cost${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`breakdown-client${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
-  const quality = useQuery('overview-quality', () => api('/data-quality'))
+
+  const toggleHiddenDimension = useCallback((dimension) => {
+    if (dim === 'all') return
+    setHiddenByDimension((current) => {
+      const hidden = current[dim] || []
+      return {
+        ...current,
+        [dim]: hidden.includes(dimension)
+          ? hidden.filter((item) => item !== dimension)
+          : [...hidden, dimension],
+      }
+    })
+  }, [dim])
 
   const metricOf = (p, tab) => {
     switch (tab) {
@@ -103,10 +124,10 @@ export default function Overview() {
     const datasets = dims.map(({ k }) => {
       const map = {}
       for (const p of byDimMap[k]) map[p.bucket] = metricOf(p, trendTab)
-      return { label: k, values: buckets.map((b) => map[b] || 0) }
+      return { label: k, values: buckets.map((b) => map[b] || 0), hidden: hiddenDimensions.includes(k) }
     })
     return { labels, tooltipLabels, datasets }
-  }, [series.data, trendTab, dim])
+  }, [series.data, trendTab, dim, hiddenDimensions])
 
   const formatY = (v) => {
     if (trendTab === 'tokens') return fmtTokensShort(v)
@@ -115,25 +136,8 @@ export default function Overview() {
     return v.toLocaleString()
   }
 
-  // 关注事件：失败调用 + 采集异常（source_errors）+ 高调用模型
-  const alerts = useMemo(() => {
-    const list = []
-    const o = overview.data || {}
-    const qd = quality.data || {}
-    const failed = o.failed_calls ?? 0
-    if (failed > 0) list.push({ type: 'error', text: `范围内 ${failed} 次调用失败（状态非成功）`, ts: null })
-    for (const se of (qd.source_errors || []).slice(0, 5)) {
-      list.push({ type: 'warning', text: `${se.source_id} 采集异常（${se.severity}）：${se.pattern || se.last_message || '未知'}`, ts: se.last_seen_at })
-    }
-    const topCalls = (byDim.data?.by || []).slice(0, 3)
-    for (const m of topCalls) {
-      if (m.model_calls > 0) list.push({ type: 'cost', text: `${m.dimension} 模型调用 ${m.model_calls} 次`, ts: null })
-    }
-    return list.slice(0, 8)
-  }, [overview.data, byDim.data, quality.data])
-
   if (overview.error) return <ErrorState error={overview.error} onRetry={overview.refresh} />
-  if (overview.loading) return <LoadingSkeleton rows={6} />
+  if (overview.loading && !overview.data) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
 
   const costItems = (byDim.data?.by || [])
@@ -273,7 +277,15 @@ export default function Overview() {
         {trendData.labels.length === 0 ? (
           <EmptyState title="当前范围无数据" />
         ) : (
-          <TrendChart labels={trendData.labels} datasets={trendData.datasets} tooltipLabels={trendData.tooltipLabels} height={320} formatY={formatY} />
+          <TrendChart
+            labels={trendData.labels}
+            datasets={trendData.datasets}
+            tooltipLabels={trendData.tooltipLabels}
+            height={320}
+            formatY={formatY}
+            ariaLabel="使用趋势，点击图例可隐藏或恢复维度"
+            onLegendClick={dim === 'all' ? undefined : toggleHiddenDimension}
+          />
         )}
       </div>
 
@@ -301,24 +313,6 @@ export default function Overview() {
         </div>
       </div>
 
-      {/* 第四行：关注事件 */}
-      <div className="mt-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">需要关注</h2>
-        </div>
-        {alerts.length === 0 ? (
-          <EmptyState title="暂无需要关注的事件" />
-        ) : (
-          <ul className="space-y-2">
-            {alerts.map((a, i) => (
-              <li key={i} className="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-700/30 text-sm">
-                <span className={`w-2 h-2 rounded-full shrink-0 ${a.type === 'error' ? 'bg-red-500' : a.type === 'warning' ? 'bg-amber-500' : 'bg-indigo-500'}`} />
-                <span className="text-gray-700 dark:text-gray-200">{a.text}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
     </>
   )
 }

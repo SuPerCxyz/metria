@@ -1,9 +1,10 @@
 // 排行列表：排名 + 名称 + 数值条。默认前 N 项。
 
 import React from 'react'
+import { sortRankingItems } from '../../services/ranking'
 
 export default function RankingList({ items, valueKey, labelKey, format, limit = 5, onItemClick }) {
-  const rows = (items || []).slice(0, limit)
+  const rows = sortRankingItems(items, valueKey, limit)
   const max = Math.max(1, ...rows.map((r) => Number(r[valueKey] ?? 0)))
 
   return (
