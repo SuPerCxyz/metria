@@ -11,24 +11,11 @@ export default function NodeFilterPicker({ className = '' }) {
 
   return (
     <div className={`relative shrink-0 ${className}`} title="按节点过滤统计数据">
-      <svg
-        className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400 dark:text-gray-500"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <rect x="2" y="2" width="8" height="8" rx="1.5" />
-        <rect x="14" y="14" width="8" height="8" rx="1.5" />
-        <path d="M6 10v4a4 4 0 0 0 4 4h4" />
-      </svg>
       <select
         value={nodeId || ''}
         onChange={(e) => setNodeId(e.target.value || null)}
         aria-label="按节点过滤"
-        className="w-full sm:w-auto max-w-52 truncate appearance-none text-sm text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700/40 rounded-lg pl-8 pr-7 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 cursor-pointer"
+        className="w-full sm:w-auto max-w-52 truncate appearance-none text-sm text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700/40 rounded-lg pl-3 pr-7 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 cursor-pointer"
       >
         <option value="">全部节点</option>
         {nodes.map(([id, name]) => (
