@@ -1,4 +1,5 @@
 // 主趋势图（Chart.js 折线/面积图）：支持多条线（datasets），数据降采样保证 ≥30 点。
+// legendDisplay=false 时隐藏内置图例（由调用方提供自定义图例，如全部模型 chips）。
 
 import React, { useEffect, useRef } from 'react'
 import Chart from 'chart.js/auto'
@@ -13,9 +14,9 @@ function downsample(data, maxPoints = 240) {
   return out
 }
 
-const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
+export const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
 
-export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick }) {
+export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
 
@@ -57,7 +58,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
         interaction: { mode: 'index', intersect: false },
         plugins: {
           legend: {
-            display: ds.length > 1 || ds.some((d) => d.label),
+            display: legendDisplay && (ds.length > 1 || ds.some((d) => d.label)),
             labels: { color: '#9ca3af', boxWidth: 12, font: { size: 11 }, usePointStyle: true, padding: 12 },
             ...(onLegendClick ? {
               onClick: (_event, legendItem, legend) => {
@@ -93,7 +94,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
     })
     chartRef.current = chart
     return () => { if (chartRef.current) chartRef.current.destroy() }
-  }, [labels, datasets, values, tooltipLabels, color, height, onLegendClick])
+  }, [labels, datasets, values, tooltipLabels, color, height, onLegendClick, legendDisplay])
 
   return <div style={{ height }}><canvas ref={ref} role="img" aria-label={`${ariaLabel}，共 ${labels?.length || 0} 个数据点`} /></div>
 }

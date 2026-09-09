@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
-import TrendChart from '../../components/charts/TrendChart'
+import TrendChart, { PALETTE as CHART_PALETTE } from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
 import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
@@ -107,7 +107,7 @@ export default function Overview() {
       return { labels, tooltipLabels, datasets: [{ label: '', values: sorted.map((p) => metricOf(p, trendTab)) }] }
     }
 
-    // 按维度拆分：每维度一条线（按指标总量取 Top5）
+    // 按维度拆分：每维度一条线（列出范围内全部有数据的维度，不再 Top5 截断）
     const byDimMap = {}
     for (const p of pts) {
       const k = p.dimension || '(未知)'
@@ -117,7 +117,6 @@ export default function Overview() {
       .map((k) => ({ k, total: byDimMap[k].reduce((s, p) => s + metricOf(p, trendTab), 0) }))
       .filter((d) => d.total > 0)
       .sort((a, b) => b.total - a.total)
-      .slice(0, 5)
     const buckets = [...new Set(pts.map((p) => p.bucket))].sort()
     const labels = buckets.map(fmtX)
     const tooltipLabels = buckets.map(fmtXFull)
@@ -277,15 +276,43 @@ export default function Overview() {
         {trendData.labels.length === 0 ? (
           <EmptyState title="当前范围无数据" />
         ) : (
-          <TrendChart
-            labels={trendData.labels}
-            datasets={trendData.datasets}
-            tooltipLabels={trendData.tooltipLabels}
-            height={320}
-            formatY={formatY}
-            ariaLabel="使用趋势，点击图例可隐藏或恢复维度"
-            onLegendClick={dim === 'all' ? undefined : toggleHiddenDimension}
-          />
+          <>
+            {dim !== 'all' && trendData.datasets.length > 0 && (
+              <div className="mb-3">
+                <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto items-start">
+                  {trendData.datasets.map((d, i) => {
+                    const hidden = hiddenDimensions.includes(d.label)
+                    return (
+                      <button
+                        key={d.label}
+                        type="button"
+                        onClick={() => toggleHiddenDimension(d.label)}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                          hidden
+                            ? 'border-gray-200 dark:border-gray-700 text-gray-400 dark:text-gray-500 line-through opacity-60'
+                            : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40'
+                        }`}
+                        title={hidden ? '点击恢复该维度' : '点击隐藏该维度（汇总卡片将排除其数据）'}
+                      >
+                        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: CHART_PALETTE[i % CHART_PALETTE.length] }} />
+                        <span className="max-w-48 truncate">{d.label}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+            <TrendChart
+              labels={trendData.labels}
+              datasets={trendData.datasets}
+              tooltipLabels={trendData.tooltipLabels}
+              height={320}
+              formatY={formatY}
+              ariaLabel="使用趋势，点击图例可隐藏或恢复维度"
+              onLegendClick={dim === 'all' ? undefined : toggleHiddenDimension}
+              legendDisplay={dim === 'all'}
+            />
+          </>
         )}
       </div>
 
