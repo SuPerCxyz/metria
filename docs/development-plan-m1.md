@@ -29,6 +29,7 @@
 | Codex 实时增量用量：恢复跨扫描上下文、刷新 Session 汇总、定向回填 | ✅ 完成 | 2026-08-13 |
 | 首页排行与趋势联动修复：排行排序、图例筛选同步汇总、移除需要关注区块 | ✅ 完成 | 2026-09-07 |
 | 跨平台 Agent 资产与 CI Node24：Hub 内置下载、Linux/Windows 目标选择、原生安装持久化、Docker 命令复制、Action 运行时升级 | ✅ 完成 | 2026-09-07 |
+| Agent 无状态轮询：游标外置 Hub、事件确认后推进、离线补齐、spool 迁移（OpenSpec `stateless-polling-agent`） | ✅ 完成 | 2026-09-09 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
@@ -554,3 +555,30 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
   节点在线状态与最近拉取时间/错误展示。运维注意：bind mount 目录需 chown 65532；VM 根磁盘
   打满会导致 SQLite 启动失败（disk full）；首次拉取即遇瞬时失败的退避起步偏长（60s×2^n），
   后续可优化为短起步（记录为改进项，不在本 change 范围）。
+
+---
+
+## 13. Agent 无状态轮询：游标外置 Hub（2026-09-09）
+
+- OpenSpec change `stateless-polling-agent`（proposal/specs×3/design/tasks 全部落地并 Archive 前验证）。
+- Push 模式重构为无状态轮询：每 `METRIA_POLL_INTERVAL`（默认 60s，5~86400 可配，安装命令注入）
+  执行「拉 Hub 游标 → 增量扫描 → 分批直传（413 自动二分拆批）→ 全部确认后推游标」；
+  不再使用 notify 与本地 spool；Hub 离线暂停扫描退避等待，恢复后按最新游标补齐（轮转文件除外）。
+- 硬性顺序：事件确认（accepted/duplicate）在前、游标推进在后；失败不推进游标，下轮重扫靠
+  event_id 幂等去重；fatal 拒绝记录 event_id+原因后跳过防活锁。
+- Hub：migration 012 `source_cursors(collector_id, source_id)` + 013 `nodes.poll_interval_seconds`；
+  `GET/POST /api/v1/collectors/cursors`（collector token 鉴权、绑定身份、幂等 upsert）；
+  删除节点级联清游标；创建/编辑节点与 Docker/Linux/Windows 安装命令支持上报间隔。
+- 遗留 spool 一次性迁移：先尽力清积压（Hub 确认）→ 再推本地游标 → 后删 spool 文件；
+  失败保留现场下次重试。Pull 模式保持本地 spool 语义不变。
+- 测试：stateless 单测 10 项（推进顺序/失败不推进/fatal/413 拆批/迁移成功与保留/配置边界）、
+  Hub e2e 游标闭环（幂等/401/删节点清理）、stateless e2e（离线追加恢复补齐精确 +32000 token、
+  重复扫描幂等）；全量门禁 fmt/clippy/test/web/docker/compose 通过。
+- 真实环境验证（lstable Hub + aitools Agent）：Hub 迁移 [12,13] 应用；Agent 重建（补
+  `--user 1000:1000` 修复卷属主 1000 与容器 65532 不匹配导致的 readonly 报错）后自动完成迁移
+  （清积压 298 条入库、165 条 fatal 孤儿事件记录后跳过、推 166 条游标、删除 ~790MB spool）；
+  轮询增量采集实测 298→328 条调用、零错误零重启；Hub 游标读回 166 条且 last_scan_at 随周期刷新；
+  心跳 spool 统计 0/0；本地 UI 实例浏览器验证添加节点对话框上报间隔与安装命令
+  `METRIA_POLL_INTERVAL=120`。
+- 注意：本地镜像直发期间 ghcr dev-latest 滞后，需推送代码触发 CI 更新镜像，避免 watchtower
+  每日 06:00 将节点回退到旧镜像。

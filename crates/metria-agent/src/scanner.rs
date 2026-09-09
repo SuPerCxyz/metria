@@ -11,7 +11,8 @@ use metria_pricing::PricingEngine;
 
 use crate::config::AgentConfig;
 use crate::error::{AgentError, Result};
-use crate::spool::{CursorUpdate, PendingEvent, Spool};
+pub use crate::spool::PendingEvent;
+use crate::spool::{CursorUpdate, Spool};
 
 /// 扫描汇总。
 #[derive(Debug, Default)]
@@ -121,6 +122,44 @@ impl Scanner {
         source: &DiscoveredSource,
     ) -> Result<SourceScan> {
         let source_id = source.path_hash.as_str().to_string();
+        let cursor_json = spool.get_cursor(&source_id);
+        let cursor: Option<SourceCursor> = cursor_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok());
+
+        let (events, next_cursor) = self.scan_source_events(adapter, source, cursor.as_ref())?;
+
+        let cursor_update = match &next_cursor {
+            Some(c) => vec![CursorUpdate {
+                source_id: source_id.clone(),
+                cursor_json: serde_json::to_string(c)
+                    .map_err(|e| AgentError::Serde(e.to_string()))?,
+            }],
+            None => vec![],
+        };
+        let ok = spool.insert_batch(&events, &cursor_update)?;
+        spool.update_source_health(&source_id, true, None, &source.adapter_id)?;
+        let skipped_full = !ok;
+
+        Ok(SourceScan {
+            sessions: events.iter().filter(|e| e.kind == "session").count(),
+            calls: events.iter().filter(|e| e.kind == "call").count(),
+            usage: events.iter().filter(|e| e.kind == "usage").count(),
+            traffic: events.iter().filter(|e| e.kind == "traffic").count(),
+            skipped_full,
+        })
+    }
+
+    /// 无状态采集：按给定游标扫描并归一化（不写本地 spool）。
+    ///
+    /// 返回 (待上传事件[含 source 注册事件], 下一游标)。
+    pub fn scan_source_events(
+        &self,
+        adapter: &dyn SourceAdapter,
+        source: &DiscoveredSource,
+        cursor: Option<&SourceCursor>,
+    ) -> Result<(Vec<PendingEvent>, Option<SourceCursor>)> {
+        let source_id = source.path_hash.as_str().to_string();
         // 来源注册事件（不含完整路径，仅指纹/哈希）
         let src_event = PendingEvent {
             event_id: EventId::from_content(&format!("source:{source_id}"))
@@ -141,36 +180,42 @@ impl Scanner {
                 "status": "active",
             }),
         };
-        let cursor_json = spool.get_cursor(&source_id);
-        let cursor: Option<SourceCursor> = cursor_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok());
 
-        let batch = adapter.scan(source, cursor.as_ref(), &self.identity)?;
+        let batch = adapter.scan(source, cursor, &self.identity)?;
         let events = normalize_batch(&batch, self.content_mode, &self.pricing, source_id.as_str());
-
-        let cursor_update = match &batch.next_cursor {
-            Some(c) => vec![CursorUpdate {
-                source_id: source_id.clone(),
-                cursor_json: serde_json::to_string(c)
-                    .map_err(|e| AgentError::Serde(e.to_string()))?,
-            }],
-            None => vec![],
-        };
         let mut all_events = Vec::with_capacity(events.len() + 1);
         all_events.push(src_event);
         all_events.extend(events);
-        let ok = spool.insert_batch(&all_events, &cursor_update)?;
-        spool.update_source_health(&source_id, true, None, &source.adapter_id)?;
-        let skipped_full = !ok;
+        Ok((all_events, batch.next_cursor))
+    }
 
-        Ok(SourceScan {
-            sessions: batch.sessions.len(),
-            calls: batch.model_calls.len(),
-            usage: batch.usage_events.len(),
-            traffic: batch.traffic_estimates.len(),
-            skipped_full,
-        })
+    /// 发现某客户端的全部 Source（无状态轮询用）；客户端未配置或发现失败返回 None。
+    pub fn discover_sources(
+        &self,
+        client: &str,
+        adapter: &dyn SourceAdapter,
+    ) -> Option<Vec<DiscoveredSource>> {
+        let root = self.cfg.client_root(client)?;
+        if !root.is_dir() {
+            return None;
+        }
+        let ctx = DiscoveryContext {
+            node_id: self.identity.node_id.clone(),
+            collector_id: self.identity.collector_id.clone(),
+            root_paths: vec![root],
+        };
+        match adapter.discover(&ctx) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("{client} 发现失败: {e}");
+                None
+            }
+        }
+    }
+
+    /// 遍历已装配的适配器（无状态轮询用）。
+    pub fn iter_adapters(&self) -> impl Iterator<Item = (&'static str, &dyn SourceAdapter)> {
+        self.adapters.iter().map(|(n, a)| (*n, a.as_ref()))
     }
 }
 

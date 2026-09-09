@@ -1254,6 +1254,7 @@ dependencies = [
  "chrono-tz",
  "hkdf",
  "hmac",
+ "metria-adapter-api",
  "metria-agent",
  "metria-core",
  "metria-pricing",

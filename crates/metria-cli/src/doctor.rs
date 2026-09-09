@@ -349,12 +349,15 @@ fn check_database() -> Result<(), String> {
 fn check_spool() -> Result<(), String> {
     println!("== Agent Spool ==");
     let data_dir = std::env::var("METRIA_DATA_DIR").unwrap_or_else(|_| "/data".into());
-    let spool = metria_agent::spool::Spool::open(
-        &PathBuf::from(&data_dir).join("spool.db"),
-        2_000_000,
-        512 * 1024 * 1024,
-    )
-    .map_err(|e: metria_agent::AgentError| e.to_string())?;
+    let path = PathBuf::from(&data_dir).join("spool.db");
+    if !path.exists() {
+        // 无状态轮询模式：游标外置 Hub，无本地 spool 属预期状态
+        println!("  无本地 spool（无状态轮询模式：游标存于 Hub，无本地缓冲）");
+        return Ok(());
+    }
+    println!("  [INFO] 存在遗留本地 spool：push 模式 Agent 首次无状态启动时将自动迁移（先清积压，再推游标，后删除）");
+    let spool = metria_agent::spool::Spool::open(&path, 2_000_000, 512 * 1024 * 1024)
+        .map_err(|e: metria_agent::AgentError| e.to_string())?;
     println!("  pending_events={}", spool.pending_count());
     println!("  spool_bytes={}", spool.spool_bytes());
     println!("  dead_letters={}", spool.dead_letter_count());

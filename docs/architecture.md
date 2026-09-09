@@ -30,10 +30,11 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 │  └─ SQLite（WAL，28 表，版本化迁移）                     │
 ├─────────────────────────────────────────────────────────┤
 │  Agent（无 tokio blocking 栈，RSS ≤35MiB 目标）          │
-│  ├─ 发现/扫描：notify 监听 + 增量扫描 + 5min reconcile   │
+│  ├─ Push 模式（默认）：无状态轮询采集，游标外置 Hub      │
+│  │   拉游标 → 增量扫描 → 直传 → 确认后推游标（60s 周期） │
+│  ├─ Pull 模式：notify 监听 + 本地 Spool，Hub 主动拉取    │
 │  ├─ 估算：traffic（7 级来源）/ pricing（多来源优先级）   │
-│  ├─ Spool：事件/游标/批次/死信，事务一致                 │
-│  └─ 上传：zstd 批传 + 指数退避 + 幂等（event_id）        │
+│  └─ 上传：zstd 批传 + 幂等（event_id）+ 413 自动拆批     │
 ├─────────────────────────────────────────────────────────┤
 │  Adapter（每客户端独立 crate，只读）                     │
 │  ├─ claude-code：projects/*.jsonl（modern entry）        │
@@ -48,11 +49,12 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
    （session / source / call / usage / traffic / tool / subagent / traffic_sample）。
 2. **估算**：Agent 本地做 traffic 估算（reconstructed/partial/content_bytes/token_profile）与
    pricing 计算（reported > user > catalog > builtin）。
-3. **Spool**：事件 + 游标同事务写入本地 SQLite；满则停止采集并告警，不丢数据。
-4. **上传**：按 min(256 事件, 256KiB 压缩) 拆批，zstd 压缩，幂等（event_id 去重），
-   部分成功按 event_id 重传失败子集。
-5. **落库**：Hub 校验（schema/深度/大小）→ 幂等 upsert → 增量 rollup（hourly/daily）。
-6. **展示**：查询 API 读 rollup（概览）与原始表（明细）；Web 通过 SSE 增量刷新。
+3. **上传（Push 无状态轮询）**：按周期「拉 Hub 游标 → 增量扫描 → 直传 → 确认后推游标」；
+   事件确认在前、游标推进在后，失败不推进、下轮重扫（event_id 幂等去重）。
+   Hub 离线时暂停扫描，恢复后按最新游标补齐。Pull 模式：事件 + 游标写本地 SQLite
+   spool，Hub 拉取确认后删除；满则停止采集并告警。
+4. **落库**：Hub 校验（schema/深度/大小）→ 幂等 upsert → 增量 rollup（hourly/daily）。
+5. **展示**：查询 API 读 rollup（概览）与原始表（明细）；Web 通过 SSE 增量刷新。
 
 ## 5. 关键设计决策
 

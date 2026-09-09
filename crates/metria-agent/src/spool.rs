@@ -255,6 +255,21 @@ impl Spool {
             .ok()
     }
 
+    /// 全部本地游标（迁移到 Hub 用）。
+    pub fn all_cursors(&self) -> Vec<(String, String)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT source_id, cursor_json FROM source_cursors ORDER BY source_id")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
     /// 取一批待上传事件（按事件数 + 未压缩字节预算）。
     pub fn next_batch(&self, max_events: usize, max_bytes: usize) -> (String, Vec<PendingEvent>) {
         let batch_id = format!("batch-{}", metria_core::model::Id::new());

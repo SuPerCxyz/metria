@@ -21,6 +21,7 @@ use crate::config::HubConfig;
 use crate::db::HubDb;
 use metria_storage::rusqlite::types::Value as SqlValue;
 
+pub mod handlers_cursor;
 pub mod handlers_misc;
 pub mod handlers_query;
 pub mod oidc;
@@ -95,6 +96,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/system/info", get(system_info))
         .route("/api/v1/collectors/register", post(register))
         .route("/api/v1/collectors/heartbeat", post(heartbeat))
+        .route(
+            "/api/v1/collectors/cursors",
+            get(handlers_cursor::cursors_get).post(handlers_cursor::cursors_push),
+        )
         .route("/api/v1/collectors/status", get(collector_status))
         .route("/api/v1/collectors/config", get(collector_config))
         .route(
@@ -230,8 +235,8 @@ async fn auth_mw(
                 "collector token 无效",
             );
         }
-        // 注入 token 身份（如有），供 ingest_batch 校验 node/collector 关系
-        if path == "/api/v1/events/batch" {
+        // 注入 token 身份（如有），供 ingest_batch 校验 node/collector 关系与游标同步归属
+        if path == "/api/v1/events/batch" || path == "/api/v1/collectors/cursors" {
             if let Some(identity) = resolve_collector_token(&st, tok) {
                 req.extensions_mut().insert(identity);
             }

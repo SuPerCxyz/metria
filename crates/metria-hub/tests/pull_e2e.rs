@@ -151,6 +151,7 @@ async fn pull_mode_end_to_end_hub_collects_from_agent() {
         reconcile_interval_seconds: 300,
         heartbeat_interval_seconds: 60,
         upload_interval_seconds: 15,
+        poll_interval_seconds: 60,
         token_refresh_interval_seconds: 6 * 24 * 3600,
         log_filter: "error".into(),
     };

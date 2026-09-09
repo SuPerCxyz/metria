@@ -11,6 +11,8 @@ pub enum AgentError {
     Adapter(#[from] metria_adapter_api::AdapterError),
     #[error("HTTP 错误: {0}")]
     Http(String),
+    #[error("批次过大被拒绝 (413)")]
+    BatchTooLarge,
     #[error("序列化错误: {0}")]
     Serde(String),
     #[error("IO 错误: {0}")]

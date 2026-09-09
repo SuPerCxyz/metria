@@ -1,44 +1,36 @@
-//! Agent 主循环：注册 → 扫描/监听 → 上传 → 心跳。
+//! Agent 主循环：注册 → 游标探测 → （push）无状态轮询 / （pull）本地采集+Pull 服务 → 心跳。
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use metria_adapter_api::ScanIdentity;
 use metria_core::model::EventId;
-use metria_protocol::{HeartbeatRequest, RegisterRequest, UploadBatch};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use metria_protocol::{HeartbeatRequest, RegisterRequest};
 
 use crate::config::AgentConfig;
 use crate::error::{AgentError, Result};
 use crate::scanner::Scanner;
 use crate::spool::Spool;
+use crate::stateless::{polling_loop, sleep_interruptible};
 use crate::wire::HubClient;
 
 /// 运行 Agent（阻塞直至退出信号）。
 pub fn run(cfg: AgentConfig) -> Result<()> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    let spool = Spool::open(
-        &cfg.data_dir.join("spool.db"),
-        cfg.max_pending_events,
-        cfg.max_spool_bytes,
-    )?;
-
     let token = crate::config::resolve_token(&cfg);
 
-    // 双模式判定：配置 HUB_URL → push（现状）；仅 token → pull（Hub 主动拉取）
+    // 双模式判定：配置 HUB_URL → push（无状态轮询）；仅 token → pull（Hub 主动拉取）
     match (&cfg.hub_url, &token) {
-        (Some(_), _) => run_push(cfg, spool, token),
+        (Some(_), _) => run_push_stateless(cfg, token),
         (None, Some(_)) => run_pull(cfg, token),
         (None, None) => Err(AgentError::Internal(
-            "pull 模式需要 METRIA_AGENT_TOKEN；或配置 METRIA_HUB_URL 走 push 模式".into(),
+            "pull 模式需要 METRIA_AGENT_TOKEN；或配置 METRIA_HUB_URL 走无状态 push 模式".into(),
         )),
     }
 }
 
 /// Pull 模式：本地采集 + 暴露采集 API，Hub 主动拉取；无需注册/上传/心跳出站。
+/// 该模式保留本地 spool（Hub 拉取-确认语义依赖本地待拉取队列）。
 pub fn run_pull(cfg: AgentConfig, token: Option<String>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let token = token.unwrap_or_default();
@@ -47,15 +39,9 @@ pub fn run_pull(cfg: AgentConfig, token: Option<String>) -> Result<()> {
         "Agent 以 pull 模式启动（Hub 主动拉取），本地采集照常进行"
     );
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    std::thread::spawn(move || {
-        let _ = ctrlc::set_handler(move || {
-            tracing::info!("收到退出信号（SIGINT/SIGTERM）");
-            stop_thread.store(true, Ordering::Relaxed);
-        });
-    });
+    spawn_stop_handler(stop.clone());
 
-    // 扫描线程（与 push 模式共用；identity 使用本地占位，Hub 侧按 token 归属重写）
+    // 扫描线程（identity 使用本地占位，Hub 侧按 token 归属重写）
     let identity = ScanIdentity {
         node_id: "pull".into(),
         collector_id: "pull".into(),
@@ -79,77 +65,115 @@ pub fn run_pull(cfg: AgentConfig, token: Option<String>) -> Result<()> {
     });
 
     // 主线程等待退出
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            tracing::info!("Agent 退出，等待子线程收尾");
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    wait_for_stop(stop);
     std::thread::sleep(Duration::from_secs(2));
     Ok(())
 }
 
-/// Push 模式（现有行为）：注册 → 扫描/监听 → 上传 → 心跳。
-fn run_push(cfg: AgentConfig, mut spool: Spool, token: Option<String>) -> Result<()> {
+/// Push 模式：无状态轮询（游标外置 Hub，无本地 spool）。
+///
+/// 启动流程：注册 → 游标能力探测（Hub 离线退避等待；不支持则明确退出）→
+/// 遗留 spool 一次性迁移 → 轮询线程 + 心跳线程。
+fn run_push_stateless(cfg: AgentConfig, token: Option<String>) -> Result<()> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
     let hub_url = cfg
         .hub_url
         .clone()
         .unwrap_or_else(|| "http://localhost:8080".into());
-
-    // Node ID：显式 > 持久化 > 由 Node Name 生成
-    let node_id = resolve_node_id(&cfg, &mut spool)?;
-
     let client = HubClient::new(&hub_url, token);
-    let identity = register(&cfg, node_id, &client)?;
-    // 持久化 collector_id 便于重启复用
-    let _ = spool.meta_set("collector_id", &identity.collector_id);
-    tracing::info!(node = %identity.node_id, collector = %identity.collector_id, "Agent 注册完成");
+    let node_id = resolve_node_id(&cfg);
+
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    std::thread::spawn(move || {
-        // ctrlc crate 同时处理 SIGINT 与 SIGTERM（cargo 特性 signal-hook）
-        let _ = ctrlc::set_handler(move || {
-            tracing::info!("收到退出信号（SIGINT/SIGTERM）");
-            stop_thread.store(true, Ordering::Relaxed);
-        });
-    });
+    spawn_stop_handler(stop.clone());
 
-    // 扫描线程
-    let scan_cfg = cfg.clone();
-    let scan_spool = reopen_spool(&cfg)?;
-    let scan_identity = identity.clone();
-    let scan_stop = stop.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = scanner_loop(scan_cfg, scan_spool, scan_identity, scan_stop) {
-            tracing::error!("扫描线程退出: {e}");
+    // 注册 + 游标能力探测（Hub 离线 → 退避等待，不退出）
+    let identity = loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
         }
-    });
+        match try_start(&cfg, &client, node_id.clone()) {
+            Ok(identity) => break identity,
+            Err(StartError::Unsupported) => {
+                return Err(AgentError::Internal(
+                    "Hub 未提供游标同步接口：无状态模式需先升级 Hub（升级后重启 Agent 即可）"
+                        .into(),
+                ));
+            }
+            Err(StartError::Transient(e)) => {
+                tracing::warn!("注册/游标探测失败，退避重试: {e}");
+                if sleep_interruptible(&stop, Duration::from_secs(10)) {
+                    return Ok(());
+                }
+            }
+        }
+    };
+    tracing::info!(
+        node = %identity.node_id,
+        collector = %identity.collector_id,
+        "Agent 注册完成（无状态轮询模式）"
+    );
 
-    // 上传线程
-    let up_cfg = cfg.clone();
-    let up_spool = reopen_spool(&cfg)?;
-    let up_client = client.clone();
-    let up_identity = identity.clone();
-    let up_stop = stop.clone();
+    // 遗留 spool 一次性迁移（失败即退出，容器重启后重试）
+    crate::stateless::migrate_legacy_spool(&cfg, &client, &identity)?;
+
+    // 轮询线程
+    let poll_cfg = cfg.clone();
+    let poll_client = client.clone();
+    let poll_identity = identity.clone();
+    let poll_stop = stop.clone();
     std::thread::spawn(move || {
-        if let Err(e) = uploader_loop(up_cfg, up_spool, up_client, up_identity, up_stop) {
-            tracing::error!("上传线程退出: {e}");
+        if let Err(e) = polling_loop(poll_cfg, poll_client, poll_identity, poll_stop) {
+            tracing::error!("轮询线程退出: {e}");
         }
     });
 
     // 心跳线程
     let hb_cfg = cfg.clone();
-    let hb_spool = reopen_spool(&cfg)?;
     let hb_client = client;
     let hb_stop = stop.clone();
     std::thread::spawn(move || {
-        if let Err(e) = heartbeat_loop(hb_cfg, hb_spool, hb_client, identity, hb_stop) {
+        if let Err(e) = heartbeat_loop(hb_cfg, hb_client, identity, hb_stop) {
             tracing::error!("心跳线程退出: {e}");
         }
     });
 
-    // 主线程等待退出信号
+    // 主线程等待退出信号；给线程一个心跳周期的收尾时间
+    wait_for_stop(stop);
+    std::thread::sleep(Duration::from_secs(2));
+    Ok(())
+}
+
+enum StartError {
+    /// Hub 不支持游标同步（旧版 Hub），需先升级。
+    Unsupported,
+    /// 网络等瞬态错误，可退避重试。
+    Transient(AgentError),
+}
+
+fn try_start(
+    cfg: &AgentConfig,
+    client: &HubClient,
+    node_id: String,
+) -> std::result::Result<ScanIdentity, StartError> {
+    let identity = register(cfg, node_id, client).map_err(StartError::Transient)?;
+    match client.fetch_cursors() {
+        Ok(Some(_)) => Ok(identity),
+        Ok(None) => Err(StartError::Unsupported),
+        Err(e) => Err(StartError::Transient(e)),
+    }
+}
+
+fn spawn_stop_handler(stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        // ctrlc crate 同时处理 SIGINT 与 SIGTERM（cargo 特性 signal-hook）
+        let _ = ctrlc::set_handler(move || {
+            tracing::info!("收到退出信号（SIGINT/SIGTERM）");
+            stop.store(true, Ordering::Relaxed);
+        });
+    });
+}
+
+fn wait_for_stop(stop: Arc<AtomicBool>) {
     loop {
         if stop.load(Ordering::Relaxed) {
             tracing::info!("Agent 退出，等待子线程收尾");
@@ -157,12 +181,9 @@ fn run_push(cfg: AgentConfig, mut spool: Spool, token: Option<String>) -> Result
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    // 优雅停止：给各线程一个心跳周期的收尾时间（冲刷 in-flight 批次）
-    std::thread::sleep(Duration::from_secs(2));
-    Ok(())
 }
 
-/// 重新打开同一 Spool（各线程独立连接）。
+/// 重新打开本地 Spool（Pull 模式使用）。
 fn reopen_spool(cfg: &AgentConfig) -> Result<Spool> {
     Spool::open(
         &cfg.data_dir.join("spool.db"),
@@ -171,18 +192,13 @@ fn reopen_spool(cfg: &AgentConfig) -> Result<Spool> {
     )
 }
 
-fn resolve_node_id(cfg: &AgentConfig, spool: &mut Spool) -> Result<String> {
-    // 优先级：显式 METRIA_NODE_ID > 持久化 > 由 Node Name 生成
+/// Node 身份：显式 METRIA_NODE_ID > 按 node_name 确定性派生（无本地持久化）。
+fn resolve_node_id(cfg: &AgentConfig) -> String {
     if !cfg.node_id.trim().is_empty() {
-        return Ok(cfg.node_id.trim().to_string());
-    }
-    if let Some(id) = spool.meta_get("node_id") {
-        return Ok(id);
+        return cfg.node_id.trim().to_string();
     }
     let gen = EventId::from_content(&format!("node:{}", cfg.node_name));
-    let id = format!("node-{}", &gen.as_str()[7..15]);
-    spool.meta_set("node_id", &id)?;
-    Ok(id)
+    format!("node-{}", &gen.as_str()[7..15])
 }
 
 fn register(cfg: &AgentConfig, node_id: String, client: &HubClient) -> Result<ScanIdentity> {
@@ -213,12 +229,15 @@ fn register(cfg: &AgentConfig, node_id: String, client: &HubClient) -> Result<Sc
     })
 }
 
+/// Pull 模式扫描线程：notify 监听 + reconcile，事件与游标写本地 Spool。
 fn scanner_loop(
     cfg: AgentConfig,
     mut spool: Spool,
     identity: ScanIdentity,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
     let scanner = Scanner::new(cfg.clone(), identity);
     let (tx, rx) = mpsc::channel::<notify::Event>();
 
@@ -289,7 +308,7 @@ fn scanner_loop(
     Ok(())
 }
 
-fn client_roots(cfg: &AgentConfig) -> Vec<PathBuf> {
+fn client_roots(cfg: &AgentConfig) -> Vec<std::path::PathBuf> {
     let mut v = Vec::new();
     for c in ["claude", "claude-code", "codex", "opencode"] {
         if let Some(p) = cfg.client_root(c) {
@@ -299,88 +318,10 @@ fn client_roots(cfg: &AgentConfig) -> Vec<PathBuf> {
     v
 }
 
-fn uploader_loop(
-    cfg: AgentConfig,
-    mut spool: Spool,
-    client: HubClient,
-    identity: ScanIdentity,
-    stop: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut backoff = Duration::from_secs(5);
-    let max_backoff = Duration::from_secs(300);
-    // 指数退避 + 抖动（S2.4）：避免多 Agent 同步冲击
-    let jittered = |b: Duration| {
-        let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0.0..=0.5);
-        b + Duration::from_secs_f64(b.as_secs_f64() * jitter)
-    };
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        if !spool.full_flag().is_full() {
-            let (batch_id, events) = spool.next_batch(cfg.batch_max_events, cfg.batch_max_bytes);
-            if !events.is_empty() {
-                let batch = UploadBatch {
-                    schema_version: metria_protocol::limits::SCHEMA_VERSION,
-                    batch_id: batch_id.clone(),
-                    node_id: identity.node_id.clone(),
-                    collector_id: identity.collector_id.clone(),
-                    agent_version: metria_core::VERSION.to_string(),
-                    events: events
-                        .iter()
-                        .map(|e| metria_protocol::BatchEvent {
-                            kind: e.kind.clone(),
-                            event_id: e.event_id.clone(),
-                            payload: e.payload.clone(),
-                        })
-                        .collect(),
-                };
-                match client.upload(&batch) {
-                    Ok(resp) => {
-                        let mut to_ack = Vec::new();
-                        to_ack.extend(resp.accepted.iter().cloned());
-                        to_ack.extend(resp.duplicate.iter().cloned());
-                        if !to_ack.is_empty() {
-                            spool.ack_uploaded(&batch_id, &to_ack)?;
-                        }
-                        let retryable: Vec<String> = resp
-                            .failed
-                            .iter()
-                            .filter(|f| f.retryable)
-                            .map(|f| f.event_id.clone())
-                            .collect();
-                        let fatal: Vec<String> = resp
-                            .failed
-                            .iter()
-                            .filter(|f| !f.retryable)
-                            .map(|f| f.event_id.clone())
-                            .collect();
-                        if !retryable.is_empty() {
-                            spool.fail_events(&batch_id, &retryable, true, "hub 重试")?;
-                        }
-                        if !fatal.is_empty() {
-                            spool.fail_events(&batch_id, &fatal, false, "hub 拒绝")?;
-                        }
-                        backoff = Duration::from_secs(5);
-                    }
-                    Err(e) => {
-                        tracing::warn!("上传失败（将重试）: {e}");
-                        std::thread::sleep(jittered(backoff));
-                        backoff = (backoff * 2).min(max_backoff);
-                    }
-                }
-            }
-        } else {
-            tracing::warn!("Spool 满，暂停上传与采集");
-        }
-        std::thread::sleep(Duration::from_secs(cfg.upload_interval_seconds));
-    }
-    Ok(())
-}
-
+/// 心跳线程：定期心跳 + collector token 续期。
+/// 无状态模式无本地 spool，统计如实报告 0。
 fn heartbeat_loop(
     cfg: AgentConfig,
-    spool: Spool,
     client: HubClient,
     mut identity: ScanIdentity,
     stop: Arc<AtomicBool>,
@@ -405,8 +346,9 @@ fn heartbeat_loop(
             schema_version: metria_protocol::limits::SCHEMA_VERSION,
             node_id: identity.node_id.clone(),
             collector_id: identity.collector_id.clone(),
-            spool_pending_events: spool.pending_count(),
-            spool_size_bytes: spool.spool_bytes(),
+            // 无状态轮询模式：无本地 spool，如实报告 0
+            spool_pending_events: 0,
+            spool_size_bytes: 0,
             source_count: 0,
             agent_clock: chrono::Utc::now(),
         };
@@ -416,7 +358,9 @@ fn heartbeat_loop(
                 tracing::debug!("心跳失败: {e}");
             }
         }
-        std::thread::sleep(Duration::from_secs(cfg.heartbeat_interval_seconds));
+        if sleep_interruptible(&stop, Duration::from_secs(cfg.heartbeat_interval_seconds)) {
+            break;
+        }
     }
     Ok(())
 }

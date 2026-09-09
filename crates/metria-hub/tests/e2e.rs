@@ -1291,3 +1291,108 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
         .unwrap();
     assert_eq!(overall["count"], 3);
 }
+
+/// 游标同步闭环：注册 → 读空 → 推进 → 读回一致 → 幂等 → 未认证 401 → 删节点清理。
+#[tokio::test(flavor = "multi_thread")]
+async fn cursor_sync_roundtrip_and_lifecycle() {
+    let dir = tempdir("e2e-cursors");
+    let (base, _state) = spawn_hub(&dir).await;
+    let admin = admin_token(&base);
+
+    // 创建节点，获取一次性专属 token
+    let created: Value = ureq::post(&format!("{base}/api/v1/nodes"))
+        .set("Authorization", &format!("Bearer {admin}"))
+        .send_json(json!({
+            "name": "cursor-node",
+            "ip": "203.0.113.9",
+            "poll_interval_seconds": 120
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let node_id = created["node_id"].as_str().unwrap().to_string();
+    let node_token = format!("Bearer {}", created["token"].as_str().unwrap());
+
+    // Agent 注册（使用节点专属 token）
+    let reg: Value = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", &node_token)
+        .send_json(json!({
+            "schema_version": 1, "node_id": node_id, "node_name": "cursor-node",
+            "agent_version": "0.4.0", "protocol_version": 1
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(reg["ok"], true);
+
+    // 初始为空
+    let cursors: Value = ureq::get(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", &node_token)
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(cursors["cursors"].as_array().unwrap().len(), 0);
+
+    // 推进游标
+    let push: Value = ureq::post(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", &node_token)
+        .send_json(json!({
+            "schema_version": 1,
+            "cursors": [{"source_id": "s1", "cursor_json": "{\"off\":10}", "updated_at": null}]
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(push["ok"], true);
+
+    // 读回一致
+    let cursors: Value = ureq::get(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", &node_token)
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let arr = cursors["cursors"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["source_id"], "s1");
+    assert_eq!(arr[0]["cursor_json"], "{\"off\":10}");
+    assert!(!arr[0]["updated_at"].as_str().unwrap_or("").is_empty());
+
+    // 幂等重复提交
+    ureq::post(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", &node_token)
+        .send_json(json!({
+            "schema_version": 1,
+            "cursors": [{"source_id": "s1", "cursor_json": "{\"off\":10}", "updated_at": null}]
+        }))
+        .unwrap();
+
+    // 未认证 → 401；env bootstrap token（无注册身份）→ 400
+    let status = ureq::get(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", "Bearer wrong")
+        .call();
+    assert!(status.is_err());
+    let err = ureq::get(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", "Bearer testtok")
+        .call()
+        .unwrap_err();
+    assert!(matches!(err, ureq::Error::Status(400, _)));
+
+    // 删除节点 → 游标随 collector 级联清理（token 同时失效 → 401）
+    ureq::delete(&format!("{base}/api/v1/nodes/{node_id}"))
+        .set("Authorization", &format!("Bearer {admin}"))
+        .call()
+        .unwrap();
+    let status = ureq::get(&format!("{base}/api/v1/collectors/cursors"))
+        .set("Authorization", &node_token)
+        .call();
+    assert!(status.is_err(), "删除节点后 collector token 应失效");
+}
+
+fn tempdir(prefix: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}

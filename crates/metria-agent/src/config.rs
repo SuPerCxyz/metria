@@ -29,6 +29,8 @@ pub struct AgentConfig {
     pub reconcile_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
     pub upload_interval_seconds: u64,
+    /// 无状态轮询间隔：push 模式「拉游标→扫描→上传→推游标」单循环周期（默认 60s，最小 5s）。
+    pub poll_interval_seconds: u64,
     /// token 刷新间隔：定期重新注册以续期 Hub 侧 collector token（默认 6 天，短于 7 天有效期）。
     pub token_refresh_interval_seconds: u64,
     pub log_filter: String,
@@ -84,6 +86,9 @@ impl AgentConfig {
             heartbeat_interval_seconds: optional_int("METRIA_HEARTBEAT_INTERVAL")?.unwrap_or(60)
                 as u64,
             upload_interval_seconds: optional_int("METRIA_UPLOAD_INTERVAL")?.unwrap_or(15) as u64,
+            poll_interval_seconds: optional_int("METRIA_POLL_INTERVAL")?
+                .unwrap_or(60)
+                .clamp(5, i64::MAX) as u64,
             token_refresh_interval_seconds: optional_int("METRIA_TOKEN_REFRESH_INTERVAL")?
                 .unwrap_or(6 * 24 * 3600) as u64,
             log_filter,
@@ -104,4 +109,24 @@ impl AgentConfig {
 /// 读取 Agent token（环境或文件）。
 pub fn resolve_token(cfg: &AgentConfig) -> Option<String> {
     cfg.token.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_interval_default_and_bounds() {
+        // 未配置 → 默认 60
+        let cfg = AgentConfig::from_env().unwrap();
+        assert_eq!(cfg.poll_interval_seconds, 60);
+        // 越大越好：不允许 clamp 边界溢出 panic
+        std::env::set_var("METRIA_POLL_INTERVAL", "999999999999");
+        let cfg = AgentConfig::from_env().unwrap();
+        assert!(cfg.poll_interval_seconds >= 5);
+        std::env::set_var("METRIA_POLL_INTERVAL", "1");
+        let cfg = AgentConfig::from_env().unwrap();
+        assert_eq!(cfg.poll_interval_seconds, 5);
+        std::env::remove_var("METRIA_POLL_INTERVAL");
+    }
 }

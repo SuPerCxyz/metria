@@ -41,7 +41,8 @@ docker compose -f docker/compose.full.yaml up -d
 | `METRIA_AGENT_BINARIES_DIR` | `/app/agent-binaries`（Hub 镜像） | Agent 跨平台二进制目录；自定义 Hub 镜像可覆盖 |
 | `METRIA_AGENT_DOWNLOAD_BASE_URL` | 无 | 可选：内置资产缺失时的跨平台 Agent Release 下载回退地址 |
 | `METRIA_CLAUDE_PATH` / `CODEX_PATH` / `OPENCODE_PATH` | 无 | 客户端目录 |
-| `METRIA_SCAN_INTERVAL` / `RECONCILE_INTERVAL` / `HEARTBEAT_INTERVAL` / `UPLOAD_INTERVAL` | 10/300/60/15s | Agent 周期 |
+| `METRIA_SCAN_INTERVAL` / `RECONCILE_INTERVAL` / `HEARTBEAT_INTERVAL` / `UPLOAD_INTERVAL` | 10/300/60/15s | Agent 周期（Pull 模式与本地扫描使用） |
+| `METRIA_POLL_INTERVAL` | 60s | **Push 模式**无状态轮询周期（拉游标→扫描→上传→推游标，5~86400 秒；可在「添加节点」时配置，随安装命令注入） |
 | `METRIA_TOKEN_REFRESH_INTERVAL` | 6 天 | Agent 重新注册续期周期（< 7 天 token 有效期） |
 | `METRIA_MAX_PENDING_EVENTS` / `MAX_SPOOL_BYTES` | 200 万 / 512MiB | Spool 上限 |
 | `METRIA_LOG` | `info` | 日志级别 |
@@ -57,12 +58,23 @@ docker compose -f docker/compose.full.yaml up -d
 
 Agent 支持两种采集模式（同一镜像/二进制，按环境变量自动判定）：
 
-| | Push 模式（默认） | Pull 模式 |
+| | Push 模式（默认，无状态轮询） | Pull 模式 |
 |---|---|---|
 | 触发条件 | 配置 `METRIA_HUB_URL` | 仅配置 `METRIA_AGENT_TOKEN`（无 HUB_URL） |
 | 数据流向 | Agent → Hub 主动上报 | Hub → Agent 主动拉取 |
 | 适用拓扑 | Hub 公网可达 | **Hub 在内网、Agent 在公网** |
 | 所需配置 | HUB_URL + NODE_ID + TOKEN | 仅 TOKEN（+ 客户端路径） |
+| 本地状态 | **无**（游标外置 Hub，无本地 spool） | 本地 spool（拉取-确认队列） |
+
+**Push 模式（无状态轮询）工作方式**：
+
+1. 每个轮询周期（`METRIA_POLL_INTERVAL`，默认 60s）从 Hub 拉取各 Source 最新游标；
+2. 增量扫描客户端日志/数据库，事件直传 Hub（批量上限与 zstd 压缩同旧模式）；
+3. 该 Source 全部事件被 Hub 确认（accepted/duplicate）**之后**才推进游标；
+   上传失败不推进，下轮从旧游标重扫，Hub 按 event_id 幂等去重；
+4. Hub 离线时暂停扫描并退避等待；恢复后按最新游标补齐离线期间的数据
+   （离线期间被轮转/删除的历史文件无法补齐，见 operations 文档）；
+5. 不写任何本地持久化状态：`/data` 卷仅用于旧版升级时的一次性迁移，可为空卷。
 
 **Pull 模式工作方式**：
 
@@ -115,6 +127,9 @@ METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 见 `docs/operations.md`：
 
 - 升级：拉新镜像 → 重启；启动时自动应用版本化迁移。
+- **升级顺序：先 Hub，后各节点 Agent**（push 模式 Agent 依赖 Hub 游标同步接口；
+  旧 Hub 上新 Agent 会明确报错等待，升级 Hub 后重启 Agent 即可）。
+- Agent 升级时若存在遗留本地 spool 会自动一次性迁移（清积压 → 推游标 → 删除本地文件）。
 - 回滚：回退镜像 tag；若已应用新迁移，先恢复旧数据库（VACUUM INTO + zstd 备份）。
 
 ## 6. 健康检查与诊断

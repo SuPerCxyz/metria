@@ -716,6 +716,9 @@ pub(crate) struct NodeCreateRequest {
     pub platform: Option<String>,
     #[serde(default)]
     pub architecture: Option<String>,
+    /// 上报间隔（秒）：无状态轮询 Agent 的采集周期，缺省 60。
+    #[serde(default)]
+    pub poll_interval_seconds: Option<i64>,
 }
 
 /// 更新节点请求。
@@ -736,6 +739,14 @@ pub(crate) struct NodeUpdateRequest {
     pub platform: Option<String>,
     #[serde(default)]
     pub architecture: Option<String>,
+    /// 上报间隔（秒）：None 表示不修改。
+    #[serde(default)]
+    pub poll_interval_seconds: Option<i64>,
+}
+
+/// 上报间隔合法范围：5 秒 ~ 24 小时。
+fn valid_poll_interval(v: i64) -> bool {
+    (5..=86_400).contains(&v)
 }
 
 /// 校验节点 IP：合法 IPv4/IPv6（含端口）、或常见主机名（字母数字、点、横线）。
@@ -827,6 +838,15 @@ pub(crate) async fn node_create(
         Ok(target) => target,
         Err(message) => return json_err(StatusCode::BAD_REQUEST, "bad_agent_target", &message),
     };
+    if let Some(v) = req.poll_interval_seconds {
+        if !valid_poll_interval(v) {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_poll_interval",
+                "上报间隔必须为 5~86400 秒",
+            );
+        }
+    }
     let now = Utc::now();
     match st.db.create_node(
         name,
@@ -836,6 +856,7 @@ pub(crate) async fn node_create(
         hub_url.as_deref(),
         target.platform,
         target.architecture,
+        req.poll_interval_seconds,
         now,
     ) {
         Ok((node_id, collector_id, token)) => {
@@ -928,6 +949,15 @@ pub(crate) async fn node_update(
     } else {
         None
     };
+    if let Some(v) = req.poll_interval_seconds {
+        if !valid_poll_interval(v) {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "bad_poll_interval",
+                "上报间隔必须为 5~86400 秒",
+            );
+        }
+    };
     match st.db.update_node(
         &id,
         name,
@@ -937,6 +967,7 @@ pub(crate) async fn node_update(
         hub_url.as_deref(),
         target.map(|value| value.platform),
         target.map(|value| value.architecture),
+        req.poll_interval_seconds,
         Utc::now(),
     ) {
         Ok(true) => {
@@ -975,21 +1006,23 @@ pub(crate) async fn node_delete(
     }
 }
 
-/// 生成 Docker 安装命令模板（含 node_id / hub_url / token / 客户端只读挂载）。
+/// 生成 Docker 安装命令模板（含 node_id / hub_url / token / 上报间隔 / 客户端只读挂载）。
 fn docker_install_command(
     node_id: &str,
     hub_url: &str,
     token: &str,
+    poll_interval: u64,
     target: AgentTarget,
 ) -> String {
     if target.platform == "windows" {
         return "Windows Agent 请使用“原生安装”PowerShell 命令；当前 Docker Agent 镜像仅支持 Linux。".into();
     }
     format!(
-        "docker run -d --name metria-agent --restart unless-stopped \\\n  -e METRIA_NODE_ID={} \\\n  -e METRIA_HUB_URL={} \\\n  -e METRIA_AGENT_TOKEN={} \\\n  -e METRIA_CLAUDE_PATH=/sources/claude \\\n  -e METRIA_CODEX_PATH=/sources/codex \\\n  -e METRIA_OPENCODE_PATH=/sources/opencode \\\n  -v $HOME/.claude:/sources/claude:ro \\\n  -v $HOME/.codex:/sources/codex:ro \\\n  -v $HOME/.local/share/opencode:/sources/opencode:ro \\\n  -v metria-agent-data:/data \\\n  ghcr.io/supercxyz/metria:latest agent",
+        "docker run -d --name metria-agent --restart unless-stopped \\\n  -e METRIA_NODE_ID={} \\\n  -e METRIA_HUB_URL={} \\\n  -e METRIA_AGENT_TOKEN={} \\\n  -e METRIA_POLL_INTERVAL={} \\\n  -e METRIA_CLAUDE_PATH=/sources/claude \\\n  -e METRIA_CODEX_PATH=/sources/codex \\\n  -e METRIA_OPENCODE_PATH=/sources/opencode \\\n  -v $HOME/.claude:/sources/claude:ro \\\n  -v $HOME/.codex:/sources/codex:ro \\\n  -v $HOME/.local/share/opencode:/sources/opencode:ro \\\n  -v metria-agent-data:/data \\\n  ghcr.io/supercxyz/metria:latest agent",
         shell_quote(node_id),
         shell_quote(hub_url),
-        shell_quote(token)
+        shell_quote(token),
+        poll_interval
     )
 }
 
@@ -1086,14 +1119,17 @@ fn native_install_command(
     node_id: &str,
     hub_url: &str,
     token: &str,
+    poll_interval: u64,
     target: AgentTarget,
 ) -> String {
     let download_url = format!("{hub_url}/api/v1/nodes/{node_id}/agent/download");
+    let poll = poll_interval.to_string();
     if target.platform == "windows" {
         let config_lines = vec![
             powershell_config_line("METRIA_NODE_ID", node_id),
             powershell_config_line("METRIA_HUB_URL", hub_url),
             powershell_config_line("METRIA_AGENT_TOKEN", token),
+            powershell_config_line("METRIA_POLL_INTERVAL", &poll),
             powershell_quote("$env:METRIA_CLAUDE_PATH = Join-Path $env:USERPROFILE '.claude'"),
             powershell_quote("$env:METRIA_CODEX_PATH = Join-Path $env:USERPROFILE '.codex'"),
             powershell_quote("$env:METRIA_OPENCODE_PATH = Join-Path $env:LOCALAPPDATA 'opencode'"),
@@ -1110,6 +1146,7 @@ fn native_install_command(
         linux_env_arg("METRIA_NODE_ID", node_id),
         linux_env_arg("METRIA_HUB_URL", hub_url),
         linux_env_arg("METRIA_AGENT_TOKEN", token),
+        linux_env_arg("METRIA_POLL_INTERVAL", &poll),
         "\"METRIA_CLAUDE_PATH=$HOME/.claude\"".into(),
         "\"METRIA_CODEX_PATH=$HOME/.codex\"".into(),
         "\"METRIA_OPENCODE_PATH=$HOME/.local/share/opencode\"".into(),
@@ -1213,6 +1250,12 @@ pub(crate) async fn node_install(
             "无法确定 Hub 地址，请从当前 Hub 页面重新生成安装命令",
         );
     };
+    // 上报间隔：节点记录值，缺省 60（无状态轮询 Agent 采集周期）
+    let poll_interval = node
+        .get("poll_interval_seconds")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0)
+        .unwrap_or(60) as u64;
     Json(serde_json::json!({
         "node_id": id,
         "name": node.get("name"),
@@ -1222,8 +1265,8 @@ pub(crate) async fn node_install(
         "architecture": target.architecture,
         "agent_asset": target.asset,
         "token": token,
-        "docker_command": docker_install_command(&id, &hub_url, &token, target),
-        "native_command": native_install_command(&id, &hub_url, &token, target),
+        "docker_command": docker_install_command(&id, &hub_url, &token, poll_interval, target),
+        "native_command": native_install_command(&id, &hub_url, &token, poll_interval, target),
     }))
     .into_response()
 }
@@ -1411,11 +1454,13 @@ mod pricing_rule_validation_tests {
             "node-test",
             "https://hub.example",
             "mct-runtime-token",
+            60,
             target,
         );
         assert!(native.contains("/api/v1/nodes/node-test/agent/download"));
         assert!(!native.contains("Authorization"));
         assert!(native.contains("METRIA_AGENT_TOKEN"));
+        assert!(native.contains("METRIA_POLL_INTERVAL"));
         assert!(native.contains("EnvironmentFile=/etc/metria/metria-agent.env"));
         assert!(native.contains("systemctl enable --now metria-agent.service"));
         assert!(!native.contains("nohup"));
@@ -1436,23 +1481,31 @@ mod pricing_rule_validation_tests {
             "node-win",
             "https://hub.example",
             "mct-runtime-token",
+            120,
             windows,
         );
         assert!(powershell.contains("Invoke-WebRequest"));
         assert!(powershell.contains("metria.exe"));
         assert!(powershell.contains("Register-ScheduledTask"));
         assert!(powershell.contains("Set-Content"));
+        assert!(powershell_contains_poll(&powershell, 120));
         assert!(!powershell.contains("Start-Process"));
         assert!(!powershell.contains("Authorization"));
-        let docker = docker_install_command("node-test", "https://hub.example", "token", target);
+        let docker =
+            docker_install_command("node-test", "https://hub.example", "token", 60, target);
         assert!(docker.contains("\\\n"));
+        assert!(docker.contains("METRIA_POLL_INTERVAL=60"));
         assert!(!docker.ends_with("\\"));
         let pull_docker = docker_install_command_pull("token", 8090, target);
         assert!(pull_docker.contains("\\\n"));
         assert!(!pull_docker.ends_with("\\"));
         assert!(
-            docker_install_command("node-win", "https://hub.example", "token", windows)
+            docker_install_command("node-win", "https://hub.example", "token", 60, windows)
                 .contains("PowerShell")
         );
+    }
+
+    fn powershell_contains_poll(cmd: &str, interval: u64) -> bool {
+        cmd.contains("$env:METRIA_POLL_INTERVAL") && cmd.contains(&interval.to_string())
     }
 }

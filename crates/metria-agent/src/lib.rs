@@ -10,6 +10,7 @@ pub mod pullserver;
 pub mod runner;
 pub mod scanner;
 pub mod spool;
+pub mod stateless;
 pub mod wire;
 
 pub use config::AgentConfig;

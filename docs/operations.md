@@ -44,6 +44,36 @@ docker compose -f docker/compose.yaml up -d
 - 启动时自动应用版本化迁移（`migrations/N_*.sql`），无需手工执行。
 - 升级前建议先备份。
 
+### 升级顺序（无状态轮询 Agent）
+
+- **先升级 Hub，再升级各节点 Agent**：push 模式 Agent 依赖 Hub 的游标同步接口
+  （`GET/POST /api/v1/collectors/cursors`）；旧版 Hub 上新版 Agent 会明确报错退出（等待升级）。
+- 新版 Agent 首次启动若检测到遗留本地 spool，会自动执行一次性迁移：
+  **先尽力上传积压事件（Hub 确认）→ 再推送本地游标到 Hub → 最后删除本地 spool 文件**。
+  任一步失败会保留现场，下次启动重试；迁移顺序保证「游标只会在数据确认后推进」。
+- 迁移成功后本地 `spool.db` 被删除（可释放数百 MB 磁盘），`metria doctor --spool`
+  将显示「无状态轮询模式：游标存于 Hub」。
+
+### 离线与数据取舍（无状态模式）
+
+- Hub 离线期间 Agent **暂停扫描**并指数退避等待；恢复后拉取最新游标，从断点补扫补齐
+  离线期间新增的数据（Hub 按 event_id 幂等去重，不重复入库）。
+- 离线期间被客户端**轮转或删除**的历史文件对应的数据无法补齐（本地无缓冲），
+  Agent 会在日志中说明；如需零丢失可继续使用 Pull 模式（保留本地 spool）。
+- Hub 永久拒绝的事件（如校验失败）会记录 ERROR 日志（含 event_id 与原因）后跳过，
+  游标继续推进，不会因坏事件阻塞采集。
+
+### 手动清理遗留 spool
+
+若升级 Agent 后因 Hub 长期不可达导致迁移反复失败、spool 占用磁盘：
+
+```bash
+# 1. 确认 Hub 可达且 Hub 侧已有该节点游标（或接受丢弃积压）
+metria doctor --spool   # 查看积压量
+# 2. 停止 Agent 后手动删除（将丢失未上传的积压事件；已上传部分不受影响）
+rm -f /data/spool.db /data/spool.db-wal /data/spool.db-shm
+```
+
 ## 回滚
 
 ```bash

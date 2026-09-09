@@ -36,6 +36,7 @@ metria-storage = { path = "../metria-storage" }
 
 [dev-dependencies]
 metria-agent = { path = "../metria-agent" }
+metria-adapter-api = { path = "../metria-adapter-api" }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 tempfile = "3"
 serde_json = "1" 

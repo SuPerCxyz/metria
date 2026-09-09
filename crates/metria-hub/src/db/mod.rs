@@ -313,6 +313,50 @@ impl HubDb {
         Ok(n)
     }
 
+    /// 列出某 collector 名下全部 Source 游标（无状态轮询采集用）。
+    pub fn list_source_cursors(&self, collector_id: &str) -> Vec<(String, String, String)> {
+        let c = self.conn();
+        let Ok(mut stmt) = c.prepare(
+            "SELECT source_id, cursor_json, updated_at FROM source_cursors WHERE collector_id = ?1 ORDER BY source_id",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([collector_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
+    /// 幂等 upsert 某 collector 的 Source 游标（Agent 确认上传后推进）。
+    pub fn upsert_source_cursors(
+        &self,
+        collector_id: &str,
+        items: &[(String, String)],
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        let ts = now.to_rfc3339();
+        let mut stmt = c
+            .prepare(
+                "INSERT INTO source_cursors (collector_id, source_id, cursor_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(collector_id, source_id) DO UPDATE SET
+                   cursor_json = excluded.cursor_json, updated_at = excluded.updated_at",
+            )
+            .map_err(StorageError::from)?;
+        for (source_id, cursor_json) in items {
+            stmt.execute(params![collector_id, source_id, cursor_json, ts])
+                .map_err(StorageError::from)?;
+        }
+        Ok(())
+    }
+
     /// 为 collector 生成并注册新 token（轮换：吊销旧 token，写入新 token 哈希）。
     pub fn rotate_collector_token(
         &self,
@@ -361,6 +405,7 @@ impl HubDb {
         hub_url: Option<&str>,
         platform: &str,
         architecture: &str,
+        poll_interval_seconds: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<(String, String, String), StorageError> {
         let node_id = format!("node-{}", metria_core::model::Id::new());
@@ -372,8 +417,8 @@ impl HubDb {
             .map_err(|e| StorageError::Serde(format!("labels 序列化失败: {e}")))?;
         let tx = c.unchecked_transaction().map_err(StorageError::from)?;
         tx.execute(
-            "INSERT INTO nodes (id, name, description, labels, ip, hub_url, platform, architecture, status, first_seen_at, last_seen_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?9, ?9, ?9)",
+            "INSERT INTO nodes (id, name, description, labels, ip, hub_url, platform, architecture, poll_interval_seconds, status, first_seen_at, last_seen_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?10, ?10, ?10)",
             params![
                 node_id,
                 name,
@@ -383,6 +428,7 @@ impl HubDb {
                 hub_url,
                 platform,
                 architecture,
+                poll_interval_seconds,
                 ts
             ],
         )
@@ -411,7 +457,7 @@ impl HubDb {
         Ok((node_id, collector_id, plain_token))
     }
 
-    /// 更新节点信息（name/ip/description/labels/hub_url）。返回是否命中。
+    /// 更新节点信息（name/ip/description/labels/hub_url/poll_interval_seconds）。返回是否命中。
     #[allow(clippy::too_many_arguments)]
     pub fn update_node(
         &self,
@@ -423,6 +469,7 @@ impl HubDb {
         hub_url: Option<&str>,
         platform: Option<&str>,
         architecture: Option<&str>,
+        poll_interval_seconds: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<bool, StorageError> {
         let c = self.conn();
@@ -430,7 +477,7 @@ impl HubDb {
             .map_err(|e| StorageError::Serde(format!("labels 序列化失败: {e}")))?;
         let n = c
             .execute(
-                "UPDATE nodes SET name = ?1, description = ?2, labels = ?3, ip = ?4, hub_url = ?5, platform = COALESCE(?6, platform), architecture = COALESCE(?7, architecture), updated_at = ?8 WHERE id = ?9",
+                "UPDATE nodes SET name = ?1, description = ?2, labels = ?3, ip = ?4, hub_url = ?5, platform = COALESCE(?6, platform), architecture = COALESCE(?7, architecture), poll_interval_seconds = COALESCE(?8, poll_interval_seconds), updated_at = ?9 WHERE id = ?10",
                 params![
                     name,
                     description,
@@ -439,6 +486,7 @@ impl HubDb {
                     hub_url,
                     platform,
                     architecture,
+                    poll_interval_seconds,
                     now.to_rfc3339(),
                     node_id
                 ],
@@ -467,6 +515,11 @@ impl HubDb {
         )
         .map_err(StorageError::from)?;
         tx.execute(
+            "DELETE FROM source_cursors WHERE collector_id IN (SELECT id FROM collectors WHERE node_id = ?1)",
+            params![node_id],
+        )
+        .map_err(StorageError::from)?;
+        tx.execute(
             "DELETE FROM collectors WHERE node_id = ?1",
             params![node_id],
         )
@@ -485,7 +538,7 @@ impl HubDb {
             .query_row(
                 "SELECT id, name, description, labels, ip, hub_url, platform, architecture, timezone, status,
                         first_seen_at, last_seen_at, created_at, updated_at,
-                        agent_url, last_pull_at, last_pull_error
+                        agent_url, last_pull_at, last_pull_error, poll_interval_seconds
                  FROM nodes WHERE id = ?1",
                 [node_id],
                 |r| {
@@ -507,6 +560,7 @@ impl HubDb {
                         "agent_url": r.get::<_, Option<String>>(14)?,
                         "last_pull_at": r.get::<_, Option<String>>(15)?,
                         "last_pull_error": r.get::<_, Option<String>>(16)?,
+                        "poll_interval_seconds": r.get::<_, Option<i64>>(17)?,
                     }))
                 },
             )

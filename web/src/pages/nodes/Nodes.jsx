@@ -235,6 +235,7 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
   const [agentUrl, setAgentUrl] = useState('')
   const [platform, setPlatform] = useState('linux')
   const [architecture, setArchitecture] = useState('amd64')
+  const [pollInterval, setPollInterval] = useState('')
 
   const submit = (e) => {
     e.preventDefault()
@@ -253,6 +254,7 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
         agent_url: agentUrlForSubmit(agentUrl) || undefined,
         platform,
         architecture,
+        poll_interval_seconds: pollInterval ? Number(pollInterval) : undefined,
       }),
     })
       .then((data) => onCreated(data))
@@ -285,6 +287,11 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
             <Label>Agent 地址（Pull 模式，可选）</Label>
             <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="203.0.113.10:8090" />
             <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写 IP 或域名，可选端口（不需要填写 http://）；Hub 将主动访问该地址拉取数据。留空则使用传统 Push 模式。</p>
+          </div>
+          <div>
+            <Label>上报间隔（秒，可选）</Label>
+            <TextInput type="number" min="5" value={pollInterval} onChange={(e) => setPollInterval(e.target.value)} placeholder="默认 60" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">Agent 轮询采集周期（5~86400 秒），随安装命令注入 METRIA_POLL_INTERVAL 生效。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
@@ -403,6 +410,7 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
   const [agentUrl, setAgentUrl] = useState(fmtAgentAddress(node.agent_url))
   const [platform, setPlatform] = useState(node.platform || 'linux')
   const [architecture, setArchitecture] = useState(node.architecture === 'aarch64' ? 'arm64' : (node.architecture || 'amd64'))
+  const [pollInterval, setPollInterval] = useState(node.poll_interval_seconds ? String(node.poll_interval_seconds) : '')
 
   function parseLabels(v) {
     if (!v) return ''
@@ -431,6 +439,8 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
         agent_url: agentUrlForSubmit(agentUrl, node.agent_url) || (node.agent_url ? '' : undefined),
         platform,
         architecture,
+        // 清空 = 恢复默认 60；留空创建时由后端取默认值
+        poll_interval_seconds: pollInterval ? Number(pollInterval) : 60,
       }),
     })
       .then(() => onSaved())
@@ -462,6 +472,11 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
             <Label>Agent 地址（Pull 模式）</Label>
             <TextInput value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} placeholder="203.0.113.10:8090" />
             <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">填写 IP 或域名，可选端口（不需要填写 http://）；填写后 Hub 主动拉取该节点。清空并保存则切回 Push 模式。</p>
+          </div>
+          <div>
+            <Label>上报间隔（秒）</Label>
+            <TextInput type="number" min="5" value={pollInterval} onChange={(e) => setPollInterval(e.target.value)} placeholder="默认 60" />
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">Agent 轮询采集周期（5~86400 秒），重新生成安装命令并更新 Agent 配置后生效。</p>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>

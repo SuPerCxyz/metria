@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use metria_protocol::{
-    HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse, UploadBatch,
-    UploadResponse,
+    CursorEntry, CursorSyncRequest, CursorSyncResponse, HeartbeatRequest, HeartbeatResponse,
+    RegisterRequest, RegisterResponse, UploadBatch, UploadResponse,
 };
 
 use crate::error::{AgentError, Result};
@@ -78,14 +78,48 @@ impl HubClient {
             .set("Content-Type", "application/json")
             .set("Content-Encoding", "zstd")
             .apply_auth(self.token.as_deref())
-            .send_bytes(&compressed)
-            .map_err(|e| AgentError::Http(format!("upload 失败: {e}")))?;
+            .send_bytes(&compressed);
+        // 413：批次过大（压缩后超限），调用方可据此拆批重试
+        let resp = match resp {
+            Ok(r) => r,
+            Err(ureq::Error::Status(413, _)) => return Err(AgentError::BatchTooLarge),
+            Err(e) => return Err(AgentError::Http(format!("upload 失败: {e}"))),
+        };
         let status = resp.status();
         if status == 413 {
-            return Err(AgentError::Http("批次过大被拒绝 (413)".into()));
+            return Err(AgentError::BatchTooLarge);
         }
         resp.into_json::<UploadResponse>()
             .map_err(|e| AgentError::Http(format!("upload 响应解析失败 (status {status}): {e}")))
+    }
+
+    /// 拉取当前 collector 全部 Source 游标；Hub 不支持（404）时返回 None。
+    pub fn fetch_cursors(&self) -> Result<Option<Vec<CursorEntry>>> {
+        match self.request("GET", "/collectors/cursors").call() {
+            Ok(resp) => {
+                let parsed: CursorSyncResponse = resp
+                    .into_json()
+                    .map_err(|e| AgentError::Http(format!("游标响应解析失败: {e}")))?;
+                Ok(Some(parsed.cursors))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(AgentError::Http(format!("拉取游标失败: {e}"))),
+        }
+    }
+
+    /// 推进游标（事件确认上传后调用；幂等 upsert）。
+    pub fn push_cursors(&self, cursors: &[CursorEntry]) -> Result<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let body = CursorSyncRequest {
+            schema_version: metria_protocol::limits::SCHEMA_VERSION,
+            cursors: cursors.to_vec(),
+        };
+        self.request("POST", "/collectors/cursors")
+            .send_json(serde_json::to_value(&body).map_err(|e| AgentError::Serde(e.to_string()))?)
+            .map_err(|e| AgentError::Http(format!("推进游标失败: {e}")))?;
+        Ok(())
     }
 
     /// 健康检查。

@@ -18,6 +18,10 @@ pub mod limits {
     pub const MAX_JSON_DEPTH: usize = 32;
     /// 单条事件最大字节数。
     pub const MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
+    /// 单次游标同步最大条目数。
+    pub const MAX_CURSORS_PER_SYNC: usize = 256;
+    /// 单条游标 JSON 最大字节数。
+    pub const MAX_CURSOR_JSON_BYTES: usize = 64 * 1024;
 }
 
 /// Collector 注册请求。
@@ -62,6 +66,55 @@ pub struct HeartbeatResponse {
     pub ok: bool,
     /// 采集器配置覆盖（可选）。
     pub config: Option<CollectorConfig>,
+}
+
+/// 一条 Source 游标（Hub 存储形态；cursor_json 对 Hub 不透明）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorEntry {
+    pub source_id: String,
+    pub cursor_json: String,
+    pub updated_at: Option<String>,
+}
+
+/// 游标推进请求（Agent 确认上传后提交；幂等 upsert）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorSyncRequest {
+    pub schema_version: u32,
+    pub cursors: Vec<CursorEntry>,
+}
+
+/// 游标读取/推进响应。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CursorSyncResponse {
+    pub cursors: Vec<CursorEntry>,
+}
+
+/// 校验游标同步请求基本合法性（返回错误信息）。
+pub fn validate_cursor_sync(req: &CursorSyncRequest) -> Result<(), String> {
+    if req.schema_version != limits::SCHEMA_VERSION {
+        return Err(format!("不支持的 schema_version: {}", req.schema_version));
+    }
+    if req.cursors.len() > limits::MAX_CURSORS_PER_SYNC {
+        return Err(format!(
+            "游标条目 {} 超过上限 {}",
+            req.cursors.len(),
+            limits::MAX_CURSORS_PER_SYNC
+        ));
+    }
+    for c in &req.cursors {
+        if c.source_id.trim().is_empty() {
+            return Err("source_id 为空".into());
+        }
+        if c.cursor_json.len() > limits::MAX_CURSOR_JSON_BYTES {
+            return Err(format!(
+                "游标 {} 超过大小上限（{} > {} 字节）",
+                c.source_id,
+                c.cursor_json.len(),
+                limits::MAX_CURSOR_JSON_BYTES
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Hub 下发的采集器配置。
