@@ -24,9 +24,11 @@ use metria_storage::rusqlite::types::Value as SqlValue;
 pub mod handlers_cursor;
 pub mod handlers_misc;
 pub mod handlers_query;
+pub mod handlers_report;
 pub mod oidc;
 use handlers_misc::*;
 use handlers_query::*;
+use handlers_report::*;
 
 /// 应用状态。
 #[derive(Debug, Clone)]
@@ -193,6 +195,12 @@ pub fn app_router(state: AppState) -> Router {
             axum::routing::put(pricing_rule_update).delete(pricing_rule_delete),
         )
         .route("/api/v1/pricing/test", post(pricing_test))
+        .route(
+            "/api/v1/settings/report",
+            get(report_settings_get).put(report_settings_put),
+        )
+        .route("/api/v1/settings/report/test", post(report_settings_test))
+        .route("/api/v1/settings/report/history", get(report_history))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_mw))
         .layer(TraceLayer::new_for_http())
@@ -880,7 +888,7 @@ async fn system_info(State(st): State<AppState>, headers: axum::http::HeaderMap)
     Json(serde_json::json!({
         "content_mode": content_mode,
         "content_mode_label": content_mode_label,
-        "timezone": st.cfg.timezone.name(),
+        "timezone": crate::report::effective_timezone_name(&st.db, &st.cfg),
         "auth_mode": auth_mode,
         "retention": {
             "automatic_cleanup": false,

@@ -32,6 +32,17 @@ pub struct UserProfile {
     pub role: String,
 }
 
+/// 一条报告发送记录。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportSendRow {
+    pub kind: String,
+    pub period: String,
+    pub channel: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
 impl HubDb {
     pub fn open(cfg: &HubConfig) -> Result<Self, StorageError> {
         let path = cfg
@@ -193,6 +204,109 @@ impl HubDb {
             .map_err(StorageError::from)?;
         }
         Ok(())
+    }
+
+    // ---------- 设置与报告 ----------
+
+    /// 读取单个设置项。
+    pub fn setting_get(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let c = self.conn();
+        c.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(StorageError::from)
+    }
+
+    /// 写入单个设置项（upsert）。
+    pub fn setting_set(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        self.settings_set_many(&[(key, value.to_string())])
+    }
+
+    /// 批量写入设置项（单事务）。
+    pub fn settings_set_many(&self, pairs: &[(&str, String)]) -> Result<(), StorageError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            )?;
+            for (k, v) in pairs {
+                stmt.execute(params![k, v, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 记录一次报告发送（一个渠道一行）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_report_send(
+        &self,
+        kind: &str,
+        period: &str,
+        channel: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO report_sends (id, kind, period, channel, status, detail, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                metria_core::model::Id::new().as_str().to_string(),
+                kind,
+                period,
+                channel,
+                status,
+                detail,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 某周期是否已成功发送过（用于重启防重发）。
+    pub fn report_period_sent(&self, kind: &str, period: &str) -> Result<bool, StorageError> {
+        let c = self.conn();
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM report_sends WHERE kind = ?1 AND period = ?2 AND status = 'success'",
+            params![kind, period],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 最近发送记录（按时间倒序）。
+    pub fn recent_report_sends(&self, limit: i64) -> Result<Vec<ReportSendRow>, StorageError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT kind, period, channel, status, detail, created_at FROM report_sends ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                Ok(ReportSendRow {
+                    kind: r.get(0)?,
+                    period: r.get(1)?,
+                    channel: r.get(2)?,
+                    status: r.get(3)?,
+                    detail: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 全部已登录/已存在的用户名（用于收件人解析回退）。
+    pub fn usernames(&self) -> Result<Vec<String>, StorageError> {
+        let c = self.conn();
+        let mut stmt = c.prepare("SELECT username FROM users ORDER BY created_at")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
     }
 
     // ---------- 身份 ----------

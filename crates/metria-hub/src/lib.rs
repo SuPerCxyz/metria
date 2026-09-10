@@ -11,6 +11,7 @@ pub mod demo;
 pub mod export;
 pub mod http;
 pub mod pull;
+pub mod report;
 pub mod rollup;
 pub mod share;
 
@@ -98,6 +99,9 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
     // Pull 调度：对配置了 Agent 地址的节点主动拉取（无配置时仅空转）
     crate::pull::spawn_pull_scheduler(state.clone());
+
+    // 报告调度：每日/每周/每月三个独立周期任务（未启用时空转）
+    crate::report::scheduler::spawn_report_scheduler(state.db.clone(), state.cfg.clone());
 
     let app = api::app_router(state)
         .layer(TraceLayer::new_for_http())

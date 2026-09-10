@@ -30,6 +30,7 @@
 | 首页排行与趋势联动修复：排行排序、图例筛选同步汇总、移除需要关注区块 | ✅ 完成 | 2026-09-07 |
 | 跨平台 Agent 资产与 CI Node24：Hub 内置下载、Linux/Windows 目标选择、原生安装持久化、Docker 命令复制、Action 运行时升级 | ✅ 完成 | 2026-09-07 |
 | Agent 无状态轮询：游标外置 Hub、事件确认后推进、离线补齐、spool 迁移（OpenSpec `stateless-polling-agent`） | ✅ 完成 | 2026-09-09 |
+| 用量报告：设置页配置全局时区/收件人/SMTP/通用 Webhook、日/周/月三独立调度、测试发送与历史；邮件含内联趋势图（Token/请求数/模型/Agent）、加宽 760px（OpenSpec `add-usage-reports`） | 🟡 实现完成，真实 SMTP + 内联图表已验证，待提交/部署 | 2026-09-10 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
