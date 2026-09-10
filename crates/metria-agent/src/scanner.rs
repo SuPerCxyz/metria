@@ -61,6 +61,26 @@ impl Scanner {
                 Box::new(metria_adapter_opencode::OpenCodeAdapter),
             ),
         ];
+        // 根目录缺失只会静默跳过；这里显式警告，避免配置丢失导致空转无感知
+        let missing: Vec<&str> = adapters
+            .iter()
+            .filter(|(client, _)| cfg.client_root(client).is_none())
+            .map(|(client, _)| *client)
+            .collect();
+        for client in &missing {
+            let var = match *client {
+                "claude-code" => "METRIA_CLAUDE_PATH",
+                "codex" => "METRIA_CODEX_PATH",
+                "opencode" => "METRIA_OPENCODE_PATH",
+                _ => "对应 METRIA_*_PATH",
+            };
+            tracing::warn!("未配置 {client} 采集目录（{var}），将跳过该客户端采集");
+        }
+        if missing.len() == adapters.len() {
+            tracing::error!(
+                "未配置任何采集目录（{missing:?}），Agent 不会采集任何数据，请检查 METRIA_*_PATH 环境变量"
+            );
+        }
         Self {
             adapters,
             identity,
