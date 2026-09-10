@@ -250,7 +250,7 @@ export default function ReportSettings() {
           <ScheduleRow label="每月" hint="汇总上一自然月" sched={draft.schedules.monthly} onChange={(p) => setSched('monthly', p)} monthly />
         </div>
         <div className="mt-4 border-t border-gray-100 dark:border-gray-700/60 pt-4">
-          <Toggle checked={draft.attachments_enabled} onChange={(v) => set('attachments_enabled', v)} label="邮件附带图表/PDF（后续版本生效）" />
+          <Toggle checked={draft.attachments_enabled} onChange={(v) => set('attachments_enabled', v)} label="邮件附带图表与 PDF" />
         </div>
       </div>
 

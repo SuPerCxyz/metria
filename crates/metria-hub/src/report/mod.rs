@@ -5,6 +5,7 @@
 pub mod aggregate;
 pub mod channels;
 pub mod charts;
+pub mod pdf;
 pub mod render;
 pub mod scheduler;
 

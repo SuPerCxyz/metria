@@ -30,6 +30,8 @@ hkdf = "0.12"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls", "hostname"] }
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "area_series", "ab_glyph"] }
+printpdf = { version = "0.7", default-features = false, features = ["embedded_images"] }
+image = { version = "0.24", default-features = false, features = ["png"] }
 metria-core = { path = "../metria-core" }
 metria-pricing = { path = "../metria-pricing" }
 metria-traffic = { path = "../metria-traffic" }

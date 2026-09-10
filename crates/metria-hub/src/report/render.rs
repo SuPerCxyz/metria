@@ -27,11 +27,11 @@ const C_REPORTED: &str = "#6366f1";
 const C_CALCULATED: &str = "#10b981";
 const C_ESTIMATED: &str = "#f59e0b";
 
-fn usd(micro: i64) -> String {
+pub(super) fn usd(micro: i64) -> String {
     format!("${:.4}", micro as f64 / 1_000_000.0)
 }
 
-fn bytes_human(b: i64) -> String {
+pub(super) fn bytes_human(b: i64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -47,7 +47,7 @@ fn bytes_human(b: i64) -> String {
     }
 }
 
-fn n(v: i64) -> String {
+pub(super) fn n(v: i64) -> String {
     let s = v.abs().to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {

@@ -12,6 +12,7 @@ use plotters::style::RGBColor;
 use super::aggregate::{self, aggregate, ChartSeries, ReportMetrics};
 use super::channels::{send_email, send_webhook};
 use super::charts;
+use super::pdf;
 use super::render::{render_html, render_text, webhook_payload, ReportChart, ReportMeta};
 use super::{
     effective_timezone, effective_timezone_name, load_config, period_and_due, period_label,
@@ -41,7 +42,11 @@ pub async fn dispatch(
     };
     let metrics = aggregate(db, from, to, 8);
     let tz = effective_timezone(db, hub_cfg);
-    let charts = build_charts(db, from, to, tz, &metrics);
+    let charts = if cfg.attachments_enabled {
+        build_charts(db, from, to, tz, &metrics)
+    } else {
+        Vec::new()
+    };
     let html = render_html(&metrics, &meta, &charts);
     let text = render_text(&metrics, &meta);
     let payload = webhook_payload(&metrics, &meta);
@@ -61,9 +66,20 @@ pub async fn dispatch(
             let smtp = cfg.smtp.clone();
             let (html_c, text_c) = (html.clone(), text.clone());
             let charts_c = charts.clone();
+            let pdf_c = if cfg.attachments_enabled {
+                match pdf::render_pdf(&metrics, &meta, &charts) {
+                    Ok(bytes) => Some((format!("metria-report-{kind}-{period}.pdf"), bytes)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "PDF 生成失败，本次仅发送 HTML 邮件");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let rc = recipients.clone();
             let res = tokio::task::spawn_blocking(move || {
-                send_email(&smtp, &rc, &subject, &html_c, &text_c, &charts_c)
+                send_email(&smtp, &rc, &subject, &html_c, &text_c, &charts_c, pdf_c)
             })
             .await;
             outcomes.push(outcome_from("email", res));

@@ -3,7 +3,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -11,12 +11,14 @@ use metria_hub::config::HubConfig;
 use metria_hub::db::HubDb;
 use metria_hub::report;
 
-/// 最小 SMTP 接收端：接受一次会话并记录是否收到 DATA。
-fn spawn_smtp_sink() -> (u16, Arc<AtomicBool>) {
+/// 最小 SMTP 接收端：接受一次会话，记录是否收到 DATA，并捕获 DATA 载荷原文。
+fn spawn_smtp_sink() -> (u16, Arc<AtomicBool>, Arc<Mutex<Vec<u8>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let got = Arc::new(AtomicBool::new(false));
     let flag = got.clone();
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let cap = captured.clone();
     thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -35,6 +37,7 @@ fn spawn_smtp_sink() -> (u16, Arc<AtomicBool>) {
                         let _ = writer.write_all(b"250 OK\r\n");
                     } else {
                         flag.store(true, Ordering::SeqCst);
+                        cap.lock().unwrap().extend_from_slice(line.as_bytes());
                     }
                     continue;
                 }
@@ -53,7 +56,7 @@ fn spawn_smtp_sink() -> (u16, Arc<AtomicBool>) {
             }
         }
     });
-    (port, got)
+    (port, got, captured)
 }
 
 /// 最小 HTTP 接收端：收到带 body 的 POST 即置位。
@@ -140,7 +143,7 @@ fn config_webhook(port: u16) -> report::ReportConfig {
 #[tokio::test]
 async fn email_and_webhook_delivered() {
     let (db, cfg, _dir) = temp_db();
-    let (smtp_port, email_got) = spawn_smtp_sink();
+    let (smtp_port, email_got, captured) = spawn_smtp_sink();
     let (http_port, hook_got) = spawn_http_sink();
     let mut rc = config_email(smtp_port);
     rc.webhook_enabled = true;
@@ -169,6 +172,52 @@ async fn email_and_webhook_delivered() {
     thread::sleep(Duration::from_millis(200));
     assert!(email_got.load(Ordering::SeqCst), "SMTP 未收到 DATA");
     assert!(hook_got.load(Ordering::SeqCst), "Webhook 未收到 body");
+    let raw = {
+        let guard = captured.lock().unwrap();
+        String::from_utf8_lossy(&guard[..]).to_string()
+    };
+    assert!(
+        raw.contains("application/pdf"),
+        "邮件应包含 PDF 附件: {raw}"
+    );
+    assert!(
+        raw.to_lowercase()
+            .contains("content-disposition: attachment"),
+        "应为附件而非内联: {raw}"
+    );
+    assert!(raw.contains(".pdf"), "附件应有 .pdf 文件名: {raw}");
+}
+
+#[tokio::test]
+async fn attachments_disabled_omits_pdf() {
+    let (db, cfg, _dir) = temp_db();
+    let (smtp_port, email_got, captured) = spawn_smtp_sink();
+    let mut rc = config_email(smtp_port);
+    rc.attachments_enabled = false;
+    report::save_config(&db, &rc).unwrap();
+
+    let outcomes = report::scheduler::dispatch(
+        &db,
+        &cfg,
+        "test",
+        "test-noatt",
+        "测试（上一自然日）",
+        chrono::Utc::now() - chrono::Duration::days(1),
+        chrono::Utc::now(),
+    )
+    .await;
+
+    assert!(outcomes.iter().any(|o| o.channel == "email" && o.ok));
+    thread::sleep(Duration::from_millis(200));
+    assert!(email_got.load(Ordering::SeqCst));
+    let raw = {
+        let guard = captured.lock().unwrap();
+        String::from_utf8_lossy(&guard[..]).to_string()
+    };
+    assert!(
+        !raw.contains("application/pdf"),
+        "关闭附件后不应有 PDF: {raw}"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +261,7 @@ async fn email_failure_isolated_from_webhook() {
 #[tokio::test]
 async fn success_records_history_and_marks_period_sent() {
     let (db, cfg, _dir) = temp_db();
-    let (smtp_port, _got) = spawn_smtp_sink();
+    let (smtp_port, _got, _cap) = spawn_smtp_sink();
     report::save_config(&db, &config_email(smtp_port)).unwrap();
     let now = chrono::Utc::now();
     let outcomes = report::scheduler::dispatch(
