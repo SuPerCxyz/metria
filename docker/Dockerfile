@@ -86,7 +86,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /home/metria --create-home metria \
     && mkdir -p /data \
-    && chown -R metria:metria /data /home/metria
+    && chown -R metria:metria /home/metria \
+    && chmod 0777 /data
 COPY --from=build /src/target/release/metria /app/metria
 COPY --from=build /src/agent-binaries /app/agent-binaries
 ENV METRIA_AGENT_BINARIES_DIR=/app/agent-binaries
