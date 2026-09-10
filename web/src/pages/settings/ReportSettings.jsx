@@ -329,7 +329,7 @@ function ScheduleRow({ label, hint, sched, onChange, weekly = false, monthly = f
         <input type="time" value={sched.time} onChange={(e) => onChange({ time: e.target.value })} className={inputCls} />
       </label>
       {weekly && (
-        <label>
+        <label className="block w-28 shrink-0">
           <Label>周几</Label>
           <select value={sched.weekday ?? 0} onChange={(e) => onChange({ weekday: Number(e.target.value) })} className={inputCls}>
             {WEEKDAYS.map((w, i) => (
@@ -341,7 +341,7 @@ function ScheduleRow({ label, hint, sched, onChange, weekly = false, monthly = f
         </label>
       )}
       {monthly && (
-        <label>
+        <label className="block w-24 shrink-0">
           <Label>几号（1–28）</Label>
           <input type="number" min={1} max={28} value={sched.day ?? 1} onChange={(e) => onChange({ day: Number(e.target.value) })} className={inputCls} />
         </label>

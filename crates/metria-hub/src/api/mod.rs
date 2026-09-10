@@ -731,9 +731,16 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
             )
         }
     };
+    let oidc_email = st
+        .cfg
+        .oidc
+        .as_ref()
+        .filter(|_| username.contains('@'))
+        .map(|_| username.clone());
     match st.db.user_profile(&username) {
         Ok(Some(p)) => Json(serde_json::json!({
             "username": p.username,
+            "email": oidc_email,
             "display_name": p.display_name,
             "avatar_text": p.avatar_text,
             "avatar_color": p.avatar_color,
@@ -744,6 +751,7 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
         .into_response(),
         Ok(None) => Json(serde_json::json!({
             "username": username,
+            "email": oidc_email,
             "display_name": null,
             "avatar_text": null,
             "avatar_color": "indigo",

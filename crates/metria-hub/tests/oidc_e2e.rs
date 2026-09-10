@@ -329,7 +329,22 @@ async fn oidc_full_flow_issues_session_for_allowed_user() {
         .into_json()
         .unwrap();
     assert_eq!(me["username"], OWNER_EMAIL);
+    assert_eq!(me["email"], OWNER_EMAIL);
     assert_eq!(me["ok"], true);
+
+    let updated: Value = ureq::put(&format!("{hub}/api/v1/auth/profile"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(json!({
+            "username": "renamed-user",
+            "email": "renamed@example.com",
+            "display_name": "OIDC 用户"
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(updated["username"], OWNER_EMAIL);
+    assert_eq!(updated["email"], OWNER_EMAIL);
+    assert_eq!(updated["display_name"], "OIDC 用户");
 
     // 4. 交换码一次性：重放拒绝
     let replay = ureq::post(&format!("{hub}/api/v1/auth/oidc/exchange"))

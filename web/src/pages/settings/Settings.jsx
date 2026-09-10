@@ -407,6 +407,7 @@ export default function Settings() {
           loading={accountLoading}
           error={accountError}
           profile={profile}
+          authMode={systemInfo?.auth_mode}
           profileDraft={profileDraft}
           setProfileDraft={setProfileDraft}
           saveProfile={saveProfile}
@@ -440,9 +441,11 @@ function TextField({ value, onChange, placeholder, maxLength, type = 'text', rea
   )
 }
 
-function AccountSettings({ loading, error, profile, profileDraft, setProfileDraft, saveProfile, profileSaving, passwordDraft, setPasswordDraft, changePassword, passwordSaving, colors }) {
+function AccountSettings({ loading, error, profile, authMode, profileDraft, setProfileDraft, saveProfile, profileSaving, passwordDraft, setPasswordDraft, changePassword, passwordSaving, colors }) {
   if (loading) return <LoadingSkeleton rows={4} />
   if (!profile) return <ErrorState error={error || '账户资料加载失败'} />
+  const oidcManaged = authMode === 'oidc' || authMode === 'oidc+password'
+  const oidcEmail = profile.email || (oidcManaged && profile.username.includes('@') ? profile.username : '')
   return (
     <div className="space-y-4">
       <form onSubmit={saveProfile} className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
@@ -454,11 +457,24 @@ function AccountSettings({ loading, error, profile, profileDraft, setProfileDraf
           <UserAvatar user={{ ...profile, ...profileDraft }} size="lg" />
         </div>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <label>
-            <FieldLabel>用户名</FieldLabel>
-            <TextField value={profile.username} readOnly />
-            <span className="mt-1 block text-xs text-gray-400 dark:text-gray-500">单 Admin 账户，用户名不可修改。</span>
-          </label>
+          <div>
+            <label>
+              <FieldLabel>用户名</FieldLabel>
+              <TextField value={profile.username} readOnly />
+            </label>
+            <span className="mt-1 block text-xs text-gray-400 dark:text-gray-500">
+              {oidcManaged ? '用户名和邮箱由 OIDC 身份提供商管理，不能在此修改。' : '单 Admin 账户，用户名不可修改。'}
+            </span>
+          </div>
+          {oidcManaged && (
+            <div>
+              <label>
+                <FieldLabel>邮箱</FieldLabel>
+                <TextField value={oidcEmail} readOnly placeholder="身份提供商未返回邮箱" />
+              </label>
+              <span className="mt-1 block text-xs text-gray-400 dark:text-gray-500">请在 OIDC 身份提供商中修改邮箱。</span>
+            </div>
+          )}
           <label>
             <FieldLabel>显示名称</FieldLabel>
             <TextField value={profileDraft.display_name} onChange={(e) => setProfileDraft((d) => ({ ...d, display_name: e.target.value }))} placeholder="例如：管理员" maxLength={64} />
