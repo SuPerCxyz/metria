@@ -279,7 +279,7 @@ export default function Overview() {
           <>
             {dim !== 'all' && trendData.datasets.length > 0 && (
               <div className="mb-3">
-                <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto items-start">
+                <div className="flex flex-wrap gap-x-2.5 gap-y-2 max-h-28 overflow-y-auto items-center">
                   {trendData.datasets.map((d, i) => {
                     const hidden = hiddenDimensions.includes(d.label)
                     return (
@@ -287,15 +287,13 @@ export default function Overview() {
                         key={d.label}
                         type="button"
                         onClick={() => toggleHiddenDimension(d.label)}
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                          hidden
-                            ? 'border-gray-200 dark:border-gray-700 text-gray-400 dark:text-gray-500 line-through opacity-60'
-                            : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/40'
-                        }`}
+                        className="inline-flex items-center text-xs font-medium cursor-pointer"
                         title={hidden ? '点击恢复该维度' : '点击隐藏该维度（汇总卡片将排除其数据）'}
                       >
-                        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: CHART_PALETTE[i % CHART_PALETTE.length] }} />
-                        <span className="max-w-48 truncate">{d.label}</span>
+                        <span className="inline-block shrink-0" style={{ width: 40, height: 12, backgroundColor: CHART_PALETTE[i % CHART_PALETTE.length] }} />
+                        <span className={`ml-1.5 max-w-48 truncate ${hidden ? 'text-gray-400 dark:text-gray-500 line-through opacity-60' : 'text-[#666] hover:opacity-70'}`}>
+                          {d.label}
+                        </span>
                       </button>
                     )
                   })}
