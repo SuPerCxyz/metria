@@ -11,9 +11,10 @@ import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { fmtDateTime, fmtUsd } from '../../services/format'
 import { EMPTY_RULE_DRAFT, PRICE_FIELDS, serializeRuleDraft } from '../../services/pricing'
+import ReportSettings from './ReportSettings'
 
-const TABS = ['模型价格', '数据保留', '节点接入', '系统设置']
-const TAB_KEYS = { pricing: '模型价格', retention: '数据保留', nodes: '节点接入', system: '系统设置' }
+const TABS = ['模型价格', '数据保留', '节点接入', '用量报告', '系统设置']
+const TAB_KEYS = { pricing: '模型价格', retention: '数据保留', nodes: '节点接入', report: '用量报告', system: '系统设置' }
 const AVATAR_COLORS = ['indigo', 'emerald', 'amber', 'rose', 'sky', 'violet']
 
 const KIND_LABEL = { openrouter: 'OpenRouter', litellm: 'LiteLLM', custom: '自定义', builtin: '内置' }
@@ -398,6 +399,8 @@ export default function Settings() {
           <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">进入节点管理后，点击“添加节点”即可获取 Docker 或原生 Agent 安装命令。</p>
         </div>
       )}
+
+      {tab === '用量报告' && <ReportSettings />}
 
       {tab === '系统设置' && (
         <AccountSettings
