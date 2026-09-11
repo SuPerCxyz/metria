@@ -1354,7 +1354,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metria-adapter-api"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-core",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "metria-adapter-claude"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-adapter-api",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "metria-adapter-codex"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-adapter-api",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "metria-adapter-opencode"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-adapter-api",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "metria-agent"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ctrlc",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "metria-cli"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "metria-core"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "metria-hub"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "metria-pricing"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-core",
@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "metria-protocol"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-core",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "metria-storage"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "metria-traffic"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "metria-core",
