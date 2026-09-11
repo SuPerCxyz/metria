@@ -44,6 +44,8 @@ pub struct ReportSendRow {
     pub created_at: String,
 }
 
+const REPORT_HISTORY_LIMIT: i64 = 30;
+
 impl HubDb {
     pub fn open(cfg: &HubConfig) -> Result<Self, StorageError> {
         let path = cfg
@@ -259,8 +261,9 @@ impl HubDb {
         status: &str,
         detail: Option<&str>,
     ) -> Result<(), StorageError> {
-        let c = self.conn();
-        c.execute(
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute(
             "INSERT INTO report_sends (id, kind, period, channel, status, detail, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 metria_core::model::Id::new().as_str().to_string(),
@@ -272,6 +275,14 @@ impl HubDb {
                 Utc::now().to_rfc3339()
             ],
         )?;
+        tx.execute(
+            "DELETE FROM report_sends WHERE rowid NOT IN (
+                 SELECT rowid FROM report_sends
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?1
+             )",
+            [REPORT_HISTORY_LIMIT],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -286,16 +297,11 @@ impl HubDb {
         Ok(n > 0)
     }
 
-    /// 最近是否已经尝试过该周期，防止失败渠道每分钟重复投递。
-    pub fn report_period_attempted_since(
-        &self,
-        kind: &str,
-        period: &str,
-        since: &str,
-    ) -> Result<bool, StorageError> {
+    /// 是否已经尝试过该周期，失败后也不再自动重试。
+    pub fn report_period_attempted(&self, kind: &str, period: &str) -> Result<bool, StorageError> {
         let n: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM report_sends WHERE kind = ?1 AND period = ?2 AND created_at >= ?3",
-            params![kind, period, since],
+            "SELECT COUNT(*) FROM report_sends WHERE kind = ?1 AND period = ?2",
+            params![kind, period],
             |r| r.get(0),
         )?;
         Ok(n > 0)

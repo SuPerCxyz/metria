@@ -2,24 +2,21 @@
 
 use std::time::Duration;
 
-use lettre::message::header::{ContentDisposition, ContentType};
-use lettre::message::{Mailbox, MultiPart, SinglePart};
+use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{Message, SmtpTransport, Transport};
 
-use super::render::ReportChart;
 use super::{SmtpConfig, WebhookConfig};
 
-/// 发送邮件（HTML + 纯文本，图表以 CID 内联，可选 PDF 附件）。同步实现，调用方应在 `spawn_blocking` 中运行。
+/// 发送邮件（HTML + 纯文本，图表以内嵌 SVG 放在 HTML 正文中，不附带 PDF）。
+/// 同步实现，调用方应在 `spawn_blocking` 中运行。
 pub fn send_email(
     smtp: &SmtpConfig,
     recipients: &[String],
     subject: &str,
     html: &str,
     text: &str,
-    _charts: &[ReportChart],
-    pdf: Option<(String, Vec<u8>)>,
 ) -> Result<(), String> {
     if smtp.host.trim().is_empty() {
         return Err("未配置 SMTP 服务器地址".into());
@@ -45,22 +42,9 @@ pub fn send_email(
         builder = builder.to(mb);
     }
     let alternative = MultiPart::alternative_plain_html(text.to_string(), html.to_string());
-    // 图表已经作为内嵌 SVG 在 HTML 正文中，不再生成 CID 图片部分。
-    let body = alternative;
-    let email = match pdf {
-        Some((filename, bytes)) => {
-            let attachment = SinglePart::builder()
-                .header(ContentType::parse("application/pdf").map_err(|e| e.to_string())?)
-                .header(ContentDisposition::attachment(&filename))
-                .body(bytes);
-            builder
-                .multipart(MultiPart::mixed().multipart(body).singlepart(attachment))
-                .map_err(|e| format!("构造邮件失败: {e}"))?
-        }
-        None => builder
-            .multipart(body)
-            .map_err(|e| format!("构造邮件失败: {e}"))?,
-    };
+    let email = builder
+        .multipart(alternative)
+        .map_err(|e| format!("构造邮件失败: {e}"))?;
 
     let mut tbuilder = SmtpTransport::builder_dangerous(smtp.host.trim()).port(smtp.port);
     match smtp.tls.as_str() {
@@ -116,7 +100,7 @@ mod tests {
     #[test]
     fn email_requires_host_and_recipient() {
         let smtp = SmtpConfig::default();
-        assert!(send_email(&smtp, &["a@b.com".into()], "s", "<p></p>", " ", &[], None).is_err());
+        assert!(send_email(&smtp, &["a@b.com".into()], "s", "<p></p>", " ").is_err());
     }
 
     #[test]

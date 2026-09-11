@@ -12,7 +12,12 @@ use printpdf::path::PaintMode;
 use printpdf::*;
 
 use super::aggregate::{DimCount, ReportMetrics};
-use super::render::{bytes_human, n, usd, ReportChart, ReportMeta};
+use super::render::{
+    bytes_human, chart_palette, n, usd, ReportChart, ReportMeta, C_CACHE_R, C_CACHE_W,
+    C_CALCULATED, C_ESTIMATED, C_INPUT, C_OUTPUT, C_REASON, C_REPORTED, REPORT_BORDER,
+    REPORT_BRAND, REPORT_BRAND_LIGHT, REPORT_BRAND_SUB, REPORT_CARD, REPORT_FAINT, REPORT_INK,
+    REPORT_MUTED, REPORT_SECTION, REPORT_SURFACE, REPORT_TRACK, REPORT_WARNING, REPORT_WARNING_BG,
+};
 
 const A4_W: f32 = 210.0;
 const A4_H: f32 = 297.0;
@@ -24,22 +29,6 @@ const PT_MM: f32 = 0.352_777_8;
 
 static FONT_REGULAR: &[u8] = include_bytes!("../../assets/report-font.ttf");
 static FONT_BOLD: &[u8] = include_bytes!("../../assets/report-font-bold.ttf");
-
-const INK: &str = "#1f2937";
-const MUTED: &str = "#6b7280";
-const FAINT: &str = "#9ca3af";
-const BORDER: &str = "#e5e7eb";
-const BG: &str = "#f9fafb";
-const BRAND: &str = "#4f46e5";
-
-const C_INPUT: &str = "#6366f1";
-const C_OUTPUT: &str = "#10b981";
-const C_CACHE_R: &str = "#f59e0b";
-const C_CACHE_W: &str = "#06b6d4";
-const C_REASON: &str = "#8b5cf6";
-const DIM_COLORS: [&str; 8] = [
-    "#6366f1", "#10b981", "#f59e0b", "#ef4444", "#06b6d4", "#8b5cf6", "#ec4899", "#84cc16",
-];
 
 fn rgb(hex: &str) -> Color {
     let h = hex.trim_start_matches('#');
@@ -60,16 +49,6 @@ fn text_width_mm(s: &str, size_pt: f32) -> f32 {
         })
         .sum();
     ems * size_pt * PT_MM
-}
-
-fn kind_label(kind: &str) -> &str {
-    match kind {
-        "daily" => "每日",
-        "weekly" => "每周",
-        "monthly" => "每月",
-        "test" => "测试",
-        other => other,
-    }
 }
 
 struct Pdf {
@@ -157,7 +136,7 @@ impl Pdf {
     fn section(&mut self, title: &str) {
         self.ensure(14.0);
         self.gap(4.0);
-        self.text(title, 12.0, INK, true);
+        self.text(title, 12.0, REPORT_SECTION, true);
     }
 
     /// 带色点的数量行：标签左对齐，数值右对齐。
@@ -182,33 +161,34 @@ impl Pdf {
         } else {
             MARGIN
         };
-        self.text_at(label, 10.0, lx, baseline, MUTED, false);
+        self.text_at(label, 10.0, lx, baseline, REPORT_MUTED, false);
         let w = text_width_mm(value, 10.0);
-        self.text_at(value, 10.0, A4_W - MARGIN - w, baseline, INK, true);
+        self.text_at(value, 10.0, A4_W - MARGIN - w, baseline, REPORT_INK, true);
         self.y -= 6.5;
     }
 
-    fn kpi_cards(&mut self, items: &[(String, String)]) {
+    fn kpi_cards(&mut self, items: &[(String, String, String)]) {
         let gap = 6.0;
         let ncols = items.len().max(1) as f32;
         let w = (CONTENT_W - gap * (ncols - 1.0)) / ncols;
         let h = 22.0;
         self.ensure(h + 2.0);
         let top = self.y;
-        for (i, (label, value)) in items.iter().enumerate() {
+        for (i, (label, value, sub)) in items.iter().enumerate() {
             let x = MARGIN + i as f32 * (w + gap);
             let layer = self.layer();
-            layer.set_fill_color(rgb(BG));
+            layer.set_fill_color(rgb(REPORT_CARD));
             layer.add_rect(
                 Rect::new(Mm(x), Mm(top - h), Mm(x + w), Mm(top)).with_mode(PaintMode::Fill),
             );
-            layer.set_outline_color(rgb(BORDER));
+            layer.set_outline_color(rgb(REPORT_BORDER));
             layer.set_outline_thickness(0.6);
             layer.add_rect(
                 Rect::new(Mm(x), Mm(top - h), Mm(x + w), Mm(top)).with_mode(PaintMode::Stroke),
             );
-            self.text_at(label, 9.5, x + 4.0, top - 6.5, MUTED, false);
-            self.text_at(value, 17.0, x + 4.0, top - 16.0, INK, true);
+            self.text_at(label, 9.5, x + 4.0, top - 6.0, REPORT_MUTED, false);
+            self.text_at(value, 17.0, x + 4.0, top - 15.0, REPORT_INK, true);
+            self.text_at(sub, 8.5, x + 4.0, top - 21.0, REPORT_FAINT, false);
         }
         self.y = top - h;
     }
@@ -240,7 +220,7 @@ impl Pdf {
         // 标题 + 图 + 图例
         self.ensure(60.0);
         self.gap(4.0);
-        self.text_at(&c.title, 11.0, MARGIN, self.y - 3.0, INK, true);
+        self.text_at(&c.title, 11.0, MARGIN, self.y - 3.0, REPORT_SECTION, true);
         self.y -= 6.0;
         self.image(&c.png, CONTENT_W)?;
         self.y -= 1.0;
@@ -253,7 +233,7 @@ impl Pdf {
                 Rect::new(Mm(x), Mm(baseline - 0.2), Mm(x + 2.4), Mm(baseline + 2.2))
                     .with_mode(PaintMode::Fill),
             );
-            self.text_at(name, 9.0, x + 4.2, baseline, MUTED, false);
+            self.text_at(name, 9.0, x + 4.2, baseline, REPORT_MUTED, false);
             x += 4.2 + text_width_mm(name, 9.0) + 6.0;
         }
         self.y -= 6.0;
@@ -265,13 +245,13 @@ impl Pdf {
 fn cost_lines(m: &ReportMetrics) -> Vec<(&'static str, i64, &'static str)> {
     let mut v = Vec::new();
     if m.reported_cost_micro_usd > 0 {
-        v.push(("上报费用", m.reported_cost_micro_usd, C_INPUT));
+        v.push(("上报费用", m.reported_cost_micro_usd, C_REPORTED));
     }
     if m.calculated_cost_micro_usd > 0 {
-        v.push(("计算费用", m.calculated_cost_micro_usd, C_OUTPUT));
+        v.push(("计算费用", m.calculated_cost_micro_usd, C_CALCULATED));
     }
     if m.estimated_cost_micro_usd > 0 {
-        v.push(("估算费用", m.estimated_cost_micro_usd, C_CACHE_R));
+        v.push(("估算费用", m.estimated_cost_micro_usd, C_ESTIMATED));
     }
     v
 }
@@ -280,13 +260,13 @@ fn token_sections(p: &mut Pdf, m: &ReportMetrics) {
     p.section("Token 构成");
     let total = m.total_tokens();
     if total == 0 {
-        p.text("未采集到 Token 数据。", 10.0, FAINT, false);
+        p.text("未采集到 Token 数据。", 10.0, REPORT_FAINT, false);
         return;
     }
     let h = 4.0;
     let top = p.y;
     let layer = p.layer();
-    layer.set_fill_color(rgb("#f3f4f6"));
+    layer.set_fill_color(rgb(REPORT_TRACK));
     layer.add_rect(
         Rect::new(Mm(MARGIN), Mm(top - h), Mm(MARGIN + CONTENT_W), Mm(top))
             .with_mode(PaintMode::Fill),
@@ -331,7 +311,7 @@ fn cost_section(p: &mut Pdf, m: &ReportMetrics) {
     p.section("费用");
     let costs = cost_lines(m);
     if costs.is_empty() {
-        p.text("无数据（未上报且未匹配定价）。", 10.0, FAINT, false);
+        p.text("无数据（未上报且未匹配定价）。", 10.0, REPORT_FAINT, false);
         return;
     }
     for (label, v, color) in costs {
@@ -348,7 +328,7 @@ fn traffic_section(p: &mut Pdf, m: &ReportMetrics) {
     p.ensure(h + 2.0);
     let top = p.y;
     let layer = p.layer();
-    layer.set_outline_color(rgb(BORDER));
+    layer.set_outline_color(rgb(REPORT_BORDER));
     layer.set_outline_thickness(0.6);
     layer.add_rect(
         Rect::new(Mm(MARGIN), Mm(top - h), Mm(MARGIN + CONTENT_W), Mm(top))
@@ -359,18 +339,24 @@ fn traffic_section(p: &mut Pdf, m: &ReportMetrics) {
         20.0,
         MARGIN + 5.0,
         top - 11.0,
-        INK,
+        REPORT_INK,
         true,
     );
     let total_w = text_width_mm(&bytes_human(m.estimated_total_bytes), 20.0);
-    p.text_at(
-        "估算",
-        9.5,
-        MARGIN + 7.0 + total_w,
-        top - 10.5,
-        C_CACHE_R,
-        true,
+    let badge_x = MARGIN + 7.0 + total_w;
+    let badge_w = text_width_mm("估算", 9.5) + 6.0;
+    let badge_layer = p.layer();
+    badge_layer.set_fill_color(rgb(REPORT_WARNING_BG));
+    badge_layer.add_rect(
+        Rect::new(
+            Mm(badge_x),
+            Mm(top - 14.5),
+            Mm(badge_x + badge_w),
+            Mm(top - 7.5),
+        )
+        .with_mode(PaintMode::Fill),
     );
+    p.text_at("估算", 9.5, badge_x + 3.0, top - 10.5, REPORT_WARNING, true);
     p.text_at(
         &format!(
             "区间 {} – {}（均为估算，非实际网卡流量）",
@@ -380,7 +366,7 @@ fn traffic_section(p: &mut Pdf, m: &ReportMetrics) {
         9.5,
         MARGIN + 5.0,
         top - 16.5,
-        FAINT,
+        REPORT_FAINT,
         false,
     );
     p.y = top - h;
@@ -392,6 +378,7 @@ fn top_section(p: &mut Pdf, title: &str, items: &[DimCount], show_tokens: bool) 
     }
     p.section(title);
     let max = items.iter().map(|d| d.calls).max().unwrap_or(1).max(1);
+    let palette = chart_palette();
     for (i, d) in items.iter().enumerate() {
         p.ensure(11.0);
         let value = if show_tokens {
@@ -400,11 +387,18 @@ fn top_section(p: &mut Pdf, title: &str, items: &[DimCount], show_tokens: bool) 
             format!("{} 次", n(d.calls))
         };
         let baseline = p.y - 3.0;
-        p.text_at(&d.name, 10.0, MARGIN, baseline, INK, false);
+        p.text_at(&d.name, 10.0, MARGIN, baseline, REPORT_INK, false);
         let w = text_width_mm(&value, 9.5);
-        p.text_at(&value, 9.5, A4_W - MARGIN - w, baseline, MUTED, false);
+        p.text_at(
+            &value,
+            9.5,
+            A4_W - MARGIN - w,
+            baseline,
+            REPORT_MUTED,
+            false,
+        );
         p.y -= 4.6;
-        let color = DIM_COLORS[i % DIM_COLORS.len()];
+        let color = &palette[i % palette.len()];
         let ratio = d.calls as f32 / max as f32;
         let layer = p.layer();
         layer.set_fill_color(rgb(color));
@@ -422,38 +416,45 @@ fn top_section(p: &mut Pdf, title: &str, items: &[DimCount], show_tokens: bool) 
 }
 
 fn header(p: &mut Pdf, meta: &ReportMeta) {
-    p.text_at("METRIA", 9.0, MARGIN, p.y - 3.0, BRAND, true);
-    p.y -= 7.0;
-    p.text(&meta.title, 21.0, INK, true);
-    p.text(
-        &format!(
-            "{} · {} · {}",
-            meta.period,
-            meta.timezone,
-            kind_label(&meta.kind)
-        ),
-        10.5,
-        MUTED,
+    const HEADER_H: f32 = 38.0;
+    let top = A4_H;
+    let layer = p.layer();
+    layer.set_fill_color(rgb(REPORT_BRAND));
+    layer.add_rect(
+        Rect::new(Mm(0.0), Mm(top - HEADER_H), Mm(A4_W), Mm(top)).with_mode(PaintMode::Fill),
+    );
+    p.text_at("METRIA", 9.0, MARGIN, top - 9.0, REPORT_BRAND_LIGHT, true);
+    p.text_at(&meta.title, 20.0, MARGIN, top - 20.0, "#ffffff", true);
+    p.text_at(
+        &format!("{} · {} · {}", meta.period, meta.timezone, meta.kind),
+        9.5,
+        MARGIN,
+        top - 29.0,
+        REPORT_BRAND_SUB,
         false,
     );
-    p.divider(BORDER);
-    p.gap(3.0);
+    p.y = top - HEADER_H - 8.0;
 }
 
 fn footer(p: &mut Pdf, meta: &ReportMeta) {
-    p.divider(BORDER);
+    p.divider(REPORT_BORDER);
     p.gap(2.0);
     p.ensure(14.0);
+    let top = p.y;
+    let layer = p.layer();
+    layer.set_fill_color(rgb(REPORT_SURFACE));
+    layer
+        .add_rect(Rect::new(Mm(0.0), Mm(top - 17.0), Mm(A4_W), Mm(top)).with_mode(PaintMode::Fill));
     p.text(
         &format!("生成时间：{}", meta.generated_at),
         9.0,
-        FAINT,
+        REPORT_FAINT,
         false,
     );
     p.text(
         "「估算」为估算值；缺失口径不显示，不代表为 0；流量为估算而非实际网卡流量。",
         8.5,
-        FAINT,
+        REPORT_FAINT,
         false,
     );
 }
@@ -469,15 +470,19 @@ pub fn render_pdf(
 
     if !m.has_data {
         p.gap(6.0);
-        p.text("本周期无数据。", 12.0, MUTED, false);
+        p.text("本周期无数据。", 12.0, REPORT_MUTED, false);
         footer(&mut p, meta);
         return p.doc.save_to_bytes().map_err(|e| e.to_string());
     }
 
     p.kpi_cards(&[
-        ("模型调用".into(), n(m.calls)),
-        ("会话".into(), n(m.sessions)),
-        ("总 Token".into(), n(m.total_tokens())),
+        ("模型调用".into(), n(m.calls), "次".into()),
+        ("会话".into(), n(m.sessions), "个".into()),
+        (
+            "总 Token".into(),
+            n(m.total_tokens()),
+            "全部类型合计".into(),
+        ),
     ]);
     p.gap(2.0);
     p.text(
@@ -490,7 +495,7 @@ pub fn render_pdf(
             n(m.reasoning_tokens)
         ),
         9.0,
-        FAINT,
+        REPORT_FAINT,
         false,
     );
 

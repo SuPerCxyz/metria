@@ -3,6 +3,9 @@
 //! HTML 采用邮件客户端安全的表格布局 + 内联样式，视觉对齐 Web 端卡片设计。
 //! 数据诚实性：缺失口径不显示（不显示为 0）；估算项统一标注「估算」。
 
+use std::sync::OnceLock;
+
+use serde::Deserialize;
 use serde_json::json;
 
 use super::aggregate::{DimCount, ReportMetrics};
@@ -18,14 +21,59 @@ pub struct ReportMeta {
 }
 
 // 与 Web Chart 调色板一致
-const C_INPUT: &str = "#6366f1";
-const C_OUTPUT: &str = "#10b981";
-const C_CACHE_R: &str = "#f59e0b";
-const C_CACHE_W: &str = "#06b6d4";
-const C_REASON: &str = "#8b5cf6";
-const C_REPORTED: &str = "#6366f1";
-const C_CALCULATED: &str = "#10b981";
-const C_ESTIMATED: &str = "#f59e0b";
+pub(crate) const C_INPUT: &str = "#6366f1";
+pub(crate) const C_OUTPUT: &str = "#10b981";
+pub(crate) const C_CACHE_R: &str = "#f59e0b";
+pub(crate) const C_CACHE_W: &str = "#06b6d4";
+pub(crate) const C_REASON: &str = "#8b5cf6";
+pub(crate) const C_REPORTED: &str = "#6366f1";
+pub(crate) const C_CALCULATED: &str = "#10b981";
+pub(crate) const C_ESTIMATED: &str = "#f59e0b";
+pub(crate) const REPORT_INK: &str = "#1f2937";
+pub(crate) const REPORT_MUTED: &str = "#6b7280";
+pub(crate) const REPORT_FAINT: &str = "#9ca3af";
+pub(crate) const REPORT_SECTION: &str = "#374151";
+pub(crate) const REPORT_BORDER: &str = "#e5e7eb";
+pub(crate) const REPORT_SURFACE: &str = "#f9fafb";
+pub(crate) const REPORT_TRACK: &str = "#f3f4f6";
+pub(crate) const REPORT_CARD: &str = "#ffffff";
+pub(crate) const REPORT_BRAND: &str = "#4f46e5";
+pub(crate) const REPORT_BRAND_LIGHT: &str = "#c7d2fe";
+pub(crate) const REPORT_BRAND_SUB: &str = "#e0e7ff";
+pub(crate) const REPORT_WARNING: &str = "#b45309";
+pub(crate) const REPORT_WARNING_BG: &str = "#fef3c7";
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChartTheme {
+    pub(crate) palette: Vec<String>,
+    #[serde(rename = "gridColor")]
+    pub(crate) grid_color: String,
+    #[serde(rename = "axisColor")]
+    pub(crate) axis_color: String,
+    #[serde(rename = "lineWidth")]
+    pub(crate) line_width: f64,
+    #[serde(rename = "fillOpacity")]
+    pub(crate) fill_opacity: f64,
+    pub(crate) tension: f64,
+    #[serde(rename = "xMaxTicks")]
+    pub(crate) x_max_ticks: usize,
+    #[serde(rename = "yTickCount")]
+    pub(crate) y_tick_count: usize,
+    #[serde(rename = "fontSize")]
+    pub(crate) font_size: u32,
+}
+
+pub(crate) fn chart_theme() -> &'static ChartTheme {
+    static THEME: OnceLock<ChartTheme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        serde_json::from_str(include_str!("../../../../web/chart-theme.json"))
+            .expect("web/chart-theme.json must be valid")
+    })
+}
+
+pub(crate) fn chart_palette() -> &'static [String] {
+    &chart_theme().palette
+}
 
 pub(super) fn usd(micro: i64) -> String {
     format!("${:.4}", micro as f64 / 1_000_000.0)
@@ -341,6 +389,7 @@ pub(crate) fn inline_chart_svg(
     const RIGHT: f64 = 1165.0;
     const TOP: f64 = 28.0;
     const BOTTOM: f64 = 248.0;
+    let theme = chart_theme();
     let max = series
         .iter()
         .flat_map(|(_, _, values)| values.iter())
@@ -355,43 +404,127 @@ pub(crate) fn inline_chart_svg(
             LEFT + (RIGHT - LEFT) * i as f64 / (days.len() - 1) as f64
         }
     };
-    let y = |value: i64| BOTTOM - (BOTTOM - TOP) * value.max(0) as f64 / max;
+    let y = |value: f64| BOTTOM - (BOTTOM - TOP) * value.max(0.0) / max;
     let mut svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"{}\" viewBox=\"0 0 {WIDTH} {HEIGHT}\" width=\"{WIDTH}\" height=\"{HEIGHT}\" style=\"display:block;width:100%;height:auto;background:#ffffff;\">",
         esc(title)
     );
-    for step in 0..=4 {
-        let yy = TOP + (BOTTOM - TOP) * step as f64 / 4.0;
+    let y_ticks = theme.y_tick_count.max(2);
+    for step in 0..y_ticks {
+        let ratio = step as f64 / (y_ticks - 1) as f64;
+        let yy = TOP + (BOTTOM - TOP) * ratio;
+        let value = max * (1.0 - ratio);
         svg.push_str(&format!(
-            "<line x1=\"{LEFT}\" y1=\"{yy:.1}\" x2=\"{RIGHT}\" y2=\"{yy:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>"
+            "<line x1=\"{LEFT}\" y1=\"{yy:.1}\" x2=\"{RIGHT}\" y2=\"{yy:.1}\" stroke=\"{}\" stroke-width=\"1\"/>\
+             <text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" fill=\"{}\" font-family=\"-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif\" font-size=\"{}\">{}</text>",
+            esc(&theme.grid_color),
+            LEFT - 8.0,
+            yy + 4.0,
+            esc(&theme.axis_color),
+            theme.font_size,
+            format_chart_number(value),
         ));
     }
+
+    for i in tick_indices(days.len(), theme.x_max_ticks) {
+        let xx = x(i);
+        let anchor = if i == 0 {
+            "start"
+        } else if i + 1 == days.len() {
+            "end"
+        } else {
+            "middle"
+        };
+        svg.push_str(&format!(
+            "<text x=\"{xx:.1}\" y=\"278\" text-anchor=\"{anchor}\" fill=\"{}\" font-family=\"-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif\" font-size=\"{}\">{}</text>",
+            esc(&theme.axis_color),
+            theme.font_size,
+            esc(&days[i]),
+        ));
+    }
+
     for (name, color, values) in series {
         let points = values
             .iter()
             .enumerate()
-            .map(|(i, value)| format!("{:.1},{:.1}", x(i), y(*value)))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .map(|(i, value)| (x(i), y(*value as f64)))
+            .collect::<Vec<_>>();
+        let path = smooth_path(&points, theme.tension);
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            svg.push_str(&format!(
+                "<path d=\"{path} L {:.1},{BOTTOM:.1} L {:.1},{BOTTOM:.1} Z\" fill=\"{}\" fill-opacity=\"{:.4}\" stroke=\"none\"/>",
+                last.0,
+                first.0,
+                esc(color),
+                theme.fill_opacity,
+            ));
+        }
         svg.push_str(&format!(
-            "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"2.5\" stroke-linejoin=\"round\" stroke-linecap=\"round\" points=\"{}\"><title>{}</title></polyline>",
-            esc(color), points, esc(name)
-        ));
-    }
-    if let Some(first) = days.first() {
-        svg.push_str(&format!(
-            "<text x=\"{LEFT}\" y=\"278\" fill=\"#6b7280\" font-family=\"Arial,sans-serif\" font-size=\"12\">{}</text>",
-            esc(first)
-        ));
-    }
-    if let Some(last) = days.last() {
-        svg.push_str(&format!(
-            "<text x=\"{RIGHT}\" y=\"278\" text-anchor=\"end\" fill=\"#6b7280\" font-family=\"Arial,sans-serif\" font-size=\"12\">{}</text>",
-            esc(last)
+            "<path d=\"{path}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\" stroke-linejoin=\"round\" stroke-linecap=\"round\"><title>{}</title></path>",
+            esc(color),
+            theme.line_width,
+            esc(name),
         ));
     }
     svg.push_str("</svg>");
     svg
+}
+
+fn tick_indices(len: usize, max_ticks: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let count = len.min(max_ticks.max(2));
+    if count == 1 {
+        return vec![0];
+    }
+    (0..count).map(|i| i * (len - 1) / (count - 1)).collect()
+}
+
+fn smooth_path(points: &[(f64, f64)], tension: f64) -> String {
+    let Some(first) = points.first() else {
+        return String::new();
+    };
+    let mut path = format!("M {:.1},{:.1}", first.0, first.1);
+    for i in 0..points.len().saturating_sub(1) {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points.get(i + 2).copied().unwrap_or(p2);
+        let scale = tension / 6.0;
+        let c1 = (p1.0 + (p2.0 - p0.0) * scale, p1.1 + (p2.1 - p0.1) * scale);
+        let c2 = (p2.0 - (p3.0 - p1.0) * scale, p2.1 - (p3.1 - p1.1) * scale);
+        path.push_str(&format!(
+            " C {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
+            c1.0, c1.1, c2.0, c2.1, p2.0, p2.1
+        ));
+    }
+    path
+}
+
+pub(crate) fn format_chart_number(value: f64) -> String {
+    let abs = value.abs();
+    let (scaled, suffix, digits) = if abs >= 1_000_000_000_000.0 {
+        (value / 1_000_000_000_000.0, "T", 2)
+    } else if abs >= 1_000_000_000.0 {
+        (value / 1_000_000_000.0, "B", 2)
+    } else if abs >= 1_000_000.0 {
+        (value / 1_000_000.0, "M", 2)
+    } else if abs >= 1_000.0 {
+        (value / 1_000.0, "K", 1)
+    } else if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    } else {
+        (value, "", 2)
+    };
+    let mut text = format!("{scaled:.digits$}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    format!("{text}{suffix}")
 }
 
 fn chart_section(c: &ReportChart) -> String {
@@ -523,7 +656,11 @@ mod tests {
             "Token 趋势",
         );
         assert!(svg.starts_with("<svg"));
-        assert!(svg.contains("<polyline"));
+        assert!(svg.contains("<path"));
+        assert!(svg.contains("text-anchor=\"end\""));
+        assert!(svg.contains("#9ca3af"));
+        assert!(svg.contains("fill-opacity=\"0.0941\""));
+        assert!(svg.contains(" C "));
         let metrics = ReportMetrics {
             has_data: true,
             ..Default::default()

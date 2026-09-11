@@ -140,6 +140,31 @@ fn config_webhook(port: u16) -> report::ReportConfig {
     }
 }
 
+fn insert_chart_rollup(db: &HubDb) {
+    let bucket = chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string();
+    let c = db.conn();
+    c.execute(
+        "INSERT INTO hourly_rollups (
+            bucket, node_id, collector_id, client_id, source_id, model,
+            input_tokens, output_tokens, cache_read_tokens, session_count, model_call_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        metria_storage::rusqlite::params![
+            bucket,
+            "node-1",
+            "collector-1",
+            "client-1",
+            "source-1",
+            "model-1",
+            100,
+            50,
+            20,
+            1,
+            1
+        ],
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn email_and_webhook_delivered() {
     let (db, cfg, _dir) = temp_db();
@@ -149,6 +174,7 @@ async fn email_and_webhook_delivered() {
     rc.webhook_enabled = true;
     rc.webhook = config_webhook(http_port).webhook;
     report::save_config(&db, &rc).unwrap();
+    insert_chart_rollup(&db);
 
     let outcomes = report::scheduler::dispatch(
         &db,
@@ -176,26 +202,39 @@ async fn email_and_webhook_delivered() {
         let guard = captured.lock().unwrap();
         String::from_utf8_lossy(&guard[..]).to_string()
     };
+    let decoded_html = raw.replace("=3D", "=");
     assert!(
-        raw.contains("application/pdf"),
-        "邮件应包含 PDF 附件: {raw}"
+        !raw.contains("application/pdf"),
+        "邮件不应包含 PDF 附件: {raw}"
     );
     assert!(
-        raw.to_lowercase()
+        !raw.to_lowercase()
             .contains("content-disposition: attachment"),
-        "应为附件而非内联: {raw}"
+        "邮件不应包含附件: {raw}"
     );
-    assert!(raw.contains(".pdf"), "附件应有 .pdf 文件名: {raw}");
+    assert!(
+        decoded_html.contains("text-anchor=\"end\""),
+        "邮件图表应包含 Y 轴刻度"
+    );
+    assert!(
+        decoded_html.contains("stroke=\"rgba(156,163,175,0.12)\""),
+        "邮件图表应使用页面网格颜色"
+    );
+    assert!(
+        decoded_html.contains("fill-opacity=\"0.0941\""),
+        "邮件图表应包含页面同款面积填充"
+    );
     assert!(!raw.contains("cid:"), "邮件 HTML 不应引用 CID 图片: {raw}");
 }
 
 #[tokio::test]
-async fn attachments_disabled_omits_pdf() {
+async fn attachments_disabled_omits_inline_charts() {
     let (db, cfg, _dir) = temp_db();
     let (smtp_port, email_got, captured) = spawn_smtp_sink();
     let mut rc = config_email(smtp_port);
     rc.attachments_enabled = false;
     report::save_config(&db, &rc).unwrap();
+    insert_chart_rollup(&db);
 
     let outcomes = report::scheduler::dispatch(
         &db,
@@ -215,10 +254,8 @@ async fn attachments_disabled_omits_pdf() {
         let guard = captured.lock().unwrap();
         String::from_utf8_lossy(&guard[..]).to_string()
     };
-    assert!(
-        !raw.contains("application/pdf"),
-        "关闭附件后不应有 PDF: {raw}"
-    );
+    assert!(!raw.contains("application/pdf"), "邮件不应包含 PDF: {raw}");
+    assert!(!raw.contains("<svg"), "关闭图表后不应有内嵌 SVG: {raw}");
 }
 
 #[tokio::test]
@@ -255,6 +292,7 @@ async fn email_failure_isolated_from_webhook() {
         outcomes.iter().any(|o| o.channel == "webhook" && o.ok),
         "Webhook 应仍成功: {outcomes:?}"
     );
+    assert!(db.report_period_attempted("test", "test-2").unwrap());
     thread::sleep(Duration::from_millis(200));
     assert!(hook_got.load(Ordering::SeqCst));
 }
@@ -281,4 +319,18 @@ async fn success_records_history_and_marks_period_sent() {
     assert!(hist
         .iter()
         .any(|h| h.period == "2026-09-09" && h.status == "success"));
+}
+
+#[test]
+fn report_history_keeps_latest_thirty_rows() {
+    let (db, _cfg, _dir) = temp_db();
+    for i in 0..35 {
+        db.record_report_send("test", &format!("period-{i:02}"), "email", "success", None)
+            .unwrap();
+    }
+
+    let rows = db.recent_report_sends(100).unwrap();
+    assert_eq!(rows.len(), 30);
+    assert_eq!(rows.first().unwrap().period, "period-34");
+    assert_eq!(rows.last().unwrap().period, "period-05");
 }

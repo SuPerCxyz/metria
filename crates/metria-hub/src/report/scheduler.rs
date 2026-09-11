@@ -12,9 +12,9 @@ use plotters::style::RGBColor;
 use super::aggregate::{self, aggregate, ChartSeries, ReportMetrics};
 use super::channels::{send_email, send_webhook};
 use super::charts;
-use super::pdf;
 use super::render::{
-    inline_chart_svg, render_html, render_text, webhook_payload, ReportChart, ReportMeta,
+    chart_palette, inline_chart_svg, render_html, render_text, webhook_payload, ReportChart,
+    ReportMeta,
 };
 use super::{
     effective_timezone, effective_timezone_name, load_config, period_and_due, period_label,
@@ -67,21 +67,9 @@ pub async fn dispatch(
             let subject = format!("Metria 用量报告 · {period_human}");
             let smtp = cfg.smtp.clone();
             let (html_c, text_c) = (html.clone(), text.clone());
-            let charts_c = charts.clone();
-            let pdf_c = if cfg.attachments_enabled {
-                match pdf::render_pdf(&metrics, &meta, &charts) {
-                    Ok(bytes) => Some((format!("metria-report-{kind}-{period}.pdf"), bytes)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "PDF 生成失败，本次仅发送 HTML 邮件");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
             let rc = recipients.clone();
             let res = tokio::task::spawn_blocking(move || {
-                send_email(&smtp, &rc, &subject, &html_c, &text_c, &charts_c, pdf_c)
+                send_email(&smtp, &rc, &subject, &html_c, &text_c)
             })
             .await;
             outcomes.push(outcome_from("email", res));
@@ -119,11 +107,6 @@ fn has_values(cs: &ChartSeries) -> bool {
     cs.series.iter().any(|s| s.values.iter().any(|v| *v > 0))
 }
 
-const TOKEN_COLORS: [&str; 3] = ["#6366f1", "#10b981", "#f59e0b"];
-const DIM_COLORS: [&str; 8] = [
-    "#6366f1", "#10b981", "#f59e0b", "#ef4444", "#06b6d4", "#8b5cf6", "#ec4899", "#84cc16",
-];
-
 fn build_charts(
     db: &HubDb,
     from: DateTime<Utc>,
@@ -135,10 +118,11 @@ fn build_charts(
     if !m.has_data {
         return out;
     }
+    let palette = chart_palette();
     // 单日报告按小时分桶，周/月按天分桶
     let by_hour = (to - from).num_hours() <= 36;
     let mk = |cs: &ChartSeries,
-              colors: &[&str],
+              colors: &[String],
               cid: &str,
               title: &str,
               fill: bool|
@@ -150,14 +134,14 @@ fn build_charts(
             .series
             .iter()
             .enumerate()
-            .map(|(i, s)| (hex_to_rgb(colors[i % colors.len()]), s.values.clone()))
+            .map(|(i, s)| (hex_to_rgb(&colors[i % colors.len()]), s.values.clone()))
             .collect();
         let png = charts::line_chart_png(&cs.days, &data, 1200, 300, fill).ok()?;
         let series = cs
             .series
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.name.clone(), colors[i % colors.len()].to_string()))
+            .map(|(i, s)| (s.name.clone(), colors[i % colors.len()].clone()))
             .collect();
         let svg_series = cs
             .series
@@ -166,7 +150,7 @@ fn build_charts(
             .map(|(i, s)| {
                 (
                     s.name.clone(),
-                    colors[i % colors.len()].to_string(),
+                    colors[i % colors.len()].clone(),
                     s.values.clone(),
                 )
             })
@@ -182,17 +166,17 @@ fn build_charts(
     };
 
     let token = aggregate::daily_token_chart(db, from, to, tz, by_hour);
-    if let Some(c) = mk(&token, &TOKEN_COLORS, "chart-token", "Token 趋势", true) {
+    if let Some(c) = mk(&token, &palette[..3], "chart-token", "Token 趋势", true) {
         out.push(c);
     }
     let calls = aggregate::daily_calls_chart(db, from, to, tz, by_hour);
-    if let Some(c) = mk(&calls, &["#6366f1"], "chart-calls", "请求数量趋势", true) {
+    if let Some(c) = mk(&calls, &palette[..1], "chart-calls", "请求数量趋势", true) {
         out.push(c);
     }
     let models = aggregate::dim_daily_chart(db, from, to, tz, "model", 0, true, by_hour);
     if let Some(c) = mk(
         &models,
-        &DIM_COLORS,
+        &palette[..8],
         "chart-models",
         "模型趋势（按 Token）",
         true,
@@ -202,7 +186,7 @@ fn build_charts(
     let clients = aggregate::dim_daily_chart(db, from, to, tz, "client_id", 0, true, by_hour);
     if let Some(c) = mk(
         &clients,
-        &DIM_COLORS,
+        &palette[..8],
         "chart-clients",
         "Agent 趋势（按 Token）",
         true,
@@ -288,14 +272,7 @@ pub fn spawn_report_scheduler(db: HubDb, hub_cfg: HubConfig) {
                     continue;
                 }
                 if db
-                    .report_period_sent(kind.as_str(), &period)
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let retry_cutoff = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
-                if db
-                    .report_period_attempted_since(kind.as_str(), &period, &retry_cutoff)
+                    .report_period_attempted(kind.as_str(), &period)
                     .unwrap_or(false)
                 {
                     continue;

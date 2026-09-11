@@ -35,6 +35,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
+COPY web/chart-theme.json ./web/chart-theme.json
 COPY --from=web /build/dist ./web/dist
 # cargo 缓存挂载：registry（依赖只下/编一次）+ target（增量编译，源码变更不触发全量）。
 # cache id 按 TARGETARCH 区分：buildx 多平台并行时两个平台的 cargo 会同时

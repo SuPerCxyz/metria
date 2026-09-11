@@ -99,7 +99,7 @@ pub(crate) async fn report_history(
     if auth_user(&st, &headers).is_none() {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
     }
-    match st.db.recent_report_sends(50) {
+    match st.db.recent_report_sends(30) {
         Ok(rows) => Json(json!({ "sends": rows })).into_response(),
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,

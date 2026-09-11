@@ -1,0 +1,21 @@
+{
+  "palette": [
+    "#6366f1",
+    "#10b981",
+    "#f59e0b",
+    "#ef4444",
+    "#06b6d4",
+    "#8b5cf6",
+    "#ec4899",
+    "#84cc16"
+  ],
+  "gridColor": "rgba(156,163,175,0.12)",
+  "axisColor": "#9ca3af",
+  "lineWidth": 2,
+  "fillAlphaHex": "18",
+  "fillOpacity": 0.0941176471,
+  "tension": 0.3,
+  "xMaxTicks": 10,
+  "yTickCount": 5,
+  "fontSize": 11
+}

@@ -4,6 +4,7 @@
 import React, { useEffect, useRef } from 'react'
 import Chart from 'chart.js/auto'
 import { formatTimeLabel } from './trendChartLabels'
+import chartTheme from '../../../chart-theme.json'
 
 // 数据点过多时降采样：保留 maxPoints 个点（≥30）
 function downsample(data, maxPoints = 240) {
@@ -14,7 +15,7 @@ function downsample(data, maxPoints = 240) {
   return out
 }
 
-export const PALETTE = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
+export const PALETTE = chartTheme.palette
 
 export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true }) {
   const ref = useRef(null)
@@ -38,11 +39,11 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
         label: d.label,
         data: idx.map((i) => d.values[i] ?? 0),
         borderColor: d.color,
-        backgroundColor: `${d.color}18`,
+        backgroundColor: `${d.color}${chartTheme.fillAlphaHex}`,
         fill: d.fill,
         hidden: d.hidden,
-        tension: 0.3,
-        borderWidth: 2,
+        tension: chartTheme.tension,
+        borderWidth: chartTheme.lineWidth,
         pointRadius: 0,
         pointHoverRadius: 4,
         pointBackgroundColor: d.color,
@@ -59,7 +60,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
         plugins: {
           legend: {
             display: legendDisplay && (ds.length > 1 || ds.some((d) => d.label)),
-            labels: { color: '#9ca3af', boxWidth: 12, font: { size: 11 }, usePointStyle: true, padding: 12 },
+            labels: { color: chartTheme.axisColor, boxWidth: 12, font: { size: chartTheme.fontSize }, usePointStyle: true, padding: 12 },
             ...(onLegendClick ? {
               onClick: (_event, legendItem, legend) => {
                 const datasetIndex = legendItem.datasetIndex
@@ -83,11 +84,11 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
         scales: {
           x: {
             grid: { display: false },
-            ticks: { maxTicksLimit: 10, maxRotation: 0, color: '#9ca3af', font: { size: 11 } },
+            ticks: { maxTicksLimit: chartTheme.xMaxTicks, maxRotation: 0, color: chartTheme.axisColor, font: { size: chartTheme.fontSize } },
           },
           y: {
-            grid: { color: 'rgba(156,163,175,0.12)' },
-            ticks: { color: '#9ca3af', font: { size: 11 }, callback: (v) => (formatY ? formatY(v) : v.toLocaleString()) },
+            grid: { color: chartTheme.gridColor },
+            ticks: { color: chartTheme.axisColor, font: { size: chartTheme.fontSize }, callback: (v) => (formatY ? formatY(v) : v.toLocaleString()) },
           },
         },
       },

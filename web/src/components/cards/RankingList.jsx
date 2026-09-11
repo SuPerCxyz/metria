@@ -23,12 +23,14 @@ export default function RankingList({ items, valueKey, labelKey, format, limit =
           >
             <span className="w-5 text-sm font-semibold text-gray-400 dark:text-gray-500 tabular-nums">{i + 1}</span>
             <span className="flex-1 min-w-0">
-              <span className="block text-sm font-medium text-gray-700 dark:text-gray-200 truncate">{label}</span>
+              <span className="flex items-baseline justify-between gap-3">
+                <span className="min-w-0 truncate text-sm font-medium text-gray-700 dark:text-gray-200">{label}</span>
+                <span className="shrink-0 text-sm font-semibold text-gray-800 dark:text-gray-100 tabular-nums">{format ? format(v) : v.toLocaleString()}</span>
+              </span>
               <span className="block h-1.5 mt-1 bg-gray-100 dark:bg-gray-700/40 rounded-full overflow-hidden">
                 <span className="block h-full bg-indigo-500/70 dark:bg-indigo-400/70 rounded-full" style={{ width: `${pct}%` }} />
               </span>
             </span>
-            <span className="text-sm font-semibold text-gray-800 dark:text-gray-100 tabular-nums">{format ? format(v) : v.toLocaleString()}</span>
           </button>
         )
       })}

@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use plotters::prelude::*;
 use plotters::style::{register_font, FontStyle};
 
+use super::render::{chart_theme, format_chart_number};
+
 /// 内嵌子集字体（仅含 0-9 K M . : - 空格），无系统字体依赖。
 static FONT: &[u8] = include_bytes!("../../assets/chart-font.ttf");
 const FONT_FAMILY: &str = "metria-chart";
@@ -28,16 +30,7 @@ fn unique() -> u64 {
 }
 
 fn compact(v: f64) -> String {
-    let a = v.abs();
-    if a >= 1_000_000.0 {
-        format!("{:.1}M", v / 1_000_000.0)
-    } else if a >= 1_000.0 {
-        format!("{:.1}K", v / 1_000.0)
-    } else if a.fract() == 0.0 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v:.1}")
-    }
+    format_chart_number(v)
 }
 
 /// Catmull-Rom 样条插值，用于把折线平滑为曲线。
@@ -91,6 +84,7 @@ pub fn line_chart_png(
     ));
 
     ensure_font();
+    let theme = chart_theme();
     {
         let root = BitMapBackend::new(&path, (width, height)).into_drawing_area();
         root.fill(&WHITE).map_err(|e| e.to_string())?;
@@ -108,13 +102,13 @@ pub fn line_chart_png(
                 .margin(8)
                 .x_label_area_size(28)
                 .y_label_area_size(52)
-                .build_cartesian_2d(0f64..x_max, 0f64..(ymax * 1.12))
+                .build_cartesian_2d(0f64..x_max, 0f64..ymax)
                 .map_err(|e| e.to_string())?;
             let labs = labels.to_vec();
             chart
                 .configure_mesh()
-                .disable_mesh()
-                .x_labels(7)
+                .disable_x_mesh()
+                .x_labels(theme.x_max_ticks)
                 .x_label_formatter(&|x: &f64| {
                     let r = x.round();
                     if (x - r).abs() > 0.05 {
@@ -123,10 +117,13 @@ pub fn line_chart_png(
                         labs.get(r as usize).cloned().unwrap_or_default()
                     }
                 })
-                .y_labels(5)
+                .y_labels(theme.y_tick_count)
                 .y_label_formatter(&|y: &f64| compact(*y))
-                .label_style(TextStyle::from((FONT_FAMILY, 14)).color(&RGBColor(156, 163, 175)))
-                .axis_style(RGBColor(214, 219, 226))
+                .label_style(
+                    TextStyle::from((FONT_FAMILY, theme.font_size)).color(&RGBColor(156, 163, 175)),
+                )
+                .axis_style(RGBColor(156, 163, 175))
+                .light_line_style(RGBColor(156, 163, 175).mix(0.12))
                 .draw()
                 .map_err(|e| e.to_string())?;
 
@@ -146,12 +143,15 @@ pub fn line_chart_png(
                     chart
                         .draw_series(std::iter::once(Polygon::new(
                             area,
-                            color.mix(0.12).filled(),
+                            color.mix(theme.fill_opacity).filled(),
                         )))
                         .map_err(|e| e.to_string())?;
                 }
                 chart
-                    .draw_series(LineSeries::new(line, color.stroke_width(2)))
+                    .draw_series(LineSeries::new(
+                        line,
+                        color.stroke_width(theme.line_width as u32),
+                    ))
                     .map_err(|e| e.to_string())?;
             }
         }
