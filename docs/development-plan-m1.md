@@ -30,7 +30,7 @@
 | 首页排行与趋势联动修复：排行排序、图例筛选同步汇总、移除需要关注区块 | ✅ 完成 | 2026-09-07 |
 | 跨平台 Agent 资产与 CI Node24：Hub 内置下载、Linux/Windows 目标选择、原生安装持久化、Docker 命令复制、Action 运行时升级 | ✅ 完成 | 2026-09-07 |
 | Agent 无状态轮询：游标外置 Hub、事件确认后推进、离线补齐、spool 迁移（OpenSpec `stateless-polling-agent`） | ✅ 完成 | 2026-09-09 |
-| 用量报告：设置页配置全局时区/收件人/SMTP/通用 Webhook、日/周/月三独立调度、测试发送与历史；邮件含内联趋势图（Token/请求数/模型/Agent）、加宽 760px（OpenSpec `add-usage-reports`） | 🟡 实现完成，失败周期不自动重试、单渠道测试结果去重、邮件 Y 轴与 Web 图表样式一致、历史最多 30 条每页 10 条、PDF 与邮件内容/视觉一致、邮件暂不附带 PDF 已补齐，真实 SMTP + 内联图表已验证，待提交/部署 | 2026-09-11 |
+| 用量报告：设置页配置全局时区/收件人/SMTP/通用 Webhook、日/周/月三独立调度、测试发送与历史；邮件含内联趋势图（Token/请求数/模型/Agent）、加宽 760px（OpenSpec `add-usage-reports`） | 🟡 已实现并提交，失败周期不自动重试、单渠道测试结果去重、邮件 Y 轴与 Web 图表样式一致、历史最多 30 条每页 10 条、PDF 与邮件内容/视觉一致、邮件暂不附带 PDF 已补齐；文档已同步，待 lstable 部署 | 2026-09-11 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
@@ -168,7 +168,7 @@
 - 协议版本协商（S2.9）：`limits::PROTOCOL_VERSION`；不兼容 register 拒绝 400，e2e 覆盖。
 - Ingest 校验（S2.10）：单事件 ≤2MiB、JSON 深度 ≤32 进入 `validate_batch`；`zstd_decode` 限长
   防 zip bomb（解压超 8MiB 拒绝）。e2e 覆盖 deep_nested / oversized / zstd_bomb。
-- Web 前端测试（S3.11）：Vitest + jsdom，format/i18n/range/api 序列化 4 文件 26 用例。
+- Web 前端测试（S3.11）：Node.js 内置测试运行器，覆盖 format/i18n/range/api 序列化等用例。
 - 集成测试补全（S2.16）：断网补传（spool 重启续传）、部分成功重传（仅失败子集）、重试耗尽转死信、
   Hub 部分成功响应、heartbeat 时钟偏移（`clock_skew_seconds` 计算与存储）。
 - 文件拆分（§7）：`db/mod.rs`(639) + `db/traffic.rs` + `db/pricing.rs`；
@@ -447,7 +447,7 @@ metria/
 | S3.8 | Traffic / Pricing / Data Quality | Traffic：统计卡片+按维度切换表（spec 五十三）+「估算流量≠网卡/账单」声明横幅；Pricing：规则列表+新增/编辑/停用/优先级/生效区间+规则测试（M1 基础）+内置目录查看；Data Quality：各 usage_source/traffic source/confidence 占比+解析失败+来源扫描/cursor/告警/clock skew |
 | S3.9 | SSE 接入 | `useStream.ts`：订阅 `/api/v1/stream`，按事件类型 invalidate 对应 useQuery key（增量刷新，不整站刷新） |
 | S3.10 | Demo 模式 | `metria hub --demo`：确定性 RNG（seeded）生成合成事件，走同一 ingest 路径：多节点/3 客户端/多模型/多 provider/多项目、session/tool/subagent/stateful reference/cache/reasoning、高/中/低可信流量、profile+区间、pricing rule；启动时禁用真实 ingest 冲突；不读真实目录、无真实用户信息 |
-| S3.11 | 前端测试 | Vitest：时间范围组件、格式化、主题切换、空/加载/错误态、请求参数序列化；demo 数据下 API 冒烟（shell 脚本验证 overview/nodes 端点返回非空） |
+| S3.11 | 前端测试 | Node.js 内置测试运行器：时间范围组件、格式化、主题切换、空/加载/错误态、请求参数序列化；Demo 数据下 API 冒烟（shell 脚本验证 overview/nodes 端点返回非空） |
 
 ---
 

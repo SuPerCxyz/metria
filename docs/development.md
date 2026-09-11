@@ -25,8 +25,10 @@ web/                      React+Vite+Tailwind+Chart.js（dist 由 hub embed）
 migrations/               SQLite 版本化 migration
 fixtures/                 claude/ codex/ opencode/ malformed/ traffic/
 docker/                   Dockerfile + compose.*.yaml + .env.example
-docs/                     architecture/data-model/adapters/api/deployment/privacy/operations
+docs/                     user-guide/architecture/data-model/adapters/api/deployment/privacy/operations
 ```
+
+报告实现位于 `crates/metria-hub/src/report/`，包含聚合、渲染、图表、SMTP/Webhook 渠道、调度和独立 PDF 渲染器；PDF 当前不接入邮件投递。
 
 依赖方向：`core ← protocol ← {traffic,pricing} ← storage ← adapter-api ← adapters ← agent/hub ← cli`，禁止反向/循环。
 
@@ -39,7 +41,7 @@ cargo test --workspace
 cargo run -p metria-cli -- hub --demo        # 演示 Hub（合成数据）
 
 # Web（需 Hub 运行在 8080）
-cd web && npm install
+cd web && npm ci
 npm run dev                                    # Vite dev server
 npm test && npm run build
 
@@ -72,7 +74,8 @@ docker compose -f docker/compose.full.yaml config
 - Adapter：golden + malformed fixture 全覆盖（详见 `docs/adapters.md`）。
 - 集成（e2e）：真实 HTTP 全链路——注册→上传（含 zstd bomb/深度/单事件/协议版本校验）→
   幂等→部分成功→rollup→查询；token 过期与续期；时钟偏移。
-- Web：Vitest（format / i18n / range / api 序列化）。
+- Hub 报告 e2e：SMTP/HTTP sink、HTML 图表、无 PDF 附件、渠道失败结果和历史保留上限。
+- Web：Node.js 内置测试运行器（格式化、国际化、时间范围和 API 序列化）。
 - 基准：`crates/metria-hub/tests/bench.rs`（10 万/100 万事件）。
 
 ## 7. 提交规范

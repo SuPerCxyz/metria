@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 语义版本规范（[SemVer](https://semver.org/lang/zh-CN/)）。
 
+## [Unreleased]
+
+### Added
+
+- 用量报告设置：支持全局时区、SMTP 邮件、JSON Webhook、日/周/月独立调度、测试发送和发送历史。
+- 邮件报告支持 HTML/纯文本正文与内嵌 SVG 趋势图；发送历史保留最新 30 条，设置页每页展示 10 条。
+
+### Changed
+
+- 自动报告同一周期只执行一次投递尝试，失败后不在当前周期自动重试；测试发送保持独立。
+- PDF 渲染能力保留，但 PDF 当前不作为邮件附件投递。
+- Web 排行组件统一将名称、数值和进度条按同一行宽对齐。
+
 ## [0.4.0] - 2026-08-25
 
 ### Added

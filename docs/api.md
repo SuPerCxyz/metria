@@ -51,6 +51,44 @@
 
 账户资料：`GET/PUT /auth/profile` 读取或更新显示名称、头像文字和头像颜色；`POST /auth/change-password` 校验旧密码并更新密码哈希。密码修改成功后现有会话失效。
 
+## 用量报告设置
+
+以下接口均要求 Admin 会话认证，配置保存在 Hub 的 `settings` 表中：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/settings/report` | 读取报告配置、有效时区、解析后的收件人；SMTP 密码只返回 `smtp_password_set`，不返回密码内容 |
+| PUT | `/settings/report` | 保存全局时区、收件人、SMTP、Webhook、日/周/月调度和邮件图表开关 |
+| POST | `/settings/report/test` | 按当前配置立即测试所有启用渠道；返回 `ok` 和每个渠道的结果/错误详情 |
+| GET | `/settings/report/history` | 返回最近 30 条发送记录，包含时间、类型、周期、渠道、状态和详情 |
+
+报告配置示例：
+
+```json
+{
+  "timezone": "Asia/Shanghai",
+  "email_enabled": true,
+  "webhook_enabled": false,
+  "recipients": "owner@example.com",
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "username": "owner@example.com",
+    "password": "只在保存时提供，读取时不回传",
+    "from": "Metria <owner@example.com>",
+    "tls": "starttls"
+  },
+  "schedules": {
+    "daily": {"enabled": true, "time": "12:00"},
+    "weekly": {"enabled": false, "time": "12:00", "weekday": 0},
+    "monthly": {"enabled": false, "time": "12:00", "day": 1}
+  },
+  "attachments_enabled": true
+}
+```
+
+`attachments_enabled` 的含义是“邮件附带图表”，只控制 HTML 正文中的内嵌 SVG，不会发送 PDF 附件。自动调度对同一 `类型 + 周期` 只尝试一次，失败后不会在当前周期持续重试；测试发送使用独立的测试周期。
+
 ## Traffic Profiles / Pricing / Share
 
 | 方法 | 路径 | 说明 |

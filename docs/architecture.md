@@ -26,8 +26,8 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 │  ├─ 认证（单 Admin 会话） / Collector 协议（token）      │
 │  ├─ Ingest：zstd 解压 → 校验 → 幂等落库 → 增量 rollup    │
 │  ├─ 查询 API（overview/timeseries/breakdown/明细）       │
-│  ├─ 后台：价格目录同步 / rollup 对账 / WAL checkpoint    │
-│  └─ SQLite（WAL，28 表，版本化迁移）                     │
+│  ├─ 后台：价格目录同步 / 报告调度 / rollup 对账 / checkpoint│
+│  └─ SQLite（WAL，32 表，版本化迁移）                     │
 ├─────────────────────────────────────────────────────────┤
 │  Agent（无 tokio blocking 栈，RSS ≤35MiB 目标）          │
 │  ├─ Push 模式（默认）：无状态轮询采集，游标外置 Hub      │
@@ -55,6 +55,7 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
    spool，Hub 拉取确认后删除；满则停止采集并告警。
 4. **落库**：Hub 校验（schema/深度/大小）→ 幂等 upsert → 增量 rollup（hourly/daily）。
 5. **展示**：查询 API 读 rollup（概览）与原始表（明细）；Web 通过 SSE 增量刷新。
+6. **报告**：调度器按全局 IANA 时区聚合完整周期，渲染 HTML/纯文本和 JSON，投递到 SMTP 或 Webhook，并记录每个渠道的结果。
 
 ## 5. 关键设计决策
 
@@ -71,7 +72,7 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 ## 6. 运行栈
 
 - **Agent**：notify + rusqlite + ureq/rustls + zstd + blake3（无 tokio/reqwest）
-- **Hub**：tokio + axum + rusqlite(blocking pool) + rust-embed + SSE
+- **Hub**：tokio + axum + rusqlite(blocking pool) + rust-embed + SSE + SMTP/Webhook 报告调度
 - **Web**：React 19 + Vite + Tailwind CSS + Chart.js，rust-embed 进 Hub 二进制
 - **依赖约束**：不强制 Redis / Kafka / ClickHouse / PostgreSQL；Hub 镜像不含 Node.js
 

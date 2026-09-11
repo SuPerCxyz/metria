@@ -18,11 +18,15 @@ Metria 采用零侵入采集，系统边界如下：
 - **Hub**：默认单 Admin；Collector 凭据仅存哈希；上传需鉴权与幂等校验。
 - **隐私**：默认 `content_mode=metadata`；不上传完整绝对路径、Git Remote、环境变量、
   API Key、Authorization、Cookie、SSH 私钥、数据库连接串；日志不输出 Token 或 Secret。
+- **报告投递**：用量报告只发送汇总指标，不包含会话正文、提示词或代码；SMTP 密码与
+  Webhook Secret 保存在 Hub 本地数据库，读取接口不回传 SMTP 密码。管理员应确认外部
+  收件人和 Webhook 目标可信，并保护 `/data` 卷及数据库备份。
 
 ## 依赖与数据
 
 - 外部价格目录（OpenRouter / LiteLLM）数据仅作参考，失败时继续使用最后有效快照。
 - 流量为估算值，不等同于网卡或账单流量。
+- 邮件图表以内嵌 SVG 放在 HTML 正文中，PDF 当前不作为邮件附件发送。
 
 ## 报告内容模板
 

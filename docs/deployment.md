@@ -5,12 +5,12 @@
 ```bash
 cp docker/.env.example docker/.env
 # 编辑 .env：METRIA_ADMIN_PASSWORD、CLAUDE_PATH/CODEX_PATH/OPENCODE_PATH、METRIA_COLLECTOR_TOKEN
-docker compose -f docker/compose.full.yaml up -d
+docker compose -f docker/compose.full.yaml --profile demo --profile agent up -d
 ```
 
 - `metria-hub`：Web + API + SQLite（`/data/metria.db`）
-- `metria-demo`（profile: demo）：`hub --demo` 生成确定性合成数据
-- `metria-agent`（profile: agent）：采集器，客户端目录只读挂载，数据写 `/data`
+- `metria-demo`（profile: demo）：`hub --demo` 生成确定性合成数据；不需要 Demo 时可不启用该 profile
+- `metria-agent`（profile: agent）：采集器，客户端目录只读挂载，数据写 `/data`；生产部署可单独使用 `docker/compose.agent.yaml`
 
 ## 2. 镜像
 
@@ -24,7 +24,7 @@ docker compose -f docker/compose.full.yaml up -d
 |---|---|---|
 | `METRIA_DATABASE_URL` | `sqlite:///data/metria.db` | Hub 数据库 |
 | `METRIA_LISTEN` | `0.0.0.0:8080` | Hub 监听 |
-| `METRIA_TIMEZONE` | `Asia/Shanghai` | 展示时区（存储恒为 UTC） |
+| `METRIA_TIMEZONE` | `Asia/Shanghai` | 展示与报告的环境默认时区（存储恒为 UTC；设置页保存值优先） |
 | `METRIA_CONTENT_MODE` | `metadata` | none/metadata/full |
 | `METRIA_SESSION_SECRET` | 无安全默认值 | 会话签名密钥，生产环境必须设置随机高强度值 |
 | `METRIA_ADMIN_USER` / `METRIA_ADMIN_PASSWORD` | admin / change-me-please（Compose） | 初始 Admin 凭据，部署后立即修改 |
@@ -122,7 +122,27 @@ METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 - 启用 OIDC 后默认**仅保留 OIDC 入口**（本地密码登录被禁用）；如需 IdP 故障时的应急后备，显式设置 `METRIA_OIDC_DISABLE_PASSWORD_LOGIN=false`。
 - 安全提示：身份校验使用 IdP userinfo 端点（未做本地 JWKS 验签），要求 Issuer 必须走 HTTPS；state 一次性且 10 分钟过期，交换码一次性且 60 秒过期，会话 token 不经过 URL。
 
-## 5. 升级 / 回滚
+## 5. 用量报告
+
+报告在 Web「设置 → 用量报告」中配置，配置写入 Hub 的 SQLite `settings` 表，不需要重新部署 Agent，也没有对应的必填环境变量。
+
+### 5.1 渠道与内容
+
+- 邮件渠道支持 SMTP 明文、STARTTLS 和 SSL/TLS；发件人、收件人和 SMTP 密码在设置页配置。
+- Webhook 渠道使用通用 JSON，可配置 URL、自定义 Header 和 `X-Metria-Secret`。
+- 收件人留空时，Hub 会尝试解析当前 OIDC 用户邮箱；解析不到时邮件渠道会报告无有效收件人。
+- 邮件同时发送 HTML 和纯文本正文；启用图表时，趋势图以内嵌 SVG 放在 HTML 正文中。
+- 报告只包含汇总指标，不包含会话正文、提示词或代码；PDF 当前不作为邮件附件。
+
+SMTP 密码和 Webhook Secret 只保存在 Hub 本地数据库，读取 API 不会回传 SMTP 密码。请将 `/data` 卷、备份文件和 Webhook 目标都按敏感配置保护。
+
+### 5.2 调度与失败处理
+
+每日、每周、每月调度相互独立，按设置页保存的全局 IANA 时区计算上一完整周期。每月日期限制为 1–28，避免短月份产生歧义。
+
+同一个自动调度的 `类型 + 周期` 只允许一次投递尝试。失败后当前周期不会自动持续重试；修复配置后可点击「发送测试邮件/Webhook」，下一周期会正常重新发送。发送历史最多保留最新 30 条，设置页每页显示 10 条。
+
+## 6. 升级 / 回滚
 
 见 `docs/operations.md`：
 
@@ -132,12 +152,12 @@ METRIA_OIDC_ALLOWED_EMAIL=owner@example.com
 - Agent 升级时若存在遗留本地 spool 会自动一次性迁移（清积压 → 推游标 → 删除本地文件）。
 - 回滚：回退镜像 tag；若已应用新迁移，先恢复旧数据库（VACUUM INTO + zstd 备份）。
 
-## 6. 健康检查与诊断
+## 7. 健康检查与诊断
 
 - `metria healthcheck`（容器内 CMD）：连通性 + 数据库 quick_check。
 - `metria doctor --adapter|--traffic|--hub|--database|--spool`：环境诊断。
 
-## 7. 前端添加节点与安装 Agent
+## 8. 前端添加节点与安装 Agent
 
 Web 端「节点 → 添加节点」可预先创建节点并生成安装命令，目标机运行命令即接入（Beszel 式流程）：
 
@@ -153,7 +173,7 @@ Web 端「节点 → 添加节点」可预先创建节点并生成安装命令�
 
 > 说明：二进制下载接口公开，只根据节点 ID 读取平台/架构并选择文件，不接收 Token；Hub 镜像包含 Linux amd64、Linux arm64、Windows amd64 三个资产。专属 Token 明文仅创建或生成安装命令时展示，Hub 只存哈希。Token 过期后可在节点详情重新生成安装命令（自动签发新 token，不吊销正在使用的旧 token）。
 
-## 8. 规模与性能
+## 9. 规模与性能
 
 - Hub 与 Agent 均 SQLite；rollup 增量更新，查询读汇总表。
 - 后台维护：每 6h rollup 对账（发现漂移自动重建最近 24h）+ WAL checkpoint。

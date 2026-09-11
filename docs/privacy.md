@@ -57,3 +57,11 @@ reconstructed > partial > content_bytes > token_profile > user_profile > builtin
 - Collector 凭独立 token（仅存哈希，7 天有效期）。
 - Share Link 为公开只读脱敏视图（不含正文与敏感信息），带查看审计。
 - MCP 服务为只读查询（`metria mcp`），不暴露写入能力。
+
+## 7. 用量报告的数据边界
+
+- 报告只发送周期汇总指标、费用口径、排行和估算流量，不包含会话正文、提示词、代码或完整客户端路径。
+- SMTP 邮件和 Webhook 都是主动向外部目标投递数据；管理员应确认收件人、Webhook URL 和第三方服务的隐私策略。
+- SMTP 密码和 Webhook Secret 保存在 Hub 本地 SQLite，读取配置的 API 不回传 SMTP 密码；应像保护数据库和备份文件一样保护 `/data` 卷。
+- 邮件图表是 HTML 正文中的内嵌 SVG；PDF 渲染能力不会改变报告的数据边界，也不会作为邮件附件发送。
+- 自动调度失败后当前周期不会持续重试，避免错误配置造成重复外发；修复后可通过设置页手动测试。

@@ -19,7 +19,7 @@
 | TrafficProfile | p50/p75/p90、fixed、overhead ratio、cache transport factor、effective_from/to、version、source(5 类)、enabled |
 | PricingCatalog/Rule/Match | 金额微美元、priority/effective 区间、source 含 builtin_catalog/client_reported/user_override |
 
-## 2. Hub 数据库（28 表）
+## 2. Hub 数据库（32 表）
 
 | 分组 | 表 |
 |---|---|
@@ -30,7 +30,11 @@
 | 价格 | pricing_catalogs / pricing_snapshots / pricing_rules / pricing_matches |
 | 汇总 | hourly_rollups / daily_rollups |
 | 分享/上传 | share_links / share_audits / upload_batches |
+| 报告与状态 | settings / report_sends / source_cursors |
 | 系统 | server_meta / schema_migrations（由 storage 运行时建） |
+
+`settings` 使用键值存储保存全局时区和报告配置；SMTP 密码不会通过读取接口回传。
+`report_sends` 记录每个报告渠道的周期、状态和错误详情，数据库内只保留最新 30 条。
 
 ### 关键约束
 

@@ -11,6 +11,7 @@ Metria 默认**全量保留**原始事件与 rollup，无自动删除。可依�
 | `hourly_rollups` / `daily_rollups` | 永久 | Dashboard 读取的汇总 |
 | `traffic_estimates` | 永久 | 估算流量，保留版本以便重新估算对比 |
 | `traffic_profile_samples` | 永久 | 自动学习样本 |
+| `report_sends` | 最新 30 条 | 报告渠道、周期、状态和错误详情 |
 
 **建议**：
 
@@ -31,8 +32,28 @@ docker compose -f docker/compose.yaml start
 ```
 
 - 备份使用 SQLite `VACUUM INTO`，WAL 安全，生成一致性快照。
+- 备份包含报告配置（`settings`）和发送历史（`report_sends`），恢复后会一并恢复 SMTP/Webhook 设置及历史记录。
 - 恢复会覆盖目标数据库并清理残留 WAL/SHM 文件。
 - 建议配合 cron/系统定时任务定期备份，并保留最近 N 份。
+
+## 用量报告运维
+
+报告配置在 Web「设置 → 用量报告」维护，配置保存于 Hub 数据库，不需要在 Agent 节点重复配置。
+
+### 调度与投递
+
+- 每日、每周、每月调度独立运行，按设置页保存的全局 IANA 时区汇总上一完整周期。
+- 邮件渠道使用 SMTP，支持明文、STARTTLS 和 SSL/TLS；Webhook 渠道使用通用 JSON。
+- 邮件包含 HTML 和纯文本正文；启用图表时，趋势图以内嵌 SVG 发送。PDF 渲染能力保留，但当前不作为邮件附件投递。
+- 自动调度对同一个 `类型 + 周期` 只尝试一次。失败后本周期不自动重试；修复配置后可手动测试，下一周期会重新尝试。
+- 测试发送不占用自动调度周期。发送历史最多保留 30 条，前端每页展示 10 条。
+
+### 故障排查
+
+1. 在设置页确认 SMTP 主机、端口、TLS 模式、发件人和收件人；Webhook 则确认 URL、Header 和密钥。
+2. 点击「发送测试邮件/Webhook」，查看渠道级错误详情。
+3. 如果自动报告已在本周期失败，修复配置后不要等待当前周期自动重试，直接使用测试发送验证；下一完整周期会重新发送。
+4. 报告密码和 Webhook Secret 存在 Hub 本地数据库，备份文件与 `/data` 卷应按敏感数据保护。
 
 ## 升级
 
@@ -118,5 +139,6 @@ Dashboard 默认读 rollup，不在每次请求时扫描全部历史事件。
 | `METRIA_PRICING_LITELLM_ENABLED` | 启用 LiteLLM 价格目录 |
 | `METRIA_PRICING_CUSTOM_URL` / `_AUTH` | 自定义 HTTP 价格目录 |
 | `METRIA_CONTENT_MODE` | `none` / `metadata` / `full` |
+| `METRIA_TIMEZONE` | Web 展示与报告的环境默认时区（设置页保存值优先） |
 | `METRIA_NODE_ID` / `METRIA_NODE_NAME` | Agent 节点身份 |
 | `METRIA_HUB_URL` / `METRIA_AGENT_TOKEN_FILE` | Agent 连接配置 |
