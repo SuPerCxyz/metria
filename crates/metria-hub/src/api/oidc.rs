@@ -146,6 +146,13 @@ struct UserInfo {
     preferred_username: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    picture: Option<String>,
+}
+
+fn safe_picture_url(picture: Option<&str>) -> Option<String> {
+    let url = Url::parse(picture?.trim()).ok()?;
+    (url.scheme() == "https" && url.host_str().is_some()).then(|| url.to_string())
 }
 
 fn fetch_userinfo(userinfo_endpoint: &str, access_token: &str) -> Result<UserInfo, String> {
@@ -347,7 +354,7 @@ pub async fn oidc_callback(
         return redirect_login_error("缺少 OIDC authorization code");
     };
 
-    let flow = || -> Result<(String, Option<String>), String> {
+    let flow = || -> Result<(String, Option<String>, Option<String>), String> {
         let disc = fetch_discovery(&cfg)?;
         let userinfo_endpoint = disc
             .userinfo_endpoint
@@ -374,9 +381,10 @@ pub async fn oidc_callback(
         }
         let username = ui.email.clone().unwrap_or_else(|| ui.sub.clone());
         let display_name = ui.name.or(ui.preferred_username);
-        Ok((username, display_name))
+        let avatar_url = safe_picture_url(ui.picture.as_deref());
+        Ok((username, display_name, avatar_url))
     };
-    let (username, display_name) = match flow() {
+    let (username, display_name, avatar_url) = match flow() {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "OIDC 登录失败");
@@ -385,7 +393,10 @@ pub async fn oidc_callback(
     };
 
     // 建立 users 记录（无本地密码），复用现有 profile / 会话机制
-    if let Err(e) = st.db.ensure_oidc_user(&username, display_name.as_deref()) {
+    if let Err(e) =
+        st.db
+            .ensure_oidc_user(&username, display_name.as_deref(), avatar_url.as_deref())
+    {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "db_error",
@@ -456,6 +467,7 @@ mod tests {
             email_verified: verified,
             preferred_username: None,
             name: None,
+            picture: None,
         }
     }
 
@@ -498,6 +510,18 @@ mod tests {
             &none,
             &ui("sub-1", Some("a@example.com"), Some(true))
         ));
+    }
+
+    #[test]
+    fn picture_requires_https_with_host() {
+        assert_eq!(
+            safe_picture_url(Some("https://idp.example.com/avatar.png")).as_deref(),
+            Some("https://idp.example.com/avatar.png")
+        );
+        assert!(safe_picture_url(Some("http://idp.example.com/avatar.png")).is_none());
+        assert!(safe_picture_url(Some("data:image/png;base64,abc")).is_none());
+        assert!(safe_picture_url(Some("not-a-url")).is_none());
+        assert!(safe_picture_url(None).is_none());
     }
 
     #[test]

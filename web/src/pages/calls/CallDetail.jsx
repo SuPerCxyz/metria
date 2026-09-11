@@ -56,8 +56,8 @@ export default function CallDetail() {
         </div>
         <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-4">
           {[
-            ['请求流量', fmtBytes(tr.estimated_request_wire_bytes)],
-            ['响应流量', fmtBytes(tr.estimated_response_wire_bytes)],
+            ['请求估算流量', fmtBytes(tr.estimated_request_wire_bytes)],
+            ['响应估算流量', fmtBytes(tr.estimated_response_wire_bytes)],
             ['估算来源', tr.estimation_source || '—'],
             ['上下文传输', tr.context_transport_mode || '—'],
             ['Cache 行为', tr.cache_transport_behavior || '—'],

@@ -13,7 +13,9 @@ use super::aggregate::{self, aggregate, ChartSeries, ReportMetrics};
 use super::channels::{send_email, send_webhook};
 use super::charts;
 use super::pdf;
-use super::render::{render_html, render_text, webhook_payload, ReportChart, ReportMeta};
+use super::render::{
+    inline_chart_svg, render_html, render_text, webhook_payload, ReportChart, ReportMeta,
+};
 use super::{
     effective_timezone, effective_timezone_name, load_config, period_and_due, period_label,
     period_range, resolve_recipients, ChannelOutcome, Kind,
@@ -157,10 +159,23 @@ fn build_charts(
             .enumerate()
             .map(|(i, s)| (s.name.clone(), colors[i % colors.len()].to_string()))
             .collect();
+        let svg_series = cs
+            .series
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    s.name.clone(),
+                    colors[i % colors.len()].to_string(),
+                    s.values.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         Some(ReportChart {
             cid: cid.to_string(),
             title: title.to_string(),
             png,
+            svg: inline_chart_svg(&cs.days, &svg_series, title),
             series,
             days: cs.days.clone(),
         })
@@ -274,6 +289,13 @@ pub fn spawn_report_scheduler(db: HubDb, hub_cfg: HubConfig) {
                 }
                 if db
                     .report_period_sent(kind.as_str(), &period)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let retry_cutoff = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+                if db
+                    .report_period_attempted_since(kind.as_str(), &period, &retry_cutoff)
                     .unwrap_or(false)
                 {
                     continue;

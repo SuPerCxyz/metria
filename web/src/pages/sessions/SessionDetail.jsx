@@ -17,7 +17,7 @@ import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, fmtSessionT
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
   { key: 'cost', label: '费用' },
-  { key: 'traffic', label: '流量' },
+  { key: 'traffic', label: '估算流量' },
   { key: 'latency', label: '延迟' },
 ]
 
@@ -89,7 +89,7 @@ export default function SessionDetail() {
           { label: '调用次数', value: String(s.model_call_count ?? 0) },
           { label: '总 Token', value: fmtTokensShort(sumTokens(s)) },
           { label: '总费用', value: fmtUsd(s.reported_cost_micro_usd ?? s.calculated_cost_micro_usd ?? s.estimated_cost_micro_usd) },
-          { label: '总流量', value: fmtBytes(s.estimated_total_bytes) },
+          { label: '总估算流量', value: fmtBytes(s.estimated_total_bytes) },
           { label: '模型', value: s.model || '—' },
         ]}
       />

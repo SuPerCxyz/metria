@@ -130,6 +130,13 @@ pub(crate) async fn traffic_reestimate(
 ) -> Response {
     match st.db.reestimate_calls(req.model.as_deref()) {
         Ok(n) => {
+            if let Err(e) = st.db.rebuild_all_traffic_rollups() {
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "traffic_rollup_failed",
+                    &e.to_string(),
+                );
+            }
             st.sse.publish("traffic.profile_updated", "{}");
             Json(serde_json::json!({
                 "ok": true,

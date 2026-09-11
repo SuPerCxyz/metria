@@ -44,7 +44,7 @@ export default function ModelDetail() {
     { key: 'model', label: '模型', render: (r) => r.model || '—' },
     { key: 'client_id', label: 'Agent', render: (r) => r.client_id || '—' },
     { key: 'input_tokens', label: 'Token', render: (r) => fmtTokensShort(sumTokens(r)) },
-    { key: 'estimated_total_bytes', label: '流量', render: (r) => fmtBytes(r.estimated_total_bytes) },
+    { key: 'estimated_total_bytes', label: '估算流量', render: (r) => fmtBytes(r.estimated_total_bytes) },
   ]
 
   return (
@@ -63,7 +63,7 @@ export default function ModelDetail() {
             { label: '请求数', value: String(s.model_calls ?? 0) },
             { label: 'Token', value: fmtTokensShort(sumTokens(s)) },
             { label: '费用', value: fmtUsd(s.cost_micro_usd) },
-            { label: '网络流量', value: fmtBytes(s.estimated_total_bytes) },
+            { label: '估算流量', value: fmtBytes(s.estimated_total_bytes) },
             { label: '缓存命中率', value: (d.summary && s.input_tokens > 0) ? `${((s.cache_read_tokens ?? 0) / ((s.input_tokens ?? 0) + (s.cache_read_tokens ?? 0)) * 100).toFixed(1)}%` : '—' },
           ]}
         />

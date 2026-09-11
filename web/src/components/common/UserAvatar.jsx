@@ -1,6 +1,6 @@
-// 用户头像：使用可持久化的文字与颜色键，不加载外部图片。
+// 用户头像：OIDC HTTPS picture 优先，失败时回退到可持久化文字与颜色。
 
-import React from 'react'
+import React, { useEffect, useState } from 'react'
 
 const COLORS = {
   indigo: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-400/20 dark:text-indigo-300',
@@ -12,11 +12,28 @@ const COLORS = {
 }
 
 export default function UserAvatar({ user, size = 'sm' }) {
+  const [imageFailed, setImageFailed] = useState(false)
+  const avatarUrl = typeof user?.avatar_url === 'string' && user.avatar_url.startsWith('https://')
+    ? user.avatar_url
+    : ''
+  useEffect(() => setImageFailed(false), [avatarUrl])
   const source = user?.avatar_text || user?.display_name || user?.username || 'A'
   const text = Array.from(source.trim() || 'A').slice(0, 2).join('').toUpperCase()
   const sizeClass = size === 'lg' ? 'h-16 w-16 text-xl' : 'h-8 w-8 text-xs'
+  const label = `${user?.display_name || user?.username || '用户'}的头像`
+  if (avatarUrl && !imageFailed) {
+    return (
+      <img
+        src={avatarUrl}
+        alt={label}
+        referrerPolicy="no-referrer"
+        onError={() => setImageFailed(true)}
+        className={`${sizeClass} shrink-0 rounded-full object-cover`}
+      />
+    )
+  }
   return (
-    <span className={`inline-flex shrink-0 items-center justify-center rounded-full font-bold ${sizeClass} ${COLORS[user?.avatar_color] || COLORS.indigo}`}>
+    <span role="img" aria-label={label} className={`inline-flex shrink-0 items-center justify-center rounded-full font-bold ${sizeClass} ${COLORS[user?.avatar_color] || COLORS.indigo}`}>
       {text}
     </span>
   )

@@ -29,6 +29,7 @@ pub struct UserProfile {
     pub display_name: Option<String>,
     pub avatar_text: Option<String>,
     pub avatar_color: String,
+    pub avatar_url: Option<String>,
     pub role: String,
 }
 
@@ -128,7 +129,7 @@ impl HubDb {
     pub fn user_profile(&self, username: &str) -> Result<Option<UserProfile>, StorageError> {
         let c = self.conn();
         c.query_row(
-            "SELECT username, display_name, avatar_text, avatar_color, role FROM users WHERE username = ?1",
+            "SELECT username, display_name, avatar_text, avatar_color, avatar_url, role FROM users WHERE username = ?1",
             [username],
             |r| {
                 Ok(UserProfile {
@@ -136,7 +137,8 @@ impl HubDb {
                     display_name: r.get(1)?,
                     avatar_text: r.get(2)?,
                     avatar_color: r.get(3)?,
-                    role: r.get(4)?,
+                    avatar_url: r.get(4)?,
+                    role: r.get(5)?,
                 })
             },
         )
@@ -187,6 +189,7 @@ impl HubDb {
         &self,
         username: &str,
         display_name: Option<&str>,
+        avatar_url: Option<&str>,
     ) -> Result<(), StorageError> {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
@@ -203,6 +206,11 @@ impl HubDb {
             )
             .map_err(StorageError::from)?;
         }
+        c.execute(
+            "UPDATE users SET avatar_url = ?1, updated_at = ?2 WHERE username = ?3",
+            params![avatar_url, now, username],
+        )
+        .map_err(StorageError::from)?;
         Ok(())
     }
 
@@ -273,6 +281,21 @@ impl HubDb {
         let n: i64 = c.query_row(
             "SELECT COUNT(*) FROM report_sends WHERE kind = ?1 AND period = ?2 AND status = 'success'",
             params![kind, period],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 最近是否已经尝试过该周期，防止失败渠道每分钟重复投递。
+    pub fn report_period_attempted_since(
+        &self,
+        kind: &str,
+        period: &str,
+        since: &str,
+    ) -> Result<bool, StorageError> {
+        let n: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM report_sends WHERE kind = ?1 AND period = ?2 AND created_at >= ?3",
+            params![kind, period, since],
             |r| r.get(0),
         )?;
         Ok(n > 0)
@@ -1031,7 +1054,11 @@ impl HubDb {
                     opt(g("content_hash")),
                     gn("content_length"),
                     gn("utf8_bytes"),
-                    now,
+                    if g("created_at").is_empty() {
+                        &now
+                    } else {
+                        g("created_at")
+                    },
                     bool_i(v.get("redacted")),
                 ],
             )
@@ -1052,8 +1079,9 @@ impl HubDb {
                     first_response_at, completed_at, duration_ms, status, status_code, streaming, stream_completed,
                     client_aborted, retry_count, call_granularity, input_tokens, output_tokens, cache_read_tokens,
                     cache_write_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
-                    estimated_cost_micro_usd, usage_event_id, traffic_estimate_id, created_at, updated_at
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)",
+                    estimated_cost_micro_usd, usage_event_id, traffic_estimate_id, created_at, updated_at,
+                    timing_source, timing_quality
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38)",
                 params![
                     g("id"),
                     opt(g("source_call_id")),
@@ -1091,14 +1119,85 @@ impl HubDb {
                     opt(g("traffic_estimate_id")),
                     now,
                     now,
+                    opt(g("timing_source")),
+                    opt(g("timing_quality")),
                 ],
             )
             .map_err(StorageError::from)?;
+        c.execute(
+            "UPDATE model_calls SET traffic_estimate_id = COALESCE(
+                traffic_estimate_id,
+                (SELECT id FROM traffic_estimates WHERE model_call_id = ?1 ORDER BY created_at DESC LIMIT 1)
+             ) WHERE id = ?1",
+            [g("id")],
+        )?;
         self.link_usage_to_call(&c, g("id"))?;
         // 即使这是上传重试中的重复 call，也重算一次；若上次 call 已提交但聚合刷新失败，
         // 本次重试仍能修复 session 摘要。
         self.refresh_session_agg(&c, session_key)?;
         Ok(n > 0)
+    }
+
+    /// 查询调用的业务发生时间，供估算流量按调用时间进入汇总。
+    pub fn model_call_started_at(&self, call_id: &str) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT started_at FROM model_calls WHERE id = ?1",
+                [call_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 对旧版适配器写入的同值 timing 做一次保守回填。
+    ///
+    /// 只使用已持久化的 turn 起点、assistant/message 时间和原 duration；无法
+    /// 证明首输出的来源保持 NULL。
+    pub fn repair_legacy_call_timings(&self) -> Result<usize, StorageError> {
+        let c = self.conn();
+        let opencode = c.execute(
+            "UPDATE model_calls
+             SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', julianday(started_at) + duration_ms / 86400000.0),
+                 first_response_at = started_at,
+                 duration_ms = CAST(MAX(0, (julianday(strftime('%Y-%m-%dT%H:%M:%fZ', julianday(started_at) + duration_ms / 86400000.0)) - julianday(COALESCE((SELECT started_at FROM turns WHERE turns.id = model_calls.turn_id), started_at))) * 86400000.0) AS INTEGER),
+                 started_at = COALESCE((SELECT started_at FROM turns WHERE turns.id = model_calls.turn_id), started_at),
+                 timing_source = 'opencode_message_timestamps',
+                 timing_quality = 'observed'
+             WHERE client_id = 'opencode' AND timing_source IS NULL AND duration_ms IS NOT NULL",
+            [],
+        )?;
+        let bounded = c.execute(
+            "UPDATE model_calls
+             SET completed_at = started_at,
+                 first_response_at = NULL,
+                 duration_ms = CAST(MAX(0, (julianday(started_at) - julianday(COALESCE((SELECT started_at FROM turns WHERE turns.id = model_calls.turn_id), started_at))) * 86400000.0) AS INTEGER),
+                 started_at = COALESCE((SELECT started_at FROM turns WHERE turns.id = model_calls.turn_id), started_at),
+                 timing_source = CASE client_id WHEN 'codex' THEN 'codex_turn_to_token_count' ELSE 'claude_message_timestamps' END,
+                 timing_quality = 'bounded'
+             WHERE client_id IN ('codex','claude-code') AND timing_source IS NULL
+               AND EXISTS (SELECT 1 FROM turns WHERE turns.id = model_calls.turn_id AND turns.started_at <= model_calls.started_at)",
+            [],
+        )?;
+        let legacy = c.execute(
+            "UPDATE model_calls
+             SET started_at = CASE
+                    WHEN duration_ms IS NOT NULL AND completed_at IS NOT NULL
+                    THEN strftime('%Y-%m-%dT%H:%M:%fZ', julianday(completed_at) - duration_ms / 86400000.0)
+                    ELSE started_at END,
+                 completed_at = COALESCE(completed_at, started_at),
+                 first_response_at = NULL,
+                 timing_source = CASE
+                    WHEN duration_ms IS NOT NULL THEN 'legacy_bounded_duration'
+                    ELSE 'legacy_unavailable' END,
+                 timing_quality = CASE
+                    WHEN duration_ms IS NOT NULL THEN 'bounded'
+                    ELSE 'unavailable' END
+             WHERE client_id IN ('codex','claude-code') AND timing_source IS NULL",
+            [],
+        )?;
+        Ok(opencode + bounded + legacy)
     }
 
     /// 新调用落库后刷新会话聚合字段。
@@ -1240,6 +1339,26 @@ impl HubDb {
                 ],
             )
             .map_err(StorageError::from)?;
+        if n > 0
+            && (cost_f("reported_micro_usd").is_some()
+                || cost_f("calculated_micro_usd").is_some()
+                || cost_f("estimated_micro_usd").is_some())
+        {
+            c.execute(
+                "INSERT INTO pricing_matches (id, usage_event_id, pricing_rule_id, pricing_snapshot_id, match_type, calculated_at, total_cost)
+                 VALUES (?1,?2,?3,?4,'ingest',?5,?6)",
+                params![
+                    metria_core::model::Id::new().as_str().to_string(),
+                    g("event_id"),
+                    opt(cost.get("pricing_rule_id").and_then(|x| x.as_str()).unwrap_or("")),
+                    opt(cost.get("pricing_snapshot_id").and_then(|x| x.as_str()).unwrap_or("")),
+                    Utc::now().to_rfc3339(),
+                    cost_f("reported_micro_usd")
+                        .or_else(|| cost_f("calculated_micro_usd"))
+                        .or_else(|| cost_f("estimated_micro_usd")),
+                ],
+            )?;
+        }
         let model_call_id = g("model_call_id");
         if !model_call_id.is_empty() {
             self.link_usage_to_call(&c, model_call_id)?;
@@ -1312,6 +1431,13 @@ impl HubDb {
                 ],
             )
             .map_err(StorageError::from)?;
+        if n > 0 && !g("model_call_id").is_empty() {
+            c.execute(
+                "UPDATE model_calls SET traffic_estimate_id = ?1
+                 WHERE id = ?2 AND (traffic_estimate_id IS NULL OR traffic_estimate_id = '')",
+                params![g("id"), g("model_call_id")],
+            )?;
+        }
         Ok(n > 0)
     }
 

@@ -374,7 +374,7 @@ impl HubDb {
 
         let mut reestimated = 0i64;
         for row in rows.flatten() {
-            let (call_id, client, provider, model, started, input, output, cr, cw, rea) = row;
+            let (call_id, client, provider, model, _started, input, output, cr, cw, rea) = row;
             let est = metria_traffic::estimate_with_candidates(
                 &metria_traffic::EstimateInput {
                     client: &client,
@@ -426,7 +426,7 @@ impl HubDb {
                         out.upper_bound_bytes,
                         format!("{:?}", out.estimation_source).to_ascii_lowercase(),
                         out.confidence,
-                        started,
+                        Utc::now().to_rfc3339(),
                         Utc::now().to_rfc3339(),
                     ],
                 )

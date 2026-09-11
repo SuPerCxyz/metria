@@ -149,4 +149,16 @@
 .app-scroll-container {
   scrollbar-gutter: stable;
 }
+
+/* 报告调度的日期输入始终显示原生数字调节箭头。 */
+.report-day-input {
+  appearance: auto;
+  -moz-appearance: number-input;
+}
+
+.report-day-input::-webkit-inner-spin-button,
+.report-day-input::-webkit-outer-spin-button {
+  display: block;
+  opacity: 1;
+}
 /* build-cache-test */

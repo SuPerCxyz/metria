@@ -118,6 +118,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/usage/timeseries", get(usage_timeseries))
         .route("/api/v1/usage/breakdown", get(usage_breakdown))
         .route("/api/v1/usage/latency", get(usage_latency))
+        .route("/api/v1/usage/performance", get(usage_performance))
         .route(
             "/api/v1/usage/latency/timeseries",
             get(usage_latency_timeseries),
@@ -744,6 +745,7 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
             "display_name": p.display_name,
             "avatar_text": p.avatar_text,
             "avatar_color": p.avatar_color,
+            "avatar_url": p.avatar_url,
             "role": p.role,
             "local_password": has_local_password,
             "ok": true
@@ -755,6 +757,7 @@ async fn me(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Respo
             "display_name": null,
             "avatar_text": null,
             "avatar_color": "indigo",
+            "avatar_url": null,
             "role": "admin",
             "local_password": has_local_password,
             "ok": true
@@ -1055,13 +1058,41 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
     let mut accepted = Vec::new();
     let mut duplicate = Vec::new();
     let mut failed = Vec::new();
+    // 每个批次只构造一次引擎，使新 usage 在落库和 rollup 前立即得到费用。
+    let pricing_engine = crate::catalog::pricing_engine(&st.db);
+    let call_times: HashMap<&str, &str> = batch
+        .events
+        .iter()
+        .filter(|event| event.kind == "call")
+        .filter_map(|event| {
+            Some((
+                event.payload.get("id")?.as_str()?,
+                event.payload.get("started_at")?.as_str()?,
+            ))
+        })
+        .collect();
 
     let session_map = st.db.session_key_map(&serde_json::json!({
         "sessions": batch.events.iter().filter(|e| e.kind == "session").map(|e| e.payload.clone()).collect::<Vec<_>>()
     }));
 
     for ev in &batch.events {
-        let v = &ev.payload;
+        let mut payload = ev.payload.clone();
+        if ev.kind == "usage" {
+            if let Err(error) = crate::catalog::price_usage_payload(&pricing_engine, &mut payload) {
+                tracing::warn!(%error, event_id = %ev.event_id, "usage 即时计价失败，保留未定价状态");
+            }
+        }
+        if ev.kind == "traffic" {
+            if let Some(call_id) = payload.get("model_call_id").and_then(|v| v.as_str()) {
+                if let Some(started_at) = call_times.get(call_id) {
+                    payload["timestamp"] = serde_json::json!(started_at);
+                } else if let Some(started_at) = st.db.model_call_started_at(call_id) {
+                    payload["timestamp"] = serde_json::json!(started_at);
+                }
+            }
+        }
+        let v = &payload;
         let node = v
             .get("node_id")
             .and_then(|x| x.as_str())

@@ -5,6 +5,74 @@
 use crate::db::HubDb;
 use serde_json::Value;
 
+/// 从当前启用规则构造价格引擎；内置规则由引擎自身提供。
+pub fn pricing_engine(db: &HubDb) -> metria_pricing::PricingEngine {
+    let mut engine = metria_pricing::PricingEngine::new();
+    for rule in db.load_all_rules() {
+        engine.add_rule(rule);
+    }
+    engine
+}
+
+/// 在 usage 落库前即时补齐费用。无可靠价格时保持 null，不硬造 0。
+pub fn price_usage_payload(
+    engine: &metria_pricing::PricingEngine,
+    payload: &mut Value,
+) -> Result<(), String> {
+    let usage_value = payload.get("usage").cloned().unwrap_or(Value::Null);
+    let token = |key: &str| usage_value.get(key).and_then(Value::as_i64);
+    let usage = metria_core::model::Usage {
+        input: token("input"),
+        output: token("output"),
+        cache_read: token("cache_read"),
+        cache_write: token("cache_write"),
+        reasoning: token("reasoning"),
+    };
+    let existing = payload
+        .get("cost")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if [
+        "reported_micro_usd",
+        "calculated_micro_usd",
+        "estimated_micro_usd",
+    ]
+    .iter()
+    .any(|key| existing.get(*key).and_then(Value::as_i64).is_some())
+    {
+        return Ok(());
+    }
+    let reported = existing.get("reported_micro_usd").and_then(Value::as_i64);
+    let model = payload
+        .get("model_normalized")
+        .or_else(|| payload.get("model_raw"))
+        .and_then(Value::as_str);
+    let provider = payload
+        .get("provider_normalized")
+        .or_else(|| payload.get("provider_raw"))
+        .and_then(Value::as_str);
+    let at = payload
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    let cost = engine
+        .compute(&usage, model, provider, at, reported)
+        .map_err(|e| e.to_string())?;
+    if !cost.pricing_available {
+        return Ok(());
+    }
+    payload["cost"] = serde_json::json!({
+        "reported_micro_usd": cost.reported_micro_usd,
+        "calculated_micro_usd": cost.calculated_micro_usd,
+        "estimated_micro_usd": cost.estimated_micro_usd,
+        "pricing_rule_id": cost.rule_id,
+        "pricing_snapshot_id": cost.snapshot_id,
+    });
+    Ok(())
+}
+
 /// 目录定义。
 #[derive(Debug, Clone)]
 pub struct CatalogDef {
@@ -205,15 +273,41 @@ pub fn known_catalogs() -> Vec<(&'static str, &'static str)> {
 ///
 /// `only_unpriced = true` 时仅处理尚无费用的事件（后台周期增量），否则全量重算。
 pub fn reprice_from_rules(db: &HubDb, only_unpriced: bool) -> Result<i64, String> {
-    let rules = db.load_all_rules();
-    let mut engine = metria_pricing::PricingEngine::new();
-    for r in rules {
-        engine.add_rule(r);
-    }
+    let engine = pricing_engine(db);
     let n = db
         .reprice_all(&engine, only_unpriced)
         .map_err(|e| e.to_string())?;
-    // 重建最近 31 天费用 rollup，使 Overview/费用页按最新价格反映
-    db.rebuild_usage_rollups(31).map_err(|e| e.to_string())?;
+    // 历史规则可能命中任意时间的事件，必须全量重建费用口径。
+    if n > 0 || !only_unpriced {
+        db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+    }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_pricing_fills_known_model_and_leaves_unknown_unavailable() {
+        let engine = metria_pricing::PricingEngine::new();
+        let mut known = serde_json::json!({
+            "timestamp": "2026-09-11T00:00:00Z",
+            "provider_normalized": "openai",
+            "model_normalized": "gpt-5",
+            "usage": { "input": 1_000_000, "output": 100_000 }
+        });
+        price_usage_payload(&engine, &mut known).unwrap();
+        assert!(known["cost"]["calculated_micro_usd"].as_i64().unwrap() > 0);
+
+        let mut unknown = serde_json::json!({
+            "timestamp": "2026-09-11T00:00:00Z",
+            "provider_normalized": "custom",
+            "model_normalized": "unknown-model",
+            "usage": { "input": 1_000_000, "output": 100_000 },
+            "cost": {}
+        });
+        price_usage_payload(&engine, &mut unknown).unwrap();
+        assert!(unknown["cost"].as_object().unwrap().is_empty());
+    }
 }

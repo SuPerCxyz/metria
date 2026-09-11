@@ -583,3 +583,14 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
   `METRIA_POLL_INTERVAL=120`。
 - 注意：本地镜像直发期间 ghcr dev-latest 滞后，需推送代码触发 CI 更新镜像，避免 watchtower
   每日 06:00 将节点回退到旧镜像。
+
+---
+
+## 14. 可观测性、设置完整性与报告邮件（2026-09-11）
+
+- 完成设置页：SMTP 启用即时持久化、发件人校验、测试结果容器、全局右上角 Toast、调度字段对齐和几号 1–28 约束；节点动作同步使用 Toast。
+- OIDC UserInfo `picture` 仅接受 HTTPS 并持久化，头像加载失败回退文字头像；OIDC 用户名和邮箱保持只读。
+- 费用：ingest 即时计价、历史规则 match 保留、未定价覆盖率可见、全历史 rollup 重建；估算流量按 model call 时间归属并补齐历史当前版本。
+- 性能：适配器记录可证明的首个可观察输出和完成时间；API/前端展示覆盖率，无法证明时保持不可用。
+- 图表：输入/输出/缓存、模型、Agent 等数据文案统一 TrendChart 图例样式；报告邮件图表改为内嵌 SVG，PDF 保留 PNG。
+- migration 015 增加 avatar/timing 字段并保留 pricing match 历史；lstable 完成全历史修复、备份、健康检查与明细/rollup 一致性核对。

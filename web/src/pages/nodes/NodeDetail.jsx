@@ -65,13 +65,13 @@ export default function NodeDetail() {
           { label: 'Token', value: fmtTokensShort(sumTokens(rs)) },
           { label: '缓存命中率', value: cacheHitRate(rs) != null ? fmtPct100(cacheHitRate(rs)) : '—' },
           { label: '费用', value: fmtUsd(rs.cost_micro_usd) },
-          { label: '网络流量', value: fmtBytes(rs.estimated_total_bytes) },
+          { label: '估算流量', value: fmtBytes(rs.estimated_total_bytes) },
           { label: '最后上报', value: fmtDateTime(n.last_seen_at) },
         ]}
       />
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token / 费用 / 流量趋势</h2>
+        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token / 费用 / 估算流量趋势</h2>
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={fmtTokensShort} />}
       </div>
 

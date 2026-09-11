@@ -1,8 +1,9 @@
 // 设置页「用量报告」区块：全局时区、收件人、SMTP/Webhook 渠道、三独立调度、测试发送与发送历史。
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { api } from '../../services/api'
 import { LoadingSkeleton, ErrorState } from '../../components/feedback/Feedback'
+import { useToast } from '../../components/feedback/Toast'
 
 const COMMON_TZ = [
   'Asia/Shanghai',
@@ -16,8 +17,8 @@ const COMMON_TZ = [
 ]
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
 const TLS_OPTIONS = [
-  { value: 'starttls', label: 'STARTTLS（587）' },
-  { value: 'tls', label: 'SSL/TLS（465）' },
+  { value: 'starttls', label: 'STARTTLS' },
+  { value: 'tls', label: 'SSL/TLS' },
   { value: 'none', label: '无加密（明文）' },
 ]
 
@@ -55,6 +56,7 @@ function mergeConfig(cfg) {
 
 const inputCls =
   'w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200'
+const compactInputCls = inputCls.replace('w-full ', '')
 const cardCls =
   'bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6'
 
@@ -62,10 +64,15 @@ function Label({ children }) {
   return <span className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{children}</span>
 }
 
-function Toggle({ checked, onChange, label }) {
+function clampReportDay(value) {
+  const day = Number(value)
+  return Number.isFinite(day) ? Math.min(28, Math.max(1, Math.trunc(day))) : 1
+}
+
+function Toggle({ checked, onChange, label, disabled = false }) {
   return (
-    <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
+    <label className={`inline-flex items-center gap-2 select-none ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}>
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500" />
       <span className="text-sm text-gray-700 dark:text-gray-200">{label}</span>
     </label>
   )
@@ -79,11 +86,36 @@ export default function ReportSettings() {
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
-  const [notice, setNotice] = useState('')
   const [testResults, setTestResults] = useState(null)
   const [history, setHistory] = useState([])
+  const { notify } = useToast()
+  const scheduleFieldRefs = useRef({})
+  const [scheduleFieldWidth, setScheduleFieldWidth] = useState(null)
 
-  async function load() {
+  useLayoutEffect(() => {
+    const measure = () => {
+      const widths = Object.values(scheduleFieldRefs.current)
+        .filter(Boolean)
+        .map(({ header, control }) => Math.ceil(Math.max(
+          header?.getBoundingClientRect().width || 0,
+          control?.getBoundingClientRect().width || 0,
+        )))
+        .filter(Boolean)
+      if (widths.length !== 2) return
+      const nextWidth = Math.max(...widths)
+      setScheduleFieldWidth((current) => (current === nextWidth ? current : nextWidth))
+    }
+
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    Object.values(scheduleFieldRefs.current).forEach(({ header, control }) => {
+      if (header) observer?.observe(header)
+      if (control) observer?.observe(control)
+    })
+    return () => observer?.disconnect()
+  }, [loading])
+
+  async function load(announce = false) {
     setLoading(true)
     setError('')
     try {
@@ -99,6 +131,7 @@ export default function ReportSettings() {
         timezone_default: res.timezone_default || '',
       })
       setHistory(hist.sends || [])
+      if (announce) notify('发送历史已刷新')
     } catch (e) {
       setError(e.message || '加载失败')
     } finally {
@@ -110,14 +143,18 @@ export default function ReportSettings() {
     load()
   }, [])
 
-  const set = (patch) => setDraft((d) => ({ ...d, ...patch }))
+  const set = (keyOrPatch, value) => {
+    const patch = typeof keyOrPatch === 'string' ? { [keyOrPatch]: value } : keyOrPatch
+    setDraft((d) => ({ ...d, ...patch }))
+  }
   const setSched = (key, patch) =>
     setDraft((d) => ({ ...d, schedules: { ...d.schedules, [key]: { ...d.schedules[key], ...patch } } }))
+  const registerScheduleField = (name, part) => (element) => {
+    scheduleFieldRefs.current[name] = { ...scheduleFieldRefs.current[name], [part]: element }
+  }
 
   async function save() {
     setSaving(true)
-    setNotice('')
-    setError('')
     try {
       const payload = {
         ...draft,
@@ -125,10 +162,33 @@ export default function ReportSettings() {
         smtp: { ...draft.smtp, password: draft.smtp.password ? draft.smtp.password : null },
       }
       await api('/settings/report', { method: 'PUT', body: JSON.stringify(payload) })
-      setNotice('已保存')
+      notify('已保存')
       await load()
     } catch (e) {
-      setError(e.message || '保存失败')
+      notify(e.message || '保存失败', 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function toggleChannel(key, enabled) {
+    const previous = draft
+    const next = { ...draft, [key]: enabled }
+    setDraft(next)
+    setSaving(true)
+    try {
+      await api('/settings/report', {
+        method: 'PUT',
+        body: JSON.stringify({
+          ...next,
+          timezone,
+          smtp: { ...next.smtp, password: next.smtp.password ? next.smtp.password : null },
+        }),
+      })
+      notify(enabled ? '已启用' : '已停用')
+    } catch (e) {
+      setDraft(previous)
+      notify(`启用状态保存失败：${e.message}`, 'error')
     } finally {
       setSaving(false)
     }
@@ -136,23 +196,26 @@ export default function ReportSettings() {
 
   async function sendTest() {
     setTesting(true)
-    setNotice('')
-    setError('')
     setTestResults(null)
     try {
       const res = await api('/settings/report/test', { method: 'POST' })
-      setTestResults(res.results || [])
-      setNotice(res.ok ? '测试发送已完成' : '测试发送未成功，请查看结果')
+      const results = res.results || []
+      setTestResults(results)
+      if (results.length > 0 && results.every((result) => result.ok)) notify('测试发送已完成')
+      else notify('测试发送未成功，请查看结果', 'error')
       const hist = await api('/settings/report/history').catch(() => ({ sends: [] }))
       setHistory(hist.sends || [])
     } catch (e) {
-      setError(e.message || '测试发送失败')
+      setTestResults([{ channel: 'system', ok: false, detail: e.message || '测试发送请求失败' }])
+      notify(e.message || '测试发送请求失败', 'error')
     } finally {
       setTesting(false)
     }
   }
 
   if (loading) return <LoadingSkeleton rows={5} />
+  if (error) return <ErrorState error={error} onRetry={() => load()} />
+  const testFailed = !!testResults && (testResults.length === 0 || testResults.some((result) => !result.ok))
 
   return (
     <div className="space-y-4">
@@ -161,8 +224,6 @@ export default function ReportSettings() {
         <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
           按日/周/月把 Token 使用情况推送到邮箱或 Webhook。估算项在报告中统一标注「估算」，缺失口径不显示。
         </p>
-        {error && <div className="mt-3 text-sm text-rose-600 dark:text-rose-400">{error}</div>}
-        {notice && <div className="mt-3 text-sm text-emerald-600 dark:text-emerald-400">{notice}</div>}
 
         <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
           <label>
@@ -188,7 +249,7 @@ export default function ReportSettings() {
       <div className={cardCls}>
         <div className="flex items-center justify-between">
           <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">邮件渠道（SMTP）</h3>
-          <Toggle checked={draft.email_enabled} onChange={(v) => set('email_enabled', v)} label="启用" />
+          <Toggle checked={draft.email_enabled} onChange={(v) => toggleChannel('email_enabled', v)} label="启用" disabled={saving} />
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           <label>
@@ -200,16 +261,18 @@ export default function ReportSettings() {
             <input type="number" value={draft.smtp.port} onChange={(e) => set({ smtp: { ...draft.smtp, port: Number(e.target.value) } })} className={inputCls} />
           </label>
           <label>
-            <Label>用户名</Label>
-            <input value={draft.smtp.username} onChange={(e) => set({ smtp: { ...draft.smtp, username: e.target.value } })} className={inputCls} />
+            <Label>用户名（SMTP 登录账号）</Label>
+            <input value={draft.smtp.username} onChange={(e) => set({ smtp: { ...draft.smtp, username: e.target.value } })} placeholder="例如 metria@soocoo.xyz" className={inputCls} />
+            <span className="mt-1 block text-xs text-gray-400 dark:text-gray-500">用于 SMTP 认证，通常填写完整邮箱地址。</span>
           </label>
           <label>
             <Label>密码{meta.smtp_password_set ? '（已设置，留空保持不变）' : ''}</Label>
             <input type="password" value={draft.smtp.password} onChange={(e) => set({ smtp: { ...draft.smtp, password: e.target.value } })} placeholder={meta.smtp_password_set ? '••••••••' : ''} className={inputCls} />
           </label>
           <label>
-            <Label>发件人</Label>
+            <Label>发件人（邮件显示地址）</Label>
             <input value={draft.smtp.from} onChange={(e) => set({ smtp: { ...draft.smtp, from: e.target.value } })} placeholder="Metria <metria@example.com>" className={inputCls} />
+            <span className="mt-1 block text-xs text-gray-400 dark:text-gray-500">收件人看到的地址，需获得 SMTP 账号授权。</span>
           </label>
           <label>
             <Label>加密方式</Label>
@@ -227,7 +290,7 @@ export default function ReportSettings() {
       <div className={cardCls}>
         <div className="flex items-center justify-between">
           <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">Webhook 渠道（通用 JSON）</h3>
-          <Toggle checked={draft.webhook_enabled} onChange={(v) => set('webhook_enabled', v)} label="启用" />
+          <Toggle checked={draft.webhook_enabled} onChange={(v) => toggleChannel('webhook_enabled', v)} label="启用" disabled={saving} />
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           <label>
@@ -246,8 +309,26 @@ export default function ReportSettings() {
         <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">三个调度相互独立，可同时启用；按全局时区汇总上一完整周期。</p>
         <div className="mt-4 space-y-4">
           <ScheduleRow label="每日" hint="汇总上一自然日" sched={draft.schedules.daily} onChange={(p) => setSched('daily', p)} />
-          <ScheduleRow label="每周" hint="汇总上一自然周" sched={draft.schedules.weekly} onChange={(p) => setSched('weekly', p)} weekly />
-          <ScheduleRow label="每月" hint="汇总上一自然月" sched={draft.schedules.monthly} onChange={(p) => setSched('monthly', p)} monthly />
+          <ScheduleRow
+            label="每周"
+            hint="汇总上一自然周"
+            sched={draft.schedules.weekly}
+            onChange={(p) => setSched('weekly', p)}
+            fieldHeaderRef={registerScheduleField('weekday', 'header')}
+            fieldControlRef={registerScheduleField('weekday', 'control')}
+            fieldWidth={scheduleFieldWidth}
+            weekly
+          />
+          <ScheduleRow
+            label="每月"
+            hint="汇总上一自然月"
+            sched={draft.schedules.monthly}
+            onChange={(p) => setSched('monthly', p)}
+            fieldHeaderRef={registerScheduleField('month', 'header')}
+            fieldControlRef={registerScheduleField('month', 'control')}
+            fieldWidth={scheduleFieldWidth}
+            monthly
+          />
         </div>
         <div className="mt-4 border-t border-gray-100 dark:border-gray-700/60 pt-4">
           <Toggle checked={draft.attachments_enabled} onChange={(v) => set('attachments_enabled', v)} label="邮件附带图表与 PDF" />
@@ -264,22 +345,35 @@ export default function ReportSettings() {
       </div>
 
       {testResults && (
-        <div className={cardCls}>
-          <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">测试发送结果</h3>
-          <ul className="mt-3 space-y-2 text-sm">
-            {testResults.map((r, i) => (
-              <li key={i} className={r.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                {r.channel}：{r.ok ? '成功' : `失败（${r.detail || '未知错误'}）`}
-              </li>
-            ))}
-          </ul>
+        <div className={`${cardCls} ${testFailed ? 'border-rose-300 dark:border-rose-700/70' : 'border-emerald-300 dark:border-emerald-700/70'}`}>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">测试发送结果</h3>
+            <span className={`text-sm font-medium ${testFailed ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+              {testFailed ? '发送未成功' : '发送成功'}
+            </span>
+          </div>
+          {testResults.length === 0 ? (
+            <p className="mt-3 text-sm text-rose-600 dark:text-rose-400">没有启用的发送渠道，未执行发送。</p>
+          ) : (
+            <ul className="mt-3 space-y-2 text-sm">
+              {testResults.map((result, i) => (
+                <li key={i} className={`rounded-lg border px-3 py-2 ${result.ok ? 'border-emerald-200 text-emerald-700 dark:border-emerald-800/70 dark:text-emerald-300' : 'border-rose-200 text-rose-700 dark:border-rose-800/70 dark:text-rose-300'}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-medium">{result.channel}</span>
+                    <span>{result.ok ? '成功' : '失败'}</span>
+                  </div>
+                  {!result.ok && <p className="mt-1 break-words text-xs">{result.detail || '未返回失败原因'}</p>}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
       <div className={cardCls}>
         <div className="flex items-center justify-between">
           <h3 className="text-base font-bold text-gray-800 dark:text-gray-100">发送历史</h3>
-          <button onClick={load} className="text-xs text-indigo-600 hover:underline dark:text-indigo-400">
+          <button onClick={() => load(true)} className="text-xs text-indigo-600 hover:underline dark:text-indigo-400">
             刷新
           </button>
         </div>
@@ -316,36 +410,50 @@ export default function ReportSettings() {
   )
 }
 
-function ScheduleRow({ label, hint, sched, onChange, weekly = false, monthly = false }) {
+function ScheduleRow({ label, hint, sched, onChange, fieldHeaderRef, fieldControlRef, fieldWidth, weekly = false, monthly = false }) {
+  const fieldStyle = fieldWidth ? { width: `${fieldWidth}px` } : { width: 'max-content' }
+  const controlStyle = {
+    width: fieldWidth ? '100%' : weekly ? 'calc(2em + 3.5rem)' : 'calc(2ch + 3.5rem)',
+  }
   return (
-    <div className="flex flex-wrap items-end gap-4">
-      <div className="min-w-[120px]">
+    <div
+      className="grid grid-cols-1 gap-x-4 gap-y-1 md:grid-rows-2 md:items-center md:grid-cols-[minmax(120px,max-content)_max-content_max-content_var(--schedule-field-width)]"
+      style={{ '--schedule-field-width': fieldWidth ? `${fieldWidth}px` : 'max-content' }}
+    >
+      <div className="min-w-[120px] md:col-start-1 md:row-start-1">
         <div className="text-sm font-medium text-gray-700 dark:text-gray-200">{label}</div>
-        <div className="text-xs text-gray-400 dark:text-gray-500">{hint}</div>
       </div>
-      <Toggle checked={sched.enabled} onChange={(v) => onChange({ enabled: v })} label="启用" />
-      <label>
+      <div className="hidden md:block md:col-start-2 md:row-start-1" aria-hidden="true" />
+      <div className="md:col-start-3 md:row-start-1">
         <Label>发送时间</Label>
-        <input type="time" value={sched.time} onChange={(e) => onChange({ time: e.target.value })} className={inputCls} />
-      </label>
-      {weekly && (
-        <label className="block w-28 shrink-0">
+      </div>
+      {weekly ? (
+        <div ref={fieldHeaderRef} className="md:col-start-4 md:row-start-1" style={fieldStyle}>
           <Label>周几</Label>
-          <select value={sched.weekday ?? 0} onChange={(e) => onChange({ weekday: Number(e.target.value) })} className={inputCls}>
-            {WEEKDAYS.map((w, i) => (
-              <option key={w} value={i}>
-                {w}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
-      {monthly && (
-        <label className="block w-24 shrink-0">
+        </div>
+      ) : monthly ? (
+        <div ref={fieldHeaderRef} className="md:col-start-4 md:row-start-1" style={fieldStyle}>
           <Label>几号（1–28）</Label>
-          <input type="number" min={1} max={28} value={sched.day ?? 1} onChange={(e) => onChange({ day: Number(e.target.value) })} className={inputCls} />
-        </label>
-      )}
+        </div>
+      ) : <div aria-hidden="true" />}
+      <div className="h-10 flex items-center text-xs text-gray-400 dark:text-gray-500 md:col-start-1 md:row-start-2">{hint}</div>
+      <div className="h-10 flex items-center md:col-start-2 md:row-start-2">
+        <Toggle checked={sched.enabled} onChange={(v) => onChange({ enabled: v })} label="启用" />
+      </div>
+      <div className="md:col-start-3 md:row-start-2">
+        <input type="time" value={sched.time} onChange={(e) => onChange({ time: e.target.value })} className={compactInputCls} style={{ width: 'max-content' }} />
+      </div>
+      {weekly ? (
+        <div ref={fieldControlRef} className="md:col-start-4 md:row-start-2" style={fieldStyle}>
+          <select value={sched.weekday ?? 0} onChange={(e) => onChange({ weekday: Number(e.target.value) })} className={compactInputCls} style={controlStyle}>
+            {WEEKDAYS.map((w, i) => <option key={w} value={i}>{w}</option>)}
+          </select>
+        </div>
+      ) : monthly ? (
+        <div ref={fieldControlRef} className="md:col-start-4 md:row-start-2" style={fieldStyle}>
+          <input type="number" min={1} max={28} step={1} value={sched.day ?? 1} onChange={(e) => onChange({ day: clampReportDay(e.target.value) })} className={`${compactInputCls} report-day-input`} style={controlStyle} />
+        </div>
+      ) : <div className="md:col-start-4 md:row-start-2" aria-hidden="true" />}
     </div>
   )
 }

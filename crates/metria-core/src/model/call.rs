@@ -29,6 +29,10 @@ pub struct ModelCall {
     pub first_response_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub timing_source: Option<String>,
+    #[serde(default)]
+    pub timing_quality: Option<String>,
     pub status: String,
     pub status_code: Option<i64>,
     pub streaming: bool,
@@ -80,6 +84,8 @@ mod tests {
             first_response_at: None,
             completed_at: None,
             duration_ms: None,
+            timing_source: None,
+            timing_quality: None,
             status: "success".into(),
             status_code: Some(200),
             streaming: false,

@@ -186,6 +186,7 @@ async fn email_and_webhook_delivered() {
         "应为附件而非内联: {raw}"
     );
     assert!(raw.contains(".pdf"), "附件应有 .pdf 文件名: {raw}");
+    assert!(!raw.contains("cid:"), "邮件 HTML 不应引用 CID 图片: {raw}");
 }
 
 #[tokio::test]

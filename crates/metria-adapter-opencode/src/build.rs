@@ -36,6 +36,7 @@ pub struct SessionBuilder {
     pub subagents: Vec<SubagentRelation>,
     pub traffic: Vec<TrafficEstimate>,
     current_turn: Option<Id>,
+    current_turn_started_at: Option<DateTime<Utc>>,
     pub parent_source_id: Option<String>,
     tool_map: HashMap<String, usize>,
     running_text: String,
@@ -100,6 +101,7 @@ impl SessionBuilder {
             subagents: Vec::new(),
             traffic: Vec::new(),
             current_turn: None,
+            current_turn_started_at: None,
             parent_source_id: None,
             tool_map: HashMap::new(),
             running_text: String::new(),
@@ -176,7 +178,17 @@ impl SessionBuilder {
         let id = turn.id.clone();
         self.turns.push(turn);
         self.current_turn = Some(id.clone());
+        self.current_turn_started_at = Some(at);
         id
+    }
+
+    pub fn current_turn_started_at(&self) -> Option<DateTime<Utc>> {
+        self.current_turn_started_at
+    }
+
+    /// 增量扫描从数据库中恢复对应回合的用户起点，不重复生成 Turn/Message。
+    pub fn restore_turn_start(&mut self, at: DateTime<Utc>) {
+        self.current_turn_started_at = Some(at);
     }
 
     pub fn ensure_turn(&mut self, at: DateTime<Utc>) -> Id {
@@ -267,7 +279,10 @@ impl SessionBuilder {
         &mut self,
         turn_id: Id,
         source_call_id: String,
-        at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        turn_started_at: Option<DateTime<Utc>>,
+        first_response_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
         model: Option<&str>,
         provider: Option<&str>,
         input: Option<i64>,
@@ -275,7 +290,6 @@ impl SessionBuilder {
         cache_read: Option<i64>,
         cache_write: Option<i64>,
         reasoning: Option<i64>,
-        duration_ms: Option<i64>,
         status: &str,
         response_text: Option<String>,
     ) {
@@ -284,6 +298,20 @@ impl SessionBuilder {
             "error" | "cancelled" | "aborted" => Some(400),
             _ => Some(200),
         };
+        let valid_start = turn_started_at
+            .filter(|start| completed_at.is_none_or(|completed| *start <= completed));
+        let valid_first = valid_start.and_then(|start| {
+            first_response_at.filter(|first| {
+                start <= *first && completed_at.is_none_or(|completed| *first <= completed)
+            })
+        });
+        let duration_ms = valid_start
+            .zip(completed_at)
+            .map(|(start, completed)| (completed - start).num_milliseconds());
+        let started_at = valid_start
+            .or(valid_first)
+            .or(completed_at)
+            .unwrap_or(observed_at);
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(source_call_id),
@@ -298,10 +326,12 @@ impl SessionBuilder {
             provider_normalized: provider.map(metria_core::normalize::normalize_provider),
             model_raw: model.map(|s| s.to_string()),
             model_normalized: model_norm.clone(),
-            started_at: at,
-            first_response_at: Some(at),
-            completed_at: Some(at),
+            started_at,
+            first_response_at: valid_first,
+            completed_at,
             duration_ms,
+            timing_source: Some("opencode_message_timestamps".into()),
+            timing_quality: Some("observed".into()),
             status: status.to_string(),
             status_code,
             streaming: true,
@@ -335,7 +365,7 @@ impl SessionBuilder {
             session_id: Some(self.session.source_session_id.clone()),
             turn_id: Some(turn_id.as_str().to_string()),
             model_call_id: Some(call.id.as_str().to_string()),
-            timestamp: at,
+            timestamp: observed_at,
             provider_raw: call.provider_raw.clone(),
             provider_normalized: call.provider_normalized.clone(),
             model_raw: call.model_raw.clone(),
@@ -466,7 +496,7 @@ impl SessionBuilder {
         self.usage.push(usage_event);
         self.calls.push(c);
         self.traffic.push(traffic);
-        self.last_activity = Some(at);
+        self.last_activity = Some(completed_at.unwrap_or(observed_at));
     }
 
     pub fn add_tool_use(

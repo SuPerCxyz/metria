@@ -45,7 +45,7 @@ export default function Agents() {
     { key: 'model_calls', label: '请求数', sortable: true, render: (r) => String(r.model_calls ?? 0) },
     { key: 'sessions', label: '会话数', render: (r) => String(r.sessions ?? 0) },
     { key: 'cost', label: '费用', render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
-    { key: 'traffic', label: '网络流量', render: (r) => fmtBytes(r.estimated_traffic_bytes) },
+    { key: 'traffic', label: '估算流量', render: (r) => fmtBytes(r.estimated_traffic_bytes) },
   ]
 
   return (

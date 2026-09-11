@@ -8,6 +8,7 @@ import DataTable from '../../components/tables/DataTable'
 import StatusBadge from '../../components/common/StatusBadge'
 import FilterBar from '../../components/filters/FilterBar'
 import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
+import { useToast } from '../../components/feedback/Toast'
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
@@ -23,6 +24,7 @@ function agentUrlForSubmit(value, previous = '') {
 export default function Nodes() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
+  const { notify } = useToast()
   const params = rangeParams(range)
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
@@ -71,7 +73,7 @@ export default function Nodes() {
     { key: 'tokens', label: 'Token', render: (r) => fmtTokensShort(sumTokens(usageMap.get(r.id))) },
     { key: 'cache', label: '缓存命中率', render: (r) => cacheHitRate(usageMap.get(r.id)) != null ? fmtPct100(cacheHitRate(usageMap.get(r.id))) : '—' },
     { key: 'cost', label: '费用', render: (r) => fmtUsd(usageMap.get(r.id)?.calculated_cost_micro_usd) },
-    { key: 'traffic', label: '网络流量', render: (r) => fmtBytes(usageMap.get(r.id)?.estimated_traffic_bytes) },
+    { key: 'traffic', label: '估算流量', render: (r) => fmtBytes(usageMap.get(r.id)?.estimated_traffic_bytes) },
     {
       key: 'last_seen_at', label: '最后上报', sortable: true, render: (r) => <span title={fmtDateTime(r.last_seen_at)}>{fmtRelative(r.last_seen_at)}</span>,
     },
@@ -127,9 +129,9 @@ export default function Nodes() {
         <DataTable columns={columns} data={filtered} pageSize={12} onRowClick={(r) => navigate(`/nodes/${encodeURIComponent(r.id)}`)} />
       </div>
 
-      {showCreate && <CreateNodeDialog onClose={closeCreate} onCreated={handleCreated} busy={busy} setBusy={setBusy} error={error} setError={setError} />}
+      {showCreate && <CreateNodeDialog onClose={closeCreate} onCreated={handleCreated} busy={busy} setBusy={setBusy} error={error} setError={setError} notify={notify} />}
       {created && <InstallDialog data={created} onClose={closeCreate} />}
-      {editing && <EditNodeDialog node={editing} onClose={() => setEditing(null)} onSaved={handleSaved} busy={busy} setBusy={setBusy} error={error} setError={setError} />}
+      {editing && <EditNodeDialog node={editing} onClose={() => setEditing(null)} onSaved={handleSaved} busy={busy} setBusy={setBusy} error={error} setError={setError} notify={notify} />}
       {confirmDelete && (
         <DeleteDialog
           node={confirmDelete}
@@ -139,6 +141,7 @@ export default function Nodes() {
           setBusy={setBusy}
           error={error}
           setError={setError}
+          notify={notify}
         />
       )}
     </>
@@ -151,7 +154,10 @@ export default function Nodes() {
       .then((data) => {
         setCreated({ node_id: data.node_id, name: data.name, token: data.token, hub_url: data.hub_url, agent_url: data.agent_url, mode: data.mode, platform: data.platform, architecture: data.architecture, agent_asset: data.agent_asset, docker_command: data.docker_command, native_command: data.native_command })
       })
-      .catch((e) => setError(e.message))
+      .catch((e) => {
+        setError(e.message)
+        notify(`安装信息加载失败：${e.message}`, 'error')
+      })
       .finally(() => setBusy(false))
   }
 
@@ -164,19 +170,25 @@ export default function Nodes() {
         setCreated({ ...data, ...inst })
         setShowCreate(false)
         refresh()
+        notify('节点已创建')
       })
-      .catch((e) => setError(e.message))
+      .catch((e) => {
+        setError(e.message)
+        notify(`节点已创建，但安装信息加载失败：${e.message}`, 'error')
+      })
       .finally(() => setBusy(false))
   }
 
   function handleSaved() {
     setEditing(null)
     refresh()
+    notify('节点已保存')
   }
 
   function handleDeleted() {
     setConfirmDelete(null)
     refresh()
+    notify('节点已删除')
   }
 }
 
@@ -227,7 +239,7 @@ function FormError({ error }) {
 
 // ---------- 添加节点 ----------
 
-function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }) {
+function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError, notify }) {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [labels, setLabels] = useState('')
@@ -258,7 +270,10 @@ function CreateNodeDialog({ onClose, onCreated, busy, setBusy, error, setError }
       }),
     })
       .then((data) => onCreated(data))
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        setError(err.message)
+        notify(`节点创建失败：${err.message}`, 'error')
+      })
       .finally(() => setBusy(false))
   }
 
@@ -402,7 +417,7 @@ function InstallDialog({ data, onClose }) {
 
 // ---------- 编辑节点 ----------
 
-function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError }) {
+function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError, notify }) {
   const [name, setName] = useState(node.name || '')
   const [description, setDescription] = useState(node.description || '')
   const [labels, setLabels] = useState(parseLabels(node.labels))
@@ -444,7 +459,10 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
       }),
     })
       .then(() => onSaved())
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        setError(err.message)
+        notify(`节点保存失败：${err.message}`, 'error')
+      })
       .finally(() => setBusy(false))
   }
 
@@ -511,13 +529,16 @@ function EditNodeDialog({ node, onClose, onSaved, busy, setBusy, error, setError
 
 // ---------- 删除节点 ----------
 
-function DeleteDialog({ node, onClose, onDeleted, busy, setBusy, error, setError }) {
+function DeleteDialog({ node, onClose, onDeleted, busy, setBusy, error, setError, notify }) {
   const doDelete = () => {
     setBusy(true)
     setError(null)
     api(`/nodes/${encodeURIComponent(node.id)}`, { method: 'DELETE' })
       .then(() => onDeleted())
-      .catch((err) => setError(err.message))
+      .catch((err) => {
+        setError(err.message)
+        notify(`节点删除失败：${err.message}`, 'error')
+      })
       .finally(() => setBusy(false))
   }
 

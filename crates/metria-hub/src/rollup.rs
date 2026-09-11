@@ -278,7 +278,9 @@ impl HubDb {
                         (SELECT COUNT(*) FROM model_calls WHERE started_at >= ?1 AND started_at < ?2),
                         (SELECT COALESCE(SUM(input_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2),
                         (SELECT COALESCE(SUM(output_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2),
-                        (SELECT COALESCE(SUM(estimated_total_wire_bytes),0) FROM traffic_estimates WHERE calculated_at >= ?1 AND calculated_at < ?2)",
+                        (SELECT COALESCE(SUM(t.estimated_total_wire_bytes),0)
+                         FROM model_calls m JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
+                         WHERE m.started_at >= ?1 AND m.started_at < ?2)",
                     params![bucket, next_bucket(bucket).to_rfc3339()],
                     |r| {
                         Ok((
@@ -423,7 +425,15 @@ impl HubDb {
     /// 不影响 session/call/traffic 行。
     pub fn rebuild_usage_rollups(&self, days: i64) -> Result<usize, StorageError> {
         let since = Utc::now() - chrono::Duration::days(days);
+        self.rebuild_usage_rollups_since(since)
+    }
 
+    /// 重建全部历史 usage rollup，供跨任意历史范围的重计价使用。
+    pub fn rebuild_all_usage_rollups(&self) -> Result<usize, StorageError> {
+        self.rebuild_usage_rollups_since(DateTime::<Utc>::UNIX_EPOCH)
+    }
+
+    fn rebuild_usage_rollups_since(&self, since: DateTime<Utc>) -> Result<usize, StorageError> {
         let c = self.conn();
         c.execute(
             "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
@@ -495,7 +505,15 @@ impl HubDb {
     /// 会删除 traffic 行却不恢复，导致维护重建后流量归零，故必须单独重建。
     pub fn rebuild_traffic_rollups(&self, days: i64) -> Result<usize, StorageError> {
         let since = Utc::now() - chrono::Duration::days(days);
+        self.rebuild_traffic_rollups_since(since)
+    }
 
+    /// 重建全部历史当前版本的估算流量汇总。
+    pub fn rebuild_all_traffic_rollups(&self) -> Result<usize, StorageError> {
+        self.rebuild_traffic_rollups_since(DateTime::<Utc>::UNIX_EPOCH)
+    }
+
+    fn rebuild_traffic_rollups_since(&self, since: DateTime<Utc>) -> Result<usize, StorageError> {
         let c = self.conn();
         c.execute(
             "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
@@ -513,10 +531,13 @@ impl HubDb {
             let c = self.conn();
             let mut stmt = c
                 .prepare(
-                    "SELECT node_id, client_id, provider, model,
-                            estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes,
-                            lower_bound_bytes, upper_bound_bytes, estimation_source, confidence, calculated_at
-                     FROM traffic_estimates WHERE calculated_at >= ?1",
+                    "SELECT t.node_id, t.client_id, t.provider, t.model,
+                            t.estimated_request_wire_bytes, t.estimated_response_wire_bytes, t.estimated_total_wire_bytes,
+                            t.lower_bound_bytes, t.upper_bound_bytes, t.estimation_source, t.confidence,
+                            m.started_at
+                     FROM model_calls m
+                     JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
+                     WHERE m.started_at >= ?1",
                 )
                 .map_err(StorageError::from)?;
             let rows = stmt
@@ -533,7 +554,7 @@ impl HubDb {
                         "upper_bound_bytes": r.get::<_, Option<i64>>(8)?,
                         "estimation_source": r.get::<_, Option<String>>(9)?,
                         "confidence": r.get::<_, Option<f64>>(10)?,
-                        "calculated_at": r.get::<_, String>(11)?,
+                        "timestamp": r.get::<_, String>(11)?,
                     }))
                 })
                 .map_err(StorageError::from)?;
@@ -703,7 +724,17 @@ mod tests {
     fn rebuild_traffic_rollups_restores_bytes() {
         let db = test_db("traffic");
         let now = Utc::now();
-        let t = traffic_json(&(now - chrono::Duration::hours(2)).to_rfc3339());
+        let call_time = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let mut t = traffic_json(&now.to_rfc3339());
+        t["model_call_id"] = serde_json::json!("traffic-call");
+        t["timestamp"] = serde_json::json!(call_time.clone());
+        let mut call = call_json(&call_time);
+        call["id"] = serde_json::json!("traffic-call");
+        call["session_id"] = serde_json::json!("traffic-session");
+        call["traffic_estimate_id"] = t["id"].clone();
+        call["status"] = serde_json::json!("success");
+        call["call_granularity"] = serde_json::json!("call");
+        db.insert_call(&call, "traffic-session").unwrap();
         db.insert_traffic(&t).unwrap();
         db.rollup_event("traffic", &t).unwrap();
 
@@ -724,6 +755,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 12000, "traffic 重建后字节应恢复");
+        let bucket: String = db
+            .conn()
+            .query_row(
+                "SELECT bucket FROM hourly_rollups WHERE traffic_estimation_source != ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bucket,
+            metria_core::time::bucket_hour(
+                DateTime::parse_from_rfc3339(&call_time)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                chrono_tz::Tz::UTC,
+            )
+            .to_rfc3339(),
+            "traffic 必须按调用时间而不是 calculated_at 归桶"
+        );
     }
 
     #[test]

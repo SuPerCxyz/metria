@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use lettre::message::header::{ContentDisposition, ContentId, ContentType};
+use lettre::message::header::{ContentDisposition, ContentType};
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -18,7 +18,7 @@ pub fn send_email(
     subject: &str,
     html: &str,
     text: &str,
-    charts: &[ReportChart],
+    _charts: &[ReportChart],
     pdf: Option<(String, Vec<u8>)>,
 ) -> Result<(), String> {
     if smtp.host.trim().is_empty() {
@@ -45,19 +45,8 @@ pub fn send_email(
         builder = builder.to(mb);
     }
     let alternative = MultiPart::alternative_plain_html(text.to_string(), html.to_string());
-    let body = if charts.is_empty() {
-        alternative
-    } else {
-        let mut related = MultiPart::related().multipart(alternative);
-        for c in charts {
-            let part = SinglePart::builder()
-                .header(ContentType::parse("image/png").map_err(|e| e.to_string())?)
-                .header(ContentId::from(c.cid.clone()))
-                .body(c.png.clone());
-            related = related.singlepart(part);
-        }
-        related
-    };
+    // 图表已经作为内嵌 SVG 在 HTML 正文中，不再生成 CID 图片部分。
+    let body = alternative;
     let email = match pdf {
         Some((filename, bytes)) => {
             let attachment = SinglePart::builder()

@@ -116,6 +116,67 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         )
         .unwrap_or(0)
         .into();
+    let (total_cost_calls, priced_calls) = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0)
+                 FROM model_calls WHERE {range_clause}
+                   AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let unpriced_models: Vec<serde_json::Value> = {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = c.prepare(&format!(
+            "SELECT COALESCE(model_normalized,'(unknown)'), COALESCE(provider_normalized,'(unknown)'), COUNT(*)
+             FROM model_calls WHERE {range_clause}
+               AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+               AND reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL
+               AND estimated_cost_micro_usd IS NULL {call_filter}
+             GROUP BY model_normalized, provider_normalized ORDER BY COUNT(*) DESC LIMIT 8"
+        )) {
+            if let Ok(rows) = stmt.query_map(
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| {
+                    Ok(serde_json::json!({
+                        "model": r.get::<_, String>(0)?,
+                        "provider": r.get::<_, String>(1)?,
+                        "calls": r.get::<_, i64>(2)?,
+                    }))
+                },
+            ) {
+                out = rows.filter_map(Result::ok).collect();
+            }
+        }
+        out
+    };
+    body["pricing_coverage"] = serde_json::json!({
+        "priced_calls": priced_calls,
+        "total_calls": total_cost_calls,
+        "ratio": if total_cost_calls > 0 { Some(priced_calls as f64 / total_cost_calls as f64) } else { None },
+        "unpriced_models": unpriced_models,
+    });
+    let estimated_calls = c
+        .query_row(
+            &format!(
+                "SELECT COALESCE(SUM(CASE WHEN traffic_estimate_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id AND t.estimated_total_wire_bytes IS NOT NULL)
+                    THEN 1 ELSE 0 END),0)
+                 FROM model_calls WHERE {range_clause}
+                   AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    body["traffic_coverage"] = serde_json::json!({
+        "estimated_calls": estimated_calls,
+        "total_calls": total_cost_calls,
+        "unavailable_calls": total_cost_calls.saturating_sub(estimated_calls),
+        "ratio": if total_cost_calls > 0 { Some(estimated_calls as f64 / total_cost_calls as f64) } else { None },
+    });
     // S3.9：范围内平均调用延迟（duration_ms 均值的毫秒数）。数据缺失时返回 null，前端诚实标注。
     body["avg_duration_ms"] = c
         .query_row(
@@ -287,7 +348,9 @@ pub(crate) async fn usage_timeseries(
                 COALESCE(SUM(COALESCE(u.reported_cost_micro_usd,0)+COALESCE(u.calculated_cost_micro_usd,0)+COALESCE(u.estimated_cost_micro_usd,0)),0),
                 COALESCE(SUM(t.estimated_total_wire_bytes),0),
                 COUNT(*)
-             FROM usage_events u LEFT JOIN traffic_estimates t ON t.model_call_id = u.model_call_id
+             FROM usage_events u
+             LEFT JOIN model_calls tm ON tm.id = u.model_call_id
+             LEFT JOIN traffic_estimates t ON t.id = tm.traffic_estimate_id
              WHERE u.timestamp >= ?1 AND u.timestamp < ?2 {prefixed_filter}
              GROUP BY {group_sql} ORDER BY b"
         )));
@@ -1345,7 +1408,7 @@ pub(crate) async fn model_detail(
             let mut st = q!(c.prepare(
                 "SELECT m.id, m.session_id, m.provider_normalized, m.model_normalized, m.started_at, m.status,
                         m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd, t.estimated_total_wire_bytes
-                 FROM model_calls m LEFT JOIN traffic_estimates t ON t.model_call_id = m.id
+                 FROM model_calls m LEFT JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
                  WHERE m.model_normalized = ?1 AND m.started_at >= ?2 AND m.started_at < ?3
                  ORDER BY m.started_at DESC LIMIT 20",
             ));
@@ -1557,7 +1620,8 @@ pub(crate) async fn call_detail(
         .query_row(
             "SELECT estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes, lower_bound_bytes, upper_bound_bytes, estimation_source, context_transport_mode, cache_transport_behavior, confidence,
                     request_reconstruction_quality, response_reconstruction_quality, profile_id, profile_version
-             FROM traffic_estimates WHERE model_call_id = ?1",
+             FROM traffic_estimates
+             WHERE id = (SELECT traffic_estimate_id FROM model_calls WHERE id = ?1)",
             [&id],
             |r| {
                 Ok(serde_json::json!({
@@ -1788,7 +1852,7 @@ pub(crate) async fn session_calls(
                 COALESCE(m.calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
                 COALESCE(m.estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
                 t.estimated_total_wire_bytes, m.duration_ms
-         FROM model_calls m LEFT JOIN traffic_estimates t ON t.model_call_id = m.id WHERE m.session_id = ?1 ORDER BY m.started_at",
+         FROM model_calls m LEFT JOIN traffic_estimates t ON t.id = m.traffic_estimate_id WHERE m.session_id = ?1 ORDER BY m.started_at",
     ));
     let rows = q!(stmt.query_map([&id], |r| {
         Ok(serde_json::json!({
@@ -2118,7 +2182,9 @@ pub(crate) async fn data_quality(
                         WHEN confidence IS NOT NULL THEN 'low'
                         ELSE 'unknown' END AS level,
                     COUNT(*)
-             FROM traffic_estimates GROUP BY level",
+             FROM model_calls m
+             JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
+             GROUP BY level",
         );
         let mut out = Vec::new();
         if let Ok(mut st) = st {
@@ -2232,6 +2298,109 @@ pub(crate) async fn usage_latency(
         "p95_ms": percentile(0.95),
         "p99_ms": percentile(0.99),
         "avg_ms": if n > 0 { Some(durations.iter().sum::<i64>() / n as i64) } else { None },
+    }))
+    .into_response()
+}
+
+/// 首个可观察输出延迟与估算输出速度；仅聚合时间关系有效的调用。
+pub(crate) async fn usage_performance(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    let (from, to) = parse_range(&p);
+    let (filter, fargs) = range_filter_usage(&p);
+    let c = st.db.conn();
+    let mut stmt = q!(c.prepare(&format!(
+        "SELECT started_at, first_response_at, completed_at, output_tokens,
+                timing_source, timing_quality
+         FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 {filter}"
+    )));
+    let rows = q!(
+        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })
+    );
+    let mut total = 0usize;
+    let mut ttft = Vec::new();
+    let mut speeds = Vec::new();
+    let mut sources: std::collections::HashMap<(String, String), i64> = Default::default();
+    for row in rows.flatten() {
+        total += 1;
+        let parse = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|ts| ts.with_timezone(&Utc))
+        };
+        let Some(started) = parse(&row.0) else {
+            continue;
+        };
+        let first = row.1.as_deref().and_then(parse);
+        let completed = row.2.as_deref().and_then(parse);
+        let source = row.4.unwrap_or_else(|| "unknown".into());
+        let quality = row.5.unwrap_or_else(|| "unknown".into());
+        if let Some(first) = first.filter(|first| *first >= started) {
+            ttft.push((first - started).num_milliseconds());
+            *sources
+                .entry((source.clone(), quality.clone()))
+                .or_default() += 1;
+            if let (Some(completed), Some(tokens)) = (completed, row.3.filter(|v| *v > 0)) {
+                let generation_ms = (completed - first).num_milliseconds();
+                if generation_ms > 0 {
+                    speeds.push(tokens as f64 * 1000.0 / generation_ms as f64);
+                }
+            }
+        }
+    }
+    ttft.sort_unstable();
+    speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let percentile_i64 = |values: &[i64], p: f64| -> Option<i64> {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)])
+        }
+    };
+    let percentile_f64 = |values: &[f64], p: f64| -> Option<f64> {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)])
+        }
+    };
+    let ttft_count = ttft.len();
+    let speed_count = speeds.len();
+    let mut source_rows: Vec<serde_json::Value> = sources
+        .into_iter()
+        .map(|((source, quality), count)| {
+            serde_json::json!({ "source": source, "quality": quality, "count": count })
+        })
+        .collect();
+    source_rows.sort_by_key(|row| std::cmp::Reverse(row["count"].as_i64().unwrap_or(0)));
+    Json(serde_json::json!({
+        "total_calls": total,
+        "ttft": {
+            "count": ttft_count,
+            "avg_ms": if ttft_count > 0 { Some(ttft.iter().sum::<i64>() / ttft_count as i64) } else { None },
+            "p50_ms": percentile_i64(&ttft, 0.50),
+            "p95_ms": percentile_i64(&ttft, 0.95),
+            "p99_ms": percentile_i64(&ttft, 0.99),
+            "coverage": if total > 0 { Some(ttft_count as f64 / total as f64) } else { None },
+        },
+        "output_speed": {
+            "count": speed_count,
+            "avg_tokens_per_second": if speed_count > 0 { Some(speeds.iter().sum::<f64>() / speed_count as f64) } else { None },
+            "p50_tokens_per_second": percentile_f64(&speeds, 0.50),
+            "p95_tokens_per_second": percentile_f64(&speeds, 0.95),
+            "coverage": if total > 0 { Some(speed_count as f64 / total as f64) } else { None },
+        },
+        "sources": source_rows,
     }))
     .into_response()
 }

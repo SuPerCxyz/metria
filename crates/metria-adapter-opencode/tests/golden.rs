@@ -7,6 +7,10 @@ use metria_adapter_api::{DiscoveredSource, ScanIdentity, SourceAdapter};
 use metria_adapter_opencode::OpenCodeAdapter;
 use metria_storage::rusqlite::Connection;
 
+fn ts(ms: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_millis(ms).unwrap()
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("metria-opencode-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -178,13 +182,23 @@ fn golden_full_reads_session_usage_tools_subagents() {
     assert!(te.lower_bound_bytes.unwrap() < te.estimated_total_wire_bytes.unwrap());
     assert!(te.upper_bound_bytes.unwrap() > te.estimated_total_wire_bytes.unwrap());
 
-    // 时长与状态：m2 的 time.created→completed 差值应写入 duration_ms；finish 非 error 应记 success
+    // OpenCode assistant.created 是首个可观察输出；耗时从对应 user turn 起点计算。
     let call = batch
         .model_calls
         .iter()
         .find(|c| c.source_call_id.as_deref() == Some("m2"))
         .expect("应有 m2 的模型调用");
-    assert_eq!(call.duration_ms, Some(1000));
+    assert_eq!(call.started_at, ts(1783137427100));
+    assert_eq!(call.first_response_at, Some(ts(1783137437000)));
+    assert_eq!(call.completed_at, Some(ts(1783137438000)));
+    assert_eq!(call.duration_ms, Some(10_900));
+    assert_eq!(
+        call.timing_source.as_deref(),
+        Some("opencode_message_timestamps")
+    );
+    assert_eq!(call.timing_quality.as_deref(), Some("observed"));
+    assert_ne!(call.started_at, call.first_response_at.unwrap());
+    assert_ne!(call.first_response_at, call.completed_at);
     assert_eq!(call.status, "success");
     assert_eq!(call.status_code, Some(200));
 
@@ -295,5 +309,77 @@ fn error_finish_maps_to_error_status() {
         .expect("应有 m2 的模型调用");
     assert_eq!(call.status, "error");
     assert_eq!(call.status_code, Some(400));
-    assert_eq!(call.duration_ms, Some(1500));
+    assert_eq!(call.duration_ms, Some(2500));
+}
+
+#[test]
+fn missing_assistant_created_keeps_first_response_unavailable() {
+    let dir = temp_dir("missing-created");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','timing', '1.0', 1000, 3000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',2000,3000, ?1)",
+        [r#"{"role":"assistant","time":{"completed":3000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = &summary.batch.model_calls[0];
+    assert_eq!(call.started_at, ts(1000));
+    assert_eq!(call.first_response_at, None);
+    assert_eq!(call.completed_at, Some(ts(3000)));
+    assert_eq!(call.duration_ms, Some(2000));
+}
+
+#[test]
+fn incremental_assistant_restores_corresponding_user_turn_start() {
+    let dir = temp_dir("incremental-timing");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','timing', '1.0', 1000, 3000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',2000,3000, ?1)",
+        [r#"{"role":"assistant","time":{"created":2000,"completed":3000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    let call = &second.model_calls[0];
+    assert_eq!(call.started_at, ts(1000));
+    assert_eq!(call.first_response_at, Some(ts(2000)));
+    assert_eq!(call.completed_at, Some(ts(3000)));
+    assert_eq!(call.duration_ms, Some(2000));
 }

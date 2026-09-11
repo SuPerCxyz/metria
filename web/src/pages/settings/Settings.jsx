@@ -7,6 +7,7 @@ import DataTable from '../../components/tables/DataTable'
 import Segmented from '../../components/ui/Segmented'
 import UserAvatar from '../../components/common/UserAvatar'
 import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
+import { useToast } from '../../components/feedback/Toast'
 import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { fmtDateTime, fmtUsd } from '../../services/format'
@@ -41,11 +42,11 @@ export default function Settings() {
   const [drafts, setDrafts] = useState({})
   const [busyId, setBusyId] = useState(null)
   const [repricing, setRepricing] = useState(false)
-  const [notice, setNotice] = useState('')
   const [priceSearch, setPriceSearch] = useState('')
   const [ruleDraft, setRuleDraft] = useState(EMPTY_RULE_DRAFT)
   const [ruleSaving, setRuleSaving] = useState(false)
   const [ruleError, setRuleError] = useState('')
+  const { notify } = useToast()
 
   useEffect(() => {
     setTab(requestedTab)
@@ -89,9 +90,9 @@ export default function Settings() {
         avatar_color: updated.avatar_color || 'indigo',
       })
       window.dispatchEvent(new CustomEvent('metria:profile-updated'))
-      setAccountError('资料已保存')
+      notify('资料已保存')
     } catch (e) {
-      setAccountError(`资料保存失败：${e.message}`)
+      notify(`资料保存失败：${e.message}`, 'error')
     } finally {
       setProfileSaving(false)
     }
@@ -101,11 +102,11 @@ export default function Settings() {
     event.preventDefault()
     setAccountError('')
     if (passwordDraft.new_password !== passwordDraft.confirm_password) {
-      setAccountError('两次输入的新密码不一致')
+      notify('两次输入的新密码不一致', 'error')
       return
     }
     if (passwordDraft.new_password.length < 8) {
-      setAccountError('新密码至少需要 8 个字符')
+      notify('新密码至少需要 8 个字符', 'error')
       return
     }
     setPasswordSaving(true)
@@ -114,14 +115,14 @@ export default function Settings() {
         method: 'POST',
         body: JSON.stringify({ old_password: passwordDraft.old_password, new_password: passwordDraft.new_password }),
       })
-      setAccountError('密码已修改，即将返回登录页…')
+      notify('密码已修改，即将返回登录页…')
       setTimeout(() => {
         setToken(null)
         window.dispatchEvent(new CustomEvent('metria:unauth'))
         navigate('/login', { replace: true })
       }, 800)
     } catch (e) {
-      setAccountError(`密码修改失败：${e.message}`)
+      notify(`密码修改失败：${e.message}`, 'error')
     } finally {
       setPasswordSaving(false)
     }
@@ -162,13 +163,12 @@ export default function Settings() {
   const saveCatalog = async (c) => {
     const d = draft(c)
     setBusyId(c.id)
-    setNotice('')
     try {
       await api(`/pricing/catalogs/${encodeURIComponent(c.id)}`, { method: 'PUT', body: JSON.stringify({ base_url: d.base_url.trim(), authentication_type: d.authentication_type.trim(), enabled: d.enabled }) })
-      setNotice(`已保存 ${c.name}`)
+      notify(`已保存 ${c.name}`)
       await loadCatalogs()
     } catch (e) {
-      setNotice(`保存失败：${e.message}`)
+      notify(`保存失败：${e.message}`, 'error')
     } finally {
       setBusyId(null)
     }
@@ -176,13 +176,12 @@ export default function Settings() {
 
   const syncCatalog = async (c) => {
     setBusyId(c.id)
-    setNotice('')
     try {
       const j = await api(`/pricing/catalogs/${encodeURIComponent(c.id)}/refresh`, { method: 'POST' })
-      setNotice(`同步完成：${j.fetched ? `更新 ${j.rules} 条规则` : '无变化'}` + (j.repriced != null ? `，重新计价 ${j.repriced} 条` : ''))
+      notify(`同步完成：${j.fetched ? `更新 ${j.rules} 条规则` : '无变化'}` + (j.repriced != null ? `，重新计价 ${j.repriced} 条` : ''))
       await loadCatalogs()
     } catch (e) {
-      setNotice(`同步失败：${e.message}`)
+      notify(`同步失败：${e.message}`, 'error')
     } finally {
       setBusyId(null)
     }
@@ -190,12 +189,11 @@ export default function Settings() {
 
   const doReprice = async () => {
     setRepricing(true)
-    setNotice('')
     try {
       const j = await api('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
-      setNotice(`重新计价完成：${j.repriced} 条调用`)
+      notify(`重新计价完成：${j.repriced} 条调用`)
     } catch (e) {
-      setNotice(`重新计价失败：${e.message}`)
+      notify(`重新计价失败：${e.message}`, 'error')
     } finally {
       setRepricing(false)
     }
@@ -209,6 +207,7 @@ export default function Settings() {
       payload = serializeRuleDraft(ruleDraft)
     } catch (e) {
       setRuleError(e.message)
+      notify(`价格规则校验失败：${e.message}`, 'error')
       return
     }
 
@@ -217,10 +216,10 @@ export default function Settings() {
       await api('/pricing/rules', { method: 'POST', body: JSON.stringify(payload) })
       await rules.refresh()
       const repriced = await api('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
-      setNotice(`已保存模型价格，重新计价 ${repriced.repriced ?? 0} 条调用`)
+      notify(`已保存模型价格，重新计价 ${repriced.repriced ?? 0} 条调用`)
       setRuleDraft(EMPTY_RULE_DRAFT)
     } catch (e) {
-      setRuleError(`保存失败：${e.message}`)
+      notify(`保存失败：${e.message}`, 'error')
     } finally {
       setRuleSaving(false)
     }
@@ -244,7 +243,6 @@ export default function Settings() {
               </button>
             </div>
             <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">配置外部价格目录地址，点击「同步」拉取官方计费并重新计算费用。来源与快照自动保留。</p>
-            {notice && <div className="mb-4 text-sm text-indigo-600 dark:text-indigo-400">{notice}</div>}
             {catalogsError && <ErrorState error={catalogsError} onRetry={loadCatalogs} />}
             {catalogsLoading && <LoadingSkeleton rows={3} />}
             {!catalogsLoading && !catalogsError && (
@@ -452,7 +450,9 @@ function AccountSettings({ loading, error, profile, authMode, profileDraft, setP
         <div className="flex items-center justify-between gap-3 mb-5 flex-wrap">
           <div>
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">账户资料</h2>
-            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">修改顶部用户菜单中显示的名称和头像。</p>
+            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+              {oidcManaged ? '显示名称可在此修改；OIDC 头像会在登录时同步，文字和颜色用于图片不可用时回退。' : '修改顶部用户菜单中显示的名称和头像。'}
+            </p>
           </div>
           <UserAvatar user={{ ...profile, ...profileDraft }} size="lg" />
         </div>
@@ -480,11 +480,11 @@ function AccountSettings({ loading, error, profile, authMode, profileDraft, setP
             <TextField value={profileDraft.display_name} onChange={(e) => setProfileDraft((d) => ({ ...d, display_name: e.target.value }))} placeholder="例如：管理员" maxLength={64} />
           </label>
           <label>
-            <FieldLabel>头像文字</FieldLabel>
+            <FieldLabel>{oidcManaged ? '回退头像文字' : '头像文字'}</FieldLabel>
             <TextField value={profileDraft.avatar_text} onChange={(e) => setProfileDraft((d) => ({ ...d, avatar_text: e.target.value }))} placeholder="最多 2 个字符" maxLength={2} />
           </label>
           <label>
-            <FieldLabel>头像颜色</FieldLabel>
+            <FieldLabel>{oidcManaged ? '回退头像颜色' : '头像颜色'}</FieldLabel>
             <select
               value={profileDraft.avatar_color}
               onChange={(e) => setProfileDraft((d) => ({ ...d, avatar_color: e.target.value }))}

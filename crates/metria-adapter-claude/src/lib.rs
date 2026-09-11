@@ -6,6 +6,8 @@ pub mod entry;
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 use metria_adapter_api::types::{
@@ -22,6 +24,9 @@ use entry::{is_assistant, is_real_user_prompt, RawContent, RawEntry};
 
 /// 单行上限（工具结果可能很大）。
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 从增量游标前恢复最近真实用户消息时的初始回看窗口。
+const TIMING_LOOKBACK_BYTES: u64 = 1024 * 1024;
 
 /// Claude Code Adapter。
 #[derive(Debug, Default, Clone)]
@@ -106,6 +111,8 @@ impl SourceAdapter for ClaudeCodeAdapter {
         let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
         let mut last_user_at: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         let mut entry_warnings: Vec<String> = Vec::new();
+
+        restore_last_real_user_times(path, offset as u64, &mut last_user_at, &mut entry_warnings)?;
 
         let new_offset = scan_jsonl_file(
             path,
@@ -325,22 +332,18 @@ fn process_entry(
                     .or_else(|| entry.uuid.clone())
                     .unwrap_or_else(|| Id::new().as_str().to_string());
                 let model = msg.model.clone().or_else(|| entry.model_field.clone());
-                // 时长估算：assistant 时间 - 最近一次真实 user 消息时间（可能缺，返回 None）
-                let duration_ms = last_user_at
-                    .get(&sid)
-                    .map(|u| (at - *u).num_milliseconds().max(0));
                 builder.add_call(
                     turn,
                     call_id,
                     model,
                     at,
+                    last_user_at.get(&sid).copied(),
                     usage.input_tokens,
                     usage.output_tokens,
                     usage.cache_read_input_tokens,
                     usage
                         .cache_creation_input_tokens
                         .or(usage.cache_write_input_tokens),
-                    duration_ms,
                     "success",
                     if response_text.is_empty() {
                         None
@@ -357,7 +360,6 @@ fn process_entry(
     // user 消息且含 tool_result / 附件：回填工具结果
     if let Some(msg) = &entry.message {
         if msg.role.as_deref() == Some("user") {
-            last_user_at.insert(sid.clone(), at);
             if let Some(RawContent::Blocks(blocks)) = &msg.content {
                 let turn = builder.ensure_turn(false, "user", at);
                 let source_msg_id = msg.id.clone().or_else(|| entry.uuid.clone());
@@ -388,6 +390,65 @@ fn process_entry(
     }
 
     Ok(())
+}
+
+fn restore_last_real_user_times(
+    path: &Path,
+    offset: u64,
+    last_user_at: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+    warnings: &mut Vec<String>,
+) -> Result<(), AdapterError> {
+    if offset == 0 {
+        return Ok(());
+    }
+    let file = File::open(path).map_err(|source| AdapterError::NotReadable {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut lookback = TIMING_LOOKBACK_BYTES;
+    let mut buf = Vec::with_capacity(16 * 1024);
+    loop {
+        let start = offset.saturating_sub(lookback);
+        reader.seek(SeekFrom::Start(start))?;
+        if start > 0 {
+            buf.clear();
+            let _ = reader.read_until(b'\n', &mut buf)?;
+        }
+        let mut found = HashMap::new();
+        while reader.stream_position()? < offset {
+            let line_start = reader.stream_position()?;
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 || !buf.ends_with(b"\n") || line_start + n as u64 > offset {
+                break;
+            }
+            let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() || line.len() > MAX_LINE_BYTES {
+                continue;
+            }
+            match serde_json::from_slice::<RawEntry>(line) {
+                Ok(entry) if is_real_user_prompt(&entry) => {
+                    if let (Some(session_id), Some(at)) =
+                        (entry.session_id.clone(), entry_time(&entry))
+                    {
+                        found.insert(session_id, at);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warnings.push(format!(
+                    "{}: 时间上下文恢复时 JSON 解析失败: {error}",
+                    path.display()
+                )),
+            }
+        }
+        if !found.is_empty() || start == 0 {
+            last_user_at.extend(found);
+            return Ok(());
+        }
+        lookback = offset;
+    }
 }
 
 /// 递归收集目录下的 JSONL 文件（含子目录）。

@@ -50,7 +50,7 @@ export default function AgentDetail() {
       <DetailSummary
         items={[
           { label: '费用', value: fmtUsd(d.calculated_cost_micro_usd) },
-          { label: '网络流量', value: fmtBytes(d.estimated_total_bytes) },
+          { label: '估算流量', value: fmtBytes(d.estimated_total_bytes) },
           { label: '缓存命中率', value: cacheHitRate(d) != null ? fmtPct100(cacheHitRate(d)) : '—' },
           { label: 'Source 健康', value: d.source_health ? `${d.source_health.healthy ?? 0}/${d.source_health.total ?? 0}` : '—' },
           { label: '版本数', value: String((d.version_dist || []).length) },

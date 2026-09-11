@@ -9,6 +9,12 @@ use metria_adapter_api::{ScanIdentity, SourceAdapter};
 
 use metria_adapter_codex::CodexAdapter;
 
+fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex")
 }
@@ -58,6 +64,29 @@ fn golden_full_parses_session_events() {
     for c in &s.batch.model_calls {
         assert!(c.reasoning_tokens.is_some());
     }
+
+    let first = &s.batch.model_calls[0];
+    assert_eq!(first.started_at, ts("2026-08-03T06:02:58.200Z"));
+    assert_eq!(
+        first.first_response_at,
+        Some(ts("2026-08-03T06:03:01.500Z"))
+    );
+    assert_eq!(first.completed_at, Some(ts("2026-08-03T06:03:02Z")));
+    assert_eq!(first.duration_ms, Some(3800));
+    assert_eq!(
+        first.timing_source.as_deref(),
+        Some("codex_event_timestamps")
+    );
+    assert_eq!(first.timing_quality.as_deref(), Some("observed"));
+
+    // 工具结果是同一 turn 内下一次模型调用的开始边界，不能沿用首条用户消息。
+    let second = &s.batch.model_calls[1];
+    assert_eq!(second.started_at, ts("2026-08-03T06:03:04Z"));
+    assert_eq!(second.first_response_at, Some(ts("2026-08-03T06:03:05Z")));
+    assert_eq!(second.completed_at, Some(ts("2026-08-03T06:03:06.500Z")));
+    assert_eq!(second.duration_ms, Some(2500));
+    assert_ne!(second.started_at, second.first_response_at.unwrap());
+    assert_ne!(second.first_response_at, second.completed_at);
 }
 
 #[test]
@@ -203,12 +232,80 @@ fn appended_usage_restores_session_and_model_context() {
         Some("gpt-5.6-sol")
     );
     assert_eq!(third.model_calls[0].input_tokens, Some(1200));
+    assert_eq!(
+        third.model_calls[0].started_at,
+        ts("2026-08-13T01:01:00Z"),
+        "增量扫描必须从游标前恢复当前 turn 起点"
+    );
+    assert_eq!(third.model_calls[0].first_response_at, None);
+    assert_eq!(third.model_calls[0].duration_ms, Some(2000));
 
     let fourth = adapter
         .scan(&source, third.next_cursor.as_ref(), &identity)
         .unwrap();
     assert!(fourth.model_calls.is_empty());
     assert!(fourth.usage_events.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn timing_missing_output_and_identical_usage_do_not_cross_turns() {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-timing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("timing.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"session_meta","payload":{"session_id":"timing-session"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"one"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:10Z","type":"event_msg","payload":{"type":"user_message","message":"two"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:11Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"opaque"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-01T00:00:12Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = CodexAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let batch = adapter.scan(&source, None, &ScanIdentity::test()).unwrap();
+
+    assert_eq!(batch.model_calls.len(), 2, "相同 usage 不能跨 turn 去重");
+    assert_eq!(batch.model_calls[0].first_response_at, None);
+    assert_eq!(batch.model_calls[0].duration_ms, Some(2000));
+    assert_eq!(batch.model_calls[1].started_at, ts("2026-09-01T00:00:10Z"));
+    assert_eq!(
+        batch.model_calls[1].first_response_at,
+        Some(ts("2026-09-01T00:00:11Z"))
+    );
+    assert_eq!(
+        batch.model_calls[1].timing_source.as_deref(),
+        Some("codex_reasoning_event_timestamps")
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

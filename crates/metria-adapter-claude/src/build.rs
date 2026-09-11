@@ -219,12 +219,12 @@ impl SessionBuilder {
         turn_id: Id,
         source_call_id: String,
         model_raw: Option<String>,
-        at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+        turn_started_at: Option<DateTime<Utc>>,
         input: Option<i64>,
         output: Option<i64>,
         cache_read: Option<i64>,
         cache_write: Option<i64>,
-        duration_ms: Option<i64>,
         status: &str,
         response_text: Option<String>,
     ) {
@@ -233,6 +233,9 @@ impl SessionBuilder {
             "error" | "cancelled" | "aborted" => Some(400),
             _ => Some(200),
         };
+        let reliable_start = turn_started_at.filter(|start| *start <= completed_at);
+        let started_at = reliable_start.unwrap_or(completed_at);
+        let duration_ms = reliable_start.map(|start| (completed_at - start).num_milliseconds());
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(source_call_id),
@@ -247,10 +250,12 @@ impl SessionBuilder {
             provider_normalized: None,
             model_raw: model_raw.clone(),
             model_normalized: model_norm.clone(),
-            started_at: at,
-            first_response_at: Some(at),
-            completed_at: Some(at),
+            started_at,
+            first_response_at: None,
+            completed_at: Some(completed_at),
             duration_ms,
+            timing_source: Some("claude_message_timestamps".into()),
+            timing_quality: Some("bounded".into()),
             status: status.to_string(),
             status_code,
             streaming: false,
@@ -289,7 +294,7 @@ impl SessionBuilder {
             session_id: Some(self.session.source_session_id.clone()),
             turn_id: Some(turn_id.as_str().to_string()),
             model_call_id: Some(call.id.as_str().to_string()),
-            timestamp: at,
+            timestamp: completed_at,
             provider_raw: None,
             provider_normalized: None,
             model_raw: model_raw.clone(),
@@ -419,7 +424,7 @@ impl SessionBuilder {
         self.usage.push(usage_event);
         self.calls.push(c);
         self.traffic.push(traffic);
-        self.last_activity = Some(at);
+        self.last_activity = Some(completed_at);
     }
 
     /// 记录 tool_use；返回是否新记录。

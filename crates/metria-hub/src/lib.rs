@@ -72,6 +72,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
     // 价格目录种子 + 后台同步
     seed_catalogs(&db);
+    spawn_integrity_repair(db.clone());
     spawn_catalog_sync(db.clone());
 
     // 后台维护：周期 rollup 对账 + WAL checkpoint
@@ -120,6 +121,52 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
         .map_err(|e| HubError::Io(std::io::Error::other(e)))?;
     info!("Hub 已退出");
     Ok(())
+}
+
+/// 新统计口径上线后的幂等历史修复；标记成功后不在每次重启重复生成估算版本。
+fn spawn_integrity_repair(db: db::HubDb) {
+    tokio::task::spawn_blocking(move || {
+        const KEY: &str = "observability_integrity_version";
+        const TIMING_KEY: &str = "observability_timing_repair_version";
+        const VERSION: &str = "1";
+        let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
+        let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
+        if !full_needed && !timing_needed {
+            return;
+        }
+        let result = (|| -> Result<(usize, i64), String> {
+            let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
+            let traffic = if full_needed {
+                crate::catalog::reprice_from_rules(&db, false)?;
+                let traffic = db.reestimate_calls(None).map_err(|e| e.to_string())?;
+                db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
+                db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+                db.rebuild_all_traffic_rollups()
+                    .map_err(|e| e.to_string())?;
+                traffic
+            } else if timings > 0 {
+                db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
+                db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+                db.rebuild_all_traffic_rollups()
+                    .map_err(|e| e.to_string())?;
+                0
+            } else {
+                0
+            };
+            if full_needed {
+                db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
+            }
+            if timing_needed {
+                db.setting_set(TIMING_KEY, VERSION)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok((timings, traffic))
+        })();
+        match result {
+            Ok((timings, traffic)) => info!(timings, traffic, "历史统计一致性修复完成"),
+            Err(error) => warn!(%error, "历史统计一致性修复失败，将在下次启动重试"),
+        }
+    });
 }
 
 /// 按环境变量启用外部价格目录。

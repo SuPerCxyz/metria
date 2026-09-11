@@ -203,6 +203,16 @@ impl SourceAdapter for OpenCodeAdapter {
                 b
             });
 
+            if data.role.as_deref() == Some("assistant")
+                && builder.current_turn_started_at().is_none()
+            {
+                if let Some(started_at) =
+                    load_previous_user_time(&conn, &session_id, rowid, &mut tolerance)
+                {
+                    builder.restore_turn_start(started_at);
+                }
+            }
+
             process_message(&conn, builder, &msg_id, &data, at, &mut tolerance);
         }
 
@@ -336,9 +346,15 @@ fn process_message(
     tolerance: &mut ScanTolerance,
 ) {
     let role = data.role.as_deref().unwrap_or("");
+    let message_created_at = data
+        .time
+        .as_ref()
+        .and_then(|time| time.created)
+        .and_then(from_millis)
+        .unwrap_or(at);
     let turn = match role {
-        "user" => builder.new_turn(at),
-        _ => builder.ensure_turn(at),
+        "user" => builder.new_turn(message_created_at),
+        _ => builder.ensure_turn(message_created_at),
     };
 
     // 加载该消息的 parts（text/reasoning/tool）
@@ -384,7 +400,7 @@ fn process_message(
                             .and_then(|s| s.time.as_ref())
                             .and_then(|t| t.start)
                             .and_then(from_millis)
-                            .unwrap_or(at);
+                            .unwrap_or(message_created_at);
                         let input = part.state.as_ref().and_then(|s| s.input.as_ref());
                         let output = part.state.as_ref().and_then(|s| s.output.as_ref());
                         builder.add_tool_use(call_id, name, input, output, status, start);
@@ -416,12 +432,17 @@ fn process_message(
                     .and_then(|m| m.provider_id.clone())
                     .or_else(|| data.provider_id.clone());
                 let cache = tokens.cache.as_ref().map(|c| (c.read, c.write));
-                let duration_ms = data
+                let turn_started_at = builder.current_turn_started_at();
+                let first_response_at = data
                     .time
                     .as_ref()
-                    .and_then(|t| t.completed)
-                    .zip(data.time.as_ref().and_then(|t| t.created))
-                    .map(|(c, s)| (c - s).max(0));
+                    .and_then(|time| time.created)
+                    .and_then(from_millis);
+                let completed_at = data
+                    .time
+                    .as_ref()
+                    .and_then(|time| time.completed)
+                    .and_then(from_millis);
                 let status = match data.finish.as_deref() {
                     Some("error") => "error",
                     Some("length") => "truncated",
@@ -432,6 +453,9 @@ fn process_message(
                     turn,
                     msg_id.to_string(),
                     at,
+                    turn_started_at,
+                    first_response_at,
+                    completed_at,
                     model.as_deref(),
                     provider.as_deref(),
                     tokens.input,
@@ -439,7 +463,6 @@ fn process_message(
                     cache.and_then(|(r, _)| r),
                     cache.and_then(|(_, w)| w),
                     tokens.reasoning,
-                    duration_ms,
                     status,
                     if response_text.is_empty() {
                         None
@@ -456,6 +479,51 @@ fn process_message(
     } else if role == "user" && !user_text.is_empty() {
         // 无 parts 时的兜底（已有 text part 时避免重复）
     }
+}
+
+fn load_previous_user_time(
+    conn: &Connection,
+    session_id: &str,
+    before_rowid: i64,
+    tolerance: &mut ScanTolerance,
+) -> Option<DateTime<Utc>> {
+    let mut stmt = match conn.prepare(
+        "SELECT time_created, data FROM message \
+         WHERE session_id = ?1 AND rowid < ?2 ORDER BY rowid DESC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            tolerance.record(format!("回合起点查询失败: {error}"));
+            return None;
+        }
+    };
+    let rows = match stmt.query_map(
+        metria_storage::rusqlite::params![session_id, before_rowid],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tolerance.record(format!("回合起点读取失败: {error}"));
+            return None;
+        }
+    };
+    for row in rows {
+        let Ok((time_created, data_json)) = row else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<MessageData>(&data_json) else {
+            continue;
+        };
+        if data.role.as_deref() == Some("user") {
+            return data
+                .time
+                .as_ref()
+                .and_then(|time| time.created)
+                .and_then(from_millis)
+                .or_else(|| from_millis(time_created));
+        }
+    }
+    None
 }
 
 fn load_parts(conn: &Connection, msg_id: &str) -> Result<Vec<PartData>, String> {

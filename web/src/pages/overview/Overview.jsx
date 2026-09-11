@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
-import TrendChart, { PALETTE as CHART_PALETTE } from '../../components/charts/TrendChart'
+import TrendChart from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
 import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
@@ -17,7 +17,7 @@ import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, su
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
   { key: 'cost', label: '费用' },
-  { key: 'traffic', label: '流量' },
+  { key: 'traffic', label: '估算流量' },
   { key: 'requests', label: '请求数' },
 ]
 
@@ -214,7 +214,7 @@ export default function Overview() {
           />
           <MetricCard
             span="xl:col-span-4"
-            label="网络流量"
+            label="估算流量"
             value={fmtBytes(o.estimated_total_bytes)}
             sub="估算流量（含上下界）"
             hint={`范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}`}
@@ -277,29 +277,6 @@ export default function Overview() {
           <EmptyState title="当前范围无数据" />
         ) : (
           <>
-            {dim !== 'all' && trendData.datasets.length > 0 && (
-              <div className="mb-3">
-                <div className="flex flex-wrap gap-x-2.5 gap-y-2 max-h-28 overflow-y-auto items-center">
-                  {trendData.datasets.map((d, i) => {
-                    const hidden = hiddenDimensions.includes(d.label)
-                    return (
-                      <button
-                        key={d.label}
-                        type="button"
-                        onClick={() => toggleHiddenDimension(d.label)}
-                        className="inline-flex items-center text-xs font-medium cursor-pointer"
-                        title={hidden ? '点击恢复该维度' : '点击隐藏该维度（汇总卡片将排除其数据）'}
-                      >
-                        <span className="inline-block shrink-0" style={{ width: 40, height: 12, backgroundColor: CHART_PALETTE[i % CHART_PALETTE.length] }} />
-                        <span className={`ml-1.5 max-w-48 truncate ${hidden ? 'text-gray-400 dark:text-gray-500 line-through opacity-60' : 'text-[#666] hover:opacity-70'}`}>
-                          {d.label}
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
             <TrendChart
               labels={trendData.labels}
               datasets={trendData.datasets}
@@ -308,7 +285,7 @@ export default function Overview() {
               formatY={formatY}
               ariaLabel="使用趋势，点击图例可隐藏或恢复维度"
               onLegendClick={dim === 'all' ? undefined : toggleHiddenDimension}
-              legendDisplay={dim === 'all'}
+              legendDisplay={trendData.datasets.length > 0}
             />
           </>
         )}

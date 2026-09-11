@@ -317,26 +317,89 @@ fn top_section(title: &str, items: &[DimCount], show_tokens: bool) -> String {
     s
 }
 
-/// 内联图表（PNG 以 CID 嵌入邮件）。
+/// 报告图表：PNG 供 PDF 使用，SVG 直接嵌入邮件 HTML。
 #[derive(Clone, Debug)]
 pub struct ReportChart {
     pub cid: String,
     pub title: String,
     pub png: Vec<u8>,
+    pub svg: String,
     pub series: Vec<(String, String)>,
     pub days: Vec<String>,
 }
 
-const CHART_W: u32 = 1200;
+/// 生成无脚本、无外部资源的邮件内嵌 SVG。数据标签和图例使用统一的
+/// 邮件文案样式，PNG 仅留给 PDF 路径。
+pub(crate) fn inline_chart_svg(
+    days: &[String],
+    series: &[(String, String, Vec<i64>)],
+    title: &str,
+) -> String {
+    const WIDTH: f64 = 1200.0;
+    const HEIGHT: f64 = 300.0;
+    const LEFT: f64 = 42.0;
+    const RIGHT: f64 = 1165.0;
+    const TOP: f64 = 28.0;
+    const BOTTOM: f64 = 248.0;
+    let max = series
+        .iter()
+        .flat_map(|(_, _, values)| values.iter())
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+    let x = |i: usize| {
+        if days.len() <= 1 {
+            LEFT
+        } else {
+            LEFT + (RIGHT - LEFT) * i as f64 / (days.len() - 1) as f64
+        }
+    };
+    let y = |value: i64| BOTTOM - (BOTTOM - TOP) * value.max(0) as f64 / max;
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"{}\" viewBox=\"0 0 {WIDTH} {HEIGHT}\" width=\"{WIDTH}\" height=\"{HEIGHT}\" style=\"display:block;width:100%;height:auto;background:#ffffff;\">",
+        esc(title)
+    );
+    for step in 0..=4 {
+        let yy = TOP + (BOTTOM - TOP) * step as f64 / 4.0;
+        svg.push_str(&format!(
+            "<line x1=\"{LEFT}\" y1=\"{yy:.1}\" x2=\"{RIGHT}\" y2=\"{yy:.1}\" stroke=\"#e5e7eb\" stroke-width=\"1\"/>"
+        ));
+    }
+    for (name, color, values) in series {
+        let points = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| format!("{:.1},{:.1}", x(i), y(*value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        svg.push_str(&format!(
+            "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"2.5\" stroke-linejoin=\"round\" stroke-linecap=\"round\" points=\"{}\"><title>{}</title></polyline>",
+            esc(color), points, esc(name)
+        ));
+    }
+    if let Some(first) = days.first() {
+        svg.push_str(&format!(
+            "<text x=\"{LEFT}\" y=\"278\" fill=\"#6b7280\" font-family=\"Arial,sans-serif\" font-size=\"12\">{}</text>",
+            esc(first)
+        ));
+    }
+    if let Some(last) = days.last() {
+        svg.push_str(&format!(
+            "<text x=\"{RIGHT}\" y=\"278\" text-anchor=\"end\" fill=\"#6b7280\" font-family=\"Arial,sans-serif\" font-size=\"12\">{}</text>",
+            esc(last)
+        ));
+    }
+    svg.push_str("</svg>");
+    svg
+}
 
 fn chart_section(c: &ReportChart) -> String {
     let mut s = format!(
         "<div style=\"margin-top:18px;\"><div style=\"font-size:13px;font-weight:700;color:#374151;margin-bottom:8px;\">{}</div>\
-         <img src=\"cid:{}\" width=\"{w}\" alt=\"{t}\" style=\"width:100%;max-width:{w}px;height:auto;display:block;\">",
+         {}",
         esc(&c.title),
-        esc(&c.cid),
-        w = CHART_W,
-        t = esc(&c.title),
+        c.svg,
     );
     // 时间刻度已绘制在图内，这里仅保留多条曲线图例
     if !c.series.is_empty() {
@@ -450,6 +513,36 @@ mod tests {
             kind: "每日".into(),
             generated_at: "2026-09-10T12:00:00+08:00".into(),
         }
+    }
+
+    #[test]
+    fn html_chart_is_inline_svg_without_cid_image() {
+        let svg = inline_chart_svg(
+            &["09-10".into(), "09-11".into()],
+            &[("输入".into(), C_INPUT.into(), vec![10, 20])],
+            "Token 趋势",
+        );
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("<polyline"));
+        let metrics = ReportMetrics {
+            has_data: true,
+            ..Default::default()
+        };
+        let html = render_html(
+            &metrics,
+            &meta(),
+            &[ReportChart {
+                cid: "chart-token".into(),
+                title: "Token 趋势".into(),
+                png: Vec::new(),
+                svg,
+                series: vec![("输入".into(), C_INPUT.into())],
+                days: vec!["09-10".into(), "09-11".into()],
+            }],
+        );
+        assert!(html.contains("<svg"));
+        assert!(!html.contains("cid:chart-token"));
+        assert!(!html.contains("<img"));
     }
 
     #[test]

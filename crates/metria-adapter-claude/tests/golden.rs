@@ -7,6 +7,12 @@ use metria_adapter_api::{ScanIdentity, SourceAdapter};
 
 use metria_adapter_claude::ClaudeCodeAdapter;
 
+fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude")
 }
@@ -58,10 +64,20 @@ fn golden_full_parses_session_events() {
     assert_eq!(s.batch.tool_events.len(), 2);
     assert_eq!(s.batch.messages.len(), 7);
 
-    // 时长与状态：assistant - 最近 user 的毫秒差值（4000/3500/1000），status 默认 success
+    // Claude 只能证明真实 user 到最终 assistant 记录的有界耗时；tool_result 不是新 turn 起点。
     let durations: Vec<Option<i64>> = s.batch.model_calls.iter().map(|c| c.duration_ms).collect();
-    assert_eq!(durations, vec![Some(4000), Some(3500), Some(1000)]);
+    assert_eq!(durations, vec![Some(4000), Some(9000), Some(11000)]);
     for c in &s.batch.model_calls {
+        assert_eq!(c.started_at, ts("2026-08-05T01:00:01Z"));
+        assert_eq!(c.first_response_at, None);
+        assert!(c
+            .completed_at
+            .is_some_and(|completed| completed > c.started_at));
+        assert_eq!(
+            c.timing_source.as_deref(),
+            Some("claude_message_timestamps")
+        );
+        assert_eq!(c.timing_quality.as_deref(), Some("bounded"));
         assert_eq!(c.status, "success");
         assert_eq!(c.status_code, Some(200));
     }
@@ -204,4 +220,107 @@ fn task_tool_use_emits_subagent_relation() {
     assert_eq!(rel.child_session_id.as_str(), "sub-child-0002");
     assert_eq!(rel.session_id, session.id);
     assert_eq!(session.model_call_count, 1);
+}
+
+#[test]
+fn assistant_without_real_user_has_no_latency_sample() {
+    let dir = std::env::temp_dir().join(format!(
+        "metria-claude-no-user-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("no-user.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"assistant","sessionId":"no-user","timestamp":"2026-09-01T00:00:02Z","message":{"id":"a1","role":"assistant","model":"claude-test","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"text","text":"done"}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = ClaudeCodeAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let batch = adapter.scan(&source, None, &ScanIdentity::test()).unwrap();
+    let call = &batch.model_calls[0];
+    assert_eq!(call.first_response_at, None);
+    assert_eq!(call.duration_ms, None);
+    assert_eq!(call.started_at, call.completed_at.unwrap());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn incremental_assistant_restores_real_user_start() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!(
+        "metria-claude-timing-incremental-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("incremental.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","sessionId":"incremental","timestamp":"2026-09-01T00:00:01Z","message":{"id":"u1","role":"user","content":"go"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = ClaudeCodeAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"assistant","sessionId":"incremental","timestamp":"2026-09-01T00:00:04Z","message":{{"id":"a1","role":"assistant","model":"claude-test","usage":{{"input_tokens":10,"output_tokens":2}},"content":[{{"type":"text","text":"done"}}]}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    let call = &second.model_calls[0];
+    assert_eq!(call.started_at, ts("2026-09-01T00:00:01Z"));
+    assert_eq!(call.completed_at, Some(ts("2026-09-01T00:00:04Z")));
+    assert_eq!(call.duration_ms, Some(3000));
+    assert_eq!(call.first_response_at, None);
+
+    let _ = std::fs::remove_dir_all(dir);
 }

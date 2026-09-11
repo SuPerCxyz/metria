@@ -13,7 +13,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtDuration, sumTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, sumTokens } from '../../services/format'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -59,6 +59,7 @@ export default function Analytics() {
   )
   const latency = useQuery(`latency${q(scopedParams)}`, () => api(`/usage/latency${q(scopedParams)}`))
   const latencySeries = useQuery(`latency-ts${q(scopedParams)}`, () => api(`/usage/latency/timeseries${q(scopedParams)}`))
+  const performance = useQuery(`performance${q(scopedParams)}`, () => api(`/usage/performance${q(scopedParams)}`))
   const nodeNames = useNodeNames()
 
   const latencyTrend = useMemo(() => {
@@ -212,6 +213,35 @@ export default function Analytics() {
       {tab === 'latency' && (
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">延迟分析</h2>
+          {performance.loading ? <LoadingSkeleton rows={2} /> : performance.error ? (
+            <ErrorState error={performance.error} onRetry={performance.refresh} />
+          ) : (
+            <>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <PerformanceCard
+                  label="首个可观察输出延迟"
+                  value={performance.data?.ttft?.avg_ms != null ? fmtDuration(performance.data.ttft.avg_ms) : '不可用'}
+                  count={performance.data?.ttft?.count}
+                  total={performance.data?.total_calls}
+                  coverage={performance.data?.ttft?.coverage}
+                  hint="从客户端只读日志的请求起点到首个可观察输出事件，不等同服务端精确首 Token。"
+                />
+                <PerformanceCard
+                  label="估算输出速度"
+                  value={performance.data?.output_speed?.avg_tokens_per_second != null ? `${performance.data.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '不可用'}
+                  count={performance.data?.output_speed?.count}
+                  total={performance.data?.total_calls}
+                  coverage={performance.data?.output_speed?.coverage}
+                  hint="仅在首输出、完成时间和输出 Token 均可用时计算。"
+                />
+              </div>
+              <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">
+                观测来源：{formatTimingSources(performance.data?.sources)}；不支持的调用保持不可用，不按 0 计入。
+              </p>
+            </>
+          )}
+
+          <h3 className="mb-3 mt-6 text-sm font-semibold text-gray-500 dark:text-gray-400">端到端调用时长</h3>
           {latency.loading ? <LoadingSkeleton rows={3} /> : latency.error ? (
             <ErrorState error={latency.error} onRetry={latency.refresh} />
           ) : (latency.data?.count ?? 0) > 0 ? (
@@ -222,7 +252,7 @@ export default function Analytics() {
                 <LatencyCard label="P99" ms={latency.data.p99_ms} />
                 <LatencyCard label="平均" ms={latency.data.avg_ms} />
               </div>
-        <div className="mt-4">
+              <div className="mt-4">
                 <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 mb-3">延迟趋势</h3>
                 {latencySeries.loading ? (
                   <LoadingSkeleton rows={3} />
@@ -268,7 +298,7 @@ function DetailAnalysis({
     { key: 'tokens', label: 'Token' },
     { key: 'requests', label: '请求' },
     { key: 'cost', label: '费用' },
-    { key: 'traffic', label: '流量' },
+    { key: 'traffic', label: '估算流量' },
   ]
   const formatY = metric === 'cost'
     ? fmtUsd
@@ -321,6 +351,24 @@ function LatencyCard({ label, ms }) {
       <div className="mt-1 text-xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{ms != null ? fmtDuration(ms) : '—'}</div>
     </div>
   )
+}
+
+function PerformanceCard({ label, value, count = 0, total = 0, coverage, hint }) {
+  return (
+    <div className="rounded-xl bg-gray-50 p-4 dark:bg-gray-700/30">
+      <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
+      <div className="mt-1 text-xl font-bold tabular-nums text-gray-800 dark:text-gray-100">{value}</div>
+      <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+        覆盖率 {fmtPct(coverage)} · {count} / {total} 次调用
+      </div>
+      <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">{hint}</p>
+    </div>
+  )
+}
+
+function formatTimingSources(sources) {
+  if (!sources?.length) return '当前范围无可用样本'
+  return sources.map((item) => `${item.source}（${item.quality}，${item.count}）`).join('、')
 }
 
 function RankingCard({ title, items, onClick }) {

@@ -286,6 +286,10 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(overview["cache_write_tokens"], 50);
     assert_eq!(overview["calculated_cost_micro_usd"], 33218 + 11100);
     assert_eq!(overview["estimated_total_bytes"], 7000 + 4000);
+    assert_eq!(overview["pricing_coverage"]["priced_calls"], 2);
+    assert_eq!(overview["pricing_coverage"]["total_calls"], 2);
+    assert_eq!(overview["traffic_coverage"]["estimated_calls"], 2);
+    assert_eq!(overview["traffic_coverage"]["total_calls"], 2);
 
     // 图表图例隐藏维度后，汇总与时间序列都应排除对应 Agent/模型。
     let excluded_overview: Value = ureq::get(&format!(
@@ -1184,6 +1188,10 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
                     "provider_raw": "anthropic",
                     "provider_normalized": "anthropic",
                     "started_at": "2026-08-05T01:00:05Z",
+                    "first_response_at": "2026-08-05T01:00:05.200Z",
+                    "completed_at": "2026-08-05T01:00:05.800Z",
+                    "timing_source": "test_event_timestamps",
+                    "timing_quality": "observed",
                     "status": "success",
                     "call_granularity": "call",
                     "duration_ms": 800,
@@ -1207,6 +1215,10 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
                     "provider_raw": "anthropic",
                     "provider_normalized": "anthropic",
                     "started_at": "2026-08-05T01:00:45Z",
+                    "first_response_at": "2026-08-05T01:00:45.300Z",
+                    "completed_at": "2026-08-05T01:00:46.200Z",
+                    "timing_source": "test_event_timestamps",
+                    "timing_quality": "observed",
                     "status": "success",
                     "call_granularity": "call",
                     "duration_ms": 1200,
@@ -1290,6 +1302,23 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
         .into_json()
         .unwrap();
     assert_eq!(overall["count"], 3);
+
+    let performance: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/performance?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(performance["total_calls"], 3);
+    assert_eq!(performance["ttft"]["count"], 2);
+    assert_eq!(performance["ttft"]["avg_ms"], 250);
+    assert_eq!(performance["output_speed"]["count"], 2);
+    let avg_speed = performance["output_speed"]["avg_tokens_per_second"]
+        .as_f64()
+        .unwrap();
+    assert!((avg_speed - 69.44).abs() < 0.1, "avg_speed={avg_speed}");
 }
 
 /// 游标同步闭环：注册 → 读空 → 推进 → 读回一致 → 幂等 → 未认证 401 → 删节点清理。

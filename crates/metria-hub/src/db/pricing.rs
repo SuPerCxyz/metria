@@ -213,14 +213,23 @@ impl HubDb {
     ) -> Result<i64, StorageError> {
         let c = self.conn();
         let filter = if only_unpriced {
-            " WHERE (calculated_cost_micro_usd IS NULL AND estimated_cost_micro_usd IS NULL)"
+            " WHERE (reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL AND estimated_cost_micro_usd IS NULL)"
         } else {
+            // 全量重算时先清除旧派生费用；reported 口径始终保留。无法再匹配
+            // 规则的事件应恢复为不可用，不能继续显示过期价格。
+            c.execute(
+                "UPDATE usage_events SET calculated_cost_micro_usd = NULL,
+                    estimated_cost_micro_usd = NULL, pricing_rule_id = NULL",
+                [],
+            )
+            .map_err(StorageError::from)?;
             ""
         };
         let mut stmt = c
             .prepare(&format!(
                 "SELECT event_id, model_normalized, provider_normalized, timestamp,
-                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                        reported_cost_micro_usd
                  FROM usage_events{filter}",
             ))
             .map_err(StorageError::from)?;
@@ -236,6 +245,7 @@ impl HubDb {
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<i64>>(7)?,
                     r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
                 ))
             })
             .map_err(StorageError::from)?;
@@ -246,7 +256,7 @@ impl HubDb {
             )
             .map_err(StorageError::from)?;
         for row in rows.flatten() {
-            let (event_id, model, provider, ts, input, output, cr, cw, rea) = row;
+            let (event_id, model, provider, ts, input, output, cr, cw, rea, reported) = row;
             let at = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|t| t.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -257,7 +267,8 @@ impl HubDb {
                 cache_write: cw,
                 reasoning: rea,
             };
-            let Ok(cost) = engine.compute(&usage, model.as_deref(), provider.as_deref(), at, None)
+            let Ok(cost) =
+                engine.compute(&usage, model.as_deref(), provider.as_deref(), at, reported)
             else {
                 continue;
             };
@@ -274,7 +285,7 @@ impl HubDb {
             .map_err(StorageError::from)?;
             // 写入 pricing_match（保留历史，不覆盖）
             c.execute(
-                "INSERT OR REPLACE INTO pricing_matches (id, usage_event_id, pricing_rule_id, pricing_snapshot_id, match_type, calculated_at, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning_cost, request_cost, total_cost) VALUES (?1,?2,?3,NULL,'reprice',?4,NULL,NULL,NULL,NULL,NULL,NULL,?5)",
+                "INSERT INTO pricing_matches (id, usage_event_id, pricing_rule_id, pricing_snapshot_id, match_type, calculated_at, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning_cost, request_cost, total_cost) VALUES (?1,?2,?3,NULL,'reprice',?4,NULL,NULL,NULL,NULL,NULL,NULL,?5)",
                 params![
                     metria_core::model::Id::new().as_str().to_string(),
                     event_id,
@@ -306,10 +317,7 @@ impl HubDb {
                 calculated_cost_micro_usd = (SELECT calculated_cost_micro_usd FROM usage_events WHERE event_id = model_calls.usage_event_id),
                 estimated_cost_micro_usd = (SELECT estimated_cost_micro_usd FROM usage_events WHERE event_id = model_calls.usage_event_id)
              WHERE usage_event_id IS NOT NULL
-               AND usage_event_id IN (
-                   SELECT event_id FROM usage_events
-                   WHERE reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL
-               )",
+               AND EXISTS (SELECT 1 FROM usage_events WHERE event_id = model_calls.usage_event_id)",
             [],
         )
         .map_err(StorageError::from)?;

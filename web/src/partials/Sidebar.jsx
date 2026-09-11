@@ -1,4 +1,4 @@
-// Metria 侧边栏：总览 / 使用分析 / 会话 / 节点 / Agents / 模型 / 费用 / 网络流量 / 设置。
+// Metria 侧边栏：总览 / 使用分析 / 会话 / 节点 / Agents / 模型 / 费用 / 估算流量 / 设置。
 
 import React, { useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
@@ -86,7 +86,7 @@ const NAV_GROUPS = [
     label: '分析',
     items: [
       { to: '/costs', label: '费用', icon: NAV_ICONS.costs },
-      { to: '/traffic', label: '网络流量', icon: NAV_ICONS.traffic },
+      { to: '/traffic', label: '估算流量', icon: NAV_ICONS.traffic },
     ],
   },
   {

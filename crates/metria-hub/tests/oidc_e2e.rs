@@ -184,7 +184,8 @@ fn route_idp(
                         "email": OWNER_EMAIL,
                         "email_verified": true,
                         "preferred_username": "owner",
-                        "name": "Owner"
+                        "name": "Owner",
+                        "picture": "https://idp.example.com/avatar/owner.png"
                     })
                     .to_string(),
                 ),
@@ -330,6 +331,7 @@ async fn oidc_full_flow_issues_session_for_allowed_user() {
         .unwrap();
     assert_eq!(me["username"], OWNER_EMAIL);
     assert_eq!(me["email"], OWNER_EMAIL);
+    assert_eq!(me["avatar_url"], "https://idp.example.com/avatar/owner.png");
     assert_eq!(me["ok"], true);
 
     let updated: Value = ureq::put(&format!("{hub}/api/v1/auth/profile"))

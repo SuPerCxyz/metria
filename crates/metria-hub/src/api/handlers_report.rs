@@ -4,6 +4,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use lettre::message::Mailbox;
 use serde_json::json;
 
 use crate::report::{self, ReportConfig};
@@ -132,11 +133,19 @@ fn validate(c: &ReportConfig) -> Result<(), String> {
     if c.smtp.port == 0 {
         return Err("SMTP 端口无效".into());
     }
+    let effective_from = if c.smtp.from.trim().is_empty() {
+        c.smtp.username.trim()
+    } else {
+        c.smtp.from.trim()
+    };
+    if !effective_from.is_empty() && effective_from.parse::<Mailbox>().is_err() {
+        return Err("发件人必须是合法邮箱地址，可使用“名称 <user@example.com>”格式".into());
+    }
     if c.email_enabled {
         if c.smtp.host.trim().is_empty() {
             return Err("启用邮件渠道需配置 SMTP 服务器地址".into());
         }
-        if c.smtp.from.trim().is_empty() && c.smtp.username.trim().is_empty() {
+        if effective_from.is_empty() {
             return Err("启用邮件渠道需配置发件人或用户名".into());
         }
         for r in c.recipients.split(',') {
@@ -153,4 +162,26 @@ fn validate(c: &ReportConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_effective_sender_and_month_day() {
+        let mut cfg = ReportConfig {
+            email_enabled: true,
+            ..Default::default()
+        };
+        cfg.smtp.host = "smtp.example.com".into();
+        cfg.smtp.username = "not-an-email".into();
+        assert!(validate(&cfg).unwrap_err().contains("发件人必须"));
+
+        cfg.smtp.username = "sender@example.com".into();
+        cfg.schedules.monthly.day = Some(29);
+        assert!(validate(&cfg).unwrap_err().contains("1 到 28"));
+        cfg.schedules.monthly.day = Some(28);
+        assert!(validate(&cfg).is_ok());
+    }
 }

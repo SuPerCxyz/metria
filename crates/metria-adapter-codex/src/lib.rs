@@ -283,7 +283,101 @@ fn bootstrap_incremental_context(
         // 窗口内无 turn_context：扩大到整个已读区间继续回溯。
         lookback = offset;
     }
+
+    // 同样恢复尚未结束调用的时间边界，但只更新构建器状态，不重复生成业务事件。
+    let mut lookback = CONTEXT_LOOKBACK_BYTES;
+    loop {
+        let start = offset.saturating_sub(lookback);
+        reader.seek(SeekFrom::Start(start))?;
+        if start > 0 {
+            buf.clear();
+            let _ = reader.read_until(b'\n', &mut buf)?;
+        }
+        let mut events = Vec::new();
+        let mut found_boundary = false;
+        while reader.stream_position()? < offset {
+            let line_start = reader.stream_position()?;
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 || !buf.ends_with(b"\n") || line_start + n as u64 > offset {
+                break;
+            }
+            if let Some(event) = parse_bootstrap_event(path, &buf, warnings) {
+                found_boundary |= is_timing_boundary(&event);
+                events.push(event);
+            }
+        }
+        if found_boundary || start == 0 {
+            if let Some(sid) = state.current.clone() {
+                for event in events {
+                    restore_timing_event(state.builder(ctx, &sid, utc_now()), &event);
+                }
+            }
+            break;
+        }
+        lookback = offset;
+    }
     Ok(())
+}
+
+fn is_timing_boundary(event: &RawEvent) -> bool {
+    let kind = event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("type"))
+        .and_then(|kind| kind.as_str());
+    matches!(
+        (event.event_type.as_str(), kind),
+        ("event_msg", Some("user_message" | "token_count"))
+            | (
+                "response_item",
+                Some("custom_tool_call_output" | "function_call_output")
+            )
+    )
+}
+
+fn restore_timing_event(builder: &mut SessionBuilder, event: &RawEvent) {
+    let Some(at) = event.timestamp.as_deref().and_then(entry_time) else {
+        return;
+    };
+    let payload = event.payload.as_ref();
+    let kind = payload
+        .and_then(|payload| payload.get("type"))
+        .and_then(|kind| kind.as_str());
+    match (event.event_type.as_str(), kind) {
+        ("event_msg", Some("user_message")) => builder.restore_call_start(at),
+        ("event_msg", Some("token_count")) => builder.note_call_completed(),
+        ("event_msg", Some("agent_message"))
+            if payload
+                .and_then(|payload| payload.get("message"))
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| !message.is_empty()) =>
+        {
+            builder.note_visible_output(at)
+        }
+        ("response_item", Some("reasoning")) => builder.note_reasoning_output(at),
+        ("response_item", Some("message")) => {
+            if payload.is_some_and(|payload| {
+                payload.get("role").and_then(|role| role.as_str()) == Some("assistant")
+                    && payload
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("text")
+                                    .and_then(|text| text.as_str())
+                                    .is_some_and(|text| !text.is_empty())
+                            })
+                        })
+            }) {
+                builder.note_visible_output(at);
+            }
+        }
+        ("response_item", Some("custom_tool_call_output" | "function_call_output")) => {
+            builder.note_tool_result_input(at)
+        }
+        _ => {}
+    }
 }
 
 fn parse_bootstrap_event(
@@ -415,6 +509,7 @@ fn process_event_msg(
                 .to_string();
             if !text.is_empty() {
                 let turn = builder.ensure_turn(at);
+                builder.note_visible_output(at);
                 builder.add_message(turn, "assistant", "text", Some(text), at);
             }
         }
@@ -464,6 +559,15 @@ fn process_response_item(
                 serde_json::from_value(payload).map_err(|e| format!("message 解析失败: {e}"))?;
             let role = p.role.unwrap_or_default();
             let turn = builder.ensure_turn(at);
+            if role == "assistant"
+                && p.content.as_ref().is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.text.as_deref().is_some_and(|text| !text.is_empty()))
+                })
+            {
+                builder.note_visible_output(at);
+            }
             if let Some(items) = p.content {
                 for item in items {
                     if let Some(text) = item.text {
@@ -475,6 +579,7 @@ fn process_response_item(
         "reasoning" => {
             let p: ReasoningPayload =
                 serde_json::from_value(payload).map_err(|e| format!("reasoning 解析失败: {e}"))?;
+            builder.note_reasoning_output(at);
             // 摘要可选记录（正文可能加密，不保存）
             if let Some(s) = p.summary {
                 if !s.is_empty() {
@@ -513,6 +618,8 @@ fn process_response_item(
                     .unwrap_or(0);
                 builder.complete_tool_result(&call_id, p.is_error.unwrap_or(false), out_len, at);
             }
+            // 工具结果是下一次模型调用可证明的输入边界。
+            builder.note_tool_result_input(at);
         }
         _ => {}
     }

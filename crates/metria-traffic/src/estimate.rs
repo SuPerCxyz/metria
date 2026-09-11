@@ -122,6 +122,7 @@ fn estimate_request<'a>(
     candidates: &[metria_core::model::TrafficProfile],
     notes: &mut Vec<String>,
 ) -> (Option<i64>, EstimationSource, Option<ProfileMatch>) {
+    let mut partial_payload = None;
     // 1. 完整重建 / 直接 payload
     if let Some(text) = input.request_text {
         let bytes = text.len() as i64;
@@ -132,9 +133,8 @@ fn estimate_request<'a>(
                 return (Some(payload), EstimationSource::ReconstructedPayload, None);
             }
             ReconstructionQuality::Partial => {
-                let payload = (bytes as f64 * 1.15).round() as i64;
-                notes.push("请求：部分重建，隐藏内容未知，+15% 补偿并降低置信度".into());
-                return (Some(payload), EstimationSource::PartialReconstruction, None);
+                partial_payload = Some((bytes as f64 * 1.15).round() as i64);
+                notes.push("请求：部分重建，继续结合 Token Profile 约束隐藏内容".into());
             }
             ReconstructionQuality::None => {}
         }
@@ -144,6 +144,9 @@ fn estimate_request<'a>(
     let input_tokens = match input.input_tokens {
         Some(t) if t >= 0 => t,
         _ => {
+            if let Some(payload) = partial_payload {
+                return (Some(payload), EstimationSource::PartialReconstruction, None);
+            }
             notes.push("请求：无 token 与正文，无法估算".into());
             return (None, EstimationSource::Unavailable, None);
         }
@@ -182,19 +185,18 @@ fn estimate_request<'a>(
         .unwrap_or(1.0);
     let fixed = p.map(|m| m.profile.fixed_request_bytes).unwrap_or(1024) as f64;
 
-    let (payload, source) = match input.context_transport_mode {
+    let payload = match input.context_transport_mode {
         ContextTransportMode::FullContext => {
-            let b = uncached * bpt
+            uncached * bpt
                 + cache_read * cache_read_factor
                 + cache_write * cache_write_factor
-                + fixed;
-            (b, EstimationSource::TokenProfile)
+                + fixed
         }
         ContextTransportMode::StatefulReference => {
             // 本次上传主要为新上下文与写缓存内容；缓存读不重复上传
             let b = uncached * bpt + cache_write * cache_write_factor + fixed;
             notes.push("请求：stateful_reference，未计入 cache_read 重传".into());
-            (b, EstimationSource::TokenProfile)
+            b
         }
         ContextTransportMode::Mixed => {
             let b = uncached * bpt
@@ -202,7 +204,7 @@ fn estimate_request<'a>(
                 + cache_write * cache_write_factor
                 + fixed;
             notes.push("请求：mixed 传输，cache_read 按 50% 折算".into());
-            (b, EstimationSource::TokenProfile)
+            b
         }
         ContextTransportMode::Unknown => {
             let b = uncached * bpt
@@ -210,7 +212,7 @@ fn estimate_request<'a>(
                 + cache_write * cache_write_factor
                 + fixed;
             notes.push("请求：传输模式未知，区间将放宽".into());
-            (b, EstimationSource::TokenProfile)
+            b
         }
     };
 
@@ -224,7 +226,23 @@ fn estimate_request<'a>(
         _ => {}
     }
 
-    (Some(payload.round() as i64), source, profile_match)
+    let token_payload = payload.round() as i64;
+    if let Some(visible_payload) = partial_payload {
+        let fused = visible_payload.max(token_payload);
+        notes.push(format!(
+            "请求：部分可见={visible_payload}B，Token Profile={token_payload}B，采用保守中值={fused}B"
+        ));
+        return (
+            Some(fused),
+            EstimationSource::PartialReconstruction,
+            profile_match,
+        );
+    }
+    (
+        Some(token_payload),
+        EstimationSource::TokenProfile,
+        profile_match,
+    )
 }
 
 fn estimate_response<'a>(
@@ -232,6 +250,7 @@ fn estimate_response<'a>(
     candidates: &[metria_core::model::TrafficProfile],
     notes: &mut Vec<String>,
 ) -> (Option<i64>, EstimationSource, Option<ProfileMatch>) {
+    let mut partial_payload = None;
     // 1. 可见内容优先
     if let Some(text) = input.response_text {
         let bytes = text.len() as i64;
@@ -249,9 +268,8 @@ fn estimate_response<'a>(
                 );
             }
             ReconstructionQuality::Partial => {
-                let payload = (bytes as f64 * 1.1).round() as i64;
-                notes.push("响应：部分重建".into());
-                return (Some(payload), EstimationSource::PartialReconstruction, None);
+                partial_payload = Some((bytes as f64 * 1.1).round() as i64);
+                notes.push("响应：部分重建，继续结合 Token Profile 约束隐藏输出".into());
             }
             ReconstructionQuality::None => {}
         }
@@ -261,6 +279,9 @@ fn estimate_response<'a>(
     let output_tokens = match input.output_tokens {
         Some(t) if t >= 0 => t,
         _ => {
+            if let Some(payload) = partial_payload {
+                return (Some(payload), EstimationSource::PartialReconstruction, None);
+            }
             notes.push("响应：无 token 与正文，无法估算".into());
             return (None, EstimationSource::Unavailable, None);
         }
@@ -299,8 +320,20 @@ fn estimate_response<'a>(
         payload *= 1.0 + STREAM_EVENT_OVERHEAD_RATIO;
         notes.push("响应：流式事件开销计入".into());
     }
+    let token_payload = payload.round() as i64;
+    if let Some(visible_payload) = partial_payload {
+        let fused = visible_payload.max(token_payload);
+        notes.push(format!(
+            "响应：部分可见={visible_payload}B，Token Profile={token_payload}B，采用保守中值={fused}B"
+        ));
+        return (
+            Some(fused),
+            EstimationSource::PartialReconstruction,
+            profile_match,
+        );
+    }
     (
-        Some(payload.round() as i64),
+        Some(token_payload),
         EstimationSource::TokenProfile,
         profile_match,
     )
@@ -442,6 +475,26 @@ mod tests {
             EstimationSource::ReconstructedPayload
         );
         assert!(out.estimated_request_wire_bytes.is_some());
+    }
+
+    #[test]
+    fn partial_reconstruction_uses_token_profile_as_floor() {
+        let mut partial = base();
+        partial.request_text = Some("x");
+        partial.response_text = Some("y");
+        partial.request_reconstruction_quality = ReconstructionQuality::Partial;
+        partial.response_reconstruction_quality = ReconstructionQuality::Partial;
+
+        let token_only = estimate(&base()).unwrap();
+        let fused = estimate(&partial).unwrap();
+        assert_eq!(
+            fused.estimation_source,
+            EstimationSource::PartialReconstruction
+        );
+        assert!(
+            fused.estimated_total_wire_bytes.unwrap()
+                >= token_only.estimated_total_wire_bytes.unwrap()
+        );
     }
 
     #[test]

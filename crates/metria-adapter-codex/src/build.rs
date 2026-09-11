@@ -66,6 +66,10 @@ pub struct SessionBuilder {
     pub context_transport_mode: ContextTransportMode,
     pub cache_transport_behavior: CacheTransportBehavior,
     current_turn: Option<Id>,
+    current_call_started_at: Option<DateTime<Utc>>,
+    pending_call_started_at: Option<DateTime<Utc>>,
+    first_visible_output_at: Option<DateTime<Utc>>,
+    first_reasoning_output_at: Option<DateTime<Utc>>,
     tool_map: HashMap<String, usize>,
     running_text: String,
     running_bytes: usize,
@@ -134,6 +138,10 @@ impl SessionBuilder {
             context_transport_mode: ContextTransportMode::FullContext,
             cache_transport_behavior: CacheTransportBehavior::FullContentSent,
             current_turn: None,
+            current_call_started_at: None,
+            pending_call_started_at: None,
+            first_visible_output_at: None,
+            first_reasoning_output_at: None,
             tool_map: HashMap::new(),
             running_text: String::new(),
             running_bytes: 0,
@@ -210,7 +218,51 @@ impl SessionBuilder {
         let id = turn.id.clone();
         self.turns.push(turn);
         self.current_turn = Some(id.clone());
+        self.last_usage_key = None;
+        self.begin_call(at);
         id
+    }
+
+    fn begin_call(&mut self, at: DateTime<Utc>) {
+        self.current_call_started_at = Some(at);
+        self.pending_call_started_at = None;
+        self.first_visible_output_at = None;
+        self.first_reasoning_output_at = None;
+    }
+
+    /// 增量扫描恢复游标前尚未完成调用的开始边界。
+    pub fn restore_call_start(&mut self, at: DateTime<Utc>) {
+        self.begin_call(at);
+    }
+
+    /// 工具结果可能先于上一调用的 token_count 落盘；此时保留为下一调用起点。
+    pub fn note_tool_result_input(&mut self, at: DateTime<Utc>) {
+        if self.first_visible_output_at.is_some() || self.first_reasoning_output_at.is_some() {
+            self.pending_call_started_at = Some(at);
+        } else {
+            self.begin_call(at);
+        }
+    }
+
+    /// 记录当前调用第一个可见 assistant 输出。
+    pub fn note_visible_output(&mut self, at: DateTime<Utc>) {
+        if self.current_call_started_at.is_some() && self.first_visible_output_at.is_none() {
+            self.first_visible_output_at = Some(at);
+        }
+    }
+
+    /// 记录 reasoning 事件，仅在没有可见 assistant 输出时作为回退。
+    pub fn note_reasoning_output(&mut self, at: DateTime<Utc>) {
+        if self.current_call_started_at.is_some() && self.first_reasoning_output_at.is_none() {
+            self.first_reasoning_output_at = Some(at);
+        }
+    }
+
+    /// token_count 已关闭上一调用；后续必须等待新用户输入或工具结果。
+    pub fn note_call_completed(&mut self) {
+        self.current_call_started_at = self.pending_call_started_at.take();
+        self.first_visible_output_at = None;
+        self.first_reasoning_output_at = None;
     }
 
     pub fn ensure_turn(&mut self, at: DateTime<Utc>) -> Id {
@@ -332,6 +384,28 @@ impl SessionBuilder {
         }
         self.last_usage_key = Some(key);
 
+        let observed_start = self.current_call_started_at;
+        let (first_response_at, timing_source) =
+            if observed_start.is_some() {
+                if let Some(first) = self.first_visible_output_at.filter(|first| {
+                    observed_start.is_some_and(|start| start <= *first) && *first <= at
+                }) {
+                    (Some(first), "codex_event_timestamps")
+                } else if let Some(first) = self.first_reasoning_output_at.filter(|first| {
+                    observed_start.is_some_and(|start| start <= *first) && *first <= at
+                }) {
+                    (Some(first), "codex_reasoning_event_timestamps")
+                } else {
+                    (None, "codex_event_timestamps")
+                }
+            } else {
+                (None, "codex_event_timestamps")
+            };
+        let started_at = observed_start.unwrap_or(at);
+        let duration_ms = observed_start
+            .filter(|start| *start <= at)
+            .map(|start| (at - start).num_milliseconds());
+
         // 优先显式模型，否则回退到 turn_context 记录的本会话模型
         let model_raw = model
             .map(|s| s.to_string())
@@ -355,10 +429,12 @@ impl SessionBuilder {
             provider_normalized: None,
             model_raw: model_raw.clone(),
             model_normalized: model_norm,
-            started_at: at,
-            first_response_at: Some(at),
+            started_at,
+            first_response_at,
             completed_at: Some(at),
-            duration_ms: None,
+            duration_ms,
+            timing_source: Some(timing_source.into()),
+            timing_quality: Some("observed".into()),
             status: "success".into(),
             status_code: Some(200),
             streaming: true,
@@ -529,6 +605,7 @@ impl SessionBuilder {
         self.calls.push(c);
         self.traffic.push(traffic);
         self.last_activity = Some(at);
+        self.note_call_completed();
     }
 
     pub fn add_tool_use(
