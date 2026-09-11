@@ -122,17 +122,13 @@ metria version      # 版本信息
 
 ## 架构概览
 
-```text
-客户端数据源（只读挂载）
-        │  JSONL offset / SQLite rowid 增量扫描
-        ▼
-Agent / Collector
-        │  归一化、估算、zstd 批传、幂等上传
-        ▼
-Hub（认证、Ingest、Rollup、SQLite、Web UI）
-        ├─ 查询：用量、费用、流量、模型、会话、数据质量
-        └─ 报告：日/周/月 → HTML 邮件 / JSON Webhook
-```
+| 层级 | 组件 | 主要职责 |
+|---|---|---|
+| 数据源 | Claude Code、Codex、OpenCode 的本地日志与数据库 | 只读挂载，不修改客户端 |
+| 采集 | Agent / Collector | 增量扫描、归一化、流量估算、批量上传 |
+| 汇聚 | Hub | 认证、校验、幂等入库、Rollup 和 SQLite 存储 |
+| 展示 | Web UI | 用量、费用、流量、模型、会话和数据质量 |
+| 报告 | Hub Scheduler | 日 / 周 / 月聚合后投递 HTML 邮件或 JSON Webhook |
 
 核心概念见 [数据模型](docs/data-model.md)，完整设计见 [架构文档](docs/architecture.md)。
 

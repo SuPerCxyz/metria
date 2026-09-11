@@ -18,30 +18,15 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 
 ## 3. 架构分层
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Web（React + Vite + Chart.js）  ← rust-embed 进 Hub 镜像 │
-├─────────────────────────────────────────────────────────┤
-│  Hub（axum + tokio）                                     │
-│  ├─ 认证（单 Admin 会话） / Collector 协议（token）      │
-│  ├─ Ingest：zstd 解压 → 校验 → 幂等落库 → 增量 rollup    │
-│  ├─ 查询 API（overview/timeseries/breakdown/明细）       │
-│  ├─ 后台：价格目录同步 / 报告调度 / rollup 对账 / checkpoint│
-│  └─ SQLite（WAL，32 表，版本化迁移）                     │
-├─────────────────────────────────────────────────────────┤
-│  Agent（无 tokio blocking 栈，RSS ≤35MiB 目标）          │
-│  ├─ Push 模式（默认）：无状态轮询采集，游标外置 Hub      │
-│  │   拉游标 → 增量扫描 → 直传 → 确认后推游标（60s 周期） │
-│  ├─ Pull 模式：notify 监听 + 本地 Spool，Hub 主动拉取    │
-│  ├─ 估算：traffic（7 级来源）/ pricing（多来源优先级）   │
-│  └─ 上传：zstd 批传 + 幂等（event_id）+ 413 自动拆批     │
-├─────────────────────────────────────────────────────────┤
-│  Adapter（每客户端独立 crate，只读）                     │
-│  ├─ claude-code：projects/*.jsonl（modern entry）        │
-│  ├─ codex：sessions/*/rollout-*.jsonl                    │
-│  └─ opencode：全局 opencode.db / project storage（只读） │
-└─────────────────────────────────────────────────────────┘
-```
+| 层级 | 组件 | 主要职责 |
+|---|---|---|
+| Web | React 19 + Vite + Tailwind CSS + Chart.js | Web UI，构建产物由 rust-embed 嵌入 Hub |
+| Hub | axum + tokio + SQLite | 认证、Ingest 校验、幂等落库、Rollup、查询 API 和报告调度 |
+| Agent | blocking 采集栈 | Push/Pull 采集、增量游标、流量/费用估算和批量上传 |
+| Adapter | Claude Code / Codex / OpenCode 独立 crate | 只读发现和解析各客户端数据源 |
+| 报告 | SMTP + JSON Webhook | 日 / 周 / 月聚合、HTML/纯文本渲染、渠道结果记录 |
+
+Hub 数据库使用 SQLite WAL 和版本化迁移，目前包含 32 张表；Agent 的 Push 模式将游标保存在 Hub，Pull 模式使用本地 spool。
 
 ## 4. 数据流
 
