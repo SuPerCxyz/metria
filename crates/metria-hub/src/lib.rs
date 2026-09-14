@@ -14,6 +14,7 @@ pub mod pull;
 pub mod report;
 pub mod rollup;
 pub mod share;
+pub mod timeseries;
 
 use metria_core::logging::init_logging;
 use tokio::net::TcpListener;

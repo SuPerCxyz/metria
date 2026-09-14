@@ -44,6 +44,7 @@ export default function Settings() {
   const [repricing, setRepricing] = useState(false)
   const [priceSearch, setPriceSearch] = useState('')
   const [ruleDraft, setRuleDraft] = useState(EMPTY_RULE_DRAFT)
+  const [ruleApplyMode, setRuleApplyMode] = useState('future')
   const [ruleSaving, setRuleSaving] = useState(false)
   const [ruleError, setRuleError] = useState('')
   const { notify } = useToast()
@@ -132,11 +133,12 @@ export default function Settings() {
     const query = priceSearch.trim().toLocaleLowerCase()
     const list = rules.data?.rules || []
     if (!query) return list
-    return list.filter((rule) => `${rule.model_pattern || ''} ${rule.source || ''}`.toLocaleLowerCase().includes(query))
+    return list.filter((rule) => `${rule.model_pattern || ''} ${rule.price_equivalent_to || ''} ${rule.source || ''}`.toLocaleLowerCase().includes(query))
   }, [priceSearch, rules.data])
 
   const priceColumns = useMemo(() => [
     { key: 'model_pattern', label: '模型匹配', sortable: true, render: (rule) => <span title={rule.model_pattern} className="block max-w-[32rem] truncate">{rule.model_pattern}</span> },
+    { key: 'price_equivalent_to', label: '价格等价于', sortable: true, render: (rule) => rule.price_equivalent_to ? <span title={rule.price_equivalent_to} className="block max-w-[18rem] truncate">{rule.price_equivalent_to}{rule.price_equivalent_missing_as_free ? '（缺价按 0）' : ''}</span> : '—' },
     { key: 'input_price', label: '输入/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.input_price != null ? fmtUsd(rule.input_price) : '—'}</span> },
     { key: 'output_price', label: '输出/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.output_price != null ? fmtUsd(rule.output_price) : '—'}</span> },
     { key: 'source', label: '来源', sortable: true, render: (rule) => <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700/40 text-gray-600 dark:text-gray-300">{rule.source}</span> },
@@ -199,12 +201,26 @@ export default function Settings() {
     }
   }
 
+  const setRuleEquivalent = (value) => {
+    setRuleDraft((current) => {
+      const next = { ...current, price_equivalent_to: value }
+      if (value.trim()) {
+        for (const [key] of PRICE_FIELDS) next[key] = ''
+      } else {
+        next.price_equivalent_missing_as_free = false
+      }
+      return next
+    })
+  }
+
   const createRule = async (event) => {
     event.preventDefault()
     setRuleError('')
     let payload
     try {
-      payload = serializeRuleDraft(ruleDraft)
+      payload = serializeRuleDraft(ruleDraft, {
+        effectiveFrom: ruleApplyMode === 'future' ? new Date().toISOString() : undefined,
+      })
     } catch (e) {
       setRuleError(e.message)
       notify(`价格规则校验失败：${e.message}`, 'error')
@@ -214,10 +230,24 @@ export default function Settings() {
     setRuleSaving(true)
     try {
       await api('/pricing/rules', { method: 'POST', body: JSON.stringify(payload) })
-      await rules.refresh()
-      const repriced = await api('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
-      notify(`已保存模型价格，重新计价 ${repriced.repriced ?? 0} 条调用`)
+      const applyMode = ruleApplyMode
       setRuleDraft(EMPTY_RULE_DRAFT)
+      setRuleApplyMode('future')
+      if (applyMode === 'all') {
+        try {
+          const repriced = await api('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
+          notify(`已保存模型价格，重新计价 ${repriced.repriced ?? 0} 条调用`)
+        } catch (e) {
+          notify(`模型价格已保存，但历史重新计价失败：${e.message}`, 'error')
+        }
+      } else {
+        notify('已保存模型价格，仅对后续数据生效')
+      }
+      try {
+        await rules.refresh()
+      } catch (e) {
+        notify(`价格规则列表刷新失败：${e.message}`, 'error')
+      }
     } catch (e) {
       notify(`保存失败：${e.message}`, 'error')
     } finally {
@@ -334,6 +364,32 @@ export default function Settings() {
                   className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
                 />
               </label>
+              <label className="block md:col-span-2">
+                <span className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">价格等价于模型（可选）</span>
+                <input
+                  type="text"
+                  value={ruleDraft.price_equivalent_to}
+                  onChange={(e) => setRuleEquivalent(e.target.value)}
+                  placeholder="例如 gpt-5 或 claude-sonnet-4.5"
+                  aria-describedby="price-equivalent-help"
+                  className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
+                />
+                <span id="price-equivalent-help" className="mt-1 block text-xs text-gray-400 dark:text-gray-500">填写后自动跟随目标模型价格；目标无价格时默认保持未定价。</span>
+              </label>
+              {ruleDraft.price_equivalent_to.trim() && (
+                <label className="inline-flex items-start gap-2 md:col-span-2 text-sm text-gray-600 dark:text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={ruleDraft.price_equivalent_missing_as_free}
+                    onChange={(e) => setRuleDraft((d) => ({ ...d, price_equivalent_missing_as_free: e.target.checked }))}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="block">目标模型无价格时按 0 计费</span>
+                    <span className="block text-xs text-gray-400 dark:text-gray-500">这是明确的免费配置；目标有价格时仍使用目标价格。</span>
+                  </span>
+                </label>
+              )}
               {PRICE_FIELDS.map(([key, label]) => (
                 <label key={key} className="block">
                   <span className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">{label}</span>
@@ -341,6 +397,7 @@ export default function Settings() {
                     type="text"
                     inputMode="numeric"
                     value={ruleDraft[key]}
+                    disabled={Boolean(ruleDraft.price_equivalent_to.trim())}
                     onChange={(e) => setRuleDraft((d) => ({ ...d, [key]: e.target.value }))}
                     placeholder="例如 0.08；免费请填 0"
                     className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
@@ -348,9 +405,23 @@ export default function Settings() {
                 </label>
               ))}
             </div>
+            <fieldset className="mt-4 rounded-lg border border-gray-200 dark:border-gray-700/60 p-3">
+              <legend className="px-1 text-xs font-medium text-gray-500 dark:text-gray-400">生效范围</legend>
+              <div className="flex flex-col gap-2 sm:flex-row sm:gap-5 text-sm text-gray-600 dark:text-gray-300">
+                <label className="inline-flex items-center gap-2">
+                  <input type="radio" name="price-apply-mode" value="future" checked={ruleApplyMode === 'future'} onChange={() => setRuleApplyMode('future')} />
+                  仅后续数据生效
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="radio" name="price-apply-mode" value="all" checked={ruleApplyMode === 'all'} onChange={() => setRuleApplyMode('all')} />
+                  强制重新计算全部历史
+                </label>
+              </div>
+              <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">{ruleApplyMode === 'all' ? '会更新历史费用并保留已有价格匹配记录。' : '保存时间以前的数据保持原费用，不触发历史重新计价。'}</p>
+            </fieldset>
             <div className="mt-4 flex justify-end">
               <button type="submit" disabled={ruleSaving} className="text-sm text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg px-4 py-2 disabled:opacity-50">
-                {ruleSaving ? '保存并重新计价中…' : '保存并重新计价'}
+                {ruleSaving ? (ruleApplyMode === 'all' ? '保存并重新计价中…' : '保存中…') : (ruleApplyMode === 'all' ? '保存并重新计价全部历史' : '保存，仅后续生效')}
               </button>
             </div>
           </form>

@@ -29,3 +29,30 @@ test('rejects invalid and empty price drafts', () => {
   assert.throws(() => serializeRuleDraft({ ...EMPTY_RULE_DRAFT, model_pattern: 'mimo-v2.5' }), /至少填写一项/)
   assert.throws(() => serializeRuleDraft({ ...EMPTY_RULE_DRAFT, model_pattern: 'mimo-v2.5', input_price: '-1' }), /非负美元/)
 })
+
+test('serializes model equivalence and explicit missing-price free fallback', () => {
+  assert.deepEqual(
+    serializeRuleDraft({
+      ...EMPTY_RULE_DRAFT,
+      model_pattern: 'my-custom-model',
+      price_equivalent_to: 'OpenAI/GPT-5',
+      price_equivalent_missing_as_free: true,
+    }, { effectiveFrom: '2026-09-14T00:00:00Z' }),
+    {
+      model_pattern: 'my-custom-model',
+      provider_pattern: '*',
+      price_equivalent_to: 'openai/gpt-5',
+      price_equivalent_missing_as_free: true,
+      effective_from: '2026-09-14T00:00:00Z',
+    },
+  )
+})
+
+test('does not allow prices together with an equivalent model', () => {
+  assert.throws(() => serializeRuleDraft({
+    ...EMPTY_RULE_DRAFT,
+    model_pattern: 'my-custom-model',
+    price_equivalent_to: 'gpt-5',
+    input_price: '0.08',
+  }), /等价规则不需要重复填写价格/)
+})

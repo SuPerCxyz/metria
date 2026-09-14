@@ -2,12 +2,18 @@
 //!
 //! 与 `mod.rs` 同模块，可访问私有字段与辅助函数（`super::*`）。
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use metria_storage::rusqlite::params;
 use metria_storage::StorageError;
 use serde_json::Value;
 
 use super::HubDb;
+
+fn parse_rule_time(value: Option<String>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
 
 impl HubDb {
     pub fn last_snapshot_etag(&self, catalog_id: &str) -> Option<String> {
@@ -138,7 +144,7 @@ impl HubDb {
         let c = self.conn();
         let mut out = Vec::new();
         if let Ok(mut stmt) = c.prepare(
-            "SELECT id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled FROM pricing_rules WHERE enabled = 1",
+            "SELECT id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, effective_from, effective_to, metadata FROM pricing_rules WHERE enabled = 1",
         ) {
             if let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
@@ -155,10 +161,13 @@ impl HubDb {
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, Option<i64>>(12)?,
                     r.get::<_, i64>(13)?,
+                    r.get::<_, Option<String>>(15)?,
+                    r.get::<_, Option<String>>(16)?,
+                    r.get::<_, String>(17)?,
                 ))
             }) {
                 for row in rows.flatten() {
-                    let (id, snapshot_id, source, channel, provider, model, input, output, cr, cw, rea, request, priority) = row;
+                    let (id, snapshot_id, source, channel, provider, model, input, output, cr, cw, rea, request, priority, effective_from, effective_to, metadata) = row;
                     out.push(metria_core::model::PricingRule {
                         id: metria_core::model::Id::parse(&id).unwrap_or_default(),
                         snapshot_id: snapshot_id.and_then(|s| metria_core::model::Id::parse(&s).ok()),
@@ -188,11 +197,12 @@ impl HubDb {
                         cache_write_price: cw,
                         reasoning_price: rea,
                         request_price: request,
-                        effective_from: None,
-                        effective_to: None,
+                        effective_from: parse_rule_time(effective_from),
+                        effective_to: parse_rule_time(effective_to),
                         priority,
                         enabled: true,
-                        metadata: serde_json::json!({}),
+                        metadata: serde_json::from_str(&metadata)
+                            .unwrap_or_else(|_| serde_json::json!({})),
                         created_at: Utc::now(),
                         updated_at: Utc::now(),
                     });
@@ -401,6 +411,9 @@ impl HubDb {
             "SELECT id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, effective_from, effective_to, metadata, created_at FROM pricing_rules ORDER BY priority DESC",
         ) {
             if let Ok(rows) = stmt.query_map([], |r| {
+                let metadata: String = r.get(16)?;
+                let metadata_value =
+                    serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| serde_json::json!({}));
                 Ok(serde_json::json!({
                     "id": r.get::<_, String>(0)?,
                     "source": r.get::<_, String>(1)?,
@@ -419,6 +432,11 @@ impl HubDb {
                     "effective_from": r.get::<_, Option<String>>(14)?,
                     "effective_to": r.get::<_, Option<String>>(15)?,
                     "metadata": r.get::<_, String>(16)?,
+                    "price_equivalent_to": metadata_value.get("price_equivalent_to").and_then(Value::as_str),
+                    "price_equivalent_missing_as_free": metadata_value
+                        .get("price_equivalent_missing_as_free")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     "created_at": r.get::<_, String>(17)?,
                 }))
             }) {
@@ -456,8 +474,36 @@ impl HubDb {
         } else {
             g("client_pattern")
         };
+        let effective_from = v
+            .get("effective_from")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let effective_to = v
+            .get("effective_to")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let metadata = v
+            .get("price_equivalent_to")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|target| {
+                serde_json::json!({
+                    "price_equivalent_to": target,
+                    "price_equivalent_missing_as_free": v
+                        .get("price_equivalent_missing_as_free")
+                        .and_then(|value| value.as_bool())
+                        == Some(true),
+                })
+                .to_string()
+            })
+            .unwrap_or_else(|| "{}".to_string());
         c.execute(
-            "INSERT INTO pricing_rules (id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, metadata, created_at, updated_at) VALUES (?1, NULL, 'user_override', 'vendor_direct', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, '{}', ?12, ?12)",
+            "INSERT INTO pricing_rules (id, snapshot_id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, effective_from, effective_to, priority, enabled, metadata, created_at, updated_at) VALUES (?1, NULL, 'user_override', 'vendor_direct', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15, ?15)",
             params![
                 &id,
                 provider,
@@ -469,7 +515,10 @@ impl HubDb {
                 gn("cache_write_price"),
                 gn("reasoning_price"),
                 gn("request_price"),
+                effective_from,
+                effective_to,
                 gn("priority").unwrap_or(0),
+                metadata,
                 now,
             ],
         )
@@ -488,6 +537,21 @@ impl HubDb {
             })
         };
         let en = v.get("enabled").and_then(|x| x.as_bool());
+        let metadata = v
+            .get("price_equivalent_to")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|target| {
+                serde_json::json!({
+                    "price_equivalent_to": target,
+                    "price_equivalent_missing_as_free": v
+                        .get("price_equivalent_missing_as_free")
+                        .and_then(|value| value.as_bool())
+                        == Some(true),
+                })
+                .to_string()
+            });
         let n = c
             .execute(
                 "UPDATE pricing_rules SET
@@ -503,9 +567,10 @@ impl HubDb {
                 priority = COALESCE(?10, priority),
                 effective_from = COALESCE(NULLIF(?11,''), effective_from),
                 effective_to = COALESCE(NULLIF(?12,''), effective_to),
-                enabled = COALESCE(?13, enabled),
-                updated_at = ?14
-             WHERE id = ?15 AND source = 'user_override'",
+                metadata = COALESCE(?13, metadata),
+                enabled = COALESCE(?14, enabled),
+                updated_at = ?15
+             WHERE id = ?16 AND source = 'user_override'",
                 params![
                     g("provider_pattern"),
                     g("model_pattern"),
@@ -519,6 +584,7 @@ impl HubDb {
                     gn("priority"),
                     g("effective_from"),
                     g("effective_to"),
+                    metadata,
                     en.map(|b| if b { 1 } else { 0 }),
                     Utc::now().to_rfc3339(),
                     id,

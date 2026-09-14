@@ -178,11 +178,34 @@ fn validate_pricing_rule(
     require_price: bool,
 ) -> Result<(), String> {
     let model = v.get("model_pattern").and_then(|x| x.as_str());
+    let equivalent = v
+        .get("price_equivalent_to")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let fallback_free = v
+        .get("price_equivalent_missing_as_free")
+        .and_then(|x| x.as_bool())
+        == Some(true);
     if require_model && model.map(str::trim).unwrap_or("").is_empty() {
         return Err("模型匹配不能为空".into());
     }
     if model.is_some_and(|value| value.trim().is_empty()) {
         return Err("模型匹配不能为空".into());
+    }
+    if fallback_free && equivalent.is_none() {
+        return Err("勾选缺价按 0 计费时必须填写等价目标模型".into());
+    }
+    if equivalent.is_some() && model.is_some_and(|value| value.trim() == equivalent.unwrap()) {
+        return Err("等价目标模型不能与当前模型相同".into());
+    }
+
+    for key in ["effective_from", "effective_to"] {
+        if let Some(value) = v.get(key).and_then(|x| x.as_str()) {
+            if !value.trim().is_empty() && DateTime::parse_from_rfc3339(value).is_err() {
+                return Err(format!("{key} 必须是 RFC3339 时间"));
+            }
+        }
     }
 
     let mut has_price = false;
@@ -204,7 +227,10 @@ fn validate_pricing_rule(
         }
         has_price = true;
     }
-    if require_price && !has_price {
+    if equivalent.is_some() && has_price {
+        return Err("等价规则不需要重复填写价格".into());
+    }
+    if require_price && !has_price && equivalent.is_none() {
         return Err("至少填写一项价格，免费模型请填写 0".into());
     }
     Ok(())
@@ -1392,6 +1418,33 @@ mod pricing_rule_validation_tests {
             true,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn accepts_equivalent_rule_without_price() {
+        let result = validate_pricing_rule(
+            &json!({
+                "model_pattern": "my-custom-model",
+                "price_equivalent_to": "gpt-5",
+                "effective_from": "2026-09-14T00:00:00Z"
+            }),
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_free_fallback_without_equivalent_target() {
+        let result = validate_pricing_rule(
+            &json!({
+                "model_pattern": "my-custom-model",
+                "price_equivalent_missing_as_free": true
+            }),
+            true,
+            true,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

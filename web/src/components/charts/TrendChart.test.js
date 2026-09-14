@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels.js'
+import { downsampleIndices, formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels.js'
+
+test('long-range chart downsampling keeps the same deterministic points', () => {
+  assert.deepEqual(downsampleIndices(337), Array.from({ length: 169 }, (_, i) => i * 2))
+})
 
 test('ISO labels are compact on the axis and complete in the tooltip', () => {
   const iso = new Date(2026, 7, 13, 9, 5, 7).toISOString()

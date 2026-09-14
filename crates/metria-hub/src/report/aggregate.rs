@@ -1,10 +1,12 @@
-//! 报告聚合：从 `hourly_rollups` 汇总指定 UTC 时间范围的指标与按日序列。
+//! 报告聚合：复用 Web 趋势查询生成指定时间范围的报告序列。
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
+use serde_json::Value;
 
+use crate::api::{handlers_query::query_usage_timeseries, RangeParams};
 use crate::db::HubDb;
 
 /// 报告聚合结果。费用/流量为微美元与字节；0 表示该口径无数据。
@@ -158,112 +160,111 @@ fn dim_breakdown(
     }
 }
 
-fn include_date_time(from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
-    to - from > chrono::Duration::days(1)
-}
-
-/// 完整时间轴标签（缺失桶补 0 用）：单日=24 个整点，周/月=范围内每一天。
-fn full_axis(
+fn query_params(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     tz: chrono_tz::Tz,
-    by_hour: bool,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let include_date = include_date_time(from, to);
-    if by_hour {
-        let mut cur = from;
-        while cur < to && out.len() < 400 {
-            let label = if include_date { "%m-%d %H:00" } else { "%H:00" };
-            out.push(cur.with_timezone(&tz).format(label).to_string());
-            cur += chrono::Duration::hours(1);
-        }
-    } else {
-        let start = from.with_timezone(&tz).date_naive();
-        let end = (to - chrono::Duration::seconds(1))
-            .with_timezone(&tz)
-            .date_naive();
-        let mut d = start;
-        while d <= end && out.len() < 400 {
-            let label = if include_date { "%m-%d 00:00" } else { "%m-%d" };
-            out.push(d.format(label).to_string());
-            match d.succ_opt() {
-                Some(n) => d = n,
-                None => break,
-            }
+    dim: Option<&str>,
+) -> RangeParams {
+    RangeParams {
+        from: Some(from.to_rfc3339()),
+        to: Some(to.to_rfc3339()),
+        timezone: Some(tz.to_string()),
+        dim: dim.map(str::to_string),
+        ..RangeParams::default()
+    }
+}
+
+fn query_points(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    tz: chrono_tz::Tz,
+    dim: Option<&str>,
+) -> Vec<Value> {
+    query_usage_timeseries(db, &query_params(from, to, tz, dim)).unwrap_or_default()
+}
+
+fn bucket(point: &Value) -> Option<&str> {
+    point.get("bucket").and_then(Value::as_str)
+}
+
+fn unique_buckets(points: &[Value]) -> Vec<String> {
+    let mut buckets = Vec::new();
+    for point in points {
+        let Some(current) = bucket(point) else {
+            continue;
+        };
+        if buckets.last().map(String::as_str) != Some(current) {
+            buckets.push(current.to_string());
         }
     }
-    out
+    buckets
 }
 
-fn local_label(
-    bucket: &str,
-    tz: chrono_tz::Tz,
-    by_hour: bool,
-    include_date: bool,
-) -> Option<String> {
-    DateTime::parse_from_rfc3339(bucket).ok().map(|d| {
-        let l = d.with_timezone(&tz);
-        if by_hour {
-            let label = if include_date { "%m-%d %H:00" } else { "%H:00" };
-            l.format(label).to_string()
+fn label_bucket(bucket: &str, tz: chrono_tz::Tz, include_date: bool) -> String {
+    if let Ok(value) = DateTime::parse_from_rfc3339(bucket) {
+        let format = if include_date { "%m-%d %H:%M" } else { "%H:%M" };
+        return value.with_timezone(&tz).format(format).to_string();
+    }
+    if let Ok(value) = NaiveDate::parse_from_str(bucket, "%Y-%m-%d") {
+        return if include_date {
+            value.format("%m-%d 00:00").to_string()
         } else {
-            let label = if include_date { "%m-%d 00:00" } else { "%m-%d" };
-            l.format(label).to_string()
-        }
-    })
+            "00:00".to_string()
+        };
+    }
+    bucket.to_string()
 }
 
-/// 按日 Token 构成趋势（输入/输出/缓存读/缓存写/推理）。
+fn axis(
+    points: &[Value],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    tz: chrono_tz::Tz,
+) -> (Vec<String>, Vec<String>) {
+    let buckets = unique_buckets(points);
+    let include_date = to - from > chrono::Duration::days(1);
+    let labels = buckets
+        .iter()
+        .map(|b| label_bucket(b, tz, include_date))
+        .collect();
+    (buckets, labels)
+}
+
+fn value(point: &Value, key: &str) -> i64 {
+    point.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn overall_values(points: &[Value], buckets: &[String], key: &str) -> Vec<i64> {
+    let by_bucket: HashMap<&str, i64> = points
+        .iter()
+        .filter_map(|point| bucket(point).map(|b| (b, value(point, key))))
+        .collect();
+    buckets
+        .iter()
+        .map(|bucket| by_bucket.get(bucket.as_str()).copied().unwrap_or(0))
+        .collect()
+}
+
+/// 与 Web `/usage/timeseries` 使用相同分桶、补零和时间轴。
 pub fn daily_token_chart(
     db: &HubDb,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     tz: chrono_tz::Tz,
-    by_hour: bool,
 ) -> ChartSeries {
-    let c = db.conn();
-    let include_date = include_date_time(from, to);
-    let mut map: BTreeMap<String, [i64; 5]> = BTreeMap::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT bucket,
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                COALESCE(SUM(reasoning_tokens),0)
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 GROUP BY bucket",
-    ) {
-        if let Ok(it) = stmt.query_map([from.to_rfc3339(), to.to_rfc3339()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                [
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                ],
-            ))
-        }) {
-            for (bucket, vals) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
-                    let e = map.entry(day).or_insert([0; 5]);
-                    for i in 0..5 {
-                        e[i] += vals[i];
-                    }
-                }
-            }
-        }
-    }
-    let days = full_axis(from, to, tz, by_hour);
-    // 与页面 Token 视图一致：输入 / 输出 / 缓存读取
+    let points = query_points(db, from, to, tz, None);
+    let (buckets, days) = axis(&points, from, to, tz);
     let names = ["输入", "输出", "缓存读取"];
     let series = (0..3)
         .map(|i| NamedSeries {
             name: names[i].to_string(),
-            values: days
-                .iter()
-                .map(|d| map.get(d).map(|v| v[i]).unwrap_or(0))
-                .collect(),
+            values: overall_values(
+                &points,
+                &buckets,
+                ["input_tokens", "output_tokens", "cache_read_tokens"][i],
+            ),
         })
         .collect();
     ChartSeries { days, series }
@@ -275,125 +276,69 @@ pub fn daily_calls_chart(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     tz: chrono_tz::Tz,
-    by_hour: bool,
 ) -> ChartSeries {
-    let c = db.conn();
-    let include_date = include_date_time(from, to);
-    let mut map: BTreeMap<String, i64> = BTreeMap::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT bucket, COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 GROUP BY bucket",
-    ) {
-        if let Ok(it) = stmt.query_map([from.to_rfc3339(), to.to_rfc3339()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        }) {
-            for (bucket, v) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
-                    *map.entry(day).or_insert(0) += v;
-                }
-            }
-        }
-    }
-    let days = full_axis(from, to, tz, by_hour);
+    let points = query_points(db, from, to, tz, None);
+    let (buckets, days) = axis(&points, from, to, tz);
     let series = vec![NamedSeries {
         name: "请求数".to_string(),
-        values: days
-            .iter()
-            .map(|d| map.get(d).copied().unwrap_or(0))
-            .collect(),
+        values: overall_values(&points, &buckets, "model_calls"),
     }];
     ChartSeries { days, series }
 }
 
-/// 按日维度趋势（模型/客户端 Top N，按 token 或调用排序）。
-#[allow(clippy::too_many_arguments)]
+/// 按 Web 趋势查询的维度序列（模型/客户端）。
 pub fn dim_daily_chart(
     db: &HubDb,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     tz: chrono_tz::Tz,
     column: &str,
-    top_n: i64,
     by_tokens: bool,
-    by_hour: bool,
 ) -> ChartSeries {
-    let c = db.conn();
-    let include_date = include_date_time(from, to);
-    // 与页面 Token 视图口径一致：输入 + 输出 + 缓存读取
-    let metric = if by_tokens {
-        "SUM(input_tokens+output_tokens+cache_read_tokens)"
-    } else {
-        "SUM(model_call_count)"
-    };
-    let from_s = from.to_rfc3339();
-    let to_s = to.to_rfc3339();
-    let mut names: Vec<String> = Vec::new();
-    let top_sql = if top_n > 0 {
-        format!(
-            "SELECT {column} FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND {column} <> '' GROUP BY {column} ORDER BY {metric} DESC LIMIT ?3"
-        )
-    } else {
-        format!(
-            "SELECT {column} FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND {column} <> '' GROUP BY {column} ORDER BY {metric} DESC"
-        )
-    };
-    if let Ok(mut stmt) = c.prepare(&top_sql) {
-        let params: Vec<metria_storage::rusqlite::types::Value> = if top_n > 0 {
-            vec![from_s.clone().into(), to_s.clone().into(), top_n.into()]
-        } else {
-            vec![from_s.clone().into(), to_s.clone().into()]
-        };
-        if let Ok(it) = stmt.query_map(
-            metria_storage::rusqlite::params_from_iter(params.iter()),
-            |r| r.get::<_, String>(0),
-        ) {
-            names = it.filter_map(Result::ok).collect();
-        }
-    }
-    if names.is_empty() {
-        return ChartSeries {
-            days: Vec::new(),
-            series: Vec::new(),
-        };
-    }
-    let placeholders = (0..names.len())
-        .map(|i| format!("?{}", i + 3))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT bucket, {column}, {metric} FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND {column} IN ({placeholders}) GROUP BY bucket, {column}"
-    );
-    let mut params: Vec<metria_storage::rusqlite::types::Value> = vec![from_s.into(), to_s.into()];
-    for n in &names {
-        params.push(n.clone().into());
-    }
-    let mut map: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-    if let Ok(mut stmt) = c.prepare(&sql) {
-        if let Ok(it) = stmt.query_map(
-            metria_storage::rusqlite::params_from_iter(params.iter()),
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            },
-        ) {
-            for (bucket, name, val) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
-                    *map.entry(day).or_default().entry(name).or_insert(0) += val;
-                }
+    let dimension = match column {
+        "model" => "model",
+        "client" | "client_id" => "client",
+        _ => {
+            return ChartSeries {
+                days: Vec::new(),
+                series: Vec::new(),
             }
         }
+    };
+    let points = query_points(db, from, to, tz, Some(dimension));
+    let (buckets, days) = axis(&points, from, to, tz);
+    let mut totals: HashMap<String, i64> = HashMap::new();
+    let mut values: HashMap<(String, String), i64> = HashMap::new();
+    for point in &points {
+        let (Some(bucket), Some(dimension)) = (
+            bucket(point),
+            point.get("dimension").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if dimension.is_empty() {
+            continue;
+        }
+        let current = if by_tokens {
+            value(point, "input_tokens")
+                + value(point, "output_tokens")
+                + value(point, "cache_read_tokens")
+        } else {
+            value(point, "model_calls")
+        };
+        *totals.entry(dimension.to_string()).or_default() += current;
+        values.insert((bucket.to_string(), dimension.to_string()), current);
     }
-    let days = full_axis(from, to, tz, by_hour);
+    let mut names: Vec<(String, i64)> = totals.into_iter().collect();
+    names.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let series = names
-        .iter()
-        .map(|n| NamedSeries {
-            name: n.clone(),
-            values: days
+        .into_iter()
+        .map(|(name, _)| NamedSeries {
+            values: buckets
                 .iter()
-                .map(|d| map.get(d).and_then(|m| m.get(n)).copied().unwrap_or(0))
+                .map(|b| values.get(&(b.clone(), name.clone())).copied().unwrap_or(0))
                 .collect(),
+            name,
         })
         .collect();
     ChartSeries { days, series }
@@ -402,7 +347,6 @@ pub fn dim_daily_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn totals_add_up() {
@@ -436,40 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn long_report_ranges_include_date_and_time_on_axis() {
-        let from = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
-        let to = from + chrono::Duration::days(7);
-
+    fn report_labels_preserve_hour_and_day_buckets() {
         assert_eq!(
-            full_axis(from, to, chrono_tz::UTC, false),
-            vec![
-                "09-10 00:00",
-                "09-11 00:00",
-                "09-12 00:00",
-                "09-13 00:00",
-                "09-14 00:00",
-                "09-15 00:00",
-                "09-16 00:00",
-            ]
+            label_bucket("2026-09-12T15:30:00+00:00", chrono_tz::UTC, true),
+            "09-12 15:30"
         );
         assert_eq!(
-            local_label("2026-09-12T15:00:00Z", chrono_tz::UTC, false, true),
-            Some("09-12 00:00".into())
-        );
-    }
-
-    #[test]
-    fn one_day_report_keeps_hour_only_axis() {
-        let from = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
-        let to = from + chrono::Duration::days(1);
-
-        assert_eq!(
-            full_axis(from, to, chrono_tz::UTC, true).first(),
-            Some(&"00:00".to_string())
+            label_bucket("2026-09-12T15:30:00+00:00", chrono_tz::UTC, false),
+            "15:30"
         );
         assert_eq!(
-            local_label("2026-09-10T15:00:00Z", chrono_tz::UTC, true, false),
-            Some("15:00".into())
+            label_bucket("2026-09-12", chrono_tz::UTC, true),
+            "09-12 00:00"
         );
     }
 }

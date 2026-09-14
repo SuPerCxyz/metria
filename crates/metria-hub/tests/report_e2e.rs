@@ -165,6 +165,67 @@ fn insert_chart_rollup(db: &HubDb) {
     .unwrap();
 }
 
+fn insert_hourly_rollups(db: &HubDb, from: chrono::DateTime<chrono::Utc>, count: i64) {
+    let c = db.conn();
+    for i in 0..count {
+        let bucket = (from + chrono::Duration::hours(i)).to_rfc3339();
+        c.execute(
+            "INSERT INTO hourly_rollups (
+                bucket, node_id, collector_id, client_id, source_id, model,
+                input_tokens, output_tokens, cache_read_tokens, session_count, model_call_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            metria_storage::rusqlite::params![
+                bucket,
+                "node-1",
+                "collector-1",
+                "client-1",
+                "source-1",
+                "model-1",
+                100,
+                50,
+                20,
+                1,
+                1
+            ],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn report_chart_density_matches_web_policy_for_seven_and_fourteen_days() {
+    let (db, _cfg, _dir) = temp_db();
+    let from = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let to = from + chrono::Duration::days(14);
+    insert_hourly_rollups(&db, from, 337);
+
+    let week = report::aggregate::daily_token_chart(
+        &db,
+        from,
+        from + chrono::Duration::days(7),
+        chrono_tz::UTC,
+    );
+    let fortnight = report::aggregate::daily_token_chart(&db, from, to, chrono_tz::UTC);
+
+    assert_eq!(week.days.len(), 169);
+    assert_eq!(fortnight.days.len(), 337);
+    assert_eq!(
+        metria_hub::timeseries::downsample_indices(
+            fortnight.days.len(),
+            metria_hub::timeseries::MAX_CHART_POINTS,
+        )
+        .len(),
+        169
+    );
+    assert_eq!(week.days.first().map(String::as_str), Some("09-01 00:00"));
+    assert_eq!(
+        fortnight.days.first().map(String::as_str),
+        Some("09-01 00:00")
+    );
+}
+
 #[tokio::test]
 async fn email_and_webhook_delivered() {
     let (db, cfg, _dir) = temp_db();

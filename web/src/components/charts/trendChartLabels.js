@@ -1,5 +1,15 @@
 const DAY_MS = 24 * 60 * 60 * 1000
 
+export const MAX_CHART_POINTS = 240
+
+export function downsampleIndices(length, maxPoints = MAX_CHART_POINTS) {
+  if (length <= maxPoints) return Array.from({ length }, (_, index) => index)
+  const step = Math.ceil(length / maxPoints)
+  const indices = []
+  for (let index = 0; index < length; index += step) indices.push(index)
+  return indices
+}
+
 export function isRangeLongerThanDay(range) {
   if (!range?.from || !range?.to) return true
   const from = new Date(range.from).getTime()

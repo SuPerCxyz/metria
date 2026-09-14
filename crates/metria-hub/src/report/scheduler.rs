@@ -7,6 +7,7 @@ use tokio::time::interval;
 
 use crate::config::HubConfig;
 use crate::db::HubDb;
+use crate::timeseries;
 use plotters::style::RGBColor;
 
 use super::aggregate::{self, aggregate, ChartSeries, ReportMetrics};
@@ -119,8 +120,6 @@ fn build_charts(
         return out;
     }
     let palette = chart_palette();
-    // 单日报告按小时分桶，周/月按天分桶
-    let by_hour = (to - from).num_hours() <= 36;
     let mk = |cs: &ChartSeries,
               colors: &[String],
               cid: &str,
@@ -130,13 +129,23 @@ fn build_charts(
         if !has_values(cs) {
             return None;
         }
+        let indices = timeseries::downsample_indices(cs.days.len(), timeseries::MAX_CHART_POINTS);
+        let days = indices
+            .iter()
+            .map(|i| cs.days[*i].clone())
+            .collect::<Vec<_>>();
         let data: Vec<(RGBColor, Vec<i64>)> = cs
             .series
             .iter()
             .enumerate()
-            .map(|(i, s)| (hex_to_rgb(&colors[i % colors.len()]), s.values.clone()))
+            .map(|(i, s)| {
+                (
+                    hex_to_rgb(&colors[i % colors.len()]),
+                    indices.iter().map(|j| s.values[*j]).collect(),
+                )
+            })
             .collect();
-        let png = charts::line_chart_png(&cs.days, &data, 1200, 300, fill).ok()?;
+        let png = charts::line_chart_png(&days, &data, 1200, 300, fill).ok()?;
         let series = cs
             .series
             .iter()
@@ -151,7 +160,7 @@ fn build_charts(
                 (
                     s.name.clone(),
                     colors[i % colors.len()].clone(),
-                    s.values.clone(),
+                    indices.iter().map(|j| s.values[*j]).collect(),
                 )
             })
             .collect::<Vec<_>>();
@@ -159,21 +168,21 @@ fn build_charts(
             cid: cid.to_string(),
             title: title.to_string(),
             png,
-            svg: inline_chart_svg(&cs.days, &svg_series, title),
+            svg: inline_chart_svg(&days, &svg_series, title),
             series,
-            days: cs.days.clone(),
+            days,
         })
     };
 
-    let token = aggregate::daily_token_chart(db, from, to, tz, by_hour);
+    let token = aggregate::daily_token_chart(db, from, to, tz);
     if let Some(c) = mk(&token, &palette[..3], "chart-token", "Token 趋势", true) {
         out.push(c);
     }
-    let calls = aggregate::daily_calls_chart(db, from, to, tz, by_hour);
+    let calls = aggregate::daily_calls_chart(db, from, to, tz);
     if let Some(c) = mk(&calls, &palette[..1], "chart-calls", "请求数量趋势", true) {
         out.push(c);
     }
-    let models = aggregate::dim_daily_chart(db, from, to, tz, "model", 0, true, by_hour);
+    let models = aggregate::dim_daily_chart(db, from, to, tz, "model", true);
     if let Some(c) = mk(
         &models,
         &palette[..8],
@@ -183,7 +192,7 @@ fn build_charts(
     ) {
         out.push(c);
     }
-    let clients = aggregate::dim_daily_chart(db, from, to, tz, "client_id", 0, true, by_hour);
+    let clients = aggregate::dim_daily_chart(db, from, to, tz, "client", true);
     if let Some(c) = mk(
         &clients,
         &palette[..8],

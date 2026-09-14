@@ -3,17 +3,8 @@
 
 import React, { useEffect, useRef } from 'react'
 import Chart from 'chart.js/auto'
-import { formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels'
+import { downsampleIndices, formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels'
 import chartTheme from '../../../chart-theme.json'
-
-// 数据点过多时降采样：保留 maxPoints 个点（≥30）
-function downsample(data, maxPoints = 240) {
-  if (data.length <= maxPoints) return data
-  const step = Math.ceil(data.length / maxPoints)
-  const out = []
-  for (let i = 0; i < data.length; i += step) out.push(data[i])
-  return out
-}
 
 export const PALETTE = chartTheme.palette
 
@@ -32,7 +23,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, ra
       : [{ label: '', values: values || [], color, fill: true }]
 
     // 按下采样后的索引对齐 labels 与所有数据集
-    const idx = downsample((labels || []).map((_, i) => i))
+    const idx = downsampleIndices((labels || []).length)
     const ttip = tooltipLabels ? idx.map((i) => tooltipLabels[i]) : idx.map((i) => formatTimeLabel(labels[i], true))
     const data = {
       labels: idx.map((i) => formatTimeLabel(labels[i], false, showDateOnAxis)),

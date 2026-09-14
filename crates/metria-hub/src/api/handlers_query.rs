@@ -12,6 +12,7 @@ use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValu
 use crate::api::{
     add_exclusions, json_err, parse_range, range_args, range_filter, AppState, RangeParams,
 };
+use crate::db::HubDb;
 use crate::q;
 
 /// 会话闲置阈值：最后活跃超过该分钟数视为闲置。
@@ -272,8 +273,19 @@ pub(crate) async fn usage_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let bucket_secs = bucket_granularity(&p, from, to);
+    match query_usage_timeseries(&st.db, &p) {
+        Ok(points) => Json(serde_json::json!({ "series": points })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+    }
+}
+
+/// 查询趋势数据，供 Web API 与邮件报告共用同一套分桶和补零规则。
+pub(crate) fn query_usage_timeseries(
+    db: &HubDb,
+    p: &RangeParams,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (from, to) = parse_range(p);
+    let bucket_secs = bucket_granularity(p, from, to);
     // 仅细粒度（<1h）从原始事件表分桶，其余走 rollup
     let use_raw = bucket_secs < 3600;
 
@@ -325,9 +337,9 @@ pub(crate) async fn usage_timeseries(
     };
 
     let (filter, fargs) = if use_raw {
-        range_filter_usage(&p)
+        range_filter_usage(p)
     } else {
-        range_filter(&p)
+        range_filter(p)
     };
     // raw 路径带 LEFT JOIN，过滤条件需加 u. 前缀消除同名列歧义
     let prefixed_filter = if use_raw {
@@ -336,11 +348,11 @@ pub(crate) async fn usage_timeseries(
         filter.clone()
     };
 
-    let c = st.db.conn();
+    let c = db.conn();
     let points: Vec<serde_json::Value> = if use_raw {
         // 原始事件细粒度分桶（usage_events + traffic_estimates 关联字节）
         // 所有列加 u. 前缀，避免与 LEFT JOIN 的 traffic_estimates 列名歧义
-        let mut stmt = q!(c.prepare(&format!(
+        let mut stmt = c.prepare(&format!(
             "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00',
                         datetime((CAST(strftime('%s', u.timestamp) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b{dim_sql},
                 COALESCE(SUM(u.input_tokens),0), COALESCE(SUM(u.output_tokens),0),
@@ -353,9 +365,10 @@ pub(crate) async fn usage_timeseries(
              LEFT JOIN traffic_estimates t ON t.id = tm.traffic_estimate_id
              WHERE u.timestamp >= ?1 AND u.timestamp < ?2 {prefixed_filter}
              GROUP BY {group_sql} ORDER BY b"
-        )));
-        let rows = q!(
-            stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+        ))
+        .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
                 Ok(serde_json::json!({
                     "bucket": r.get::<_, String>(0)?,
                     "dimension": r.get::<_, Option<String>>(1)?,
@@ -367,8 +380,8 @@ pub(crate) async fn usage_timeseries(
                     "estimated_traffic_bytes": r.get::<_, i64>(7)?,
                     "model_calls": r.get::<_, i64>(8)?,
                 }))
-            },)
-        );
+            })
+            .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     } else {
         let table = if bucket_secs >= 86400 {
@@ -379,19 +392,22 @@ pub(crate) async fn usage_timeseries(
         let bucket_col = if bucket_secs >= 86400 {
             "substr(bucket,1,10)"
         } else {
-            "bucket"
+            // 统一历史数据可能使用的 `Z` 与当前写入使用的 `+00:00`。
+            "strftime('%Y-%m-%dT%H:%M:%S+00:00', bucket)"
         };
-        let mut stmt = q!(c.prepare(&format!(
-            "SELECT {bucket_col} AS b{dim_sql},
+        let mut stmt = c
+            .prepare(&format!(
+                "SELECT {bucket_col} AS b{dim_sql},
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
                 COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
              FROM {table} WHERE bucket >= ?1 AND bucket < ?2 {filter}
              GROUP BY {group_sql} ORDER BY b"
-        )));
-        let rows = q!(
-            stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
                 Ok(serde_json::json!({
                     "bucket": r.get::<_, String>(0)?,
                     "dimension": r.get::<_, Option<String>>(1)?,
@@ -403,14 +419,13 @@ pub(crate) async fn usage_timeseries(
                     "estimated_traffic_bytes": r.get::<_, i64>(7)?,
                     "model_calls": r.get::<_, i64>(8)?,
                 }))
-            },)
-        );
+            })
+            .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
     let has_dim = !dim_group.is_empty();
-    let filled = fill_timeseries(points, from, to, bucket_secs, has_dim);
-    Json(serde_json::json!({ "series": filled })).into_response()
+    Ok(fill_timeseries(points, from, to, bucket_secs, has_dim))
 }
 
 /// 自适应分桶粒度，保证短范围也有足够连续点；延迟序列与 usage_timeseries 共用。

@@ -265,6 +265,24 @@ impl PricingEngine {
         provider: Option<&str>,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Option<PricingRule> {
+        self.resolve_rule_with_alias(model, provider, at, &mut Vec::new())
+    }
+
+    fn resolve_rule_with_alias(
+        &self,
+        model: Option<&str>,
+        provider: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+        seen: &mut Vec<String>,
+    ) -> Option<PricingRule> {
+        if let Some(model) = model {
+            let key = model.to_ascii_lowercase();
+            if seen.iter().any(|item| item == &key) {
+                return None;
+            }
+            seen.push(key);
+        }
+
         // 用户覆盖优先于自动 free 规则与目录规则。
         let mut user_rules: Vec<&PricingRule> = self
             .rules
@@ -273,11 +291,29 @@ impl PricingEngine {
             .filter(|r| r.effective_at(at))
             .filter(|r| model_is_match(r, model))
             .filter(|r| provider_is_match(r, provider))
-            .filter(|r| has_price(r))
+            .filter(|r| has_price(r) || alias_target(r).is_some())
             .collect();
         user_rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
-        if let Some(rule) = user_rules.into_iter().next() {
-            return Some(rule.clone());
+        let mut alias_blocked = false;
+        for rule in user_rules {
+            if let Some(target) = alias_target(rule) {
+                alias_blocked = true;
+                if let Some(target_rule) =
+                    self.resolve_rule_with_alias(Some(target), provider, at, seen)
+                {
+                    return Some(materialize_alias(rule, target_rule));
+                }
+                if alias_fallback_free(rule) {
+                    return Some(materialize_alias(rule, free_rule(at)));
+                }
+                break;
+            }
+            if has_price(rule) {
+                return Some(rule.clone());
+            }
+        }
+        if alias_blocked {
+            return None;
         }
 
         if model.is_some_and(is_free_model) {
@@ -389,6 +425,35 @@ fn model_is_match(rule: &PricingRule, model: Option<&str>) -> bool {
         Some(m) => model_matches_pattern(&rule.model_pattern, m),
         None => rule.model_pattern == "*",
     }
+}
+
+fn alias_target(rule: &PricingRule) -> Option<&str> {
+    rule.metadata
+        .get("price_equivalent_to")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn alias_fallback_free(rule: &PricingRule) -> bool {
+    rule.metadata
+        .get("price_equivalent_missing_as_free")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+fn materialize_alias(alias: &PricingRule, mut target: PricingRule) -> PricingRule {
+    // 费用记录绑定别名规则，保留“这是用户明确配置”的来源，同时复用目标价格。
+    target.id = alias.id.clone();
+    target.source = PricingSource::UserOverride;
+    target.channel = alias.channel;
+    target.provider_pattern = alias.provider_pattern.clone();
+    target.model_pattern = alias.model_pattern.clone();
+    target.client_pattern = alias.client_pattern.clone();
+    target.effective_from = alias.effective_from;
+    target.effective_to = alias.effective_to;
+    target.metadata = alias.metadata.clone();
+    target
 }
 
 /// 返回模型匹配候选：原始名、`/` 后缀，以及去掉 exact `free` 段的形式。
@@ -771,5 +836,224 @@ mod tests {
             e.pricing_source(Some("mimo-v2.5-free"), Some("opencode-go"), Utc::now()),
             Some("user_override".into())
         );
+    }
+
+    #[test]
+    fn model_alias_uses_target_price_and_alias_rule_id() {
+        let target_id = Id::new();
+        let alias_id = Id::new();
+        let mut e = PricingEngine::new();
+        e.add_user_rule(PricingRule {
+            id: target_id,
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "gpt-5".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: Some(2_000_000),
+            output_price: Some(4_000_000),
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        e.add_user_rule(PricingRule {
+            id: alias_id.clone(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "my-custom-model".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 20,
+            enabled: true,
+            metadata: serde_json::json!({"price_equivalent_to": "gpt-5"}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+
+        let result = e
+            .compute(
+                &usage(),
+                Some("my-custom-model"),
+                Some("custom"),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.calculated_micro_usd, Some(10_000));
+        assert_eq!(result.rule_id, Some(alias_id.as_str().to_string()));
+        assert_eq!(
+            e.pricing_source(Some("my-custom-model"), Some("custom"), Utc::now()),
+            Some("user_override".into())
+        );
+    }
+
+    #[test]
+    fn missing_alias_target_is_unavailable_unless_explicitly_free() {
+        let mut unavailable = PricingEngine::new();
+        unavailable.add_user_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "custom-unpriced".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({"price_equivalent_to": "missing-model"}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let result = unavailable
+            .compute(&usage(), Some("custom-unpriced"), None, Utc::now(), None)
+            .unwrap();
+        assert!(!result.pricing_available);
+
+        let mut free = PricingEngine::new();
+        free.add_user_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "custom-free".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({
+                "price_equivalent_to": "missing-model",
+                "price_equivalent_missing_as_free": true
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let result = free
+            .compute(&usage(), Some("custom-free"), None, Utc::now(), None)
+            .unwrap();
+        assert_eq!(result.calculated_micro_usd, Some(0));
+        assert!(result.pricing_available);
+    }
+
+    #[test]
+    fn future_alias_does_not_match_before_effective_time() {
+        let now = Utc::now();
+        let mut e = PricingEngine::new();
+        e.add_user_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "gpt-5".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: Some(1_000_000),
+            output_price: Some(2_000_000),
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        });
+        e.add_user_rule(PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "my-future-model".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: None,
+            output_price: None,
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: None,
+            request_price: None,
+            effective_from: Some(now + chrono::Duration::hours(1)),
+            effective_to: None,
+            priority: 20,
+            enabled: true,
+            metadata: serde_json::json!({"price_equivalent_to": "gpt-5"}),
+            created_at: now,
+            updated_at: now,
+        });
+
+        let before = e
+            .compute(&usage(), Some("my-future-model"), None, now, None)
+            .unwrap();
+        assert!(!before.pricing_available);
+        let after = e
+            .compute(
+                &usage(),
+                Some("my-future-model"),
+                None,
+                now + chrono::Duration::hours(1),
+                None,
+            )
+            .unwrap();
+        assert_eq!(after.calculated_micro_usd, Some(5_000));
     }
 }

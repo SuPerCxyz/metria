@@ -11,6 +11,7 @@ import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
 import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
+import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens } from '../../services/format'
 
@@ -24,6 +25,7 @@ const TREND_TABS = [
 export default function SessionDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { range } = useTimeRange()
   const [trendTab, setTrendTab] = useState('tokens')
 
   const query = useQuery(`session-detail-${id}`, () => api(`/sessions/${encodeURIComponent(id)}`))

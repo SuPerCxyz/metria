@@ -1419,6 +1419,32 @@ async fn cursor_sync_roundtrip_and_lifecycle() {
     assert!(status.is_err(), "删除节点后 collector token 应失效");
 }
 
+#[test]
+fn pricing_alias_persists_metadata_and_effective_time() {
+    let dir = tempdir("metria-pricing-alias");
+    let db = HubDb::open(&test_cfg(&dir)).unwrap();
+    db.apply_migrations().unwrap();
+    let id = db
+        .insert_pricing_rule(&json!({
+            "model_pattern": "my-custom-model",
+            "price_equivalent_to": "gpt-5",
+            "price_equivalent_missing_as_free": true,
+            "effective_from": "2026-09-14T00:00:00Z"
+        }))
+        .unwrap();
+    let rule = db
+        .load_all_rules()
+        .into_iter()
+        .find(|rule| rule.id.as_str() == id)
+        .expect("alias rule");
+    assert_eq!(rule.metadata["price_equivalent_to"], "gpt-5");
+    assert_eq!(rule.metadata["price_equivalent_missing_as_free"], true);
+    assert_eq!(
+        rule.effective_from.unwrap().to_rfc3339(),
+        "2026-09-14T00:00:00+00:00"
+    );
+}
+
 fn tempdir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
