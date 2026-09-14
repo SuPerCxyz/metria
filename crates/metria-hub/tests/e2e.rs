@@ -1445,6 +1445,41 @@ fn pricing_alias_persists_metadata_and_effective_time() {
     );
 }
 
+#[test]
+fn pricing_options_use_platform_models_and_catalog_rules() {
+    let dir = tempdir("metria-pricing-options");
+    let db = HubDb::open(&test_cfg(&dir)).unwrap();
+    db.apply_migrations().unwrap();
+    {
+        let c = db.conn();
+        c.execute(
+            "INSERT INTO model_calls
+                (id, node_id, collector_id, client_id, source_id, session_id,
+                 model_normalized, started_at, status, call_granularity,
+                 created_at, updated_at)
+             VALUES (?1, 'node', 'collector', 'client', 'source', 'session',
+                     ?2, '2026-09-14T00:00:00Z', 'success', 'call',
+                     '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            metria_storage::rusqlite::params!["call-options", "custom-model"],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO pricing_rules
+                (id, source, channel, provider_pattern, model_pattern,
+                 input_price, priority, enabled, metadata, created_at, updated_at)
+             VALUES ('catalog-option', 'openrouter_catalog', 'openrouter',
+                     'openai', 'gpt-5', 1000000, 0, 1, '{}',
+                     '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    let options = db.pricing_model_options();
+    assert_eq!(options["used_models"][0]["model"], "custom-model");
+    assert_eq!(options["catalog_models"][0]["model_pattern"], "gpt-5");
+    assert_eq!(options["catalog_models"][0]["price_available"], true);
+}
+
 fn tempdir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

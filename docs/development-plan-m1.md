@@ -32,7 +32,7 @@
 | Agent 无状态轮询：游标外置 Hub、事件确认后推进、离线补齐、spool 迁移（OpenSpec `stateless-polling-agent`） | ✅ 完成 | 2026-09-09 |
 | 用量报告：设置页配置全局时区/收件人/SMTP/通用 Webhook、日/周/月三独立调度、测试发送与历史；邮件含内联趋势图（Token/请求数/模型/Agent）、加宽 760px（OpenSpec `add-usage-reports`） | 🟡 已实现并提交，失败周期不自动重试、单渠道测试结果去重、邮件 Y 轴与 Web 图表样式一致、历史最多 30 条每页 10 条、PDF 与邮件内容/视觉一致、邮件暂不附带 PDF 已补齐；已部署 lstable | 2026-09-14 |
 | 邮件与页面趋势图一致性：统一分桶、补零、点数降采样及长范围日期时间标签；覆盖 7/14 天报告回归 | ✅ 完成 | 2026-09-14 |
-| 模型价格等价：自定义模型跟随目标价格、目标缺价明确按 0、仅后续生效或强制重算全部历史 | ✅ 完成 | 2026-09-14 |
+| 模型价格等价：自定义模型跟随目标价格、目标缺价明确按 0、仅后续生效或强制重算全部历史；平台模型与价格目录模型支持输入自动匹配 | ✅ 完成 | 2026-09-14 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
@@ -233,6 +233,12 @@
 - metria doctor：--adapter（发现/健康/扫描摘要）、--traffic（能力表）、--hub（healthz 连通性）。
 - fixtures：claude（golden_full/missing_usage/malformed/non_utf8/truncated_tail）、codex（golden_full/missing_usage/malformed）。
 - 门禁：fmt/clippy(-D warnings)/test(98)/web build/docker build/compose config 全绿。
+
+### 模型价格等价完成记录（2026-09-14）
+
+- 价格关联候选由平台历史已使用模型和启用的价格目录规则提供，避免手工填写模型名导致匹配失败。
+- 平台模型和价格目录模型均支持受控输入过滤、鼠标选择及方向键/回车选择；提交时校验候选并使用规范候选值。
+- 已验证 Web 测试/构建、Playwright 交互路径、Rust workspace、clippy、Docker Hub 镜像和 Compose 配置。
 
 已知限制：adapter 尚不产出 traffic_profile_samples（自动学习在 S2/M2）；Codex 会话级 model 聚合以 message/agent 为粒度。（Claude 子代理关联已修复：Task tool_use 的 leafUuid 推导 SubagentRelation，见 2026-08-06 记录。）
 

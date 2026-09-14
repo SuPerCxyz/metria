@@ -163,6 +163,10 @@ pub(crate) async fn pricing_rules(State(st): State<AppState>) -> Response {
     Json(serde_json::json!({ "rules": st.db.list_pricing_rules() })).into_response()
 }
 
+pub(crate) async fn pricing_options(State(st): State<AppState>) -> Response {
+    Json(st.db.pricing_model_options()).into_response()
+}
+
 const PRICE_FIELDS: [&str; 6] = [
     "input_price",
     "output_price",

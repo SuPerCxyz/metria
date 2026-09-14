@@ -448,6 +448,58 @@ impl HubDb {
         out
     }
 
+    /// 返回价格关联表单的模型选项：平台实际使用过的模型与启用目录中的模型。
+    pub fn pricing_model_options(&self) -> serde_json::Value {
+        let c = self.conn();
+        let used_models = if let Ok(mut stmt) = c.prepare(
+            "SELECT model_normalized, COUNT(*)
+             FROM model_calls
+             WHERE model_normalized IS NOT NULL AND TRIM(model_normalized) != ''
+             GROUP BY model_normalized
+             ORDER BY COUNT(*) DESC, model_normalized COLLATE NOCASE",
+        ) {
+            stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "model": r.get::<_, String>(0)?,
+                    "calls": r.get::<_, i64>(1)?,
+                }))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let catalog_models = if let Ok(mut stmt) = c.prepare(
+            "SELECT model_pattern, source, provider_pattern,
+                    CASE WHEN input_price IS NOT NULL OR output_price IS NOT NULL
+                              OR cache_read_price IS NOT NULL OR cache_write_price IS NOT NULL
+                              OR reasoning_price IS NOT NULL OR request_price IS NOT NULL
+                         THEN 1 ELSE 0 END
+             FROM pricing_rules
+             WHERE enabled = 1
+               AND source IN ('openrouter_catalog', 'litellm_catalog', 'custom_http_catalog')
+               AND TRIM(model_pattern) != ''
+             ORDER BY model_pattern COLLATE NOCASE, source",
+        ) {
+            stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "model_pattern": r.get::<_, String>(0)?,
+                    "source": r.get::<_, String>(1)?,
+                    "provider_pattern": r.get::<_, String>(2)?,
+                    "price_available": r.get::<_, i64>(3)? != 0,
+                }))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        serde_json::json!({
+            "used_models": used_models,
+            "catalog_models": catalog_models,
+        })
+    }
+
     pub fn insert_pricing_rule(&self, v: &Value) -> Result<String, StorageError> {
         let c = self.conn();
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");

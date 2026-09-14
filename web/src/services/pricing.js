@@ -20,6 +20,13 @@ export const EMPTY_RULE_DRAFT = {
   price_equivalent_missing_as_free: false,
 }
 
+export const EMPTY_LINK_DRAFT = {
+  model_pattern: '',
+  provider_pattern: '',
+  price_equivalent_to: '',
+  price_equivalent_missing_as_free: false,
+}
+
 export function canonicalModelPattern(value) {
   const text = value.trim().toLowerCase()
   if (!text || /[*?]/.test(text)) return text
@@ -40,7 +47,7 @@ function usdToMicro(value) {
 export function serializeRuleDraft(draft, options = {}) {
   const model = canonicalModelPattern(draft.model_pattern)
   const equivalent = (draft.price_equivalent_to || '').trim().toLowerCase()
-  const filledPrices = PRICE_FIELDS.filter(([key]) => draft[key].trim() !== '')
+  const filledPrices = PRICE_FIELDS.filter(([key]) => (draft[key] || '').trim() !== '')
   if (!model) throw new Error('请填写模型名称或匹配模式')
   if (equivalent && filledPrices.length > 0) throw new Error('等价规则不需要重复填写价格')
   if (!equivalent && filledPrices.length === 0) throw new Error('至少填写一项价格；免费模型请填写 0')
@@ -54,7 +61,8 @@ export function serializeRuleDraft(draft, options = {}) {
   }
   if (options.effectiveFrom) payload.effective_from = options.effectiveFrom
   for (const [key] of PRICE_FIELDS) {
-    if (draft[key].trim() !== '') payload[key] = usdToMicro(draft[key])
+    const value = draft[key] || ''
+    if (value.trim() !== '') payload[key] = usdToMicro(value)
   }
   return payload
 }

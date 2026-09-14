@@ -1,6 +1,6 @@
 // 设置页：模型价格 / 数据保留 / 节点接入 / 系统设置。
 
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DataTable from '../../components/tables/DataTable'
@@ -11,7 +11,7 @@ import { useToast } from '../../components/feedback/Toast'
 import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { fmtDateTime, fmtUsd } from '../../services/format'
-import { EMPTY_RULE_DRAFT, PRICE_FIELDS, serializeRuleDraft } from '../../services/pricing'
+import { EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, PRICE_FIELDS, serializeRuleDraft } from '../../services/pricing'
 import ReportSettings from './ReportSettings'
 
 const TABS = ['模型价格', '数据保留', '节点接入', '用量报告', '系统设置']
@@ -19,12 +19,185 @@ const TAB_KEYS = { pricing: '模型价格', retention: '数据保留', nodes: '�
 const AVATAR_COLORS = ['indigo', 'emerald', 'amber', 'rose', 'sky', 'violet']
 
 const KIND_LABEL = { openrouter: 'OpenRouter', litellm: 'LiteLLM', custom: '自定义', builtin: '内置' }
+const PRICE_SOURCE_LABEL = {
+  openrouter_catalog: 'OpenRouter',
+  litellm_catalog: 'LiteLLM',
+  custom_http_catalog: '自定义目录',
+}
+
+function ModelAutocomplete({
+  id,
+  value,
+  options,
+  getOptionValue,
+  getOptionLabel = getOptionValue,
+  loading,
+  disabled,
+  placeholder,
+  loadingPlaceholder,
+  emptyPlaceholder,
+  onChange,
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [highlightedIndex, setHighlightedIndex] = useState(-1)
+  const containerRef = useRef(null)
+
+  const filteredOptions = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase()
+    if (!needle) return options
+    return options.filter((option) => String(getOptionValue(option) || '').toLocaleLowerCase().includes(needle))
+  }, [getOptionValue, options, query])
+
+  useEffect(() => {
+    const closeWhenOutside = (event) => {
+      if (!containerRef.current?.contains(event.target)) {
+        setOpen(false)
+        setHighlightedIndex(-1)
+      }
+    }
+    document.addEventListener('pointerdown', closeWhenOutside)
+    return () => document.removeEventListener('pointerdown', closeWhenOutside)
+  }, [])
+
+  useEffect(() => {
+    setHighlightedIndex((current) => {
+      if (filteredOptions.length === 0) return -1
+      if (current < 0) return 0
+      return Math.min(current, filteredOptions.length - 1)
+    })
+  }, [filteredOptions.length])
+
+  const openList = () => {
+    if (disabled) return
+    setOpen(true)
+    setQuery('')
+    setHighlightedIndex(options.length > 0 ? 0 : -1)
+  }
+
+  const selectOption = (option) => {
+    onChange(getOptionValue(option))
+    setQuery('')
+    setOpen(false)
+    setHighlightedIndex(-1)
+  }
+
+  const handleInputChange = (event) => {
+    setQuery(event.target.value)
+    onChange(event.target.value)
+    setOpen(true)
+    setHighlightedIndex(0)
+  }
+
+  const handleKeyDown = (event) => {
+    if (event.key === 'Escape') {
+      setOpen(false)
+      setHighlightedIndex(-1)
+      return
+    }
+    if (event.key === 'Tab') {
+      setOpen(false)
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!open) {
+        openList()
+        return
+      }
+      if (filteredOptions.length === 0) return
+      setHighlightedIndex((current) => {
+        const next = event.key === 'ArrowDown' ? current + 1 : current - 1
+        if (next < 0) return filteredOptions.length - 1
+        return next >= filteredOptions.length ? 0 : next
+      })
+      return
+    }
+    if (event.key === 'Enter' && open && filteredOptions[highlightedIndex]) {
+      event.preventDefault()
+      selectOption(filteredOptions[highlightedIndex])
+    }
+  }
+
+  const handleBlur = () => {
+    window.setTimeout(() => {
+      if (!containerRef.current?.contains(document.activeElement)) {
+        setOpen(false)
+        setHighlightedIndex(-1)
+      }
+    }, 0)
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <input
+        id={id}
+        required
+        type="text"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls={`${id}-options`}
+        aria-activedescendant={open && highlightedIndex >= 0 ? `${id}-option-${highlightedIndex}` : undefined}
+        autoComplete="off"
+        disabled={disabled}
+        value={value}
+        onChange={handleInputChange}
+        onFocus={openList}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+        placeholder={loading ? loadingPlaceholder : placeholder}
+        className="w-full text-sm pl-3 pr-9 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 disabled:opacity-50"
+      />
+      <button
+        type="button"
+        tabIndex={-1}
+        disabled={disabled}
+        aria-label="打开模型匹配选项"
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={openList}
+        className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 disabled:opacity-50"
+      >
+        <svg aria-hidden="true" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z" clipRule="evenodd" />
+        </svg>
+      </button>
+      {open && (
+        <div id={`${id}-options`} role="listbox" className="absolute z-30 mt-1 max-h-60 w-full overflow-auto rounded-lg border border-gray-200 bg-white py-1 text-sm shadow-lg dark:border-gray-600 dark:bg-gray-800">
+          {filteredOptions.length > 0 ? filteredOptions.map((option, index) => {
+            const optionValue = getOptionValue(option)
+            return (
+              <div
+                id={`${id}-option-${index}`}
+                key={optionValue}
+                role="option"
+                aria-selected={optionValue === value}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setHighlightedIndex(index)}
+                onClick={() => selectOption(option)}
+                className={`cursor-pointer px-3 py-2 text-gray-700 dark:text-gray-200 ${index === highlightedIndex ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-200' : 'hover:bg-gray-50 dark:hover:bg-gray-700/60'}`}
+              >
+                {getOptionLabel(option)}
+              </div>
+            )
+          }) : (
+            <div role="status" className="px-3 py-2 text-gray-500 dark:text-gray-400">
+              {options.length === 0 ? emptyPlaceholder : '没有匹配的模型，请修改输入'}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Settings() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const requestedTab = TAB_KEYS[searchParams.get('tab')] || '模型价格'
   const [tab, setTab] = useState(requestedTab)
   const rules = useQuery('pricing-rules', () => api('/pricing/rules'))
+  const pricingOptions = useQuery('pricing-options', () => api('/pricing/options'))
 
   const [profile, setProfile] = useState(null)
   const [profileDraft, setProfileDraft] = useState({ display_name: '', avatar_text: '', avatar_color: 'indigo' })
@@ -47,6 +220,10 @@ export default function Settings() {
   const [ruleApplyMode, setRuleApplyMode] = useState('future')
   const [ruleSaving, setRuleSaving] = useState(false)
   const [ruleError, setRuleError] = useState('')
+  const [linkDraft, setLinkDraft] = useState(EMPTY_LINK_DRAFT)
+  const [linkApplyMode, setLinkApplyMode] = useState('future')
+  const [linkSaving, setLinkSaving] = useState(false)
+  const [linkError, setLinkError] = useState('')
   const { notify } = useToast()
 
   useEffect(() => {
@@ -144,6 +321,38 @@ export default function Settings() {
     { key: 'source', label: '来源', sortable: true, render: (rule) => <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700/40 text-gray-600 dark:text-gray-300">{rule.source}</span> },
   ], [])
 
+  const sourceModelOptions = pricingOptions.data?.used_models || []
+  const catalogModelOptions = useMemo(() => {
+    const byModel = new Map()
+    for (const option of pricingOptions.data?.catalog_models || []) {
+      const model = (option.model_pattern || '').trim()
+      if (!model) continue
+      const key = model.toLocaleLowerCase()
+      const current = byModel.get(key)
+      if (current) {
+        current.price_available = current.price_available || Boolean(option.price_available)
+        if (!current.sources.includes(option.source)) current.sources.push(option.source)
+      } else {
+        byModel.set(key, {
+          model_pattern: model,
+          price_available: Boolean(option.price_available),
+          sources: [option.source],
+        })
+      }
+    }
+    return [...byModel.values()]
+  }, [pricingOptions.data])
+
+  const selectedSourceModel = useMemo(() => {
+    const value = linkDraft.model_pattern.trim().toLocaleLowerCase()
+    return sourceModelOptions.find((option) => option.model.toLocaleLowerCase() === value) || null
+  }, [linkDraft.model_pattern, sourceModelOptions])
+
+  const selectedCatalogModel = useMemo(() => {
+    const value = linkDraft.price_equivalent_to.trim().toLocaleLowerCase()
+    return catalogModelOptions.find((option) => option.model_pattern.toLocaleLowerCase() === value) || null
+  }, [catalogModelOptions, linkDraft.price_equivalent_to])
+
   const loadCatalogs = async () => {
     setCatalogsLoading(true)
     try {
@@ -182,6 +391,7 @@ export default function Settings() {
       const j = await api(`/pricing/catalogs/${encodeURIComponent(c.id)}/refresh`, { method: 'POST' })
       notify(`同步完成：${j.fetched ? `更新 ${j.rules} 条规则` : '无变化'}` + (j.repriced != null ? `，重新计价 ${j.repriced} 条` : ''))
       await loadCatalogs()
+      await pricingOptions.refresh()
     } catch (e) {
       notify(`同步失败：${e.message}`, 'error')
     } finally {
@@ -201,47 +411,34 @@ export default function Settings() {
     }
   }
 
-  const setRuleEquivalent = (value) => {
-    setRuleDraft((current) => {
-      const next = { ...current, price_equivalent_to: value }
-      if (value.trim()) {
-        for (const [key] of PRICE_FIELDS) next[key] = ''
-      } else {
-        next.price_equivalent_missing_as_free = false
-      }
-      return next
-    })
-  }
-
-  const createRule = async (event) => {
+  const savePricingRule = async (event, draft, applyMode, setDraft, setApplyMode, setSaving, setError, successMessage) => {
     event.preventDefault()
-    setRuleError('')
+    setError('')
     let payload
     try {
-      payload = serializeRuleDraft(ruleDraft, {
-        effectiveFrom: ruleApplyMode === 'future' ? new Date().toISOString() : undefined,
+      payload = serializeRuleDraft(draft, {
+        effectiveFrom: applyMode === 'future' ? new Date().toISOString() : undefined,
       })
     } catch (e) {
-      setRuleError(e.message)
+      setError(e.message)
       notify(`价格规则校验失败：${e.message}`, 'error')
       return
     }
 
-    setRuleSaving(true)
+    setSaving(true)
     try {
       await api('/pricing/rules', { method: 'POST', body: JSON.stringify(payload) })
-      const applyMode = ruleApplyMode
-      setRuleDraft(EMPTY_RULE_DRAFT)
-      setRuleApplyMode('future')
+      setDraft(draft.price_equivalent_to ? EMPTY_LINK_DRAFT : EMPTY_RULE_DRAFT)
+      setApplyMode('future')
       if (applyMode === 'all') {
         try {
           const repriced = await api('/pricing/reprice', { method: 'POST', body: JSON.stringify({}) })
-          notify(`已保存模型价格，重新计价 ${repriced.repriced ?? 0} 条调用`)
+          notify(`${successMessage}，重新计价 ${repriced.repriced ?? 0} 条调用`)
         } catch (e) {
           notify(`模型价格已保存，但历史重新计价失败：${e.message}`, 'error')
         }
       } else {
-        notify('已保存模型价格，仅对后续数据生效')
+        notify(`${successMessage}，仅对后续数据生效`)
       }
       try {
         await rules.refresh()
@@ -251,8 +448,25 @@ export default function Settings() {
     } catch (e) {
       notify(`保存失败：${e.message}`, 'error')
     } finally {
-      setRuleSaving(false)
+      setSaving(false)
     }
+  }
+
+  const createRule = (event) => savePricingRule(event, ruleDraft, ruleApplyMode, setRuleDraft, setRuleApplyMode, setRuleSaving, setRuleError, '已保存模型价格')
+  const createLinkRule = (event) => {
+    event.preventDefault()
+    if (!selectedSourceModel || !selectedCatalogModel) {
+      const message = '请从平台模型和价格目录的匹配选项中各选择一个模型'
+      setLinkError(message)
+      notify(`价格关联校验失败：${message}`, 'error')
+      return
+    }
+    savePricingRule(event, {
+      ...linkDraft,
+      model_pattern: selectedSourceModel.model,
+      price_equivalent_to: selectedCatalogModel.model_pattern,
+      provider_pattern: '*',
+    }, linkApplyMode, setLinkDraft, setLinkApplyMode, setLinkSaving, setLinkError, '已保存价格关联')
   }
 
   return (
@@ -339,7 +553,7 @@ export default function Settings() {
               <span className="text-xs text-gray-400 dark:text-gray-500">单位：美元 / 百万 Token</span>
             </div>
             <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-              可填写原始模型名，保存时会自动去掉 Provider 前缀和 <code className="text-xs bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded">-free</code> 后缀；价格填写 0 表示免费。
+              可填写原始模型名，保存时会自动去掉 Provider 前缀和 <code className="text-xs bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded">-free</code> 后缀；价格填写 0 表示免费。需要跟随其他模型价格时，请使用下方“添加价格关联”。
             </p>
             {ruleError && <div className="mb-4 text-sm text-red-600 dark:text-red-400">{ruleError}</div>}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -364,32 +578,6 @@ export default function Settings() {
                   className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
                 />
               </label>
-              <label className="block md:col-span-2">
-                <span className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">价格等价于模型（可选）</span>
-                <input
-                  type="text"
-                  value={ruleDraft.price_equivalent_to}
-                  onChange={(e) => setRuleEquivalent(e.target.value)}
-                  placeholder="例如 gpt-5 或 claude-sonnet-4.5"
-                  aria-describedby="price-equivalent-help"
-                  className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
-                />
-                <span id="price-equivalent-help" className="mt-1 block text-xs text-gray-400 dark:text-gray-500">填写后自动跟随目标模型价格；目标无价格时默认保持未定价。</span>
-              </label>
-              {ruleDraft.price_equivalent_to.trim() && (
-                <label className="inline-flex items-start gap-2 md:col-span-2 text-sm text-gray-600 dark:text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={ruleDraft.price_equivalent_missing_as_free}
-                    onChange={(e) => setRuleDraft((d) => ({ ...d, price_equivalent_missing_as_free: e.target.checked }))}
-                    className="mt-0.5"
-                  />
-                  <span>
-                    <span className="block">目标模型无价格时按 0 计费</span>
-                    <span className="block text-xs text-gray-400 dark:text-gray-500">这是明确的免费配置；目标有价格时仍使用目标价格。</span>
-                  </span>
-                </label>
-              )}
               {PRICE_FIELDS.map(([key, label]) => (
                 <label key={key} className="block">
                   <span className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">{label}</span>
@@ -397,7 +585,6 @@ export default function Settings() {
                     type="text"
                     inputMode="numeric"
                     value={ruleDraft[key]}
-                    disabled={Boolean(ruleDraft.price_equivalent_to.trim())}
                     onChange={(e) => setRuleDraft((d) => ({ ...d, [key]: e.target.value }))}
                     placeholder="例如 0.08；免费请填 0"
                     className="w-full text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
@@ -422,6 +609,93 @@ export default function Settings() {
             <div className="mt-4 flex justify-end">
               <button type="submit" disabled={ruleSaving} className="text-sm text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg px-4 py-2 disabled:opacity-50">
                 {ruleSaving ? (ruleApplyMode === 'all' ? '保存并重新计价中…' : '保存中…') : (ruleApplyMode === 'all' ? '保存并重新计价全部历史' : '保存，仅后续生效')}
+              </button>
+            </div>
+          </form>
+
+          <form onSubmit={createLinkRule} className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6 mb-6">
+            <div className="flex items-center justify-between gap-3 mb-1">
+              <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">添加价格关联</h2>
+              <span className="text-xs text-gray-400 dark:text-gray-500">跟随已有模型价格</span>
+            </div>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+              从平台已使用模型中选择一个自定义模型，再从已同步的价格目录中选择等价模型；费用会按照目标模型的当前价格计算。
+            </p>
+            {linkError && <div className="mb-4 text-sm text-red-600 dark:text-red-400">{linkError}</div>}
+            {pricingOptions.error && <div className="mb-4 text-sm text-red-600 dark:text-red-400">模型选项加载失败：{pricingOptions.error.message}</div>}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="block">
+                <label htmlFor="price-link-source-model" className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">平台已使用的模型</label>
+                <ModelAutocomplete
+                  id="price-link-source-model"
+                  value={linkDraft.model_pattern}
+                  options={sourceModelOptions}
+                  getOptionValue={(option) => option.model}
+                  getOptionLabel={(option) => `${option.model}（${option.calls} 次）`}
+                  disabled={pricingOptions.loading || sourceModelOptions.length === 0}
+                  loading={pricingOptions.loading}
+                  loadingPlaceholder="正在加载平台模型…"
+                  placeholder="输入或选择平台已使用的模型"
+                  emptyPlaceholder="暂无平台已使用模型"
+                  onChange={(value) => {
+                    setLinkError('')
+                    setLinkDraft((d) => ({ ...d, model_pattern: value, provider_pattern: '*' }))
+                  }}
+                />
+              </div>
+              <div className="block">
+                <label htmlFor="price-link-target-model" className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">价格目录中的等价模型</label>
+                <ModelAutocomplete
+                  id="price-link-target-model"
+                  value={linkDraft.price_equivalent_to}
+                  options={catalogModelOptions}
+                  getOptionValue={(option) => option.model_pattern}
+                  getOptionLabel={(option) => `${option.model_pattern} · ${option.sources.map((source) => PRICE_SOURCE_LABEL[source] || source).join('、')}${!option.price_available ? ' · 当前无价格' : ''}`}
+                  disabled={pricingOptions.loading || catalogModelOptions.length === 0}
+                  loading={pricingOptions.loading}
+                  loadingPlaceholder="正在加载价格目录模型…"
+                  placeholder="输入或选择价格目录中的等价模型"
+                  emptyPlaceholder="暂无可选价格目录模型"
+                  onChange={(value) => {
+                    setLinkError('')
+                    setLinkDraft((d) => ({ ...d, price_equivalent_to: value }))
+                  }}
+                />
+              </div>
+              {!pricingOptions.loading && !pricingOptions.error && sourceModelOptions.length === 0 && <p className="md:col-span-2 text-xs text-amber-600 dark:text-amber-400">暂无平台已使用模型，采集到模型调用后才能建立价格关联。</p>}
+              {!pricingOptions.loading && !pricingOptions.error && catalogModelOptions.length === 0 && <p className="md:col-span-2 text-xs text-amber-600 dark:text-amber-400">暂无可选价格目录模型，请先在上方同步价格目录。</p>}
+              {linkDraft.price_equivalent_to.trim() && (
+                <label className="inline-flex items-start gap-2 md:col-span-2 text-sm text-gray-600 dark:text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={linkDraft.price_equivalent_missing_as_free}
+                    onChange={(e) => setLinkDraft((d) => ({ ...d, price_equivalent_missing_as_free: e.target.checked }))}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="block">目标模型无价格时按 0 计费</span>
+                    <span className="block text-xs text-gray-400 dark:text-gray-500">这是明确的免费配置；目标有价格时仍使用目标价格。</span>
+                  </span>
+                </label>
+              )}
+            </div>
+            <fieldset className="mt-4 rounded-lg border border-gray-200 dark:border-gray-700/60 p-3">
+              <legend className="px-1 text-xs font-medium text-gray-500 dark:text-gray-400">生效范围</legend>
+              <div className="flex flex-col gap-2 sm:flex-row sm:gap-5 text-sm text-gray-600 dark:text-gray-300">
+                <label className="inline-flex items-center gap-2">
+                  <input type="radio" name="price-link-apply-mode" value="future" checked={linkApplyMode === 'future'} onChange={() => setLinkApplyMode('future')} />
+                  仅后续数据生效
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input type="radio" name="price-link-apply-mode" value="all" checked={linkApplyMode === 'all'} onChange={() => setLinkApplyMode('all')} />
+                  强制重新计算全部历史
+                </label>
+              </div>
+              <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">{linkApplyMode === 'all' ? '会更新历史费用并保留已有价格匹配记录。' : '保存时间以前的数据保持原费用，不触发历史重新计价。'}</p>
+            </fieldset>
+            <div className="mt-4 flex justify-end">
+              <button type="submit" disabled={linkSaving || pricingOptions.loading || !selectedSourceModel || !selectedCatalogModel} className="text-sm text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg px-4 py-2 disabled:opacity-50">
+                {linkSaving ? (linkApplyMode === 'all' ? '保存关联并重新计价中…' : '保存关联中…') : (linkApplyMode === 'all' ? '保存关联并重新计价全部历史' : '保存价格关联')}
               </button>
             </div>
           </form>

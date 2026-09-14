@@ -191,6 +191,7 @@ pub fn app_router(state: AppState) -> Router {
             "/api/v1/pricing/rules",
             get(pricing_rules).post(pricing_rules_create),
         )
+        .route("/api/v1/pricing/options", get(pricing_options))
         .route(
             "/api/v1/pricing/rules/{id}",
             axum::routing::put(pricing_rule_update).delete(pricing_rule_delete),

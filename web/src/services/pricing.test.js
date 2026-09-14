@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canonicalModelPattern, EMPTY_RULE_DRAFT, serializeRuleDraft } from './pricing.js'
+import { canonicalModelPattern, EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, serializeRuleDraft } from './pricing.js'
 
 test('canonicalizes relay and free model names', () => {
   assert.equal(canonicalModelPattern('opencode-go/mimo-v2.5-free'), 'mimo-v2.5')
@@ -33,7 +33,7 @@ test('rejects invalid and empty price drafts', () => {
 test('serializes model equivalence and explicit missing-price free fallback', () => {
   assert.deepEqual(
     serializeRuleDraft({
-      ...EMPTY_RULE_DRAFT,
+      ...EMPTY_LINK_DRAFT,
       model_pattern: 'my-custom-model',
       price_equivalent_to: 'OpenAI/GPT-5',
       price_equivalent_missing_as_free: true,
