@@ -101,7 +101,7 @@ export default function SessionDetail() {
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">会话趋势</h2>
           <Segmented items={TREND_TABS} value={trendTab} onChange={setTrendTab} />
         </div>
-        {trendData.labels.length === 0 ? <EmptyState title="该会话暂无模型调用" /> : <TrendChart labels={trendData.labels} values={trendData.values} height={320} formatY={formatY} />}
+        {trendData.labels.length === 0 ? <EmptyState title="该会话暂无模型调用" /> : <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={formatY} />}
       </div>
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">

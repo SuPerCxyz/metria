@@ -54,7 +54,7 @@ export default function Traffic() {
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">估算流量趋势</h2>
-        <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={fmtBytes} />
+        <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={fmtBytes} />
       </div>
 
       <div className="mt-4 grid grid-cols-1 xl:grid-cols-3 gap-6">

@@ -3,7 +3,7 @@
 
 import React, { useEffect, useRef } from 'react'
 import Chart from 'chart.js/auto'
-import { formatTimeLabel } from './trendChartLabels'
+import { formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels'
 import chartTheme from '../../../chart-theme.json'
 
 // 数据点过多时降采样：保留 maxPoints 个点（≥30）
@@ -17,9 +17,10 @@ function downsample(data, maxPoints = 240) {
 
 export const PALETTE = chartTheme.palette
 
-export default function TrendChart({ labels, values, datasets, tooltipLabels, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true }) {
+export default function TrendChart({ labels, values, datasets, tooltipLabels, range, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
+  const showDateOnAxis = isRangeLongerThanDay(range)
 
   useEffect(() => {
     if (!ref.current) return
@@ -34,7 +35,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
     const idx = downsample((labels || []).map((_, i) => i))
     const ttip = tooltipLabels ? idx.map((i) => tooltipLabels[i]) : idx.map((i) => formatTimeLabel(labels[i], true))
     const data = {
-      labels: idx.map((i) => formatTimeLabel(labels[i])),
+      labels: idx.map((i) => formatTimeLabel(labels[i], false, showDateOnAxis)),
       datasets: ds.map((d) => ({
         label: d.label,
         data: idx.map((i) => d.values[i] ?? 0),
@@ -95,7 +96,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, he
     })
     chartRef.current = chart
     return () => { if (chartRef.current) chartRef.current.destroy() }
-  }, [labels, datasets, values, tooltipLabels, color, height, onLegendClick, legendDisplay])
+  }, [labels, datasets, values, tooltipLabels, range, showDateOnAxis, color, height, onLegendClick, legendDisplay])
 
   return <div style={{ height }}><canvas ref={ref} role="img" aria-label={`${ariaLabel}，共 ${labels?.length || 0} 个数据点`} /></div>
 }

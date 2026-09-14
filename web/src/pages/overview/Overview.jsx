@@ -13,6 +13,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, sumTokensWithReasoning, cacheHitRate } from '../../services/format'
+import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -28,17 +29,6 @@ const DIMS = [
 ]
 
 const EMPTY_HIDDEN = []
-
-// x 轴显示时分（HH:mm）；tooltip 显示完整 MM/dd HH:mm
-function fmtX(iso) {
-  const d = new Date(iso)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
-function fmtXFull(iso) {
-  const d = new Date(iso)
-  const p = (n) => String(n).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
 
 export default function Overview() {
   const { range } = useTimeRange()
@@ -91,8 +81,8 @@ export default function Overview() {
     const sorted = pts.slice().sort((a, b) => (a.bucket < b.bucket ? -1 : 1))
 
     if (dim === 'all') {
-      const labels = sorted.map((p) => fmtX(p.bucket))
-      const tooltipLabels = sorted.map((p) => fmtXFull(p.bucket))
+      const labels = sorted.map((p) => p.bucket)
+      const tooltipLabels = sorted.map((p) => formatTimeLabel(p.bucket))
       if (trendTab === 'tokens') {
         return {
           labels,
@@ -118,8 +108,8 @@ export default function Overview() {
       .filter((d) => d.total > 0)
       .sort((a, b) => b.total - a.total)
     const buckets = [...new Set(pts.map((p) => p.bucket))].sort()
-    const labels = buckets.map(fmtX)
-    const tooltipLabels = buckets.map(fmtXFull)
+    const labels = buckets
+    const tooltipLabels = buckets.map((bucket) => formatTimeLabel(bucket))
     const datasets = dims.map(({ k }) => {
       const map = {}
       for (const p of byDimMap[k]) map[p.bucket] = metricOf(p, trendTab)
@@ -281,6 +271,7 @@ export default function Overview() {
               labels={trendData.labels}
               datasets={trendData.datasets}
               tooltipLabels={trendData.tooltipLabels}
+              range={range}
               height={320}
               formatY={formatY}
               ariaLabel="使用趋势，点击图例可隐藏或恢复维度"

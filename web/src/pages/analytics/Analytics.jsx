@@ -155,7 +155,7 @@ export default function Analytics() {
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token 趋势</h2>
-            <TrendChart labels={trendData.labels} values={trendData.values} height={320} formatY={fmtTokensShort} />
+            <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={fmtTokensShort} />
           </div>
           <div className="mt-4 grid grid-cols-1 xl:grid-cols-3 gap-6">
             <RankingCard title="Agent Token 排行" items={agentItems} onClick={(i) => navigate(`/agents/${encodeURIComponent(i.id)}`)} />
@@ -175,7 +175,7 @@ export default function Analytics() {
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">请求趋势</h2>
-            <TrendChart labels={trendData.labels} values={trendData.values} height={320} formatY={(v) => v.toLocaleString()} />
+            <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={(v) => v.toLocaleString()} />
           </div>
         </>
       )}
@@ -190,7 +190,7 @@ export default function Analytics() {
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">缓存趋势</h2>
-            <TrendChart labels={trendData.labels} values={trendData.values} height={320} formatY={fmtTokensShort} />
+            <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={fmtTokensShort} />
           </div>
         </>
       )}
@@ -198,6 +198,7 @@ export default function Analytics() {
       {detailMode && (
         <DetailAnalysis
           tab={tab}
+          range={range}
           metric={detailMetric}
           onMetricChange={setDetailMetric}
           overview={o}
@@ -262,6 +263,7 @@ export default function Analytics() {
                   <TrendChart
                     labels={latencyTrend.labels}
                     datasets={latencyTrend.datasets}
+                    range={range}
                     height={300}
                     formatY={fmtDuration}
                     ariaLabel="延迟趋势，P50、P95 与平均时长随时间变化"
@@ -284,6 +286,7 @@ const DETAIL_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#
 
 function DetailAnalysis({
   tab,
+  range,
   metric,
   onMetricChange,
   overview,
@@ -331,6 +334,7 @@ function DetailAnalysis({
           <TrendChart
             labels={trend.labels}
             datasets={trend.datasets}
+            range={range}
             height={340}
             formatY={formatY}
             ariaLabel={`${chartTitle}，点击图例可隐藏或恢复维度`}

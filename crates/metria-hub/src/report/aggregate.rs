@@ -53,7 +53,7 @@ pub struct NamedSeries {
     pub values: Vec<i64>,
 }
 
-/// 按日图表数据：日期标签（MM-DD）+ 多条序列。
+/// 报告时间轴标签 + 多条序列。
 #[derive(Debug, Clone, Serialize)]
 pub struct ChartSeries {
     pub days: Vec<String>,
@@ -158,6 +158,10 @@ fn dim_breakdown(
     }
 }
 
+fn include_date_time(from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
+    to - from > chrono::Duration::days(1)
+}
+
 /// 完整时间轴标签（缺失桶补 0 用）：单日=24 个整点，周/月=范围内每一天。
 fn full_axis(
     from: DateTime<Utc>,
@@ -166,10 +170,12 @@ fn full_axis(
     by_hour: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    let include_date = include_date_time(from, to);
     if by_hour {
         let mut cur = from;
         while cur < to && out.len() < 400 {
-            out.push(cur.with_timezone(&tz).format("%H:00").to_string());
+            let label = if include_date { "%m-%d %H:00" } else { "%H:00" };
+            out.push(cur.with_timezone(&tz).format(label).to_string());
             cur += chrono::Duration::hours(1);
         }
     } else {
@@ -179,7 +185,8 @@ fn full_axis(
             .date_naive();
         let mut d = start;
         while d <= end && out.len() < 400 {
-            out.push(d.format("%m-%d").to_string());
+            let label = if include_date { "%m-%d 00:00" } else { "%m-%d" };
+            out.push(d.format(label).to_string());
             match d.succ_opt() {
                 Some(n) => d = n,
                 None => break,
@@ -189,13 +196,20 @@ fn full_axis(
     out
 }
 
-fn local_label(bucket: &str, tz: chrono_tz::Tz, by_hour: bool) -> Option<String> {
+fn local_label(
+    bucket: &str,
+    tz: chrono_tz::Tz,
+    by_hour: bool,
+    include_date: bool,
+) -> Option<String> {
     DateTime::parse_from_rfc3339(bucket).ok().map(|d| {
         let l = d.with_timezone(&tz);
         if by_hour {
-            l.format("%H:00").to_string()
+            let label = if include_date { "%m-%d %H:00" } else { "%H:00" };
+            l.format(label).to_string()
         } else {
-            l.format("%m-%d").to_string()
+            let label = if include_date { "%m-%d 00:00" } else { "%m-%d" };
+            l.format(label).to_string()
         }
     })
 }
@@ -209,6 +223,7 @@ pub fn daily_token_chart(
     by_hour: bool,
 ) -> ChartSeries {
     let c = db.conn();
+    let include_date = include_date_time(from, to);
     let mut map: BTreeMap<String, [i64; 5]> = BTreeMap::new();
     if let Ok(mut stmt) = c.prepare(
         "SELECT bucket,
@@ -230,7 +245,7 @@ pub fn daily_token_chart(
             ))
         }) {
             for (bucket, vals) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour) {
+                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
                     let e = map.entry(day).or_insert([0; 5]);
                     for i in 0..5 {
                         e[i] += vals[i];
@@ -263,6 +278,7 @@ pub fn daily_calls_chart(
     by_hour: bool,
 ) -> ChartSeries {
     let c = db.conn();
+    let include_date = include_date_time(from, to);
     let mut map: BTreeMap<String, i64> = BTreeMap::new();
     if let Ok(mut stmt) = c.prepare(
         "SELECT bucket, COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 GROUP BY bucket",
@@ -271,7 +287,7 @@ pub fn daily_calls_chart(
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         }) {
             for (bucket, v) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour) {
+                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
                     *map.entry(day).or_insert(0) += v;
                 }
             }
@@ -301,6 +317,7 @@ pub fn dim_daily_chart(
     by_hour: bool,
 ) -> ChartSeries {
     let c = db.conn();
+    let include_date = include_date_time(from, to);
     // 与页面 Token 视图口径一致：输入 + 输出 + 缓存读取
     let metric = if by_tokens {
         "SUM(input_tokens+output_tokens+cache_read_tokens)"
@@ -362,7 +379,7 @@ pub fn dim_daily_chart(
             },
         ) {
             for (bucket, name, val) in it.filter_map(Result::ok) {
-                if let Some(day) = local_label(&bucket, tz, by_hour) {
+                if let Some(day) = local_label(&bucket, tz, by_hour, include_date) {
                     *map.entry(day).or_default().entry(name).or_insert(0) += val;
                 }
             }
@@ -385,6 +402,7 @@ pub fn dim_daily_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn totals_add_up() {
@@ -415,5 +433,43 @@ mod tests {
             ],
         };
         assert_eq!(cs.max_value(), 9);
+    }
+
+    #[test]
+    fn long_report_ranges_include_date_and_time_on_axis() {
+        let from = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
+        let to = from + chrono::Duration::days(7);
+
+        assert_eq!(
+            full_axis(from, to, chrono_tz::UTC, false),
+            vec![
+                "09-10 00:00",
+                "09-11 00:00",
+                "09-12 00:00",
+                "09-13 00:00",
+                "09-14 00:00",
+                "09-15 00:00",
+                "09-16 00:00",
+            ]
+        );
+        assert_eq!(
+            local_label("2026-09-12T15:00:00Z", chrono_tz::UTC, false, true),
+            Some("09-12 00:00".into())
+        );
+    }
+
+    #[test]
+    fn one_day_report_keeps_hour_only_axis() {
+        let from = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
+        let to = from + chrono::Duration::days(1);
+
+        assert_eq!(
+            full_axis(from, to, chrono_tz::UTC, true).first(),
+            Some(&"00:00".to_string())
+        );
+        assert_eq!(
+            local_label("2026-09-10T15:00:00Z", chrono_tz::UTC, true, false),
+            Some("15:00".into())
+        );
     }
 }

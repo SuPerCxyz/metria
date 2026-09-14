@@ -181,8 +181,8 @@ async fn email_and_webhook_delivered() {
         &cfg,
         "test",
         "test-1",
-        "测试（上一自然日）",
-        chrono::Utc::now() - chrono::Duration::days(1),
+        "测试（最近 7 天）",
+        chrono::Utc::now() - chrono::Duration::days(7),
         chrono::Utc::now(),
     )
     .await;
@@ -223,6 +223,10 @@ async fn email_and_webhook_delivered() {
     assert!(
         decoded_html.contains("fill-opacity=\"0.0941\""),
         "邮件图表应包含页面同款面积填充"
+    );
+    assert!(
+        decoded_html.contains("00:00"),
+        "超过一天的邮件图表 X 轴应包含日期和时间"
     );
     assert!(!raw.contains("cid:"), "邮件 HTML 不应引用 CID 图片: {raw}");
 }

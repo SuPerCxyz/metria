@@ -59,7 +59,7 @@ export default function AgentDetail() {
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">使用趋势</h2>
-        {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={fmtTokensShort} />}
+        {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={fmtTokensShort} />}
       </div>
 
       <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">

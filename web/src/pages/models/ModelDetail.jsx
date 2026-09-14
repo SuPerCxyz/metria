@@ -73,7 +73,7 @@ export default function ModelDetail() {
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">Token / 费用趋势</h2>
           <Segmented items={TREND_TABS} value={tab} onChange={setTab} />
         </div>
-        {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} height={320} formatY={tab === 'cost' ? fmtUsd : fmtTokensShort} />}
+        {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={tab === 'cost' ? fmtUsd : fmtTokensShort} />}
       </div>
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
