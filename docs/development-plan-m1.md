@@ -33,6 +33,7 @@
 | 用量报告：设置页配置全局时区/收件人/SMTP/通用 Webhook、日/周/月三独立调度、测试发送与历史；邮件含内联趋势图（Token/请求数/模型/Agent）、加宽 760px（OpenSpec `add-usage-reports`） | 🟡 已实现并提交，失败周期不自动重试、单渠道测试结果去重、邮件 Y 轴与 Web 图表样式一致、历史最多 30 条每页 10 条、PDF 与邮件内容/视觉一致、邮件暂不附带 PDF 已补齐；已部署 lstable | 2026-09-14 |
 | 邮件与页面趋势图一致性：统一分桶、补零、点数降采样及长范围日期时间标签；覆盖 7/14 天报告回归 | ✅ 完成 | 2026-09-14 |
 | 模型价格等价：自定义模型跟随目标价格、目标缺价明确按 0、仅后续生效或强制重算全部历史；平台模型与价格目录模型支持输入自动匹配 | ✅ 完成 | 2026-09-14 |
+| Hub 大数据重算内存优化：价格/usage/traffic 批处理、后台任务释放内存、轻量 healthcheck | ✅ 完成 | 2026-09-14 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
@@ -239,6 +240,13 @@
 - 价格关联候选由平台历史已使用模型和启用的价格目录规则提供，避免手工填写模型名导致匹配失败。
 - 平台模型和价格目录模型均支持受控输入过滤、鼠标选择及方向键/回车选择；提交时校验候选并使用规范候选值。
 - 已验证 Web 测试/构建、Playwright 交互路径、Rust workspace、clippy、Docker Hub 镜像和 Compose 配置。
+
+### Hub 大数据重算内存优化完成记录（2026-09-14）
+
+- 价格重算、usage rollup 和 traffic rollup 改为按 rowid 每批 512 行流式处理，批次之间释放数据库 guard，避免把历史 JSON 一次性载入内存。
+- catalog 同步与重新计价移入 `spawn_blocking`；Linux glibc 后台任务结束时尽力调用 `malloc_trim` 归还已释放堆页，其他目标保持无操作兼容。
+- 容器 healthcheck 改为打开数据库并读取 schema 版本；完整 `quick_check` 仍由 `metria doctor --database` 执行，避免大库存活检查超时。
+- 回归覆盖多批次重算与轻量 healthcheck；已执行 Rust fmt/clippy/workspace test、Web test/build（仓库未提供 `typecheck` script）、Docker Hub 构建、Compose 配置和 OpenSpec 校验；已部署 lstable，进程 RSS 约 20.9 MB，容器 healthcheck 为 healthy。
 
 已知限制：adapter 尚不产出 traffic_profile_samples（自动学习在 S2/M2）；Codex 会话级 model 聚合以 message/agent 为粒度。（Claude 子代理关联已修复：Task tool_use 的 leafUuid 推导 SubagentRelation，见 2026-08-06 记录。）
 

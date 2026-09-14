@@ -273,15 +273,18 @@ pub fn known_catalogs() -> Vec<(&'static str, &'static str)> {
 ///
 /// `only_unpriced = true` 时仅处理尚无费用的事件（后台周期增量），否则全量重算。
 pub fn reprice_from_rules(db: &HubDb, only_unpriced: bool) -> Result<i64, String> {
-    let engine = pricing_engine(db);
-    let n = db
-        .reprice_all(&engine, only_unpriced)
-        .map_err(|e| e.to_string())?;
-    // 历史规则可能命中任意时间的事件，必须全量重建费用口径。
-    if n > 0 || !only_unpriced {
-        db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
-    }
-    Ok(n)
+    let _heap_release = crate::memory::HeapReleaseGuard;
+    (|| {
+        let engine = pricing_engine(db);
+        let n = db
+            .reprice_all(&engine, only_unpriced)
+            .map_err(|e| e.to_string())?;
+        // 历史规则可能命中任意时间的事件，必须全量重建费用口径。
+        if n > 0 || !only_unpriced {
+            db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+        }
+        Ok(n)
+    })()
 }
 
 #[cfg(test)]

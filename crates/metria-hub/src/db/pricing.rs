@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use super::HubDb;
 
+const REPRICE_BATCH_SIZE: i64 = 512;
+
 fn parse_rule_time(value: Option<String>) -> Option<DateTime<Utc>> {
     value
         .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
@@ -221,93 +223,130 @@ impl HubDb {
         engine: &metria_pricing::PricingEngine,
         only_unpriced: bool,
     ) -> Result<i64, StorageError> {
-        let c = self.conn();
-        let filter = if only_unpriced {
-            " WHERE (reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL AND estimated_cost_micro_usd IS NULL)"
-        } else {
+        if !only_unpriced {
             // 全量重算时先清除旧派生费用；reported 口径始终保留。无法再匹配
             // 规则的事件应恢复为不可用，不能继续显示过期价格。
+            let c = self.conn();
             c.execute(
                 "UPDATE usage_events SET calculated_cost_micro_usd = NULL,
                     estimated_cost_micro_usd = NULL, pricing_rule_id = NULL",
                 [],
             )
             .map_err(StorageError::from)?;
-            ""
-        };
-        let mut stmt = c
-            .prepare(&format!(
-                "SELECT event_id, model_normalized, provider_normalized, timestamp,
-                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                        reported_cost_micro_usd
-                 FROM usage_events{filter}",
-            ))
-            .map_err(StorageError::from)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
-                    r.get::<_, Option<i64>>(7)?,
-                    r.get::<_, Option<i64>>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
-                ))
-            })
-            .map_err(StorageError::from)?;
+        }
+
         let mut repriced = 0i64;
-        let mut upd = c
-            .prepare(
-                "UPDATE usage_events SET reported_cost_micro_usd = ?1, calculated_cost_micro_usd = ?2, estimated_cost_micro_usd = ?3, pricing_rule_id = ?4 WHERE event_id = ?5",
-            )
-            .map_err(StorageError::from)?;
-        for row in rows.flatten() {
-            let (event_id, model, provider, ts, input, output, cr, cw, rea, reported) = row;
-            let at = chrono::DateTime::parse_from_rfc3339(&ts)
-                .map(|t| t.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let usage = metria_core::model::Usage {
-                input,
-                output,
-                cache_read: cr,
-                cache_write: cw,
-                reasoning: rea,
+        let mut last_rowid = 0i64;
+        loop {
+            let batch = {
+                let c = self.conn();
+                let query = if only_unpriced {
+                    "SELECT rowid, event_id, model_normalized, provider_normalized, timestamp,
+                            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                            reasoning_tokens, reported_cost_micro_usd
+                     FROM usage_events
+                     WHERE rowid > ?1
+                       AND reported_cost_micro_usd IS NULL
+                       AND calculated_cost_micro_usd IS NULL
+                       AND estimated_cost_micro_usd IS NULL
+                     ORDER BY rowid LIMIT ?2"
+                } else {
+                    "SELECT rowid, event_id, model_normalized, provider_normalized, timestamp,
+                            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                            reasoning_tokens, reported_cost_micro_usd
+                     FROM usage_events
+                     WHERE rowid > ?1
+                     ORDER BY rowid LIMIT ?2"
+                };
+                let mut stmt = c.prepare(query).map_err(StorageError::from)?;
+                let rows = stmt
+                    .query_map(params![last_rowid, REPRICE_BATCH_SIZE], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<i64>>(5)?,
+                            r.get::<_, Option<i64>>(6)?,
+                            r.get::<_, Option<i64>>(7)?,
+                            r.get::<_, Option<i64>>(8)?,
+                            r.get::<_, Option<i64>>(9)?,
+                            r.get::<_, Option<i64>>(10)?,
+                        ))
+                    })
+                    .map_err(StorageError::from)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)?
             };
-            let Ok(cost) =
-                engine.compute(&usage, model.as_deref(), provider.as_deref(), at, reported)
-            else {
-                continue;
+            let Some(last) = batch.last().map(|row| row.0) else {
+                break;
             };
-            if !cost.pricing_available {
+            last_rowid = last;
+
+            let mut updates = Vec::with_capacity(batch.len());
+            for (_, event_id, model, provider, ts, input, output, cr, cw, rea, reported) in batch {
+                let at = chrono::DateTime::parse_from_rfc3339(&ts)
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let usage = metria_core::model::Usage {
+                    input,
+                    output,
+                    cache_read: cr,
+                    cache_write: cw,
+                    reasoning: rea,
+                };
+                let Ok(cost) =
+                    engine.compute(&usage, model.as_deref(), provider.as_deref(), at, reported)
+                else {
+                    continue;
+                };
+                if cost.pricing_available {
+                    updates.push((
+                        event_id,
+                        cost.reported_micro_usd,
+                        cost.calculated_micro_usd,
+                        cost.estimated_micro_usd,
+                        cost.rule_id,
+                        cost.calculated_micro_usd.or(cost.estimated_micro_usd),
+                    ));
+                }
+            }
+
+            if updates.is_empty() {
                 continue;
             }
-            upd.execute(metria_storage::rusqlite::params![
-                cost.reported_micro_usd,
-                cost.calculated_micro_usd,
-                cost.estimated_micro_usd,
-                cost.rule_id,
-                event_id,
-            ])
-            .map_err(StorageError::from)?;
-            // 写入 pricing_match（保留历史，不覆盖）
-            c.execute(
-                "INSERT INTO pricing_matches (id, usage_event_id, pricing_rule_id, pricing_snapshot_id, match_type, calculated_at, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning_cost, request_cost, total_cost) VALUES (?1,?2,?3,NULL,'reprice',?4,NULL,NULL,NULL,NULL,NULL,NULL,?5)",
-                params![
-                    metria_core::model::Id::new().as_str().to_string(),
-                    event_id,
-                    cost.rule_id,
-                    Utc::now().to_rfc3339(),
-                    cost.calculated_micro_usd.or(cost.estimated_micro_usd),
-                ],
-            )
-            .map_err(StorageError::from)?;
-            repriced += 1;
+            let c = self.conn();
+            let update_sql = if only_unpriced {
+                "UPDATE usage_events SET reported_cost_micro_usd = ?1, calculated_cost_micro_usd = ?2, estimated_cost_micro_usd = ?3, pricing_rule_id = ?4 WHERE event_id = ?5 AND reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL AND estimated_cost_micro_usd IS NULL"
+            } else {
+                "UPDATE usage_events SET reported_cost_micro_usd = ?1, calculated_cost_micro_usd = ?2, estimated_cost_micro_usd = ?3, pricing_rule_id = ?4 WHERE event_id = ?5"
+            };
+            let mut upd = c.prepare(update_sql).map_err(StorageError::from)?;
+            for (event_id, reported, calculated, estimated, rule_id, total) in updates {
+                let changed = upd
+                    .execute(params![reported, calculated, estimated, rule_id, event_id])
+                    .map_err(StorageError::from)?;
+                if changed == 0 {
+                    continue;
+                }
+                // 写入 pricing_match（保留历史，不覆盖）
+                c.execute(
+                    "INSERT INTO pricing_matches (id, usage_event_id, pricing_rule_id, pricing_snapshot_id, match_type, calculated_at, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning_cost, request_cost, total_cost) VALUES (?1,?2,?3,NULL,'reprice',?4,NULL,NULL,NULL,NULL,NULL,NULL,?5)",
+                    params![
+                        metria_core::model::Id::new().as_str().to_string(),
+                        event_id,
+                        rule_id,
+                        Utc::now().to_rfc3339(),
+                        total,
+                    ],
+                )
+                .map_err(StorageError::from)?;
+                repriced += 1;
+            }
         }
-        drop(upd);
+
+        let c = self.conn();
         // 兼容旧数据：usage 先到时 model_calls 可能还没有 usage_event_id。
         c.execute(
             "UPDATE model_calls SET usage_event_id = (

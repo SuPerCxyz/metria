@@ -10,6 +10,7 @@ pub mod db;
 pub mod demo;
 pub mod export;
 pub mod http;
+pub mod memory;
 pub mod pull;
 pub mod report;
 pub mod rollup;
@@ -127,6 +128,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 /// 新统计口径上线后的幂等历史修复；标记成功后不在每次重启重复生成估算版本。
 fn spawn_integrity_repair(db: db::HubDb) {
     tokio::task::spawn_blocking(move || {
+        let _heap_release = crate::memory::HeapReleaseGuard;
         const KEY: &str = "observability_integrity_version";
         const TIMING_KEY: &str = "observability_timing_repair_version";
         const VERSION: &str = "1";
@@ -229,34 +231,43 @@ fn seed_catalogs(db: &db::HubDb) {
 }
 
 /// 后台周期同步外部价格目录（失败保留旧快照，不影响 Hub 运行）。
+fn sync_catalog_cycle(db: db::HubDb) {
+    let _heap_release = crate::memory::HeapReleaseGuard;
+    let catalogs = catalog::catalogs_from_db(&db);
+    for cat in &catalogs {
+        match catalog::sync_catalog(&db, cat) {
+            Ok(r) => {
+                if r.fetched {
+                    info!("价格目录 {} 同步完成（{} 条规则）", cat.name, r.rules);
+                }
+            }
+            Err(e) => {
+                let _ = db.mark_catalog_error(&cat.id, &e);
+                warn!("价格目录 {} 同步失败（使用旧快照）: {e}", cat.name);
+            }
+        }
+    }
+    // 每轮按最新目录增量重新计价（未计价事件），并重建费用 rollup，
+    // 使新上传的调用也能按 OpenRouter 官方价格计算费用。
+    match catalog::reprice_from_rules(&db, true) {
+        Ok(n) => {
+            if n > 0 {
+                info!("增量重新计价完成（{} 条）", n);
+            }
+        }
+        Err(e) => warn!("增量重新计价失败: {e}"),
+    }
+}
+
 fn spawn_catalog_sync(db: db::HubDb) {
     tokio::spawn(async move {
         // 延迟启动，避免阻塞启动路径
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         loop {
-            let catalogs = catalog::catalogs_from_db(&db);
-            for cat in &catalogs {
-                match catalog::sync_catalog(&db, cat) {
-                    Ok(r) => {
-                        if r.fetched {
-                            info!("价格目录 {} 同步完成（{} 条规则）", cat.name, r.rules);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = db.mark_catalog_error(&cat.id, &e);
-                        warn!("价格目录 {} 同步失败（使用旧快照）: {e}", cat.name);
-                    }
-                }
-            }
-            // 每轮按最新目录增量重新计价（未计价事件），并重建费用 rollup，
-            // 使新上传的调用也能按 OpenRouter 官方价格计算费用。
-            match catalog::reprice_from_rules(&db, true) {
-                Ok(n) => {
-                    if n > 0 {
-                        info!("增量重新计价完成（{} 条）", n);
-                    }
-                }
-                Err(e) => warn!("增量重新计价失败: {e}"),
+            let cycle_db = db.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || sync_catalog_cycle(cycle_db)).await
+            {
+                warn!("价格目录后台任务异常: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -355,7 +366,7 @@ async fn shutdown_signal() {
 /// 健康检查入口（容器使用）：打开数据库并检查 schema。
 pub fn healthcheck(cfg: &HubConfig) -> Result<(), HubError> {
     let db = db::HubDb::open(cfg)?;
-    db.quick_check()?;
+    db.schema_version()?;
     Ok(())
 }
 

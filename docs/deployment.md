@@ -154,7 +154,7 @@ SMTP 密码和 Webhook Secret 只保存在 Hub 本地数据库，读取 API 不�
 
 ## 7. 健康检查与诊断
 
-- `metria healthcheck`（容器内 CMD）：连通性 + 数据库 quick_check。
+- `metria healthcheck`（容器内 CMD）：打开数据库并读取 schema 版本，作为轻量存活检查；完整数据库 `quick_check` 通过 `metria doctor --database` 执行。
 - `metria doctor --adapter|--traffic|--hub|--database|--spool`：环境诊断。
 
 ## 8. 前端添加节点与安装 Agent

@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use crate::db::HubDb;
 
+const ROLLUP_BATCH_SIZE: i64 = 512;
+
 /// 汇总增量类型。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RollupKind {
@@ -434,6 +436,7 @@ impl HubDb {
     }
 
     fn rebuild_usage_rollups_since(&self, since: DateTime<Utc>) -> Result<usize, StorageError> {
+        let _heap_release = crate::memory::HeapReleaseGuard;
         let c = self.conn();
         c.execute(
             "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
@@ -447,53 +450,74 @@ impl HubDb {
         .map_err(StorageError::from)?;
         drop(c);
 
-        let events: Vec<Value> = {
-            let c = self.conn();
-            let mut stmt = c
-                .prepare(
-                    "SELECT node_id, collector_id, client_id, source_id, provider_normalized, model_normalized,
-                            timestamp, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                            reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
-                            estimated_cost_micro_usd, usage_source, usage_granularity
-                     FROM usage_events WHERE timestamp >= ?1",
-                )
-                .map_err(StorageError::from)?;
-            let rows = stmt
-                .query_map([since.to_rfc3339()], |r| {
-                    Ok(serde_json::json!({
-                        "node_id": r.get::<_, String>(0)?,
-                        "collector_id": r.get::<_, String>(1)?,
-                        "client_id": r.get::<_, String>(2)?,
-                        "source_id": r.get::<_, String>(3)?,
-                        "provider_normalized": r.get::<_, Option<String>>(4)?,
-                        "model_normalized": r.get::<_, Option<String>>(5)?,
-                        "timestamp": r.get::<_, String>(6)?,
-                        "usage": {
-                            "input": r.get::<_, Option<i64>>(7)?,
-                            "output": r.get::<_, Option<i64>>(8)?,
-                            "cache_read": r.get::<_, Option<i64>>(9)?,
-                            "cache_write": r.get::<_, Option<i64>>(10)?,
-                            "reasoning": r.get::<_, Option<i64>>(11)?,
-                        },
-                        "cost": {
-                            "reported_micro_usd": r.get::<_, Option<i64>>(12)?,
-                            "calculated_micro_usd": r.get::<_, Option<i64>>(13)?,
-                            "estimated_micro_usd": r.get::<_, Option<i64>>(14)?,
-                        },
-                        "quality": {
-                            "usage_source": r.get::<_, Option<String>>(15)?,
-                            "granularity": r.get::<_, Option<String>>(16)?,
-                        },
-                    }))
-                })
-                .map_err(StorageError::from)?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
         let mut rebuilt = 0usize;
-        for e in &events {
-            self.rollup_event("usage", e)?;
-            rebuilt += 1;
+        let since_text = since.to_rfc3339();
+        let mut last_rowid = 0i64;
+        loop {
+            let events = {
+                let c = self.conn();
+                let mut stmt = c
+                    .prepare(
+                        "SELECT rowid, node_id, collector_id, client_id, source_id,
+                                provider_normalized, model_normalized, timestamp,
+                                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
+                                estimated_cost_micro_usd, usage_source, usage_granularity
+                         FROM usage_events
+                         WHERE rowid > ?1 AND timestamp >= ?2
+                         ORDER BY rowid LIMIT ?3",
+                    )
+                    .map_err(StorageError::from)?;
+                let rows = stmt
+                    .query_map(
+                        metria_storage::rusqlite::params![
+                            last_rowid,
+                            since_text,
+                            ROLLUP_BATCH_SIZE
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                serde_json::json!({
+                                    "node_id": r.get::<_, String>(1)?,
+                                    "collector_id": r.get::<_, String>(2)?,
+                                    "client_id": r.get::<_, String>(3)?,
+                                    "source_id": r.get::<_, String>(4)?,
+                                    "provider_normalized": r.get::<_, Option<String>>(5)?,
+                                    "model_normalized": r.get::<_, Option<String>>(6)?,
+                                    "timestamp": r.get::<_, String>(7)?,
+                                    "usage": {
+                                        "input": r.get::<_, Option<i64>>(8)?,
+                                        "output": r.get::<_, Option<i64>>(9)?,
+                                        "cache_read": r.get::<_, Option<i64>>(10)?,
+                                        "cache_write": r.get::<_, Option<i64>>(11)?,
+                                        "reasoning": r.get::<_, Option<i64>>(12)?,
+                                    },
+                                    "cost": {
+                                        "reported_micro_usd": r.get::<_, Option<i64>>(13)?,
+                                        "calculated_micro_usd": r.get::<_, Option<i64>>(14)?,
+                                        "estimated_micro_usd": r.get::<_, Option<i64>>(15)?,
+                                    },
+                                    "quality": {
+                                        "usage_source": r.get::<_, Option<String>>(16)?,
+                                        "granularity": r.get::<_, Option<String>>(17)?,
+                                    },
+                                }),
+                            ))
+                        },
+                    )
+                    .map_err(StorageError::from)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)?
+            };
+            let Some(last) = events.last().map(|(rowid, _)| *rowid) else {
+                break;
+            };
+            last_rowid = last;
+            for (_, event) in events {
+                self.rollup_event("usage", &event)?;
+                rebuilt += 1;
+            }
         }
         Ok(rebuilt)
     }
@@ -514,6 +538,7 @@ impl HubDb {
     }
 
     fn rebuild_traffic_rollups_since(&self, since: DateTime<Utc>) -> Result<usize, StorageError> {
+        let _heap_release = crate::memory::HeapReleaseGuard;
         let c = self.conn();
         c.execute(
             "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
@@ -527,44 +552,63 @@ impl HubDb {
         .map_err(StorageError::from)?;
         drop(c);
 
-        let events: Vec<Value> = {
-            let c = self.conn();
-            let mut stmt = c
-                .prepare(
-                    "SELECT t.node_id, t.client_id, t.provider, t.model,
-                            t.estimated_request_wire_bytes, t.estimated_response_wire_bytes, t.estimated_total_wire_bytes,
-                            t.lower_bound_bytes, t.upper_bound_bytes, t.estimation_source, t.confidence,
-                            m.started_at
-                     FROM model_calls m
-                     JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
-                     WHERE m.started_at >= ?1",
-                )
-                .map_err(StorageError::from)?;
-            let rows = stmt
-                .query_map([since.to_rfc3339()], |r| {
-                    Ok(serde_json::json!({
-                        "node_id": r.get::<_, String>(0)?,
-                        "client_id": r.get::<_, String>(1)?,
-                        "provider": r.get::<_, Option<String>>(2)?,
-                        "model": r.get::<_, Option<String>>(3)?,
-                        "estimated_request_wire_bytes": r.get::<_, Option<i64>>(4)?,
-                        "estimated_response_wire_bytes": r.get::<_, Option<i64>>(5)?,
-                        "estimated_total_wire_bytes": r.get::<_, Option<i64>>(6)?,
-                        "lower_bound_bytes": r.get::<_, Option<i64>>(7)?,
-                        "upper_bound_bytes": r.get::<_, Option<i64>>(8)?,
-                        "estimation_source": r.get::<_, Option<String>>(9)?,
-                        "confidence": r.get::<_, Option<f64>>(10)?,
-                        "timestamp": r.get::<_, String>(11)?,
-                    }))
-                })
-                .map_err(StorageError::from)?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
         let mut rebuilt = 0usize;
-        for e in &events {
-            self.rollup_event("traffic", e)?;
-            rebuilt += 1;
+        let since_text = since.to_rfc3339();
+        let mut last_rowid = 0i64;
+        loop {
+            let events = {
+                let c = self.conn();
+                let mut stmt = c
+                    .prepare(
+                        "SELECT m.rowid, t.node_id, t.client_id, t.provider, t.model,
+                                t.estimated_request_wire_bytes, t.estimated_response_wire_bytes,
+                                t.estimated_total_wire_bytes, t.lower_bound_bytes, t.upper_bound_bytes,
+                                t.estimation_source, t.confidence, m.started_at
+                         FROM model_calls m
+                         JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
+                         WHERE m.rowid > ?1 AND m.started_at >= ?2
+                         ORDER BY m.rowid LIMIT ?3",
+                    )
+                    .map_err(StorageError::from)?;
+                let rows = stmt
+                    .query_map(
+                        metria_storage::rusqlite::params![
+                            last_rowid,
+                            since_text,
+                            ROLLUP_BATCH_SIZE
+                        ],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                serde_json::json!({
+                                    "node_id": r.get::<_, String>(1)?,
+                                    "client_id": r.get::<_, String>(2)?,
+                                    "provider": r.get::<_, Option<String>>(3)?,
+                                    "model": r.get::<_, Option<String>>(4)?,
+                                    "estimated_request_wire_bytes": r.get::<_, Option<i64>>(5)?,
+                                    "estimated_response_wire_bytes": r.get::<_, Option<i64>>(6)?,
+                                    "estimated_total_wire_bytes": r.get::<_, Option<i64>>(7)?,
+                                    "lower_bound_bytes": r.get::<_, Option<i64>>(8)?,
+                                    "upper_bound_bytes": r.get::<_, Option<i64>>(9)?,
+                                    "estimation_source": r.get::<_, Option<String>>(10)?,
+                                    "confidence": r.get::<_, Option<f64>>(11)?,
+                                    "timestamp": r.get::<_, String>(12)?,
+                                }),
+                            ))
+                        },
+                    )
+                    .map_err(StorageError::from)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)?
+            };
+            let Some(last) = events.last().map(|(rowid, _)| *rowid) else {
+                break;
+            };
+            last_rowid = last;
+            for (_, event) in events {
+                self.rollup_event("traffic", &event)?;
+                rebuilt += 1;
+            }
         }
         Ok(rebuilt)
     }
@@ -682,6 +726,25 @@ mod tests {
         })
     }
 
+    fn usage_json(index: usize, with_cost: bool) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": format!("batch-usage-{index}"),
+            "schema_version": 1,
+            "node_id": "batch-node",
+            "collector_id": "batch-collector",
+            "source_id": "batch-source",
+            "client_id": "codex",
+            "adapter_id": "codex",
+            "adapter_version": "0.1.0",
+            "timestamp": "2026-08-10T08:10:30Z",
+            "provider_normalized": "openai",
+            "model_normalized": "batch-model",
+            "usage": { "input": 10, "output": 5, "cache_read": null, "cache_write": null, "reasoning": null },
+            "cost": if with_cost { serde_json::json!({ "calculated_micro_usd": 100 }) } else { serde_json::json!({}) },
+            "quality": { "usage_source": "reported", "granularity": "call", "confidence": 1.0 },
+        })
+    }
+
     #[test]
     fn reconcile_reports_no_drift_after_clean_ingest() {
         let db = test_db("reconcile");
@@ -774,6 +837,95 @@ mod tests {
             .to_rfc3339(),
             "traffic 必须按调用时间而不是 calculated_at 归桶"
         );
+    }
+
+    #[test]
+    fn rebuild_usage_rollups_processes_multiple_batches() {
+        let db = test_db("usage-batches");
+        let count = ROLLUP_BATCH_SIZE as usize + 1;
+        for index in 0..count {
+            assert!(db
+                .insert_usage(&usage_json(index, true), "batch-node:batch-session")
+                .unwrap());
+        }
+
+        assert_eq!(db.rebuild_all_usage_rollups().unwrap(), count);
+        let (rows, input, output): (i64, i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                 FROM hourly_rollups WHERE usage_source != ''",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(input, count as i64 * 10);
+        assert_eq!(output, count as i64 * 5);
+    }
+
+    #[test]
+    fn rebuild_traffic_rollups_processes_multiple_batches() {
+        let db = test_db("traffic-batches");
+        let count = ROLLUP_BATCH_SIZE as usize + 1;
+        let call_time = "2026-08-10T08:10:30Z";
+        for index in 0..count {
+            let call_id = format!("batch-traffic-call-{index}");
+            let estimate_id = format!("batch-traffic-estimate-{index}");
+            let mut call = call_json(call_time);
+            call["id"] = serde_json::json!(call_id);
+            call["traffic_estimate_id"] = serde_json::json!(estimate_id);
+            db.insert_call(&call, "batch-traffic-session").unwrap();
+
+            let mut traffic = traffic_json(call_time);
+            traffic["id"] = serde_json::json!(estimate_id);
+            traffic["model_call_id"] = serde_json::json!(call_id);
+            traffic["timestamp"] = serde_json::json!(call_time);
+            db.insert_traffic(&traffic).unwrap();
+        }
+
+        assert_eq!(db.rebuild_all_traffic_rollups().unwrap(), count);
+        let (rows, total): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(estimated_total_bytes), 0)
+                 FROM hourly_rollups WHERE traffic_estimation_source != ''",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(total, count as i64 * 12_000);
+    }
+
+    #[test]
+    fn reprice_processes_multiple_batches() {
+        let db = test_db("reprice-batches");
+        let count = ROLLUP_BATCH_SIZE as usize + 1;
+        db.insert_pricing_rule(&serde_json::json!({
+            "model_pattern": "batch-model",
+            "provider_pattern": "*",
+            "input_price": 1_000_000,
+            "output_price": 2_000_000,
+        }))
+        .unwrap();
+        for index in 0..count {
+            assert!(db
+                .insert_usage(&usage_json(index, false), "batch-node:batch-session")
+                .unwrap());
+        }
+
+        let engine = crate::catalog::pricing_engine(&db);
+        assert_eq!(db.reprice_all(&engine, false).unwrap(), count as i64);
+        let priced: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE calculated_cost_micro_usd IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(priced, count as i64);
     }
 
     #[test]
