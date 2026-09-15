@@ -46,7 +46,8 @@ fn golden_full_parses_session_events() {
     );
     assert_eq!(session.model_call_count, 2);
     assert_eq!(session.tool_call_count, 2);
-    assert_eq!(session.input_tokens.unwrap(), 21154 + 34200);
+    // input_tokens 归一化为非缓存输入：21154-0 + (34200-21000-1500)
+    assert_eq!(session.input_tokens.unwrap(), 21154 + 11700);
     assert_eq!(session.output_tokens.unwrap(), 370 + 820);
     assert_eq!(session.cache_read_tokens.unwrap(), 21000);
     assert_eq!(session.cache_write_tokens.unwrap(), 1500);
@@ -231,7 +232,8 @@ fn appended_usage_restores_session_and_model_context() {
         third.model_calls[0].model_raw.as_deref(),
         Some("gpt-5.6-sol")
     );
-    assert_eq!(third.model_calls[0].input_tokens, Some(1200));
+    // 归一化为非缓存输入：1200 - 900
+    assert_eq!(third.model_calls[0].input_tokens, Some(300));
     assert_eq!(
         third.model_calls[0].started_at,
         ts("2026-08-13T01:01:00Z"),

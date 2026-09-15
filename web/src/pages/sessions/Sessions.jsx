@@ -7,7 +7,7 @@ import DataTable from '../../components/tables/DataTable'
 import StatusBadge from '../../components/common/StatusBadge'
 import FilterBar from '../../components/filters/FilterBar'
 import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
-import { api, q, rangeParams } from '../../services/api'
+import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
@@ -17,9 +17,8 @@ import { fmtDateTime, fmtDuration, fmtSessionTitle, fmtTokensShort, fmtUsd, fmtB
 export default function Sessions() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const params = rangeParams(range)
-  const { nodeId } = useNodeFilter()
-  if (nodeId) params.node_id = nodeId
+  const { nodeId, clientId, model, projectId } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
   const [search, setSearch] = useState('')
   const nodeNames = useNodeNames()
 

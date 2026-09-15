@@ -20,6 +20,18 @@ type UsageKey = (
     Option<i64>,
 );
 
+/// Codex 的 `input_tokens` 已包含 cached 与 cache_write，归一化为非缓存输入。
+///
+/// Metria 约定 `input` 为非缓存输入（缓存读写单独计列）；不归一化会把缓存
+/// 重复计入输入，导致总 Token、缓存命中率与费用虚高。
+pub fn fresh_input(
+    input: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+) -> Option<i64> {
+    input.map(|value| (value - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0))
+}
+
 /// 会话构建上下文。
 #[derive(Debug, Clone)]
 pub struct BuildCtx {
@@ -378,6 +390,9 @@ impl SessionBuilder {
         model: Option<&str>,
         response_text: Option<String>,
     ) {
+        // Codex 的 input_tokens 已包含 cached/cache_write，归一化为非缓存输入；
+        // 否则总 Token、缓存命中率与费用都会把缓存重复计入输入。
+        let input = fresh_input(input, cache_read, cache_write);
         let key = (input, output, cache_read, cache_write, reasoning);
         if self.last_usage_key == Some(key) {
             return; // 同一请求的重复 token_count
@@ -732,4 +747,24 @@ pub fn jsonl_cursor(
         last_event_hash: None,
         last_scan_at: Some(Utc::now()),
     })
+}
+
+#[cfg(test)]
+mod fresh_input_tests {
+    use super::fresh_input;
+
+    #[test]
+    fn subtracts_cached_and_cache_write_from_input() {
+        assert_eq!(
+            fresh_input(Some(34200), Some(21000), Some(1500)),
+            Some(11700)
+        );
+        assert_eq!(fresh_input(Some(5000), Some(100), Some(0)), Some(4900));
+    }
+
+    #[test]
+    fn clamps_to_zero_and_keeps_missing_input_null() {
+        assert_eq!(fresh_input(Some(100), Some(500), Some(0)), Some(0));
+        assert_eq!(fresh_input(None, Some(100), Some(0)), None);
+    }
 }

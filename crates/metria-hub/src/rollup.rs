@@ -252,7 +252,7 @@ impl HubDb {
                     "SELECT bucket,
                     SUM(session_count), SUM(model_call_count), SUM(input_tokens),
                     SUM(output_tokens), SUM(estimated_total_bytes)
-                 FROM hourly_rollups WHERE bucket >= ?1 GROUP BY bucket ORDER BY bucket",
+                 FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) GROUP BY bucket ORDER BY bucket",
                 )
                 .map_err(StorageError::from)?;
             let rows = stmt
@@ -396,12 +396,12 @@ impl HubDb {
         // 2. 删除待重建 bucket 的 rollup 行（先删后插，幂等）
         let c = self.conn();
         c.execute(
-            "DELETE FROM hourly_rollups WHERE bucket >= ?1",
+            "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1)",
             [since.to_rfc3339()],
         )
         .map_err(StorageError::from)?;
         c.execute(
-            "DELETE FROM daily_rollups WHERE bucket >= ?1",
+            "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1)",
             [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
         )
         .map_err(StorageError::from)?;
@@ -439,12 +439,12 @@ impl HubDb {
         let _heap_release = crate::memory::HeapReleaseGuard;
         let c = self.conn();
         c.execute(
-            "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
+            "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND (pricing_source != '' OR usage_source != '')",
             [since.to_rfc3339()],
         )
         .map_err(StorageError::from)?;
         c.execute(
-            "DELETE FROM daily_rollups WHERE bucket >= ?1 AND (pricing_source != '' OR usage_source != '')",
+            "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1) AND (pricing_source != '' OR usage_source != '')",
             [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
         )
         .map_err(StorageError::from)?;
@@ -541,12 +541,12 @@ impl HubDb {
         let _heap_release = crate::memory::HeapReleaseGuard;
         let c = self.conn();
         c.execute(
-            "DELETE FROM hourly_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
+            "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND traffic_estimation_source != ''",
             [since.to_rfc3339()],
         )
         .map_err(StorageError::from)?;
         c.execute(
-            "DELETE FROM daily_rollups WHERE bucket >= ?1 AND traffic_estimation_source != ''",
+            "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1) AND traffic_estimation_source != ''",
             [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
         )
         .map_err(StorageError::from)?;

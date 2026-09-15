@@ -66,3 +66,44 @@ export function serializeRuleDraft(draft, options = {}) {
   }
   return payload
 }
+
+// 规则来源分类：价格关联（用户关联等价模型）与用户价格需与目录规则区分展示。
+export const RULE_SOURCE_FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'link', label: '价格关联' },
+  { key: 'user', label: '用户价格' },
+  { key: 'catalog', label: '目录' },
+]
+
+const RULE_KIND_META = {
+  link: { label: '价格关联', className: 'bg-violet-100 text-violet-700 dark:bg-violet-400/10 dark:text-violet-300' },
+  user: { label: '用户价格', className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300' },
+  openrouter: { label: 'OpenRouter', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
+  litellm: { label: 'LiteLLM', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
+  custom: { label: '自定义目录', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
+  other: { label: '其他', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
+}
+
+const CATALOG_KINDS = ['openrouter', 'litellm', 'custom']
+
+export function pricingRuleKind(rule) {
+  switch (rule?.source) {
+    case 'openrouter_catalog': return 'openrouter'
+    case 'litellm_catalog': return 'litellm'
+    case 'custom_http_catalog': return 'custom'
+    case 'user_override': return rule.price_equivalent_to ? 'link' : 'user'
+    default: return 'other'
+  }
+}
+
+export function pricingRuleKindMeta(rule) {
+  return RULE_KIND_META[pricingRuleKind(rule)] || RULE_KIND_META.other
+}
+
+export function filterPricingRules(rules, kind) {
+  if (!kind || kind === 'all') return rules
+  return rules.filter((rule) => {
+    const ruleKind = pricingRuleKind(rule)
+    return kind === 'catalog' ? CATALOG_KINDS.includes(ruleKind) : ruleKind === kind
+  })
+}

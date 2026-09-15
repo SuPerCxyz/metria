@@ -71,6 +71,7 @@ fn build_batch() -> Value {
                     "collector_id": "collector-e2e-node",
                     "source_id": "src1",
                     "client_id": "claude-code",
+                    "project_id": "demo-project",
                     "started_at": "2026-08-05T01:00:00Z",
                     "status": "ended",
                     "message_count": 4,
@@ -88,6 +89,7 @@ fn build_batch() -> Value {
                     "node_id": node,
                     "collector_id": "collector-e2e-node",
                     "client_id": "claude-code",
+                    "project_id": "demo-project",
                     "source_id": "src1",
                     "session_id": "sess-id-1",
                     "model_raw": "claude-sonnet-4-5",
@@ -110,6 +112,7 @@ fn build_batch() -> Value {
                     "node_id": node,
                     "collector_id": "collector-e2e-node",
                     "client_id": "claude-code",
+                    "project_id": "demo-project",
                     "source_id": "src1",
                     "session_id": "sess-id-1",
                     "model_raw": "claude-sonnet-4-5",
@@ -140,7 +143,7 @@ fn build_batch() -> Value {
                     "timestamp": "2026-08-05T01:00:05Z",
                     "model_raw": "claude-sonnet-4-5",
                     "model_normalized": "claude-sonnet-4.5",
-                    "usage": { "input": 1000, "output": 500, "cache_read": 100, "cache_write": 50, "reasoning": null },
+                    "usage": { "input": 1000, "output": 500, "cache_read": 100, "cache_write": 50, "reasoning": 10 },
                     "cost": { "reported_micro_usd": null, "calculated_micro_usd": 33218, "estimated_micro_usd": null, "pricing_rule_id": null, "pricing_snapshot_id": null },
                     "quality": { "usage_source": "reported", "granularity": "call", "confidence": 1.0 }
                 }
@@ -284,12 +287,99 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(overview["output_tokens"], 800);
     assert_eq!(overview["cache_read_tokens"], 100);
     assert_eq!(overview["cache_write_tokens"], 50);
+    assert_eq!(overview["reasoning_tokens"], 10);
+    assert_eq!(overview["projects"], 1);
     assert_eq!(overview["calculated_cost_micro_usd"], 33218 + 11100);
     assert_eq!(overview["estimated_total_bytes"], 7000 + 4000);
     assert_eq!(overview["pricing_coverage"]["priced_calls"], 2);
     assert_eq!(overview["pricing_coverage"]["total_calls"], 2);
     assert_eq!(overview["traffic_coverage"]["estimated_calls"], 2);
     assert_eq!(overview["traffic_coverage"]["total_calls"], 2);
+    assert_eq!(overview["message_count"], 4);
+    assert_eq!(overview["tool_call_count"], 1);
+    assert!(overview["active_duration_ms"].is_null());
+
+    let filter_options: Value = ureq::get(&format!("{base}/api/v1/usage/filter-options"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert!(filter_options["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["id"] == "claude-code"));
+    assert!(filter_options["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["id"] == "claude-sonnet-4.5"));
+    assert!(filter_options["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["id"] == "demo-project"));
+
+    let project_overview: Value = ureq::get(&format!(
+        "{base}/api/v1/overview?from={from}&to={to}&project_id=demo-project"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(project_overview["model_calls"], 2);
+
+    let project_series: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/timeseries?from=2026-08-05T01:00:00Z&to=2026-08-05T01:01:00Z&project_id=demo-project&dim=model"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(
+        project_series["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["model_calls"].as_i64().unwrap())
+            .sum::<i64>(),
+        2
+    );
+
+    let heatmap: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/heatmap?from={from}&to={to}&timezone=Asia%2FShanghai"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(heatmap["cells"].as_array().unwrap().len(), 168);
+    assert_eq!(heatmap["timezone"], "Asia/Shanghai");
+
+    let daily: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/daily?from={from}&to={to}&timezone=UTC"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(daily["series"].as_array().unwrap().len(), 5);
+    assert_eq!(daily["series"][4]["tokens"], 3810);
+
+    let excluded_project: Value = ureq::get(&format!(
+        "{base}/api/v1/overview?from={from}&to={to}&project_id=missing"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(excluded_project["model_calls"], 0);
 
     // 图表图例隐藏维度后，汇总与时间序列都应排除对应 Agent/模型。
     let excluded_overview: Value = ureq::get(&format!(
@@ -307,9 +397,66 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(excluded_overview["failed_calls"], 0);
     assert!(excluded_overview["duration_p50_ms"].is_null());
     assert_eq!(excluded_overview["cache_savings_micro_usd"], 0);
-    for field in ["nodes", "collectors", "collectors_online", "projects"] {
+    for field in ["nodes", "collectors", "collectors_online"] {
         assert_eq!(excluded_overview[field], overview[field]);
     }
+    assert_eq!(excluded_overview["projects"], 0);
+
+    let series: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/timeseries?from={from}&to={to}&dim=model"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    let model_point = series["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|point| point["dimension"] == "claude-sonnet-4.5")
+        .unwrap();
+    assert_eq!(model_point["reasoning_tokens"], 10);
+
+    let breakdown: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/breakdown?from={from}&to={to}&dim=model"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(breakdown["by"][0]["reasoning_tokens"], 10);
+    assert_eq!(breakdown["by"][0]["cost_micro_usd"], 44318);
+
+    let client_detail: Value = ureq::get(&format!(
+        "{base}/api/v1/clients/claude-code?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(client_detail["by_node"][0]["cost_micro_usd"], 44318);
+    assert_eq!(client_detail["by_project"][0]["cost_micro_usd"], 44318);
+
+    let client_models: Value = ureq::get(&format!("{base}/api/v1/clients/claude-code/models"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(client_models["models"][0]["cost_micro_usd"], 44318);
+
+    let node_detail: Value =
+        ureq::get(&format!("{base}/api/v1/nodes/e2e-node?from={from}&to={to}"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+    assert_eq!(node_detail["by_model"][0]["cost_micro_usd"], 44318);
+    assert_eq!(node_detail["by_project"][0]["cost_micro_usd"], 44318);
 
     let excluded_series: Value = ureq::get(&format!(
         "{base}/api/v1/usage/timeseries?from={from}&to={to}&dim=model&exclude_models=claude-sonnet-4.5"
@@ -333,6 +480,26 @@ async fn full_ingest_rollup_query_cycle() {
         .into_json()
         .unwrap();
     assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+
+    let filtered_sessions: Value = ureq::get(&format!(
+        "{base}/api/v1/sessions?from={from}&to={to}&client_id=claude-code&model=claude-sonnet-4.5&project_id=demo-project"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(filtered_sessions["sessions"].as_array().unwrap().len(), 1);
+
+    let missing_sessions: Value = ureq::get(&format!(
+        "{base}/api/v1/sessions?from={from}&to={to}&project_id=missing"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(missing_sessions["sessions"].as_array().unwrap().is_empty());
 
     let session_id = sessions["sessions"][0]["id"].as_str().unwrap();
     let session_detail: Value = ureq::get(&format!("{base}/api/v1/sessions/{session_id}"))
@@ -390,6 +557,82 @@ async fn full_ingest_rollup_query_cycle() {
         )
         .unwrap();
     assert_eq!(calls, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpriced_dimension_cost_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _) = spawn_hub(dir.path()).await;
+
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "e2e-node", "node_name": "e2e-node",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.1.0", "protocol_version": 1
+        }))
+        .unwrap();
+
+    let mut batch = build_batch();
+    batch["batch_id"] = json!("unpriced-batch");
+    for event in batch["events"].as_array_mut().unwrap() {
+        if event["kind"] == "call" || event["kind"] == "usage" {
+            event["payload"]["model_raw"] = json!("unpriced-model");
+            event["payload"]["model_normalized"] = json!("unpriced-model");
+        }
+        if event["kind"] == "usage" {
+            event["payload"]["cost"]["reported_micro_usd"] = Value::Null;
+            event["payload"]["cost"]["calculated_micro_usd"] = Value::Null;
+            event["payload"]["cost"]["estimated_micro_usd"] = Value::Null;
+        }
+    }
+    let upload: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(upload["accepted"].as_array().unwrap().len(), 7);
+
+    let token = admin_token(&base);
+    let from = "2026-08-01T00:00:00Z";
+    let to = "2026-08-06T00:00:00Z";
+    let breakdown: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/breakdown?from={from}&to={to}&dim=model"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(breakdown["by"][0]["cost_micro_usd"].is_null());
+
+    let client_detail: Value = ureq::get(&format!(
+        "{base}/api/v1/clients/claude-code?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(client_detail["by_node"][0]["cost_micro_usd"].is_null());
+
+    let client_models: Value = ureq::get(&format!("{base}/api/v1/clients/claude-code/models"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert!(client_models["models"][0]["cost_micro_usd"].is_null());
+
+    let node_detail: Value =
+        ureq::get(&format!("{base}/api/v1/nodes/e2e-node?from={from}&to={to}"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+    assert!(node_detail["by_model"][0]["cost_micro_usd"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1478,6 +1721,103 @@ fn pricing_options_use_platform_models_and_catalog_rules() {
     assert_eq!(options["used_models"][0]["model"], "custom-model");
     assert_eq!(options["catalog_models"][0]["model_pattern"], "gpt-5");
     assert_eq!(options["catalog_models"][0]["price_available"], true);
+}
+
+#[test]
+fn catalog_sync_keeps_only_latest_snapshot_and_rules() {
+    use metria_hub::catalog::RuleInput;
+
+    let dir = tempdir("metria-pricing-retention");
+    let db = HubDb::open(&test_cfg(&dir)).unwrap();
+    db.apply_migrations().unwrap();
+    {
+        let c = db.conn();
+        c.execute(
+            "INSERT INTO pricing_catalogs (id, name, kind, enabled, base_url, priority, created_at, updated_at)
+             VALUES ('catalog-test', 'Test', 'openrouter', 1, 'http://example.test/models', 0, '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    let rule = |model: &str| RuleInput {
+        provider: "openai".into(),
+        model: model.into(),
+        input: Some(1_000_000),
+        output: Some(2_000_000),
+        cache_read: None,
+        cache_write: None,
+        reasoning: None,
+        request: None,
+    };
+    db.upsert_snapshot_and_rules(
+        "catalog-test",
+        "openrouter",
+        None,
+        "hash-a".into(),
+        &[rule("gpt-5")],
+    )
+    .unwrap();
+    // 第二次同步：旧快照与旧规则应被删除，只保留最新
+    db.upsert_snapshot_and_rules(
+        "catalog-test",
+        "openrouter",
+        None,
+        "hash-b".into(),
+        &[rule("gpt-5"), rule("gpt-5-mini")],
+    )
+    .unwrap();
+
+    let (snapshots, rules): (i64, i64) = {
+        let c = db.conn();
+        (
+            c.query_row(
+                "SELECT COUNT(*) FROM pricing_snapshots WHERE catalog_id = 'catalog-test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            c.query_row(
+                "SELECT COUNT(*) FROM pricing_rules WHERE source = 'openrouter_catalog'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(snapshots, 1, "旧快照应被删除");
+    assert_eq!(rules, 2, "只保留最新快照规则，旧规则不累积");
+
+    // 手工插入一条停用的目录规则与一条用户规则
+    {
+        let c = db.conn();
+        c.execute(
+            "INSERT INTO pricing_rules (id, source, channel, provider_pattern, model_pattern, input_price, priority, enabled, metadata, created_at, updated_at)
+             VALUES ('legacy-disabled', 'openrouter_catalog', 'openrouter', '*', 'legacy-model', 1000, 0, 0, '{}', '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO pricing_rules (id, source, channel, provider_pattern, model_pattern, priority, enabled, metadata, created_at, updated_at)
+             VALUES ('user-link', 'user_override', 'vendor_direct', '*', 'my-model', 0, 1, '{\"price_equivalent_to\":\"gpt-5\"}', '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    let listed = db.list_pricing_rules();
+    let models: Vec<String> = listed
+        .iter()
+        .filter_map(|r| {
+            r.get("model_pattern")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(models.contains(&"gpt-5".to_string()), "生效目录规则应返回");
+    assert!(models.contains(&"my-model".to_string()), "用户规则应返回");
+    assert!(
+        !models.contains(&"legacy-model".to_string()),
+        "停用目录规则不应返回"
+    );
 }
 
 fn tempdir(prefix: &str) -> std::path::PathBuf {

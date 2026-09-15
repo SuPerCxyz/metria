@@ -6,7 +6,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValue};
 
 use crate::api::{
@@ -23,6 +24,9 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     let (filter, fargs) = range_filter(&p);
     let (call_filter, call_fargs) = range_filter_usage(&p);
     let c = st.db.conn();
+    // rollup 按 UTC 整点分桶：完整小时读 rollup，两端不完整小时用原始明细补齐，
+    // 否则范围起点非整点时会把当前小时整桶丢弃（表现为卡片为 0）。
+    let (h_from, h_to) = full_hour_bounds(from, to);
     let row = c.query_row(
         &format!(
             "SELECT
@@ -32,10 +36,11 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
                 COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
                 COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
                 COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0),
-                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0)
-             FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter}"
+                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+                COALESCE(SUM(message_count),0), COALESCE(SUM(tool_call_count),0)
+             FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}"
         ),
-        params_from_iter(range_args(&from, &to, fargs)),
+        params_from_iter(range_args(&h_from, &h_to, fargs)),
         |r| {
             Ok(serde_json::json!({
                 "input_tokens": r.get::<_, i64>(0)?,
@@ -53,6 +58,8 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
                 "traffic_upper_bound_bytes": r.get::<_, i64>(12)?,
                 "model_calls": r.get::<_, i64>(13)?,
                 "sessions": r.get::<_, i64>(14)?,
+                "message_count": r.get::<_, i64>(15)?,
+                "tool_call_count": r.get::<_, i64>(16)?,
             }))
         },
     );
@@ -60,6 +67,17 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         tracing::error!(%e, "overview 查询失败");
         serde_json::json!({})
     });
+    add_overview_raw_edges(
+        &mut body,
+        &c,
+        &p,
+        from,
+        to,
+        h_from,
+        h_to,
+        &call_filter,
+        &call_fargs,
+    );
     body["nodes"] = c
         .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
         .unwrap_or(0)
@@ -93,7 +111,14 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         .unwrap_or(0)
         .into();
     body["projects"] = c
-        .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get::<_, i64>(0))
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT project_id) FROM model_calls
+                 WHERE {range_clause} AND project_id IS NOT NULL AND project_id != '' {call_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
         .unwrap_or(0)
         .into();
     // S3.3：Collector 在线状态列表（最近心跳 ≤ 5 分钟视为在线）
@@ -221,6 +246,56 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         body["duration_p95_ms"] = pct(0.95);
         body["duration_p99_ms"] = pct(0.99);
     }
+    // 会话消息中只有用户角色需要从明细表计数；总消息/工具调用沿用 rollup。
+    let (session_filter, session_fargs) = range_filter_sessions(&p);
+    body["user_message_count"] = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages m
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE s.started_at >= ?1 AND s.started_at < ?2
+                   AND m.role = 'user' {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs)),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .into();
+    // 活跃时长只统计明确记录了 duration_ms 的调用；没有记录时返回 null。
+    let (active_duration, active_count) = c
+        .query_row(
+            &format!(
+                "SELECT SUM(duration_ms), COUNT(duration_ms)
+                 FROM model_calls WHERE {range_clause} {call_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, call_fargs.clone())),
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((None, 0));
+    body["active_duration_ms"] = if active_count > 0 {
+        active_duration.into()
+    } else {
+        serde_json::Value::Null
+    };
+    // 会话持续时长是起始到最后活动/结束的跨度，允许会话之间重叠，不能解释为去重在线时长。
+    let (session_duration, session_count) = c
+        .query_row(
+            &format!(
+                "SELECT SUM(CASE WHEN COALESCE(s.last_activity_at, s.ended_at, s.started_at) > s.started_at
+                                  THEN CAST((julianday(COALESCE(s.last_activity_at, s.ended_at, s.started_at)) - julianday(s.started_at)) * 86400000 AS INTEGER)
+                                  ELSE 0 END), COUNT(*)
+                 FROM sessions s WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, range_filter_sessions(&p).1)),
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((None, 0));
+    body["session_duration_ms"] = if session_count > 0 {
+        session_duration.into()
+    } else {
+        serde_json::Value::Null
+    };
+    body["freshness"] = freshness_summary(&c, &p);
     // S3.9：缓存读取节省费用 = 范围内各模型 cache_read_tokens × 匹配规则的缓存读取单价。
     // c 在此之后不再使用；先 drop 释放 Mutex 锁，load_all_rules 才能安全取锁（Mutex 不可重入）。
     std::mem::drop(c);
@@ -277,6 +352,309 @@ pub(crate) async fn usage_timeseries(
         Ok(points) => Json(serde_json::json!({ "series": points })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
     }
+}
+
+/// 全局筛选器选项。选项来自已登记的节点/客户端以及已观测的模型/项目，
+/// 不受当前筛选值影响，避免用户选择后选项把自己隐藏掉。
+pub(crate) async fn usage_filter_options(State(st): State<AppState>) -> Response {
+    let c = st.db.conn();
+    let mut node_stmt = q!(c.prepare("SELECT id, name FROM nodes ORDER BY name, id"));
+    let node_rows = q!(node_stmt.query_map([], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "label": r.get::<_, String>(1)?,
+        }))
+    }));
+    let nodes: Vec<serde_json::Value> = node_rows.filter_map(Result::ok).collect();
+
+    let mut agent_stmt = q!(c.prepare(
+        "SELECT id, label FROM (
+             SELECT id, display_name AS label FROM clients
+             UNION
+             SELECT client_id AS id, client_id AS label FROM model_calls
+         ) ORDER BY label, id",
+    ));
+    let agent_rows = q!(agent_stmt.query_map([], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, String>(0)?,
+            "label": r.get::<_, String>(1)?,
+        }))
+    }));
+    let agents: Vec<serde_json::Value> = agent_rows.filter_map(Result::ok).collect();
+
+    let mut model_stmt = q!(c.prepare(
+        "SELECT DISTINCT model_normalized FROM model_calls
+         WHERE model_normalized IS NOT NULL AND model_normalized != ''
+         ORDER BY model_normalized",
+    ));
+    let model_rows = q!(model_stmt.query_map([], |r| {
+        let value = r.get::<_, String>(0)?;
+        Ok(serde_json::json!({ "id": value, "label": value }))
+    }));
+    let models: Vec<serde_json::Value> = model_rows.filter_map(Result::ok).collect();
+
+    let mut project_stmt = q!(c.prepare(
+        "SELECT DISTINCT project_id FROM model_calls
+         WHERE project_id IS NOT NULL AND project_id != ''
+         ORDER BY project_id",
+    ));
+    let project_rows = q!(project_stmt.query_map([], |r| {
+        let value = r.get::<_, String>(0)?;
+        Ok(serde_json::json!({ "id": value, "label": value }))
+    }));
+    let projects: Vec<serde_json::Value> = project_rows.filter_map(Result::ok).collect();
+
+    Json(serde_json::json!({ "nodes": nodes, "agents": agents, "models": models, "projects": projects })).into_response()
+}
+
+/// 按用户时区聚合最近可观测的模型调用，返回固定 7×24 网格。
+pub(crate) async fn usage_heatmap(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    match query_usage_heatmap(&st.db, &p) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+    }
+}
+
+fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value, String> {
+    let (from, to) = parse_range(p);
+    let timezone = requested_timezone(p);
+    let (filter, fargs) = range_filter_usage(p);
+    let c = db.conn();
+    let mut stmt = c
+        .prepare(&format!(
+            "SELECT m.started_at,
+                    COALESCE((SELECT SUM(u.input_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.input_tokens),
+                    COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
+                    COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
+                    COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
+                    COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    m.duration_ms
+             FROM model_calls m
+             WHERE m.started_at >= ?1 AND m.started_at < ?2 {filter}"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut cells = (0..168)
+        .map(|_| ActivityCell::default())
+        .collect::<Vec<_>>();
+    for row in rows.flatten() {
+        let Ok(started) =
+            DateTime::parse_from_rfc3339(&row.0).map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let local = started.with_timezone(&timezone);
+        let index = local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize;
+        let cell = &mut cells[index];
+        cell.input_tokens += row.1.unwrap_or(0);
+        cell.output_tokens += row.2.unwrap_or(0);
+        cell.cache_read_tokens += row.3.unwrap_or(0);
+        cell.reasoning_tokens += row.4.unwrap_or(0);
+        cell.cost_micro_usd += row.5.unwrap_or(0) + row.6.unwrap_or(0) + row.7.unwrap_or(0);
+        cell.model_calls += 1;
+        if let Some(duration) = row.8 {
+            cell.duration_ms = Some(cell.duration_ms.unwrap_or(0) + duration);
+        }
+        if cell
+            .latest_started_at
+            .is_none_or(|current| started > current)
+        {
+            cell.latest_started_at = Some(started);
+        }
+    }
+
+    let cells = cells
+        .into_iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let weekday = index / 24;
+            let hour = index % 24;
+            let (latest_from, latest_to) = cell
+                .latest_started_at
+                .and_then(|value| local_hour_bounds(value, &timezone))
+                .map_or((None, None), |(start, end)| (Some(start), Some(end)));
+            serde_json::json!({
+                "weekday": weekday,
+                "hour": hour,
+                "input_tokens": cell.input_tokens,
+                "output_tokens": cell.output_tokens,
+                "cache_read_tokens": cell.cache_read_tokens,
+                "reasoning_tokens": cell.reasoning_tokens,
+                "tokens": cell.input_tokens + cell.output_tokens + cell.reasoning_tokens,
+                "cost_micro_usd": cell.cost_micro_usd,
+                "model_calls": cell.model_calls,
+                "duration_ms": cell.duration_ms,
+                "latest_from": latest_from,
+                "latest_to": latest_to,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "timezone": timezone.to_string(),
+        "cells": cells,
+    }))
+}
+
+/// 按用户时区聚合每日分层数据。调用记录同时提供 Token、费用和 duration，
+/// 因而不会用没有时长字段的 rollup 伪造“时长趋势”。
+pub(crate) async fn usage_daily(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    match query_usage_daily(&st.db, &p) {
+        Ok(series) => Json(serde_json::json!({ "series": series })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+    }
+}
+
+fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Value>, String> {
+    let (from, to) = parse_range(p);
+    let timezone = requested_timezone(p);
+    let (filter, fargs) = range_filter_usage(p);
+    let c = db.conn();
+    let mut stmt = c
+        .prepare(&format!(
+            "SELECT m.started_at,
+                    COALESCE((SELECT SUM(u.input_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.input_tokens),
+                    COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
+                    COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
+                    COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
+                    COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
+                    m.duration_ms
+             FROM model_calls m
+             WHERE m.started_at >= ?1 AND m.started_at < ?2 {filter}"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut by_day: std::collections::BTreeMap<String, DailyActivity> = Default::default();
+    for row in rows.flatten() {
+        let Ok(started) =
+            DateTime::parse_from_rfc3339(&row.0).map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let day = started.with_timezone(&timezone).date_naive().to_string();
+        let entry = by_day.entry(day).or_default();
+        entry.input_tokens += row.1.unwrap_or(0);
+        entry.output_tokens += row.2.unwrap_or(0);
+        entry.cache_read_tokens += row.3.unwrap_or(0);
+        entry.reasoning_tokens += row.4.unwrap_or(0);
+        entry.cost_micro_usd += row.5.unwrap_or(0) + row.6.unwrap_or(0) + row.7.unwrap_or(0);
+        entry.model_calls += 1;
+        if let Some(duration) = row.8 {
+            entry.duration_ms = Some(entry.duration_ms.unwrap_or(0) + duration);
+        }
+    }
+
+    if from >= to {
+        return Ok(Vec::new());
+    }
+    let first = from.with_timezone(&timezone).date_naive();
+    let last = (to - Duration::nanoseconds(1))
+        .with_timezone(&timezone)
+        .date_naive();
+    let mut day = first;
+    let mut series = Vec::new();
+    while day <= last {
+        let key = day.to_string();
+        let value = by_day.remove(&key).unwrap_or_default();
+        series.push(serde_json::json!({
+            "bucket": key,
+            "input_tokens": value.input_tokens,
+            "output_tokens": value.output_tokens,
+            "cache_read_tokens": value.cache_read_tokens,
+            "reasoning_tokens": value.reasoning_tokens,
+            "tokens": value.input_tokens + value.output_tokens + value.reasoning_tokens,
+            "cost_micro_usd": value.cost_micro_usd,
+            "model_calls": value.model_calls,
+            "duration_ms": value.duration_ms,
+        }));
+        day += Duration::days(1);
+    }
+    Ok(series)
+}
+
+#[derive(Default)]
+struct ActivityCell {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    reasoning_tokens: i64,
+    cost_micro_usd: i64,
+    model_calls: i64,
+    duration_ms: Option<i64>,
+    latest_started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct DailyActivity {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    reasoning_tokens: i64,
+    cost_micro_usd: i64,
+    model_calls: i64,
+    duration_ms: Option<i64>,
+}
+
+fn requested_timezone(p: &RangeParams) -> Tz {
+    p.timezone
+        .as_deref()
+        .and_then(|value| value.parse::<Tz>().ok())
+        .unwrap_or(Tz::UTC)
+}
+
+fn local_hour_bounds(value: DateTime<Utc>, timezone: &Tz) -> Option<(String, String)> {
+    let local = value.with_timezone(timezone);
+    let naive = local.date_naive().and_hms_opt(local.hour(), 0, 0)?;
+    let start = timezone
+        .from_local_datetime(&naive)
+        .earliest()?
+        .with_timezone(&Utc);
+    Some((
+        start.to_rfc3339(),
+        (start + Duration::hours(1)).to_rfc3339(),
+    ))
+}
+
+fn available_cost(total: i64, priced_rows: i64) -> Option<i64> {
+    (priced_rows > 0).then_some(total)
 }
 
 /// 查询趋势数据，供 Web API 与邮件报告共用同一套分桶和补零规则。
@@ -357,6 +735,7 @@ pub(crate) fn query_usage_timeseries(
                         datetime((CAST(strftime('%s', u.timestamp) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b{dim_sql},
                 COALESCE(SUM(u.input_tokens),0), COALESCE(SUM(u.output_tokens),0),
                 COALESCE(SUM(u.cache_read_tokens),0), COALESCE(SUM(u.cache_write_tokens),0),
+                COALESCE(SUM(u.reasoning_tokens),0),
                 COALESCE(SUM(COALESCE(u.reported_cost_micro_usd,0)+COALESCE(u.calculated_cost_micro_usd,0)+COALESCE(u.estimated_cost_micro_usd,0)),0),
                 COALESCE(SUM(t.estimated_total_wire_bytes),0),
                 COUNT(*)
@@ -376,9 +755,10 @@ pub(crate) fn query_usage_timeseries(
                     "output_tokens": r.get::<_, i64>(3)?,
                     "cache_read_tokens": r.get::<_, i64>(4)?,
                     "cache_write_tokens": r.get::<_, i64>(5)?,
-                    "cost_micro_usd": r.get::<_, i64>(6)?,
-                    "estimated_traffic_bytes": r.get::<_, i64>(7)?,
-                    "model_calls": r.get::<_, i64>(8)?,
+                    "reasoning_tokens": r.get::<_, i64>(6)?,
+                    "cost_micro_usd": r.get::<_, i64>(7)?,
+                    "estimated_traffic_bytes": r.get::<_, i64>(8)?,
+                    "model_calls": r.get::<_, i64>(9)?,
                 }))
             })
             .map_err(|e| e.to_string())?;
@@ -400,9 +780,10 @@ pub(crate) fn query_usage_timeseries(
                 "SELECT {bucket_col} AS b{dim_sql},
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                COALESCE(SUM(reasoning_tokens),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
                 COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
-             FROM {table} WHERE bucket >= ?1 AND bucket < ?2 {filter}
+             FROM {table} WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}
              GROUP BY {group_sql} ORDER BY b"
             ))
             .map_err(|e| e.to_string())?;
@@ -415,9 +796,10 @@ pub(crate) fn query_usage_timeseries(
                     "output_tokens": r.get::<_, i64>(3)?,
                     "cache_read_tokens": r.get::<_, i64>(4)?,
                     "cache_write_tokens": r.get::<_, i64>(5)?,
-                    "cost_micro_usd": r.get::<_, i64>(6)?,
-                    "estimated_traffic_bytes": r.get::<_, i64>(7)?,
-                    "model_calls": r.get::<_, i64>(8)?,
+                    "reasoning_tokens": r.get::<_, i64>(6)?,
+                    "cost_micro_usd": r.get::<_, i64>(7)?,
+                    "estimated_traffic_bytes": r.get::<_, i64>(8)?,
+                    "model_calls": r.get::<_, i64>(9)?,
                 }))
             })
             .map_err(|e| e.to_string())?;
@@ -477,12 +859,180 @@ fn range_filter_usage(p: &RangeParams) -> (String, Vec<SqlValue>) {
         args.push(v.clone().into());
         parts.push(format!("provider_normalized = ?{}", args.len() + 2));
     }
+    if let Some(v) = &p.project_id {
+        args.push(v.clone().into());
+        parts.push(format!("project_id = ?{}", args.len() + 2));
+    }
     let cond = if parts.is_empty() {
         String::new()
     } else {
         format!(" AND {}", parts.join(" AND "))
     };
     (cond, args)
+}
+
+/// sessions 表专用范围过滤，列名带 s. 以便复用于消息和会话时长查询。
+fn range_filter_sessions(p: &RangeParams) -> (String, Vec<SqlValue>) {
+    let mut parts = Vec::new();
+    let mut args: Vec<SqlValue> = Vec::new();
+    if let Some(v) = &p.node_id {
+        args.push(v.clone().into());
+        parts.push(format!("s.node_id = ?{}", args.len() + 2));
+    }
+    if let Some(v) = &p.client_id {
+        args.push(v.clone().into());
+        parts.push(format!("s.client_id = ?{}", args.len() + 2));
+    }
+    if let Some(v) = &p.model {
+        args.push(v.clone().into());
+        parts.push(format!("s.primary_model_normalized = ?{}", args.len() + 2));
+    }
+    add_exclusions(
+        &mut parts,
+        &mut args,
+        "s.client_id",
+        p.exclude_client_ids.as_deref(),
+    );
+    add_exclusions(
+        &mut parts,
+        &mut args,
+        "s.primary_model_normalized",
+        p.exclude_models.as_deref(),
+    );
+    if let Some(v) = &p.provider {
+        args.push(v.clone().into());
+        parts.push(format!("s.provider_normalized = ?{}", args.len() + 2));
+    }
+    if let Some(v) = &p.project_id {
+        args.push(v.clone().into());
+        parts.push(format!("s.project_id = ?{}", args.len() + 2));
+    }
+    let cond = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", parts.join(" AND "))
+    };
+    (cond, args)
+}
+
+fn source_scope_filter(p: &RangeParams) -> (String, Vec<SqlValue>) {
+    let mut parts = Vec::new();
+    let mut args: Vec<SqlValue> = Vec::new();
+    if let Some(v) = &p.node_id {
+        args.push(v.clone().into());
+        parts.push(format!("s.node_id = ?{}", args.len()));
+    }
+    if let Some(v) = &p.client_id {
+        args.push(v.clone().into());
+        parts.push(format!("s.client_id = ?{}", args.len()));
+    }
+    let cond = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", parts.join(" AND "))
+    };
+    (cond, args)
+}
+
+fn collector_scope_filter(p: &RangeParams) -> (String, Vec<SqlValue>) {
+    let mut parts = Vec::new();
+    let mut args: Vec<SqlValue> = Vec::new();
+    if let Some(v) = &p.node_id {
+        args.push(v.clone().into());
+        parts.push(format!("col.node_id = ?{}", args.len()));
+    }
+    if let Some(v) = &p.client_id {
+        args.push(v.clone().into());
+        parts.push(format!(
+            "EXISTS (SELECT 1 FROM sources cs WHERE cs.collector_id = col.id AND cs.client_id = ?{})",
+            args.len()
+        ));
+    }
+    let cond = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", parts.join(" AND "))
+    };
+    (cond, args)
+}
+
+/// 返回与当前节点/Agent范围相关的采集健康状态。模型和项目不影响采集器本身的健康。
+fn freshness_summary(
+    c: &metria_storage::rusqlite::Connection,
+    p: &RangeParams,
+) -> serde_json::Value {
+    let (source_filter, mut source_args) = source_scope_filter(p);
+    let cutoff = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+    let cutoff_index = source_args.len() + 1;
+    source_args.push(cutoff.into());
+    let source = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'active' AND last_error IS NULL AND last_scan_at IS NOT NULL THEN 1 ELSE 0 END),0),
+                    MAX(last_scan_at), MAX(last_event_at),
+                    COALESCE(SUM(CASE WHEN last_scan_at IS NULL OR last_scan_at < ?{cutoff_index} THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+                 FROM sources s WHERE 1 = 1 {source_filter}"
+            ),
+            params_from_iter(source_args),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .unwrap_or((0, 0, None, None, 0, 0));
+
+    let (collector_filter, mut collector_args) = collector_scope_filter(p);
+    let online_index = collector_args.len() + 1;
+    collector_args.push((Utc::now() - Duration::minutes(5)).to_rfc3339().into());
+    let collectors = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN col.last_heartbeat_at >= ?{online_index} THEN 1 ELSE 0 END),0),
+                    MAX(col.last_upload_at)
+                 FROM collectors col WHERE 1 = 1 {collector_filter}"
+            ),
+            params_from_iter(collector_args),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap_or((0, 0, None));
+
+    let status = if source.5 > 0 {
+        "error"
+    } else if source.4 > 0 {
+        "delayed"
+    } else if source.0 == 0 {
+        "unavailable"
+    } else {
+        "fresh"
+    };
+    serde_json::json!({
+        "status": status,
+        "last_scan_at": source.2,
+        "last_event_at": source.3,
+        "last_upload_at": collectors.2,
+        "source_total": source.0,
+        "source_healthy": source.1,
+        "source_stale": source.4,
+        "source_errors": source.5,
+        "coverage": if source.0 > 0 { Some(source.1 as f64 / source.0 as f64) } else { None },
+        "collectors_total": collectors.0,
+        "collectors_online": collectors.1,
+    })
 }
 
 /// 为 raw 分桶查询（usage_events u LEFT JOIN traffic_estimates t）的过滤条件
@@ -496,6 +1046,7 @@ fn prefix_usage_filter(filter: &str) -> String {
         .replace("model_normalized = ", "u.model_normalized = ")
         .replace("model_normalized NOT IN", "u.model_normalized NOT IN")
         .replace("provider_normalized = ", "u.provider_normalized = ")
+        .replace("project_id = ", "tm.project_id = ")
 }
 
 /// 把 timeseries 补齐为范围内完整 bucket 序列（无数据的时段零填充），
@@ -546,6 +1097,7 @@ fn zero_point(bucket: &str, _has_dim: bool) -> serde_json::Value {
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
         "cost_micro_usd": 0,
         "estimated_traffic_bytes": 0,
         "model_calls": 0,
@@ -578,11 +1130,13 @@ pub(crate) async fn usage_breakdown(
     let mut stmt = q!(c.prepare(&format!(
         "SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+            COALESCE(SUM(reasoning_tokens),0),
             COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
             COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-            COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0)
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter}{null_filter}
-         GROUP BY {col} ORDER BY 9 DESC"
+            COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0),
+            COUNT(CASE WHEN pricing_source != '' THEN 1 END)
+         FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}{null_filter}
+         GROUP BY {col} ORDER BY 10 DESC"
     )));
     let rows = q!(
         stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
@@ -592,13 +1146,14 @@ pub(crate) async fn usage_breakdown(
                 "output_tokens": r.get::<_, i64>(2)?,
                 "cache_read_tokens": r.get::<_, i64>(3)?,
                 "cache_write_tokens": r.get::<_, i64>(4)?,
-                "estimated_traffic_bytes": r.get::<_, i64>(5)?,
-                "model_calls": r.get::<_, i64>(6)?,
-                "sessions": r.get::<_, i64>(7)?,
-                "cost_micro_usd": r.get::<_, i64>(8)?,
-                "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
-                "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
-                "reported_cost_micro_usd": r.get::<_, i64>(11)?,
+                "reasoning_tokens": r.get::<_, i64>(5)?,
+                "estimated_traffic_bytes": r.get::<_, i64>(6)?,
+                "model_calls": r.get::<_, i64>(7)?,
+                "sessions": r.get::<_, i64>(8)?,
+                "cost_micro_usd": available_cost(r.get::<_, i64>(9)?, r.get::<_, i64>(13)?),
+                "calculated_cost_micro_usd": r.get::<_, i64>(10)?,
+                "estimated_cost_micro_usd": r.get::<_, i64>(11)?,
+                "reported_cost_micro_usd": r.get::<_, i64>(12)?,
             }))
         },)
     );
@@ -668,15 +1223,20 @@ pub(crate) async fn node_detail(
     // 分布统计（S3.4）：按 Model / Project 汇总本 Node 的调用与 token
     let mut by_model = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT COALESCE(model_normalized,'(unknown)'), COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+        "SELECT COALESCE(model_normalized,'(unknown)'), COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
          FROM model_calls WHERE node_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized ORDER BY 2 DESC LIMIT 10",
     ) {
         if let Ok(rows) = stmt.query_map([&id], |r| {
+            let cost = r.get::<_, i64>(4)?;
+            let priced_calls = r.get::<_, i64>(5)?;
             Ok(serde_json::json!({
                 "model": r.get::<_, String>(0)?,
                 "calls": r.get::<_, i64>(1)?,
                 "input_tokens": r.get::<_, i64>(2)?,
                 "output_tokens": r.get::<_, i64>(3)?,
+                "cost_micro_usd": available_cost(cost, priced_calls),
             }))
         }) {
             by_model = rows.filter_map(|x| x.ok()).collect();
@@ -684,14 +1244,19 @@ pub(crate) async fn node_detail(
     }
     let mut by_project = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(estimated_total_bytes),0)
+        "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(estimated_total_bytes),0),
+                COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
          FROM sessions WHERE node_id = ?1 GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
     ) {
         if let Ok(rows) = stmt.query_map([&id], |r| {
+            let cost = r.get::<_, i64>(3)?;
+            let priced_sessions = r.get::<_, i64>(4)?;
             Ok(serde_json::json!({
                 "project_id": r.get::<_, String>(0)?,
                 "sessions": r.get::<_, i64>(1)?,
                 "estimated_total_bytes": r.get::<_, i64>(2)?,
+                "cost_micro_usd": available_cost(cost, priced_sessions),
             }))
         }) {
             by_project = rows.filter_map(|x| x.ok()).collect();
@@ -732,7 +1297,7 @@ pub(crate) async fn node_detail(
         "SELECT s.client_id, COUNT(DISTINCT s.id) as src_count,
                 COALESCE(SUM(mc.model_call_count),0)
          FROM sources s LEFT JOIN sessions se ON se.node_id = s.node_id AND se.client_id = s.client_id
-         LEFT JOIN hourly_rollups mc ON mc.node_id = s.node_id AND mc.client_id = s.client_id AND mc.bucket >= ?2 AND mc.bucket < ?3
+         LEFT JOIN hourly_rollups mc ON mc.node_id = s.node_id AND mc.client_id = s.client_id AND julianday(mc.bucket) >= julianday(?2) AND julianday(mc.bucket) < julianday(?3)
          WHERE s.node_id = ?1 GROUP BY s.client_id",
     ) {
         if let Ok(rows) = stmt.query_map(
@@ -754,8 +1319,9 @@ pub(crate) async fn node_detail(
                     COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
                     COALESCE(SUM(estimated_total_bytes),0),
                     COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
-                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
-             FROM hourly_rollups WHERE node_id = ?1 AND bucket >= ?2 AND bucket < ?3",
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0)
+             FROM hourly_rollups WHERE node_id = ?1 AND julianday(bucket) >= julianday(?2) AND julianday(bucket) < julianday(?3)",
             params![id, from.to_rfc3339(), to.to_rfc3339()],
             |r| {
                 Ok(serde_json::json!({
@@ -767,6 +1333,7 @@ pub(crate) async fn node_detail(
                     "sessions": r.get::<_, i64>(5)?,
                     "cache_read_tokens": r.get::<_, i64>(6)?,
                     "cache_write_tokens": r.get::<_, i64>(7)?,
+                    "reasoning_tokens": r.get::<_, i64>(8)?,
                 }))
             },
         )
@@ -970,7 +1537,7 @@ pub(crate) async fn list_clients(
         "SELECT client_id,
             COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
             COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0)
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter} GROUP BY client_id ORDER BY 2 DESC"
+         FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter} GROUP BY client_id ORDER BY 2 DESC"
     )));
     let rows = q!(
         stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
@@ -997,11 +1564,14 @@ pub(crate) async fn client_detail(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(
-        "SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0)
-         FROM hourly_rollups WHERE client_id = ?1 AND bucket >= ?2 AND bucket < ?3 GROUP BY node_id ORDER BY 2 DESC",
+        "SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+                COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0), COUNT(CASE WHEN pricing_source != '' THEN 1 END)
+         FROM hourly_rollups WHERE client_id = ?1 AND julianday(bucket) >= julianday(?2) AND julianday(bucket) < julianday(?3) GROUP BY node_id ORDER BY 2 DESC",
     ));
     let rows = q!(
         stmt.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+            let cost = r.get::<_, i64>(6)?;
+            let priced_rows = r.get::<_, i64>(7)?;
             Ok(serde_json::json!({
                 "node_id": r.get::<_, String>(0)?,
                 "input_tokens": r.get::<_, i64>(1)?,
@@ -1009,6 +1579,7 @@ pub(crate) async fn client_detail(
                 "estimated_traffic_bytes": r.get::<_, i64>(3)?,
                 "model_calls": r.get::<_, i64>(4)?,
                 "sessions": r.get::<_, i64>(5)?,
+                "cost_micro_usd": available_cost(cost, priced_rows),
             }))
         },)
     );
@@ -1047,7 +1618,7 @@ pub(crate) async fn client_detail(
             "SELECT COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_total_bytes),0),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
-             FROM hourly_rollups WHERE client_id = ?1 AND bucket >= ?2 AND bucket < ?3",
+             FROM hourly_rollups WHERE client_id = ?1 AND julianday(bucket) >= julianday(?2) AND julianday(bucket) < julianday(?3)",
             params![id, from.to_rfc3339(), to.to_rfc3339()],
             |r| {
                 Ok((
@@ -1067,18 +1638,23 @@ pub(crate) async fn client_detail(
     let by_project: Vec<serde_json::Value> = {
         let mut st = q!(c.prepare(
             "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(model_call_count),0),
-                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(estimated_total_bytes),0)
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
+                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
              FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
              GROUP BY project_id ORDER BY 3 DESC LIMIT 10",
         ));
         let r = q!(
             st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                let cost = r.get::<_, i64>(5)?;
+                let priced_sessions = r.get::<_, i64>(6)?;
                 Ok(serde_json::json!({
                     "project_id": r.get::<_, String>(0)?,
                     "sessions": r.get::<_, i64>(1)?,
                     "model_calls": r.get::<_, i64>(2)?,
                     "input_tokens": r.get::<_, i64>(3)?,
                     "estimated_total_bytes": r.get::<_, i64>(4)?,
+                    "cost_micro_usd": available_cost(cost, priced_sessions),
                 }))
             },)
         );
@@ -1169,16 +1745,21 @@ pub(crate) async fn client_models(
         // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
         let c = st.db.conn();
         let mut stmt = q!(c.prepare(
-            "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
+            "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
              FROM model_calls WHERE client_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized, provider_normalized ORDER BY cnt DESC",
         ));
         let rows = q!(stmt.query_map([&id], |r| {
+            let cost = r.get::<_, i64>(5)?;
+            let priced_calls = r.get::<_, i64>(6)?;
             Ok(serde_json::json!({
                 "model": r.get::<_, String>(0)?,
                 "provider": r.get::<_, Option<String>>(1)?,
                 "calls": r.get::<_, i64>(2)?,
                 "input_tokens": r.get::<_, i64>(3)?,
                 "output_tokens": r.get::<_, i64>(4)?,
+                "cost_micro_usd": available_cost(cost, priced_calls),
             }))
         }));
         rows.filter_map(|r| r.ok()).collect()
@@ -1216,8 +1797,9 @@ pub(crate) async fn list_models(
             "SELECT model, MAX(provider),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
                 COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id),
-                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0)
-             FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
+                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
+                COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0)
+             FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
         )));
         let rows = q!(
             stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
@@ -1235,6 +1817,7 @@ pub(crate) async fn list_models(
                     "calculated_cost_micro_usd": r.get::<_, i64>(10)?,
                     "estimated_cost_micro_usd": r.get::<_, i64>(11)?,
                     "reported_cost_micro_usd": r.get::<_, i64>(12)?,
+                    "reasoning_tokens": r.get::<_, i64>(13)?,
                 }))
             },)
         );
@@ -1367,7 +1950,7 @@ pub(crate) async fn model_detail(
                     COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
                     COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
                     COALESCE(SUM(session_count),0)
-             FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3",
+             FROM hourly_rollups WHERE model = ?1 AND julianday(bucket) >= julianday(?2) AND julianday(bucket) < julianday(?3)",
             params![id, from.to_rfc3339(), to.to_rfc3339()],
             |r| {
                 Ok(serde_json::json!({
@@ -1394,7 +1977,8 @@ pub(crate) async fn model_detail(
         let recent_sessions: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(
                 "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at,
-                        model_call_count, input_tokens, output_tokens, cache_read_tokens, estimated_total_bytes
+                        model_call_count, input_tokens, output_tokens, cache_read_tokens, estimated_total_bytes,
+                        reasoning_tokens
                  FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3
                  ORDER BY started_at DESC LIMIT 20",
             ));
@@ -1412,6 +1996,7 @@ pub(crate) async fn model_detail(
                         "output_tokens": r.get::<_, Option<i64>>(8)?,
                         "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
                         "estimated_total_bytes": r.get::<_, Option<i64>>(10)?,
+                        "reasoning_tokens": r.get::<_, Option<i64>>(11)?,
                     }))
                 },)
             );
@@ -1452,8 +2037,9 @@ pub(crate) async fn model_detail(
                 "SELECT bucket,
                         COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                         COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
-                 FROM hourly_rollups WHERE model = ?1 AND bucket >= ?2 AND bucket < ?3
+                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(reasoning_tokens),0)
+                 FROM hourly_rollups WHERE model = ?1 AND julianday(bucket) >= julianday(?2) AND julianday(bucket) < julianday(?3)
                  GROUP BY bucket ORDER BY bucket",
             ));
             let r = q!(
@@ -1465,6 +2051,7 @@ pub(crate) async fn model_detail(
                         "cost_micro_usd": r.get::<_, i64>(3)?,
                         "estimated_traffic_bytes": r.get::<_, i64>(4)?,
                         "model_calls": r.get::<_, i64>(5)?,
+                        "reasoning_tokens": r.get::<_, i64>(6)?,
                     }))
                 },)
             );
@@ -1669,52 +2256,59 @@ pub(crate) async fn list_sessions(
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(100).min(1000);
     let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+    let (session_filter, session_fargs) = range_filter_sessions(&p);
     // 会话在所选时间范围内仍活跃（last_activity_at 落在范围内）也展示，
     // 而非仅按 started_at 过滤，避免"还在用"的会话从列表消失。
     let range_overlap = format!(
-        "(({tcol} >= ?1 AND {tcol} < ?2) OR (last_activity_at >= ?1 AND last_activity_at < ?2))"
+        "((s.{tcol} >= ?1 AND s.{tcol} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
     );
     let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
         match crate::api::decode_cursor(cur) {
-            Some((ts, id)) => (
-                format!(
-                    "SELECT id, source_session_id, client_id, node_id, title, provider_normalized, primary_model_normalized, started_at, ended_at, last_activity_at,
+            Some((ts, id)) => {
+                let cursor_index = 3 + session_fargs.len();
+                let limit_index = cursor_index + 2;
+                let mut args = range_args(&from, &to, session_fargs.clone());
+                args.extend([
+                    SqlValue::Text(ts),
+                    SqlValue::Text(id),
+                    SqlValue::Integer(limit),
+                ]);
+                (
+                    format!(
+                    "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
                         message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
                         reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
                         estimated_total_bytes, status,
                         CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
-                             THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms
-                     FROM sessions WHERE {range_overlap}
-                       AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
-                     ORDER BY {tcol} DESC, id DESC LIMIT ?5"
+                             THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
+                        reasoning_tokens
+                     FROM sessions s WHERE {range_overlap} {session_filter}
+                       AND (s.{tcol} < ?{cursor_index} OR (s.{tcol} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
+                     ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}",
+                    next_cursor_index = cursor_index + 1,
                 ),
-                vec![
-                    SqlValue::Text(from.to_rfc3339()),
-                    SqlValue::Text(to.to_rfc3339()),
-                    SqlValue::Text(ts),
-                    SqlValue::Text(id),
-                    SqlValue::Integer(limit),
-                ],
-            ),
+                    args,
+                )
+            }
             None => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", "分页游标无效"),
         }
     } else {
+        let limit_index = 3 + session_fargs.len();
+        let mut args = range_args(&from, &to, session_fargs);
+        args.push(SqlValue::Integer(limit));
         (
             format!(
-                "SELECT id, source_session_id, client_id, node_id, title, provider_normalized, primary_model_normalized, started_at, ended_at, last_activity_at,
+                "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
                     message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
                     reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
                     estimated_total_bytes, status,
                     CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
-                         THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms
-                 FROM sessions WHERE {range_overlap}
-                 ORDER BY {tcol} DESC, id DESC LIMIT ?3"
+                         THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
+                    reasoning_tokens
+                 FROM sessions s WHERE {range_overlap} {session_filter}
+                 ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}"
             ),
-            vec![
-                SqlValue::Text(from.to_rfc3339()),
-                SqlValue::Text(to.to_rfc3339()),
-                SqlValue::Integer(limit),
-            ],
+            args,
         )
     };
     let mut stmt = q!(c.prepare(&sql));
@@ -1742,6 +2336,7 @@ pub(crate) async fn list_sessions(
             "estimated_total_bytes": r.get::<_, Option<i64>>(19)?,
             "status": r.get::<_, String>(20)?,
             "duration_ms": r.get::<_, Option<i64>>(21)?,
+            "reasoning_tokens": r.get::<_, Option<i64>>(22)?,
         }))
     },));
     let sessions: Vec<serde_json::Value> = rows
@@ -2016,7 +2611,7 @@ pub(crate) async fn traffic_summary(
         &format!(
             "SELECT COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
                 COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0), COALESCE(SUM(model_call_count),0)
-             FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter}"
+             FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}"
         ),
         params_from_iter(range_args(&from, &to, fargs)),
         |r| {
@@ -2043,7 +2638,7 @@ macro_rules! traffic_by_dim {
                 "SELECT $dim AS d,
                     COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
                     COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0), COALESCE(SUM(model_call_count),0)
-                 FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter} GROUP BY d ORDER BY 4 DESC"
+                 FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter} GROUP BY d ORDER BY 4 DESC"
             )));
             let rows = q!(stmt.query_map(
                 params_from_iter(range_args(&from, &to, fargs)),
@@ -2079,7 +2674,7 @@ pub(crate) async fn data_quality(
 
     let mut usage_dist = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT usage_source, COALESCE(SUM(input_tokens),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 GROUP BY usage_source",
+        "SELECT usage_source, COALESCE(SUM(input_tokens),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) GROUP BY usage_source",
     ) {
         if let Ok(rows) = stmt.query_map(
             params![from.to_rfc3339(), to.to_rfc3339()],
@@ -2097,7 +2692,7 @@ pub(crate) async fn data_quality(
 
     let mut traffic_dist = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT traffic_estimation_source, COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND traffic_estimation_source != '' GROUP BY traffic_estimation_source",
+        "SELECT traffic_estimation_source, COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) AND traffic_estimation_source != '' GROUP BY traffic_estimation_source",
     ) {
         if let Ok(rows) = stmt.query_map(
             params![from.to_rfc3339(), to.to_rfc3339()],
@@ -2507,4 +3102,194 @@ fn fill_latency_timeseries(
         cur += chrono::Duration::seconds(bucket_secs);
     }
     out
+}
+
+/// 完整小时边界：from 向上取整、to 向下取整（UTC 整点）。
+fn full_hour_bounds(from: DateTime<Utc>, to: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let ceil = |ts: DateTime<Utc>| {
+        let secs = ts.timestamp();
+        let rem = secs.rem_euclid(3600);
+        let aligned = if rem == 0 { secs } else { secs - rem + 3600 };
+        Utc.timestamp_opt(aligned, 0).single().unwrap_or(ts)
+    };
+    let floor = |ts: DateTime<Utc>| {
+        let secs = ts.timestamp();
+        Utc.timestamp_opt(secs - secs.rem_euclid(3600), 0)
+            .single()
+            .unwrap_or(ts)
+    };
+    (ceil(from), floor(to))
+}
+
+/// rollup 无法覆盖的两端不完整小时窗口（最多两段；不含完整小时区间）。
+fn edge_windows(
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    h_from: DateTime<Utc>,
+    h_to: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    if h_from >= h_to {
+        return if from < to {
+            vec![(from, to)]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut windows = Vec::new();
+    if from < h_from {
+        windows.push((from, h_from));
+    }
+    if h_to < to {
+        windows.push((h_to, to));
+    }
+    windows
+}
+
+/// 用原始明细补齐总览在两端不完整小时的聚合（token/费用/调用数/流量/会话/消息）。
+#[allow(clippy::too_many_arguments)]
+fn add_overview_raw_edges(
+    body: &mut serde_json::Value,
+    c: &metria_storage::rusqlite::Connection,
+    p: &RangeParams,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    h_from: DateTime<Utc>,
+    h_to: DateTime<Utc>,
+    call_filter: &str,
+    call_fargs: &[SqlValue],
+) {
+    let (session_filter, session_fargs) = range_filter_sessions(p);
+    for (w_from, w_to) in edge_windows(from, to, h_from, h_to) {
+        if let Ok(values) = c.query_row(
+            &format!(
+                "SELECT
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(reported_cost_micro_usd),0), COALESCE(SUM(calculated_cost_micro_usd),0), COALESCE(SUM(estimated_cost_micro_usd),0),
+                    COALESCE(SUM((SELECT estimated_request_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
+                    COALESCE(SUM((SELECT estimated_response_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
+                    COALESCE(SUM((SELECT estimated_total_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
+                    COALESCE(SUM((SELECT lower_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
+                    COALESCE(SUM((SELECT upper_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
+                    COUNT(*)
+                 FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 {call_filter}"
+            ),
+            params_from_iter(range_args(&w_from, &w_to, call_fargs.to_vec())),
+            |r| {
+                let mut out = Vec::with_capacity(14);
+                for i in 0..13 {
+                    out.push(r.get::<_, i64>(i).unwrap_or(0));
+                }
+                out.push(r.get::<_, i64>(13).unwrap_or(0));
+                Ok(out)
+            },
+        ) {
+            const CALL_KEYS: [&str; 14] = [
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "reported_cost_micro_usd",
+                "calculated_cost_micro_usd",
+                "estimated_cost_micro_usd",
+                "estimated_request_bytes",
+                "estimated_response_bytes",
+                "estimated_total_bytes",
+                "traffic_lower_bound_bytes",
+                "traffic_upper_bound_bytes",
+                "model_calls",
+            ];
+            for (key, value) in CALL_KEYS.iter().zip(values.iter()) {
+                add_json_number(body, key, *value);
+            }
+        }
+        if let Ok((sessions, messages, tools)) = c.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(s.message_count),0), COALESCE(SUM(s.tool_call_count),0)
+                 FROM sessions s WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
+            ),
+            params_from_iter(range_args(&w_from, &w_to, session_fargs.clone())),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0).unwrap_or(0),
+                    r.get::<_, i64>(1).unwrap_or(0),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                ))
+            },
+        ) {
+            add_json_number(body, "sessions", sessions);
+            add_json_number(body, "message_count", messages);
+            add_json_number(body, "tool_call_count", tools);
+        }
+    }
+}
+
+fn add_json_number(body: &mut serde_json::Value, key: &str, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    let current = body
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    body[key] = serde_json::json!(current + delta);
+}
+
+#[cfg(test)]
+mod rollup_window_tests {
+    use super::{edge_windows, full_hour_bounds};
+    use chrono::{DateTime, Utc};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn full_hour_bounds_ceil_and_floor() {
+        let (hf, ht) = full_hour_bounds(ts("2026-09-16T00:29:14.165Z"), ts("2026-09-16T03:15:00Z"));
+        assert_eq!(hf, ts("2026-09-16T01:00:00Z"));
+        assert_eq!(ht, ts("2026-09-16T03:00:00Z"));
+        let (hf2, ht2) = full_hour_bounds(ts("2026-09-16T01:00:00Z"), ts("2026-09-16T03:00:00Z"));
+        assert_eq!(hf2, ts("2026-09-16T01:00:00Z"));
+        assert_eq!(ht2, ts("2026-09-16T03:00:00Z"));
+    }
+
+    #[test]
+    fn edge_windows_cover_only_partial_hours() {
+        // 两边都不完整
+        let w = edge_windows(
+            ts("2026-09-16T00:29:00Z"),
+            ts("2026-09-16T03:15:00Z"),
+            ts("2026-09-16T01:00:00Z"),
+            ts("2026-09-16T03:00:00Z"),
+        );
+        assert_eq!(
+            w,
+            vec![
+                (ts("2026-09-16T00:29:00Z"), ts("2026-09-16T01:00:00Z")),
+                (ts("2026-09-16T03:00:00Z"), ts("2026-09-16T03:15:00Z"))
+            ]
+        );
+        // 对齐：无补边
+        assert!(edge_windows(
+            ts("2026-09-16T01:00:00Z"),
+            ts("2026-09-16T03:00:00Z"),
+            ts("2026-09-16T01:00:00Z"),
+            ts("2026-09-16T03:00:00Z"),
+        )
+        .is_empty());
+        // 不足一小时且不对齐：整段走明细
+        let short = edge_windows(
+            ts("2026-09-16T00:29:00Z"),
+            ts("2026-09-16T00:45:00Z"),
+            ts("2026-09-16T01:00:00Z"),
+            ts("2026-09-16T00:00:00Z"),
+        );
+        assert_eq!(
+            short,
+            vec![(ts("2026-09-16T00:29:00Z"), ts("2026-09-16T00:45:00Z"))]
+        );
+    }
 }

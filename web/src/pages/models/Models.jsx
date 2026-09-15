@@ -6,7 +6,7 @@ import PageHeader from '../../components/common/PageHeader'
 import DataTable from '../../components/tables/DataTable'
 import FilterBar from '../../components/filters/FilterBar'
 import { ErrorState, LoadingSkeleton, DataQualityNote } from '../../components/feedback/Feedback'
-import { api, q, rangeParams } from '../../services/api'
+import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
@@ -15,9 +15,8 @@ import { fmtTokensShort, fmtUsd, fmtPct100, fmtDuration, sumTokens } from '../..
 export default function Models() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const params = rangeParams(range)
-  const { nodeId } = useNodeFilter()
-  if (nodeId) params.node_id = nodeId
+  const { nodeId, clientId, model, projectId } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
   const [search, setSearch] = useState('')
 
   const query = useQuery(`models${q(params)}`, () => api(`/models${q(params)}`))

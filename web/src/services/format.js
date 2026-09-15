@@ -19,25 +19,12 @@ export function fmtTokens(t) {
 }
 
 /**
- * 统一 Token 总计口径：input + output + cache_read。
- * 全站「总 Token / Token 列」必须使用本函数，避免跨页数字分叉。
- * 缓存写入（cache_write）默认不计入，如需计入使用 sumTokensWithWrite。
+ * 统一 Token 总计口径：input + output + reasoning。
+ * 全站「总 Token / Token 列」必须使用本函数，缓存读写单独展示。
  */
 export function sumTokens(o) {
   if (!o) return 0
-  return (o.input_tokens ?? 0) + (o.output_tokens ?? 0) + (o.cache_read_tokens ?? 0)
-}
-
-/** 含缓存写入的总 Token（总览主指标口径，单独展示时标注）。 */
-export function sumTokensWithWrite(o) {
-  if (!o) return 0
-  return sumTokens(o) + (o.cache_write_tokens ?? 0)
-}
-
-/** 含推理 Token 的总 Token（总览主指标，推理并入总口径）。 */
-export function sumTokensWithReasoning(o) {
-  if (!o) return 0
-  return sumTokensWithWrite(o) + (o.reasoning_tokens ?? 0)
+  return (o.input_tokens ?? 0) + (o.output_tokens ?? 0) + (o.reasoning_tokens ?? 0)
 }
 
 /** Token 简写（表格用）：12.8M */
@@ -103,6 +90,29 @@ export function fmtPct(p) {
 export function fmtPct100(p) {
   if (p === null || p === undefined || Number.isNaN(p)) return '—'
   return `${Number(p).toFixed(1)}%`
+}
+
+/** 当前值相对上一等长周期的百分比变化；上一周期为 0 时不可比较。 */
+export function percentChange(current, previous) {
+  const currentValue = Number(current)
+  const previousValue = Number(previous)
+  if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue) || previousValue === 0) return null
+  return ((currentValue - previousValue) / Math.abs(previousValue)) * 100
+}
+
+/** KPI 对比标签：+12.3% / -4.0%。 */
+export function fmtChange(current, previous) {
+  const change = percentChange(current, previous)
+  if (change === null) return null
+  return `${change >= 0 ? '+' : ''}${change.toFixed(1)}%`
+}
+
+/** 返回 MetricCard 使用的涨跌语义；inverse 用于错误率等“越低越好”指标。 */
+export function changeTone(current, previous, inverse = false) {
+  const change = percentChange(current, previous)
+  if (change === null || change === 0) return 'neutral'
+  const positive = inverse ? change < 0 : change > 0
+  return positive ? 'up' : 'down'
 }
 
 /**

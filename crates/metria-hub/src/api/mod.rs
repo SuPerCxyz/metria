@@ -117,6 +117,9 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/usage/timeseries", get(usage_timeseries))
         .route("/api/v1/usage/breakdown", get(usage_breakdown))
+        .route("/api/v1/usage/filter-options", get(usage_filter_options))
+        .route("/api/v1/usage/heatmap", get(usage_heatmap))
+        .route("/api/v1/usage/daily", get(usage_daily))
         .route("/api/v1/usage/latency", get(usage_latency))
         .route("/api/v1/usage/performance", get(usage_performance))
         .route(
@@ -477,6 +480,10 @@ pub(crate) fn range_filter(p: &RangeParams) -> (String, Vec<SqlValue>) {
     if let Some(v) = &p.provider {
         args.push(v.clone().into());
         parts.push(format!("provider = ?{}", args.len() + 2));
+    }
+    if let Some(v) = &p.project_id {
+        args.push(v.clone().into());
+        parts.push(format!("project_id = ?{}", args.len() + 2));
     }
     let cond = if parts.is_empty() {
         String::new()

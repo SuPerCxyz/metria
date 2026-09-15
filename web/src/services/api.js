@@ -67,6 +67,17 @@ export function rangeParams(range) {
   return {
     from: range?.from || undefined,
     to: range?.to || undefined,
-    timezone: range?.timezone || undefined,
+    timezone: range?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  }
+}
+
+// 时间范围 + 全局用量筛选，所有聚合页面使用同一套参数。
+export function usageRangeParams(range, filters = {}) {
+  return {
+    ...rangeParams(range),
+    node_id: filters.nodeId || undefined,
+    client_id: filters.clientId || undefined,
+    model: filters.model || undefined,
+    project_id: filters.projectId || undefined,
   }
 }

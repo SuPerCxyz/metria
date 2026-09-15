@@ -3,7 +3,7 @@
 import React from 'react'
 import { sortRankingItems } from '../../services/ranking'
 
-export default function RankingList({ items, valueKey, labelKey, format, limit = 5, onItemClick }) {
+export default function RankingList({ items, valueKey, labelKey, format, secondaryKey, secondaryLabel = '费用', secondaryFormat, limit = 5, onItemClick }) {
   const rows = sortRankingItems(items, valueKey, limit)
   const max = Math.max(1, ...rows.map((r) => Number(r[valueKey] ?? 0)))
 
@@ -27,6 +27,11 @@ export default function RankingList({ items, valueKey, labelKey, format, limit =
                 <span className="min-w-0 truncate text-sm font-medium text-gray-700 dark:text-gray-200">{label}</span>
                 <span className="shrink-0 text-sm font-semibold text-gray-800 dark:text-gray-100 tabular-nums">{format ? format(v) : v.toLocaleString()}</span>
               </span>
+              {secondaryKey && (
+                <span className="block mt-0.5 text-xs text-gray-400 dark:text-gray-500 tabular-nums">
+                  {secondaryLabel} {secondaryFormat ? secondaryFormat(item[secondaryKey]) : (item[secondaryKey] ?? '—')}
+                </span>
+              )}
               <span className="block h-1.5 mt-1 bg-gray-100 dark:bg-gray-700/40 rounded-full overflow-hidden">
                 <span className="block h-full bg-indigo-500/70 dark:bg-indigo-400/70 rounded-full" style={{ width: `${pct}%` }} />
               </span>

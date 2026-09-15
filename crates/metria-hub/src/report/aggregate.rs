@@ -32,11 +32,11 @@ pub struct ReportMetrics {
 
 impl ReportMetrics {
     pub fn total_tokens(&self) -> i64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens
-            + self.reasoning_tokens
+        self.input_tokens + self.output_tokens + self.reasoning_tokens
+    }
+
+    pub(crate) fn token_components(&self) -> i64 {
+        self.total_tokens() + self.cache_read_tokens + self.cache_write_tokens
     }
 }
 
@@ -88,7 +88,7 @@ pub fn aggregate(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>, top_n: i64)
             COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
             COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0),
             COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0)
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2",
+         FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2)",
         [&from_s, &to_s],
         |r| {
             Ok::<_, metria_storage::rusqlite::Error>((
@@ -140,8 +140,8 @@ fn dim_breakdown(
     // column 来自内部常量，不接受外部输入，无注入风险。
     let sql = format!(
         "SELECT {column}, COALESCE(SUM(model_call_count),0) AS calls,
-                COALESCE(SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens+reasoning_tokens),0) AS tokens
-         FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 AND {column} <> ''
+                COALESCE(SUM(input_tokens+output_tokens+reasoning_tokens),0) AS tokens
+         FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) AND {column} <> ''
          GROUP BY {column} ORDER BY calls DESC, tokens DESC LIMIT ?3"
     );
     let Ok(mut stmt) = c.prepare(&sql) else {
@@ -322,7 +322,7 @@ pub fn dim_daily_chart(
         let current = if by_tokens {
             value(point, "input_tokens")
                 + value(point, "output_tokens")
-                + value(point, "cache_read_tokens")
+                + value(point, "reasoning_tokens")
         } else {
             value(point, "model_calls")
         };
@@ -358,7 +358,8 @@ mod tests {
             reasoning_tokens: 5,
             ..Default::default()
         };
-        assert_eq!(m.total_tokens(), 15);
+        assert_eq!(m.total_tokens(), 8);
+        assert_eq!(m.token_components(), 15);
     }
 
     #[test]

@@ -9,9 +9,10 @@ import StatusBadge from '../../components/common/StatusBadge'
 import FilterBar from '../../components/filters/FilterBar'
 import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { useToast } from '../../components/feedback/Toast'
-import { api, q, rangeParams } from '../../services/api'
+import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { fmtDateTime, fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtRelative, fmtAgentAddress, sumTokens, cacheHitRate } from '../../services/format'
 
 function agentUrlForSubmit(value, previous = '') {
@@ -25,7 +26,8 @@ export default function Nodes() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const { notify } = useToast()
-  const params = rangeParams(range)
+  const { nodeId, clientId, model, projectId } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [created, setCreated] = useState(null) // { node_id, name, token, hub_url, docker_command, native_command }

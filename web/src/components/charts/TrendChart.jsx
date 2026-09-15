@@ -8,7 +8,7 @@ import chartTheme from '../../../chart-theme.json'
 
 export const PALETTE = chartTheme.palette
 
-export default function TrendChart({ labels, values, datasets, tooltipLabels, range, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true }) {
+export default function TrendChart({ labels, values, datasets, tooltipLabels, range, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true, chartType = 'line', stacked = false }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
   const showDateOnAxis = isRangeLongerThanDay(range)
@@ -29,21 +29,25 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, ra
       labels: idx.map((i) => formatTimeLabel(labels[i], false, showDateOnAxis)),
       datasets: ds.map((d) => ({
         label: d.label,
-        data: idx.map((i) => d.values[i] ?? 0),
+        data: idx.map((i) => d.values[i] == null ? null : d.values[i]),
         borderColor: d.color,
-        backgroundColor: `${d.color}${chartTheme.fillAlphaHex}`,
+        backgroundColor: chartType === 'bar' ? `${d.color}cc` : `${d.color}${chartTheme.fillAlphaHex}`,
         fill: d.fill,
         hidden: d.hidden,
-        tension: chartTheme.tension,
-        borderWidth: chartTheme.lineWidth,
-        pointRadius: 0,
-        pointHoverRadius: 4,
+        tension: chartType === 'line' ? chartTheme.tension : undefined,
+        borderWidth: chartType === 'bar' ? 1 : chartTheme.lineWidth,
+        borderRadius: chartType === 'bar' ? 3 : undefined,
+        categoryPercentage: chartType === 'bar' ? 0.55 : undefined,
+        barPercentage: chartType === 'bar' ? 0.85 : undefined,
+        maxBarThickness: chartType === 'bar' ? 36 : undefined,
+        pointRadius: chartType === 'line' ? 0 : undefined,
+        pointHoverRadius: chartType === 'line' ? 4 : undefined,
         pointBackgroundColor: d.color,
       })),
     }
 
     const chart = new Chart(ctx, {
-      type: 'line',
+      type: chartType,
       data,
       options: {
         responsive: true,
@@ -76,10 +80,13 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, ra
         scales: {
           x: {
             grid: { display: false },
+            stacked: chartType === 'bar' && stacked,
             ticks: { maxTicksLimit: chartTheme.xMaxTicks, maxRotation: 0, color: chartTheme.axisColor, font: { size: chartTheme.fontSize } },
           },
           y: {
             grid: { color: chartTheme.gridColor },
+            stacked: chartType === 'bar' && stacked,
+            beginAtZero: chartType === 'bar',
             ticks: { color: chartTheme.axisColor, font: { size: chartTheme.fontSize }, callback: (v) => (formatY ? formatY(v) : v.toLocaleString()) },
           },
         },
@@ -87,7 +94,7 @@ export default function TrendChart({ labels, values, datasets, tooltipLabels, ra
     })
     chartRef.current = chart
     return () => { if (chartRef.current) chartRef.current.destroy() }
-  }, [labels, datasets, values, tooltipLabels, range, showDateOnAxis, color, height, onLegendClick, legendDisplay])
+  }, [labels, datasets, values, tooltipLabels, range, showDateOnAxis, color, height, onLegendClick, legendDisplay, chartType, stacked])
 
   return <div style={{ height }}><canvas ref={ref} role="img" aria-label={`${ariaLabel}，共 ${labels?.length || 0} 个数据点`} /></div>
 }

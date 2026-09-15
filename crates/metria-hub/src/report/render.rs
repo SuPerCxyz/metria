@@ -151,7 +151,7 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.cache_write_tokens),
         n(m.reasoning_tokens)
     ));
-    if m.total_tokens() == 0 {
+    if m.token_components() == 0 {
         s.push_str("（未采集到 Token 数据）\n");
     }
     let costs = cost_lines(m);
@@ -232,7 +232,7 @@ fn kpi_cards(m: &ReportMetrics) -> String {
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>{}{}{}</tr></table>",
         card("模型调用", &n(m.calls), "次"),
         card("会话", &n(m.sessions), "个"),
-        card("总 Token", &n(m.total_tokens()), "全部类型合计"),
+        card("总 Token", &n(m.total_tokens()), "不含缓存读写"),
     );
     let detail = format!(
         "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {} · 推理 {}</div>",
@@ -246,7 +246,7 @@ fn kpi_cards(m: &ReportMetrics) -> String {
 }
 
 fn token_section(m: &ReportMetrics) -> String {
-    let total = m.total_tokens();
+    let total = m.token_components();
     if total == 0 {
         return format!(
             "{}<div style=\"font-size:13px;color:#9ca3af;\">未采集到 Token 数据。</div>",
@@ -747,5 +747,27 @@ mod tests {
         assert!(h.contains("估算</span>"));
         assert!(h.contains("计算费用"));
         assert!(!h.contains("上报费用"));
+    }
+
+    #[test]
+    fn total_tokens_excludes_cache_in_report_outputs() {
+        let m = ReportMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            reasoning_tokens: 10,
+            cache_read_tokens: 900,
+            cache_write_tokens: 20,
+            has_data: true,
+            ..Default::default()
+        };
+        assert_eq!(m.total_tokens(), 160);
+        assert_eq!(m.token_components(), 1_080);
+
+        let text = render_text(&m, &meta());
+        assert!(text.contains("总 Token：160"));
+        let payload = webhook_payload(&m, &meta());
+        assert_eq!(payload["tokens"]["total"], 160);
+        assert_eq!(payload["tokens"]["cache_read"], 900);
+        assert_eq!(payload["tokens"]["cache_write"], 20);
     }
 }

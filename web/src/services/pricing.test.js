@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canonicalModelPattern, EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, serializeRuleDraft } from './pricing.js'
+import { canonicalModelPattern, EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, filterPricingRules, pricingRuleKind, serializeRuleDraft } from './pricing.js'
 
 test('canonicalizes relay and free model names', () => {
   assert.equal(canonicalModelPattern('opencode-go/mimo-v2.5-free'), 'mimo-v2.5')
@@ -55,4 +55,24 @@ test('does not allow prices together with an equivalent model', () => {
     price_equivalent_to: 'gpt-5',
     input_price: '0.08',
   }), /等价规则不需要重复填写价格/)
+})
+
+test('classifies linked, user and catalog rules distinctly', () => {
+  assert.equal(pricingRuleKind({ source: 'user_override', price_equivalent_to: 'deepseek-v4.1-flash' }), 'link')
+  assert.equal(pricingRuleKind({ source: 'user_override' }), 'user')
+  assert.equal(pricingRuleKind({ source: 'openrouter_catalog' }), 'openrouter')
+  assert.equal(pricingRuleKind({ source: 'litellm_catalog' }), 'litellm')
+})
+
+test('filters pricing rules by source category', () => {
+  const rules = [
+    { source: 'user_override', price_equivalent_to: 'a' },
+    { source: 'user_override' },
+    { source: 'openrouter_catalog' },
+    { source: 'litellm_catalog' },
+  ]
+  assert.equal(filterPricingRules(rules, 'all').length, 4)
+  assert.equal(filterPricingRules(rules, 'link').length, 1)
+  assert.equal(filterPricingRules(rules, 'user').length, 1)
+  assert.equal(filterPricingRules(rules, 'catalog').length, 2)
 })

@@ -11,7 +11,7 @@ import { useToast } from '../../components/feedback/Toast'
 import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { fmtDateTime, fmtUsd } from '../../services/format'
-import { EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, PRICE_FIELDS, serializeRuleDraft } from '../../services/pricing'
+import { EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, PRICE_FIELDS, RULE_SOURCE_FILTERS, filterPricingRules, pricingRuleKind, pricingRuleKindMeta, serializeRuleDraft } from '../../services/pricing'
 import ReportSettings from './ReportSettings'
 
 const TABS = ['模型价格', '数据保留', '节点接入', '用量报告', '系统设置']
@@ -216,6 +216,7 @@ export default function Settings() {
   const [busyId, setBusyId] = useState(null)
   const [repricing, setRepricing] = useState(false)
   const [priceSearch, setPriceSearch] = useState('')
+  const [priceSourceFilter, setPriceSourceFilter] = useState('all')
   const [ruleDraft, setRuleDraft] = useState(EMPTY_RULE_DRAFT)
   const [ruleApplyMode, setRuleApplyMode] = useState('future')
   const [ruleSaving, setRuleSaving] = useState(false)
@@ -308,17 +309,25 @@ export default function Settings() {
 
   const priceRules = useMemo(() => {
     const query = priceSearch.trim().toLocaleLowerCase()
-    const list = rules.data?.rules || []
-    if (!query) return list
-    return list.filter((rule) => `${rule.model_pattern || ''} ${rule.price_equivalent_to || ''} ${rule.source || ''}`.toLocaleLowerCase().includes(query))
-  }, [priceSearch, rules.data])
+    const matched = filterPricingRules(rules.data?.rules || [], priceSourceFilter)
+    const searched = query
+      ? matched.filter((rule) => `${rule.model_pattern || ''} ${rule.price_equivalent_to || ''} ${rule.source || ''}`.toLocaleLowerCase().includes(query))
+      : matched
+    // 用户规则（价格关联 / 用户价格）优先展示，避免被大量目录规则淹没
+    return [...searched].sort((left, right) => {
+      const leftUser = pricingRuleKind(left) === 'link' || pricingRuleKind(left) === 'user'
+      const rightUser = pricingRuleKind(right) === 'link' || pricingRuleKind(right) === 'user'
+      if (leftUser !== rightUser) return leftUser ? -1 : 1
+      return 0
+    })
+  }, [priceSearch, priceSourceFilter, rules.data])
 
   const priceColumns = useMemo(() => [
     { key: 'model_pattern', label: '模型匹配', sortable: true, render: (rule) => <span title={rule.model_pattern} className="block max-w-[32rem] truncate">{rule.model_pattern}</span> },
     { key: 'price_equivalent_to', label: '价格等价于', sortable: true, render: (rule) => rule.price_equivalent_to ? <span title={rule.price_equivalent_to} className="block max-w-[18rem] truncate">{rule.price_equivalent_to}{rule.price_equivalent_missing_as_free ? '（缺价按 0）' : ''}</span> : '—' },
     { key: 'input_price', label: '输入/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.input_price != null ? fmtUsd(rule.input_price) : '—'}</span> },
     { key: 'output_price', label: '输出/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.output_price != null ? fmtUsd(rule.output_price) : '—'}</span> },
-    { key: 'source', label: '来源', sortable: true, render: (rule) => <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700/40 text-gray-600 dark:text-gray-300">{rule.source}</span> },
+    { key: 'source', label: '来源', sortable: true, render: (rule) => { const meta = pricingRuleKindMeta(rule); return <span className={`text-xs px-2 py-0.5 rounded-full ${meta.className}`}>{meta.label}</span> } },
   ], [])
 
   const sourceModelOptions = pricingOptions.data?.used_models || []
@@ -486,7 +495,7 @@ export default function Settings() {
                 {repricing ? '重新计价中…' : '重新计价'}
               </button>
             </div>
-            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">配置外部价格目录地址，点击「同步」拉取官方计费并重新计算费用。来源与快照自动保留。</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">配置外部价格目录地址，点击「同步」拉取官方计费并重新计算费用。每个目录只保留最新快照与规则。</p>
             {catalogsError && <ErrorState error={catalogsError} onRetry={loadCatalogs} />}
             {catalogsLoading && <LoadingSkeleton rows={3} />}
             {!catalogsLoading && !catalogsError && (
@@ -704,25 +713,28 @@ export default function Settings() {
           <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">价格规则</h2>
-              <label className="relative block w-full sm:w-80">
-                <span className="sr-only">搜索价格规则</span>
-                <svg aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="8" />
-                  <path d="m21 21-4.3-4.3" />
-                </svg>
-                <input
-                  type="search"
-                  value={priceSearch}
-                  onChange={(event) => setPriceSearch(event.target.value)}
-                  placeholder="搜索模型或来源"
-                  className="w-full rounded-lg border border-gray-300 bg-white py-2 pl-9 pr-3 text-sm text-gray-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
-                />
-              </label>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                <Segmented items={RULE_SOURCE_FILTERS} value={priceSourceFilter} onChange={setPriceSourceFilter} />
+                <label className="relative block w-full sm:w-80">
+                  <span className="sr-only">搜索价格规则</span>
+                  <svg aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="11" cy="11" r="8" />
+                    <path d="m21 21-4.3-4.3" />
+                  </svg>
+                  <input
+                    type="search"
+                    value={priceSearch}
+                    onChange={(event) => setPriceSearch(event.target.value)}
+                    placeholder="搜索模型或来源"
+                    className="w-full rounded-lg border border-gray-300 bg-white py-2 pl-9 pr-3 text-sm text-gray-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
+                  />
+                </label>
+              </div>
             </div>
             {rules.error && <ErrorState error={rules.error} onRetry={rules.refresh} />}
             {rules.loading && <LoadingSkeleton rows={5} />}
             {!rules.loading && !rules.error && (
-              <DataTable columns={priceColumns} data={priceRules} pageSize={20} emptyText={priceSearch ? '没有匹配的价格规则' : '暂无价格规则'} />
+              <DataTable columns={priceColumns} data={priceRules} pageSize={20} emptyText={priceSearch || priceSourceFilter !== 'all' ? '没有匹配的价格规则' : '暂无价格规则'} />
             )}
           </div>
         </>

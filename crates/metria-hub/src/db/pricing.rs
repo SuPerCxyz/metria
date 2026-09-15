@@ -57,6 +57,17 @@ impl HubDb {
             "custom" => ("custom_http_catalog", "custom"),
             _ => ("openrouter_catalog", "openrouter"),
         };
+        // 只保留最新快照：先删除该目录的历史快照与规则（不保留旧计价规则）。
+        c.execute(
+            "DELETE FROM pricing_rules WHERE snapshot_id IN (SELECT id FROM pricing_snapshots WHERE catalog_id = ?1)",
+            [catalog_id],
+        )
+        .map_err(StorageError::from)?;
+        c.execute(
+            "DELETE FROM pricing_snapshots WHERE catalog_id = ?1",
+            [catalog_id],
+        )
+        .map_err(StorageError::from)?;
         c.execute(
             "INSERT INTO pricing_snapshots (id, catalog_id, etag, fetched_at, effective_at, content_hash, record_count, status, created_at) VALUES (?1,?2,?3,?4,?4,?5,?6,'ok',?4)",
             params![
@@ -67,12 +78,6 @@ impl HubDb {
                 content_hash,
                 rules.len() as i64,
             ],
-        )
-        .map_err(StorageError::from)?;
-        // 停用旧快照规则
-        c.execute(
-            "UPDATE pricing_rules SET enabled = 0 WHERE snapshot_id IN (SELECT id FROM pricing_snapshots WHERE catalog_id = ?1)",
-            [catalog_id],
         )
         .map_err(StorageError::from)?;
         {
@@ -447,7 +452,7 @@ impl HubDb {
         let c = self.conn();
         let mut out = Vec::new();
         if let Ok(mut stmt) = c.prepare(
-            "SELECT id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, effective_from, effective_to, metadata, created_at FROM pricing_rules ORDER BY priority DESC",
+            "SELECT id, source, channel, provider_pattern, model_pattern, client_pattern, input_price, output_price, cache_read_price, cache_write_price, reasoning_price, request_price, priority, enabled, effective_from, effective_to, metadata, created_at FROM pricing_rules WHERE enabled = 1 OR source = 'user_override' ORDER BY priority DESC",
         ) {
             if let Ok(rows) = stmt.query_map([], |r| {
                 let metadata: String = r.get(16)?;

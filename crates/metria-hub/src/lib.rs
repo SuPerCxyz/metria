@@ -131,7 +131,8 @@ fn spawn_integrity_repair(db: db::HubDb) {
         let _heap_release = crate::memory::HeapReleaseGuard;
         const KEY: &str = "observability_integrity_version";
         const TIMING_KEY: &str = "observability_timing_repair_version";
-        const VERSION: &str = "1";
+        // v2：Codex input 归一化回填后，需重新计价、重估流量并重建 rollup。
+        const VERSION: &str = "2";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
         let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
         if !full_needed && !timing_needed {

@@ -65,11 +65,11 @@ export default function AgentDetail() {
       <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">模型分布</h2>
-          <RankingList items={(models.data?.models || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
+          <RankingList items={(models.data?.models || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0, cost: m.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
         </div>
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">节点分布</h2>
-          <RankingList items={(d.by_node || []).map((n) => ({ id: n.node_id, name: nodeNames[n.node_id] || n.node_id, value: n.model_calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(n) => navigate(`/nodes/${encodeURIComponent(n.id)}`)} />
+          <RankingList items={(d.by_node || []).map((n) => ({ id: n.node_id, name: nodeNames[n.node_id] || n.node_id, value: n.model_calls ?? 0, cost: n.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(n) => navigate(`/nodes/${encodeURIComponent(n.id)}`)} />
         </div>
       </div>
 

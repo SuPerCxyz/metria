@@ -93,7 +93,7 @@ export default function NodeDetail() {
         </div>
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">使用的模型</h2>
-          <RankingList items={(query.data?.by_model || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0 }))} valueKey="value" labelKey="name" format={fmtTokensShort} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
+          <RankingList items={(query.data?.by_model || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0, cost: m.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
         </div>
       </div>
 
