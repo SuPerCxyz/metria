@@ -133,7 +133,8 @@ fn spawn_integrity_repair(db: db::HubDb) {
         const TIMING_KEY: &str = "observability_timing_repair_version";
         // v2：Codex input 归一化回填后，需重新计价、重估流量并重建 rollup。
         // v3：Codex output 归一化（扣除推理）回填后，同样需要重算全链路。
-        const VERSION: &str = "3";
+        // v4：旧 Agent 期间入库的 Codex 行补扣缓存/推理后，同样需要重算全链路。
+        const VERSION: &str = "4";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
         let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
         if !full_needed && !timing_needed {

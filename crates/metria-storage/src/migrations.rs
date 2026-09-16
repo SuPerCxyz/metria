@@ -275,4 +275,166 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+
+    /// 019 只回填「017/018 应用后、Agent 更新前」入库的 Codex 行：
+    /// input 补扣缓存、output 补扣推理；窗口外与已归一化的行不动。
+    #[test]
+    fn migration_019_fills_only_the_late_ingest_window() {
+        let path = temp_path("late-ingest");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut conn = open(&path, &DbOptions::default()).unwrap();
+        migrate_embedded(&mut conn, Some(18)).unwrap();
+        // 固定 017/018 的应用时刻，避免依赖测试运行时间
+        conn.execute(
+            "UPDATE schema_migrations SET applied_at = '2026-09-15T16:16:00Z' WHERE version = 17",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE schema_migrations SET applied_at = '2026-09-16T03:03:00Z' WHERE version = 18",
+            [],
+        )
+        .unwrap();
+
+        let insert_usage = "INSERT INTO usage_events (
+                event_id, schema_version, node_id, collector_id, source_id, client_id,
+                adapter_id, adapter_version, timestamp, input_tokens, output_tokens,
+                reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                usage_source, usage_granularity
+            ) VALUES (?1, 1, 'n', 'c', 's', ?2, 'a', '1', '2026-09-16T00:00:00Z', ?3, ?4, ?5, ?6, ?7,
+                      'reported', 'call')";
+        let insert_call = "INSERT INTO model_calls (
+                id, node_id, collector_id, client_id, source_id, session_id, started_at,
+                status, call_granularity, input_tokens, output_tokens, reasoning_tokens,
+                cache_read_tokens, cache_write_tokens, usage_event_id, created_at, updated_at
+            ) VALUES (?1, 'n', 'c', ?2, 's', 'sess', '2026-09-16T00:00:00Z', 'success', 'call',
+                      ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)";
+
+        // (name, client, created_at, input, output, reasoning, cache_read, cache_write)
+        type WindowRow = (
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let rows: [WindowRow; 7] = [
+            // A: 017 之后、018 之前入库 —— 只修 input
+            ("a", "codex", "2026-09-15T20:00:00Z", 1000, 200, 150, 900, 0),
+            // B: 018 之后、Agent 更新前入库 —— input 与 output 都修
+            (
+                "b",
+                "codex",
+                "2026-09-16T04:00:00Z",
+                2000,
+                300,
+                100,
+                1500,
+                0,
+            ),
+            // C: Agent 更新后入库 —— 不动
+            ("c", "codex", "2026-09-16T06:00:00Z", 3000, 400, 200, 100, 0),
+            // D: 017 之前入库 —— 不动
+            (
+                "d",
+                "codex",
+                "2026-09-15T10:00:00Z",
+                4000,
+                500,
+                250,
+                3000,
+                0,
+            ),
+            // E: 窗口内但非 Codex —— 不动
+            (
+                "e",
+                "opencode",
+                "2026-09-16T04:00:00Z",
+                5000,
+                600,
+                300,
+                4000,
+                0,
+            ),
+            // F: 窗口内但 input 已小于缓存 —— input 守卫拦住；output 仍未归一化，正常扣减
+            ("f", "codex", "2026-09-16T04:00:00Z", 10, 700, 100, 500, 0),
+            // G: 窗口内两个维度都已小于被扣项 —— 两个守卫都拦住，不动
+            ("g", "codex", "2026-09-16T04:00:00Z", 20, 50, 100, 800, 0),
+        ];
+        for (id, client, created, input, output, reasoning, cr, cw) in rows {
+            let event_id = format!("ev-{id}");
+            conn.execute(
+                insert_usage,
+                rusqlite::params![event_id, client, input, output, reasoning, cr, cw],
+            )
+            .unwrap();
+            conn.execute(
+                insert_call,
+                rusqlite::params![
+                    format!("call-{id}"),
+                    client,
+                    input,
+                    output,
+                    reasoning,
+                    cr,
+                    cw,
+                    event_id,
+                    created
+                ],
+            )
+            .unwrap();
+        }
+
+        let applied = migrate_embedded(&mut conn, Some(19)).unwrap();
+        assert_eq!(applied, vec![19]);
+
+        let read = |table: &str, key: &str| -> (i64, i64, i64) {
+            let (col, id) = if table == "usage_events" {
+                ("event_id", format!("ev-{key}"))
+            } else {
+                ("id", format!("call-{key}"))
+            };
+            conn.query_row(
+                &format!(
+                    "SELECT input_tokens, output_tokens, reasoning_tokens FROM {table} WHERE {col} = ?1"
+                ),
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        for (table, key) in [("usage_events", "a"), ("model_calls", "a")] {
+            // 只扣 input：1000-900；output 200 在 018 之前入库，不应再扣推理
+            assert_eq!(read(table, key), (100, 200, 150), "{table} row a");
+        }
+        for (table, key) in [("usage_events", "b"), ("model_calls", "b")] {
+            // input 2000-1500；output 300-100
+            assert_eq!(read(table, key), (500, 200, 100), "{table} row b");
+        }
+        for (table, key) in [("usage_events", "c"), ("model_calls", "c")] {
+            assert_eq!(read(table, key), (3000, 400, 200), "{table} row c");
+        }
+        for (table, key) in [("usage_events", "d"), ("model_calls", "d")] {
+            assert_eq!(read(table, key), (4000, 500, 250), "{table} row d");
+        }
+        for (table, key) in [("usage_events", "e"), ("model_calls", "e")] {
+            assert_eq!(read(table, key), (5000, 600, 300), "{table} row e");
+        }
+        for (table, key) in [("usage_events", "f"), ("model_calls", "f")] {
+            // input 守卫生效（10 < 500+0）；output 700-100
+            assert_eq!(read(table, key), (10, 600, 100), "{table} row f");
+        }
+        for (table, key) in [("usage_events", "g"), ("model_calls", "g")] {
+            // input 20 < 800、output 50 < 100，两个守卫都生效
+            assert_eq!(read(table, key), (20, 50, 100), "{table} row g");
+        }
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

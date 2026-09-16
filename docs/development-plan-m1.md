@@ -38,7 +38,7 @@
 | 总览分析增强：同期对比、Agent/模型/项目/节点全局筛选、日分层趋势、小时热力图、时长/消息量、数据新鲜度与排行费用副指标（OpenSpec `add-dashboard-usage-insights`） | ✅ 实现与可用门禁完成（Web 无 `typecheck` 脚本） | 2026-09-15 |
 | 价格目录与 Codex Token 口径修复：目录只保留最新快照与规则、规则列表过滤历史并区分「价格关联」、Codex `input_tokens` 归一化为非缓存输入 + 历史回填重算（OpenSpec `fix-pricing-retention-and-codex-tokens`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-15 |
 | rollup 范围口径修复：整点边界统一 julianday 比较；总览及使用趋势/流量/节点/客户端/模型页面不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
-| 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
+| 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | ✅ 已部署并核对（含 Agent 更新与迁移 019 追加回填） | 2026-09-16 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 
@@ -62,9 +62,18 @@
   demo 实例（1847 条调用、613 条 `cache_write > 0`）验证：`/api/v1/models` 的 `cache_hit_rate`
   与新分母逐模型零不匹配且低于旧分母，总览/分析/模型/模型详情/节点/节点详情/Agent 七个页面
   渲染正常、命中率跨页一致、Console 无 error、每日趋势 4 层堆叠柱正常。
-- 遗留：`aitools` 节点的 metria-agent 容器仍是旧镜像，且 Hub 不做 ingest 归一化，故**新采集的
-  Codex 行仍按旧口径落库**（实测 raw `input 130333/cached 128768/output 158/reasoning 16` 对应
-  库内 `input 130333/output 158/reasoning 16`）。需更新该 agent 容器后新数据才生效。
+- Agent 更新与追加回填（2026-09-16）：`aitools` 节点的 metria-agent 容器更新到新镜像后逐行验证
+  —— raw `input 226224/cached 9984/output 375/reasoning 247` 对应库内 `input 216240/
+  cache_read 9984/output 128/reasoning 247`，input 与 output 两个维度都已归一化。
+  但 017/018 只回填了「迁移执行时刻已存在的行」：017 应用（本库 2026-09-15T16:16Z）后至 Agent
+  更新（2026-09-16T05:40Z）之间入库的 Codex 行 input 仍含缓存，018 应用（03:03Z）后至 Agent 更新
+  之间的行 output 仍含推理，Hub 不做 ingest 归一化，故这些行把缓存按输入价重复计费（今日
+  gpt-5.6-luna 因此虚高约 9 倍：Hub $18.63 vs ccswitch $2.04，同一套价格）。
+- 迁移 019 追加回填：以 `schema_migrations` 中 017/018 的 `applied_at` 为下界、Agent 更新时刻
+  2026-09-16T05:40:00Z 为上界，回填该窗口内 Codex 的 `input`（扣缓存）与 `output`（扣推理），
+  并用 `input >= cache`、`output >= reasoning` 必要条件守卫兜底；新装实例窗口为空不受影响。
+  修复版本号提升至 4 触发重新计价、流量重估与 rollup 重建。dry-run：input 85,954,610 →
+  959,538（386 行）、output 60,763 → 28,060（173 行）。
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
