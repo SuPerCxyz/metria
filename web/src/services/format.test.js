@@ -2,14 +2,20 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, percentChange, sumTokens } from './format.js'
 
-test('excludes cache tokens from the total while keeping reasoning tokens', () => {
+test('includes cache tokens in the total (v2 semantics)', () => {
   assert.equal(sumTokens({
     input_tokens: 100,
     output_tokens: 50,
     reasoning_tokens: 10,
     cache_read_tokens: 900,
     cache_write_tokens: 20,
-  }), 160)
+  }), 1080)
+})
+
+test('counts cache-only objects and handles missing values', () => {
+  assert.equal(sumTokens({ cache_read_tokens: 900, cache_write_tokens: 20 }), 920)
+  assert.equal(sumTokens({}), 0)
+  assert.equal(sumTokens(null), 0)
 })
 
 test('includes cache writes in the cache hit rate denominator', () => {

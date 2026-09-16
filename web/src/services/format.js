@@ -19,12 +19,19 @@ export function fmtTokens(t) {
 }
 
 /**
- * 统一 Token 总计口径：input + output + reasoning。
- * 全站「总 Token / Token 列」必须使用本函数，缓存读写单独展示。
+ * 统一 Token 总计口径（v2）：input + output + reasoning + cache_read + cache_write。
+ * 全站「总 Token / Token 列」必须使用本函数；等价于 ccswitch 的「真实消耗 Tokens」。
+ * v1（2026-09-15 之前）不含缓存读写，跨版本对比时数值不可比。
  */
 export function sumTokens(o) {
   if (!o) return 0
-  return (o.input_tokens ?? 0) + (o.output_tokens ?? 0) + (o.reasoning_tokens ?? 0)
+  return (
+    (o.input_tokens ?? 0) +
+    (o.output_tokens ?? 0) +
+    (o.reasoning_tokens ?? 0) +
+    (o.cache_read_tokens ?? 0) +
+    (o.cache_write_tokens ?? 0)
+  )
 }
 
 /** Token 简写（表格用）：12.8M */

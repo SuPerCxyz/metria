@@ -26,7 +26,7 @@ Adapter 落库前统一归一化，各客户端语义一致：
 - `input_tokens` 为**非缓存输入**（扣除 `cache_read_tokens` 与 `cache_write_tokens`）。
 - `output_tokens` 为**不含推理的生成 Token**（扣除 `reasoning_tokens`）。
 - `reasoning_tokens` 单独计列，按推理单价计价，不换算为响应字节。
-- 总 Token = `input + output + reasoning`，不含缓存读写；缓存读写、缓存命中率与缓存节省费用单独展示。
+- 总 Token（v2，2026-09-16 起）= `input + output + reasoning + cache_read + cache_write`，含缓存读写，等价于 ccswitch 的「真实消耗 Tokens」；缓存命中率与缓存节省费用仍单独展示。v1（2026-09-15 之前）为 `input + output + reasoning`（不含缓存），跨版本数值不可比。
 - 缓存命中率 = `cache_read / (input + cache_write + cache_read)`；无缓存数据或分母为 0 时标记为不可用。
 
 ## 2. Hub 数据库（32 表）

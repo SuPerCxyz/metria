@@ -31,12 +31,13 @@ pub struct ReportMetrics {
 }
 
 impl ReportMetrics {
+    /// 总 Token（v2，2026-09-16 起）：含缓存读写，等价于 ccswitch 的「真实消耗 Tokens」。
     pub fn total_tokens(&self) -> i64 {
-        self.input_tokens + self.output_tokens + self.reasoning_tokens
-    }
-
-    pub(crate) fn token_components(&self) -> i64 {
-        self.total_tokens() + self.cache_read_tokens + self.cache_write_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.reasoning_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
     }
 }
 
@@ -140,7 +141,7 @@ fn dim_breakdown(
     // column 来自内部常量，不接受外部输入，无注入风险。
     let sql = format!(
         "SELECT {column}, COALESCE(SUM(model_call_count),0) AS calls,
-                COALESCE(SUM(input_tokens+output_tokens+reasoning_tokens),0) AS tokens
+                COALESCE(SUM(input_tokens+output_tokens+reasoning_tokens+cache_read_tokens+cache_write_tokens),0) AS tokens
          FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) AND {column} <> ''
          GROUP BY {column} ORDER BY calls DESC, tokens DESC LIMIT ?3"
     );
@@ -358,8 +359,8 @@ mod tests {
             reasoning_tokens: 5,
             ..Default::default()
         };
-        assert_eq!(m.total_tokens(), 8);
-        assert_eq!(m.token_components(), 15);
+        // 总 Token 含缓存读写：1 + 2 + 5 + 3 + 4
+        assert_eq!(m.total_tokens(), 15);
     }
 
     #[test]

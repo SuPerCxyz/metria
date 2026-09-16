@@ -430,6 +430,7 @@ fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value,
                     COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
                     COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
                     COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
+                    COALESCE((SELECT SUM(u.cache_write_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_write_tokens),
                     COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
                     COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
                     COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
@@ -450,6 +451,7 @@ fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value,
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
                 r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -470,9 +472,10 @@ fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value,
         cell.output_tokens += row.2.unwrap_or(0);
         cell.cache_read_tokens += row.3.unwrap_or(0);
         cell.reasoning_tokens += row.4.unwrap_or(0);
-        cell.cost_micro_usd += row.5.unwrap_or(0) + row.6.unwrap_or(0) + row.7.unwrap_or(0);
+        cell.cache_write_tokens += row.5.unwrap_or(0);
+        cell.cost_micro_usd += row.6.unwrap_or(0) + row.7.unwrap_or(0) + row.8.unwrap_or(0);
         cell.model_calls += 1;
-        if let Some(duration) = row.8 {
+        if let Some(duration) = row.9 {
             cell.duration_ms = Some(cell.duration_ms.unwrap_or(0) + duration);
         }
         if cell
@@ -499,8 +502,10 @@ fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value,
                 "input_tokens": cell.input_tokens,
                 "output_tokens": cell.output_tokens,
                 "cache_read_tokens": cell.cache_read_tokens,
+                "cache_write_tokens": cell.cache_write_tokens,
                 "reasoning_tokens": cell.reasoning_tokens,
-                "tokens": cell.input_tokens + cell.output_tokens + cell.reasoning_tokens,
+                "tokens": cell.input_tokens + cell.output_tokens + cell.reasoning_tokens
+                    + cell.cache_read_tokens + cell.cache_write_tokens,
                 "cost_micro_usd": cell.cost_micro_usd,
                 "model_calls": cell.model_calls,
                 "duration_ms": cell.duration_ms,
@@ -539,6 +544,7 @@ fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Valu
                     COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
                     COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
                     COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
+                    COALESCE((SELECT SUM(u.cache_write_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_write_tokens),
                     COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
                     COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
                     COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
@@ -559,6 +565,7 @@ fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Valu
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
                 r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -575,9 +582,10 @@ fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Valu
         entry.output_tokens += row.2.unwrap_or(0);
         entry.cache_read_tokens += row.3.unwrap_or(0);
         entry.reasoning_tokens += row.4.unwrap_or(0);
-        entry.cost_micro_usd += row.5.unwrap_or(0) + row.6.unwrap_or(0) + row.7.unwrap_or(0);
+        entry.cache_write_tokens += row.5.unwrap_or(0);
+        entry.cost_micro_usd += row.6.unwrap_or(0) + row.7.unwrap_or(0) + row.8.unwrap_or(0);
         entry.model_calls += 1;
-        if let Some(duration) = row.8 {
+        if let Some(duration) = row.9 {
             entry.duration_ms = Some(entry.duration_ms.unwrap_or(0) + duration);
         }
     }
@@ -599,8 +607,10 @@ fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Valu
             "input_tokens": value.input_tokens,
             "output_tokens": value.output_tokens,
             "cache_read_tokens": value.cache_read_tokens,
+            "cache_write_tokens": value.cache_write_tokens,
             "reasoning_tokens": value.reasoning_tokens,
-            "tokens": value.input_tokens + value.output_tokens + value.reasoning_tokens,
+            "tokens": value.input_tokens + value.output_tokens + value.reasoning_tokens
+                + value.cache_read_tokens + value.cache_write_tokens,
             "cost_micro_usd": value.cost_micro_usd,
             "model_calls": value.model_calls,
             "duration_ms": value.duration_ms,
@@ -615,6 +625,7 @@ struct ActivityCell {
     input_tokens: i64,
     output_tokens: i64,
     cache_read_tokens: i64,
+    cache_write_tokens: i64,
     reasoning_tokens: i64,
     cost_micro_usd: i64,
     model_calls: i64,
@@ -627,6 +638,7 @@ struct DailyActivity {
     input_tokens: i64,
     output_tokens: i64,
     cache_read_tokens: i64,
+    cache_write_tokens: i64,
     reasoning_tokens: i64,
     cost_micro_usd: i64,
     model_calls: i64,

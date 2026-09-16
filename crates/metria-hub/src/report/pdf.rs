@@ -258,7 +258,7 @@ fn cost_lines(m: &ReportMetrics) -> Vec<(&'static str, i64, &'static str)> {
 
 fn token_sections(p: &mut Pdf, m: &ReportMetrics) {
     p.section("Token 构成");
-    let total = m.token_components();
+    let total = m.total_tokens();
     if total == 0 {
         p.text("未采集到 Token 数据。", 10.0, REPORT_FAINT, false);
         return;
@@ -479,9 +479,9 @@ pub fn render_pdf(
         ("模型调用".into(), n(m.calls), "次".into()),
         ("会话".into(), n(m.sessions), "个".into()),
         (
-            "总 Token".into(),
+            "真实消耗 Token".into(),
             n(m.total_tokens()),
-            "不含缓存读写".into(),
+            "含缓存读写".into(),
         ),
     ]);
     p.gap(2.0);
@@ -560,7 +560,8 @@ mod tests {
     #[test]
     fn renders_pdf_header_and_content() {
         let data = metrics();
-        assert_eq!(data.total_tokens(), 1_512_000);
+        // 总 Token 含缓存读写：1_200_000 + 300_000 + 12_000 + 5_000_000 + 40_000
+        assert_eq!(data.total_tokens(), 6_552_000);
         let pdf = render_pdf(&data, &meta(), &[]).expect("pdf");
         assert_eq!(&pdf[..4], b"%PDF");
         assert!(pdf.len() > 3000, "pdf too small: {}", pdf.len());

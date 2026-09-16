@@ -143,7 +143,7 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.sessions)
     ));
     s.push_str(&format!(
-        "总 Token：{}（输入 {} / 输出 {} / 缓存读 {} / 缓存写 {} / 推理 {}）\n",
+        "真实消耗 Token：{}（输入 {} / 输出 {} / 缓存读 {} / 缓存写 {} / 推理 {}）\n",
         n(m.total_tokens()),
         n(m.input_tokens),
         n(m.output_tokens),
@@ -151,7 +151,7 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.cache_write_tokens),
         n(m.reasoning_tokens)
     ));
-    if m.token_components() == 0 {
+    if m.total_tokens() == 0 {
         s.push_str("（未采集到 Token 数据）\n");
     }
     let costs = cost_lines(m);
@@ -232,7 +232,7 @@ fn kpi_cards(m: &ReportMetrics) -> String {
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>{}{}{}</tr></table>",
         card("模型调用", &n(m.calls), "次"),
         card("会话", &n(m.sessions), "个"),
-        card("总 Token", &n(m.total_tokens()), "不含缓存读写"),
+        card("真实消耗 Token", &n(m.total_tokens()), "含缓存读写"),
     );
     let detail = format!(
         "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {} · 推理 {}</div>",
@@ -246,7 +246,7 @@ fn kpi_cards(m: &ReportMetrics) -> String {
 }
 
 fn token_section(m: &ReportMetrics) -> String {
-    let total = m.token_components();
+    let total = m.total_tokens();
     if total == 0 {
         return format!(
             "{}<div style=\"font-size:13px;color:#9ca3af;\">未采集到 Token 数据。</div>",
@@ -742,7 +742,7 @@ mod tests {
         };
         let h = render_html(&m, &meta(), &[]);
         assert!(h.contains("claude-sonnet-4.5"));
-        assert!(h.contains("总 Token"));
+        assert!(h.contains("真实消耗 Token"));
         assert!(h.contains("#6366f1"));
         assert!(h.contains("估算</span>"));
         assert!(h.contains("计算费用"));
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn total_tokens_excludes_cache_in_report_outputs() {
+    fn total_tokens_includes_cache_in_report_outputs() {
         let m = ReportMetrics {
             input_tokens: 100,
             output_tokens: 50,
@@ -760,13 +760,14 @@ mod tests {
             has_data: true,
             ..Default::default()
         };
-        assert_eq!(m.total_tokens(), 160);
-        assert_eq!(m.token_components(), 1_080);
+        // 总 Token 含缓存读写：100 + 50 + 10 + 900 + 20
+        assert_eq!(m.total_tokens(), 1_080);
 
         let text = render_text(&m, &meta());
-        assert!(text.contains("总 Token：160"));
+        assert!(text.contains("真实消耗 Token：1,080"));
+        assert!(!text.contains("不含缓存读写"));
         let payload = webhook_payload(&m, &meta());
-        assert_eq!(payload["tokens"]["total"], 160);
+        assert_eq!(payload["tokens"]["total"], 1_080);
         assert_eq!(payload["tokens"]["cache_read"], 900);
         assert_eq!(payload["tokens"]["cache_write"], 20);
     }

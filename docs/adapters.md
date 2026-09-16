@@ -38,7 +38,7 @@ Adapter 必须把客户端上报的 Token 归一到 Metria 的统一口径后再
 - `output_tokens`：不含推理的生成 Token。客户端把推理计入输出的（Codex），采集层减 `reasoning_output_tokens`（不小于 0）。
 - `reasoning_tokens`：单独计列、单独按推理单价计费，不得换算为响应字节。
 
-总 Token 口径为 `input + output + reasoning`，缓存读写单独展示。
+总 Token 口径（v2）为 `input + output + reasoning + cache_read + cache_write`，即含缓存读写。
 
 ## 3. 解析健壮性要求（硬性）
 

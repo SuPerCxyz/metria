@@ -109,6 +109,8 @@ export default function Overview() {
             { label: '输入', values: sorted.map((p) => p.input_tokens) },
             { label: '输出', values: sorted.map((p) => p.output_tokens) },
             { label: '缓存读取', values: sorted.map((p) => p.cache_read_tokens) },
+            { label: '缓存写入', values: sorted.map((p) => p.cache_write_tokens) },
+            { label: '推理', values: sorted.map((p) => p.reasoning_tokens) },
           ],
         }
       }
@@ -189,12 +191,12 @@ export default function Overview() {
         <div className="grid grid-cols-12 gap-6">
           <MetricCard
             span="xl:col-span-4"
-            label="总 Token"
+            label="真实消耗 Token"
             value={fmtTokens(sumTokens(o))}
             {...compare(sumTokens(o), previous ? sumTokens(previous) : null)}
             sub={
               <span className="tabular-nums">
-                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(o.output_tokens)} · 缓存 {fmtTokensShort(o.cache_read_tokens)} · 推理 {fmtTokensShort(o.reasoning_tokens)}</span>
+                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(o.output_tokens)} · 缓存读取 {fmtTokensShort(o.cache_read_tokens)} · 缓存写入 {fmtTokensShort(o.cache_write_tokens)} · 推理 {fmtTokensShort(o.reasoning_tokens)}</span>
               </span>
             }
           />

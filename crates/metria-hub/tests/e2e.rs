@@ -369,7 +369,8 @@ async fn full_ingest_rollup_query_cycle() {
     .into_json()
     .unwrap();
     assert_eq!(daily["series"].as_array().unwrap().len(), 5);
-    assert_eq!(daily["series"][4]["tokens"], 3810);
+    // 总 Token 含缓存读写：3000 + 800 + 10 + 100 + 50
+    assert_eq!(daily["series"][4]["tokens"], 3960);
 
     let excluded_project: Value = ureq::get(&format!(
         "{base}/api/v1/overview?from={from}&to={to}&project_id=missing"

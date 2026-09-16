@@ -15,6 +15,7 @@ const COLORS = {
   input: '#6366f1',
   output: '#10b981',
   cache: '#94a3b8',
+  cacheWrite: '#cbd5e1',
   reasoning: '#f59e0b',
   cost: '#f59e0b',
   duration: '#06b6d4',
@@ -36,6 +37,7 @@ export default function DailyUsageChart({ series, range, metric, onMetricChange,
         { label: '输入', color: COLORS.input, values: points.map((point) => point.input_tokens ?? null) },
         { label: '输出', color: COLORS.output, values: points.map((point) => point.output_tokens ?? null) },
         { label: '缓存读取', color: COLORS.cache, values: points.map((point) => point.cache_read_tokens ?? null) },
+        { label: '缓存写入', color: COLORS.cacheWrite, values: points.map((point) => point.cache_write_tokens ?? null) },
         { label: '推理', color: COLORS.reasoning, values: points.map((point) => point.reasoning_tokens ?? null) },
       ],
       formatY: fmtTokensShort,
@@ -49,7 +51,7 @@ export default function DailyUsageChart({ series, range, metric, onMetricChange,
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">每日使用趋势</h2>
           <Segmented items={METRICS} value={metric} onChange={onMetricChange} />
         </div>
-        <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">Token 分层不含缓存读写的总 Token 口径；缓存单独展示</p>
+        <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">Token 分层即总 Token 口径：输入 + 输出 + 缓存读取 + 缓存写入 + 推理</p>
       </div>
       {loading && !series ? <div className="py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="py-12 text-center text-sm text-amber-600 dark:text-amber-400">每日趋势加载失败，请刷新重试。</div> : data.labels.length === 0 ? <div className="py-12 text-center text-sm text-gray-400 dark:text-gray-500">当前范围无数据</div> : data.unavailable ? <div className="py-12 text-center text-sm text-gray-400 dark:text-gray-500">当前范围没有可观测的调用时长</div> : (
         <TrendChart
