@@ -11,7 +11,7 @@ import { ErrorState, LoadingSkeleton, EmptyState, DataQualityNote } from '../../
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, sumTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -64,7 +64,7 @@ export default function ModelDetail() {
             { label: 'Token', value: fmtTokensShort(sumTokens(s)) },
             { label: '费用', value: fmtUsd(s.cost_micro_usd) },
             { label: '估算流量', value: fmtBytes(s.estimated_total_bytes) },
-            { label: '缓存命中率', value: (d.summary && s.input_tokens > 0) ? `${((s.cache_read_tokens ?? 0) / ((s.input_tokens ?? 0) + (s.cache_read_tokens ?? 0)) * 100).toFixed(1)}%` : '—' },
+            { label: '缓存命中率', value: fmtPct100(cacheHitRate(s)) },
           ]}
         />
 

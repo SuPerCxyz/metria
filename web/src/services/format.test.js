@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, percentChange, sumTokens } from './format.js'
+import { cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, percentChange, sumTokens } from './format.js'
 
 test('excludes cache tokens from the total while keeping reasoning tokens', () => {
   assert.equal(sumTokens({
@@ -10,6 +10,26 @@ test('excludes cache tokens from the total while keeping reasoning tokens', () =
     cache_read_tokens: 900,
     cache_write_tokens: 20,
   }), 160)
+})
+
+test('includes cache writes in the cache hit rate denominator', () => {
+  assert.equal(cacheHitRate({
+    input_tokens: 100,
+    cache_read_tokens: 900,
+    cache_write_tokens: 100,
+  }), (900 / 1100) * 100)
+  assert.equal(cacheHitRate({
+    input_tokens: 100,
+    cache_read_tokens: 900,
+    cache_write_tokens: 0,
+  }), 90)
+})
+
+test('reports cache hit rate as unavailable without cache data', () => {
+  assert.equal(cacheHitRate(null), null)
+  assert.equal(cacheHitRate({ input_tokens: 100 }), null)
+  assert.equal(cacheHitRate({ input_tokens: 100, cache_read_tokens: 0, cache_write_tokens: 0 }), null)
+  assert.equal(cacheHitRate({ input_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 }), null)
 })
 
 test('formats timestamps with a stable 24-hour shape', () => {

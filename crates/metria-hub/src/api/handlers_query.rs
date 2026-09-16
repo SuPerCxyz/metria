@@ -657,6 +657,18 @@ fn available_cost(total: i64, priced_rows: i64) -> Option<i64> {
     (priced_rows > 0).then_some(total)
 }
 
+/// 缓存命中率：`cache_read / (input + cache_write + cache_read)`。
+///
+/// 无任何缓存数据或分母为 0 时返回 `None`（调用方展示为不可用），不硬造 0。
+/// 前端口径与 `web/src/services/format.js:cacheHitRate` 保持一致。
+fn cache_hit_rate(input: i64, cache_write: i64, cache_read: i64) -> Option<f64> {
+    let cacheable = input + cache_write + cache_read;
+    if cacheable <= 0 || (cache_read <= 0 && cache_write <= 0) {
+        return None;
+    }
+    Some(cache_read as f64 / cacheable as f64)
+}
+
 /// 查询趋势数据，供 Web API 与邮件报告共用同一套分桶和补零规则。
 pub(crate) fn query_usage_timeseries(
     db: &HubDb,
@@ -1809,7 +1821,7 @@ pub(crate) async fn list_models(
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
                 COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id),
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
-                COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0)
+                COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cache_write_tokens),0)
              FROM rollup_src WHERE 1=1 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
         )));
         let rows = q!(
@@ -1829,6 +1841,7 @@ pub(crate) async fn list_models(
                     "estimated_cost_micro_usd": r.get::<_, i64>(11)?,
                     "reported_cost_micro_usd": r.get::<_, i64>(12)?,
                     "reasoning_tokens": r.get::<_, i64>(13)?,
+                    "cache_write_tokens": r.get::<_, i64>(14)?,
                 }))
             },)
         );
@@ -1853,17 +1866,19 @@ pub(crate) async fn list_models(
             };
             m["bytes_per_input_token"] = bpi;
             m["bytes_per_output_token"] = bpo;
-            // 缓存命中率：cache_read / (input + cache_read)
+            // 缓存命中率：cache_read / (input + cache_write + cache_read)
             let cr = m
                 .get("cache_read_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            let cache_hit = if in_t + cr > 0 {
-                serde_json::json!((cr as f64) / ((in_t + cr) as f64))
-            } else {
-                serde_json::Value::Null
+            let cw = m
+                .get("cache_write_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            m["cache_hit_rate"] = match cache_hit_rate(in_t, cw, cr) {
+                Some(rate) => serde_json::json!(rate),
+                None => serde_json::Value::Null,
             };
-            m["cache_hit_rate"] = cache_hit;
         }
         models
     };
@@ -3348,5 +3363,29 @@ mod rollup_window_tests {
             short,
             vec![(ts("2026-09-16T00:29:00Z"), ts("2026-09-16T00:45:00Z"))]
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_hit_rate_tests {
+    use super::cache_hit_rate;
+
+    #[test]
+    fn includes_cache_write_in_the_denominator() {
+        // 900 / (100 + 100 + 900)
+        let rate = cache_hit_rate(100, 100, 900).unwrap();
+        assert!((rate - 900.0 / 1100.0).abs() < 1e-12);
+        assert_eq!(cache_hit_rate(100, 0, 900), Some(0.9));
+    }
+
+    #[test]
+    fn unavailable_without_cache_data() {
+        assert_eq!(cache_hit_rate(100, 0, 0), None);
+        assert_eq!(cache_hit_rate(0, 0, 0), None);
+    }
+
+    #[test]
+    fn only_cache_writes_still_reports_zero_hit_rate() {
+        assert_eq!(cache_hit_rate(0, 500, 0), Some(0.0));
     }
 }

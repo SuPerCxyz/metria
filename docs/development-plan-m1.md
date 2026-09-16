@@ -38,6 +38,22 @@
 | 总览分析增强：同期对比、Agent/模型/项目/节点全局筛选、日分层趋势、小时热力图、时长/消息量、数据新鲜度与排行费用副指标（OpenSpec `add-dashboard-usage-insights`） | ✅ 实现与可用门禁完成（Web 无 `typecheck` 脚本） | 2026-09-15 |
 | 价格目录与 Codex Token 口径修复：目录只保留最新快照与规则、规则列表过滤历史并区分「价格关联」、Codex `input_tokens` 归一化为非缓存输入 + 历史回填重算（OpenSpec `fix-pricing-retention-and-codex-tokens`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-15 |
 | rollup 范围口径修复：整点边界统一 julianday 比较；总览及使用趋势/流量/节点/客户端/模型页面不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
+| 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
+
+### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
+
+- 根因：Codex 上报的 `output_tokens` 已包含 `reasoning_output_tokens`，而定价对 `output` 与
+  `reasoning` 各按单价计一次，导致推理被重复计入总 Token 并按输出单价重复计费；缓存命中率分母
+  漏 `cache_write`，有缓存写入的客户端命中率虚高。
+- 方向取舍：曾评估把推理并入 `output`（对齐 OpenAI 语义），但会把双算转移到 OpenCode，并让流量
+  估算把推理全量换算为响应字节（违反项目硬性约束）。最终改为镜像归一化：Codex 的 `output`
+  扣除推理，`reasoning` 单独保留。总 Token 口径 `input + output + reasoning` 不变，故总 Token
+  数值不变，仅「输出/推理」拆分、费用与估算流量修正。
+- 实现：`fresh_output` 于 Codex 采集层归一化；迁移 018 回填历史 `usage_events`/`model_calls`；
+  修复版本号提升至 3 触发重新计价、流量重估与 rollup 重建；缓存命中率收敛为
+  `cache_read/(input+cache_write+cache_read)`，前后端共用同一口径。
+- 验证：Codex golden/单测、迁移 018 回填测试、命中率前后端单测、fmt/clippy/workspace test 与
+  Web 测试/构建；lstable 部署与线上核对见部署记录。
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 

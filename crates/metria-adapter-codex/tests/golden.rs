@@ -48,10 +48,18 @@ fn golden_full_parses_session_events() {
     assert_eq!(session.tool_call_count, 2);
     // input_tokens 归一化为非缓存输入：21154-0 + (34200-21000-1500)
     assert_eq!(session.input_tokens.unwrap(), 21154 + 11700);
-    assert_eq!(session.output_tokens.unwrap(), 370 + 820);
+    // output_tokens 归一化为不含推理的生成 Token：(370-107) + (820-260)
+    assert_eq!(session.output_tokens.unwrap(), (370 - 107) + (820 - 260));
     assert_eq!(session.cache_read_tokens.unwrap(), 21000);
     assert_eq!(session.cache_write_tokens.unwrap(), 1500);
     assert_eq!(session.reasoning_tokens.unwrap(), 107 + 260);
+    // 总 Token 口径 input + output + reasoning 与扣减前恒等
+    assert_eq!(
+        session.input_tokens.unwrap()
+            + session.output_tokens.unwrap()
+            + session.reasoning_tokens.unwrap(),
+        (21154 + 11700) + (370 + 820)
+    );
     assert!(session.working_directory_hash.is_some());
     assert!(session.content_available);
 

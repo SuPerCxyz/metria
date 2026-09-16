@@ -27,8 +27,18 @@ subagent_relations / traffic_estimates / traffic_profile_samples / next_cursor /
 | Adapter | 数据源 | 解析要点 | 游标 |
 |---|---|---|---|
 | claude-code | `projects/*/*.jsonl` + 扁平布局 | modern entry（type/user/assistant/message.usage/cache_*/tool_use/tool_result/summary/ai-title）；turn 分组；Task tool_use 的 `leafUuid` 推导子代理关系 | JSONL offset+inode |
-| codex | `sessions/<id>/*.jsonl` | session_meta / user_message / token_count(last_token_usage) / response_item(message/reasoning/custom_tool_call/output)；`previous_response_id` → stateful_reference；重复 token_count 去重；全零 usage 不产假调用 | JSONL offset |
+| codex | `sessions/<id>/*.jsonl` | session_meta / user_message / token_count(last_token_usage) / response_item(message/reasoning/custom_tool_call/output)；`previous_response_id` → stateful_reference；重复 token_count 去重；全零 usage 不产假调用；`input` 扣除 cached/cache_write、`output` 扣除 reasoning 归一到 Metria 口径 | JSONL offset |
 | opencode | 全局 `opencode.db` + `project/*/storage/**/*.db` | 只读打开（READ_ONLY+busy_timeout+query_only，不改 PRAGMA/不 migration）；message/part(text/reasoning/tool/step)；session.cost→reported；parent_id→subagent | SQLite rowid 增量 |
+
+### 2.1 Token 口径归一化
+
+Adapter 必须把客户端上报的 Token 归一到 Metria 的统一口径后再落库：
+
+- `input_tokens`：非缓存输入。客户端把缓存计入输入的（Codex），采集层减 `cached_input_tokens` 与 `cache_write_input_tokens`（不小于 0）。
+- `output_tokens`：不含推理的生成 Token。客户端把推理计入输出的（Codex），采集层减 `reasoning_output_tokens`（不小于 0）。
+- `reasoning_tokens`：单独计列、单独按推理单价计费，不得换算为响应字节。
+
+总 Token 口径为 `input + output + reasoning`，缓存读写单独展示。
 
 ## 3. 解析健壮性要求（硬性）
 

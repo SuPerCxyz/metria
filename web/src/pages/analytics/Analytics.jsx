@@ -14,7 +14,7 @@ import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate } from '../../services/format'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -139,7 +139,7 @@ export default function Analytics() {
     deltaTone: previous ? changeTone(current, previousValue, inverse) : 'neutral',
   })
 
-  const cacheHitRate = o.input_tokens > 0 ? (o.cache_read_tokens / (o.input_tokens + o.cache_read_tokens)) * 100 : null
+  const cacheHit = cacheHitRate(o)
 
   const modelItems = (byModel.data?.by || [])
     .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
@@ -197,7 +197,7 @@ export default function Analytics() {
         <>
           <div className="grid grid-cols-12 gap-6">
             <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
-            <MetricCard label="缓存命中率" value={fmtPct100(cacheHitRate)} {...compare(cacheHitRate, previous ? (previous.input_tokens > 0 ? previous.cache_read_tokens / (previous.input_tokens + previous.cache_read_tokens) * 100 : null) : null)} />
+            <MetricCard label="缓存命中率" value={fmtPct100(cacheHit)} {...compare(cacheHit, cacheHitRate(previous))} />
             <MetricCard label="缓存节省费用" value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'} {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)} sub={o.cache_savings_micro_usd > 0 ? '按缓存读取单价估算' : '无价格规则或缓存数据'} />
             <MetricCard label="缓存写入" value={fmtTokensShort(o.cache_write_tokens)} {...compare(o.cache_write_tokens, previous?.cache_write_tokens)} />
           </div>

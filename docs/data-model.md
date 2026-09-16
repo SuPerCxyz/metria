@@ -19,6 +19,16 @@
 | TrafficProfile | p50/p75/p90、fixed、overhead ratio、cache transport factor、effective_from/to、version、source(5 类)、enabled |
 | PricingCatalog/Rule/Match | 金额微美元、priority/effective 区间、source 含 builtin_catalog/client_reported/user_override |
 
+### 1.1 Token 口径
+
+Adapter 落库前统一归一化，各客户端语义一致：
+
+- `input_tokens` 为**非缓存输入**（扣除 `cache_read_tokens` 与 `cache_write_tokens`）。
+- `output_tokens` 为**不含推理的生成 Token**（扣除 `reasoning_tokens`）。
+- `reasoning_tokens` 单独计列，按推理单价计价，不换算为响应字节。
+- 总 Token = `input + output + reasoning`，不含缓存读写；缓存读写、缓存命中率与缓存节省费用单独展示。
+- 缓存命中率 = `cache_read / (input + cache_write + cache_read)`；无缓存数据或分母为 0 时标记为不可用。
+
 ## 2. Hub 数据库（32 表）
 
 | 分组 | 表 |

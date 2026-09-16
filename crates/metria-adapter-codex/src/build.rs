@@ -32,6 +32,15 @@ pub fn fresh_input(
     input.map(|value| (value - cache_read.unwrap_or(0) - cache_write.unwrap_or(0)).max(0))
 }
 
+/// Codex 的 `output_tokens` 已包含 `reasoning_output_tokens`，归一化为不含推理的
+/// 生成 Token。
+///
+/// Metria 约定 `output` 为不含推理的生成 Token（推理单独计列并单独计价）；
+/// 不归一化会把推理重复计入总 Token，并按输出单价重复计费。
+pub fn fresh_output(output: Option<i64>, reasoning: Option<i64>) -> Option<i64> {
+    output.map(|value| (value - reasoning.unwrap_or(0)).max(0))
+}
+
 /// 会话构建上下文。
 #[derive(Debug, Clone)]
 pub struct BuildCtx {
@@ -393,6 +402,9 @@ impl SessionBuilder {
         // Codex 的 input_tokens 已包含 cached/cache_write，归一化为非缓存输入；
         // 否则总 Token、缓存命中率与费用都会把缓存重复计入输入。
         let input = fresh_input(input, cache_read, cache_write);
+        // Codex 的 output_tokens 已包含 reasoning_output_tokens，归一化为不含推理的
+        // 生成 Token；否则总 Token 与费用会把推理重复计入（推理亦单独计价）。
+        let output = fresh_output(output, reasoning);
         let key = (input, output, cache_read, cache_write, reasoning);
         if self.last_usage_key == Some(key) {
             return; // 同一请求的重复 token_count
@@ -766,5 +778,24 @@ mod fresh_input_tests {
     fn clamps_to_zero_and_keeps_missing_input_null() {
         assert_eq!(fresh_input(Some(100), Some(500), Some(0)), Some(0));
         assert_eq!(fresh_input(None, Some(100), Some(0)), None);
+    }
+}
+
+#[cfg(test)]
+mod fresh_output_tests {
+    use super::fresh_output;
+
+    #[test]
+    fn subtracts_reasoning_from_output() {
+        assert_eq!(fresh_output(Some(370), Some(107)), Some(263));
+        assert_eq!(fresh_output(Some(820), Some(260)), Some(560));
+    }
+
+    #[test]
+    fn clamps_to_zero_and_keeps_missing_output_null() {
+        assert_eq!(fresh_output(Some(100), Some(500)), Some(0));
+        assert_eq!(fresh_output(Some(100), None), Some(100));
+        assert_eq!(fresh_output(Some(100), Some(0)), Some(100));
+        assert_eq!(fresh_output(None, Some(100)), None);
     }
 }

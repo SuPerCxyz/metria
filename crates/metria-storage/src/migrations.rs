@@ -186,4 +186,87 @@ mod tests {
         assert_eq!(current_version(&conn).unwrap(), 0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    /// 018 只把 Codex 的 output_tokens 扣减为不含推理的生成 Token，
+    /// 其它客户端与 reasoning 保持原值，且总 Token 恒等。
+    #[test]
+    fn migration_018_normalizes_codex_output_only() {
+        let path = temp_path("reasoning-output");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut conn = open(&path, &DbOptions::default()).unwrap();
+        migrate_embedded(&mut conn, Some(17)).unwrap();
+
+        let insert_usage = "INSERT INTO usage_events (
+                event_id, schema_version, node_id, collector_id, source_id, client_id,
+                adapter_id, adapter_version, timestamp, input_tokens, output_tokens,
+                reasoning_tokens, usage_source, usage_granularity
+            ) VALUES (?1, 1, 'n', 'c', 's', ?2, 'a', '1', '2026-09-01T00:00:00Z', ?3, ?4, ?5,
+                      'reported', 'call')";
+        let rows: [(&str, &str, i64, i64, Option<i64>); 4] = [
+            // Codex：输出含推理
+            ("e1", "codex", 100, 370, Some(107)),
+            // Codex 异常行：推理大于输出
+            ("e2", "codex", 100, 50, Some(80)),
+            // 输出本就不含推理的客户端
+            ("e3", "opencode", 100, 370, Some(107)),
+            // 无推理的 Codex 行
+            ("e4", "codex", 100, 200, None),
+        ];
+        for (id, client, input, output, reasoning) in rows {
+            conn.execute(
+                insert_usage,
+                rusqlite::params![id, client, input, output, reasoning],
+            )
+            .unwrap();
+        }
+
+        let insert_call = "INSERT INTO model_calls (
+                id, node_id, collector_id, client_id, source_id, session_id, started_at,
+                status, call_granularity, output_tokens, reasoning_tokens, created_at, updated_at
+            ) VALUES (?1, 'n', 'c', ?2, 's', 'sess', '2026-09-01T00:00:00Z', 'success', 'call', ?3, ?4,
+                      '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')";
+        conn.execute(
+            insert_call,
+            rusqlite::params!["c1", "codex", 370i64, 107i64],
+        )
+        .unwrap();
+        conn.execute(
+            insert_call,
+            rusqlite::params!["c2", "opencode", 370i64, 107i64],
+        )
+        .unwrap();
+
+        let applied = migrate_embedded(&mut conn, Some(18)).unwrap();
+        assert_eq!(applied, vec![18]);
+
+        let read_usage = |id: &str| -> (i64, Option<i64>) {
+            conn.query_row(
+                "SELECT output_tokens, reasoning_tokens FROM usage_events WHERE event_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        // 370 - 107；异常行钳到 0；非 Codex 不变；无推理不变
+        assert_eq!(read_usage("e1"), (263, Some(107)));
+        assert_eq!(read_usage("e2"), (0, Some(80)));
+        assert_eq!(read_usage("e3"), (370, Some(107)));
+        assert_eq!(read_usage("e4"), (200, None));
+
+        let read_call = |id: &str| -> (i64, Option<i64>) {
+            conn.query_row(
+                "SELECT output_tokens, reasoning_tokens FROM model_calls WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read_call("c1"), (263, Some(107)));
+        assert_eq!(read_call("c2"), (370, Some(107)));
+
+        // 总 Token = input + output + reasoning 扣减前后恒等
+        assert_eq!(100 + 263 + 107, 100 + 370);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

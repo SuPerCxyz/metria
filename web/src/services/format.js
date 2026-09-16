@@ -116,15 +116,17 @@ export function changeTone(current, previous, inverse = false) {
 }
 
 /**
- * 缓存命中率：cache_read / (input + cache_read)。
- * 返回 0-100 的百分比数值；无缓存或数据缺失返回 null（前端显示「—」，不硬造）。
+ * 缓存命中率：cache_read / (input + cache_write + cache_read)。
+ * 返回 0-100 的百分比数值；无缓存数据或分母为 0 返回 null（前端显示「—」，不硬造）。
  */
 export function cacheHitRate(o) {
   if (!o) return null
   const input = Number(o.input_tokens ?? 0)
   const cr = Number(o.cache_read_tokens ?? 0)
-  if (input <= 0 || cr <= 0) return null
-  return (cr / (input + cr)) * 100
+  const cw = Number(o.cache_write_tokens ?? 0)
+  const cacheable = input + cw + cr
+  if (cacheable <= 0 || (cr <= 0 && cw <= 0)) return null
+  return (cr / cacheable) * 100
 }
 
 /** ISO 时间 → 用户时区本地 24 小时格式。 */
