@@ -39,7 +39,7 @@
 | 价格目录与 Codex Token 口径修复：目录只保留最新快照与规则、规则列表过滤历史并区分「价格关联」、Codex `input_tokens` 归一化为非缓存输入 + 历史回填重算（OpenSpec `fix-pricing-retention-and-codex-tokens`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-15 |
 | rollup 范围口径修复：整点边界统一 julianday 比较；总览及使用趋势/流量/节点/客户端/模型页面不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
 | 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | ✅ 已部署并核对（含 Agent 更新与迁移 019 追加回填） | 2026-09-16 |
-| 总 Token 口径与 ccswitch 对齐：总 Token 改为含缓存读写、等值于 ccswitch「真实消耗 Tokens」，全站 Web/报告/Webhook 同步，分层堆叠图补「缓存写入」层（OpenSpec `include-cache-in-total-tokens`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
+| 总 Token 口径与 ccswitch 对齐：总 Token 改为含缓存读写、等值于 ccswitch 用量面板的消耗总量，全站 Web/报告/Webhook 同步，分层堆叠图补「缓存写入」层（OpenSpec `include-cache-in-total-tokens`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 
@@ -82,11 +82,11 @@
   1,593,759 vs 1,592,820、cache_read 113,961,472 vs 113,524,480、输出+推理 285,154 vs 284,005、
   luna 成本 $2.678 vs $2.668（原 $18.63，差 0.4%）；OpenCode 输入/cache_read/输出+推理与 ccswitch
   完全一致。（当时 Hub 的「总 Token」不含缓存，故等于 ccswitch 的「fresh 输入 + 输出」；该口径随后由
-  `include-cache-in-total-tokens` 反转为含缓存，与 ccswitch 的「真实消耗 Tokens」直接可比。）
+  `include-cache-in-total-tokens` 反转为含缓存，与 ccswitch 用量面板的消耗总量直接可比。）
 
 ### 总 Token 口径与 ccswitch 对齐记录（2026-09-16）
 
-- 背景：与 ccswitch 用量面板对比时，两边头号指标不可比 —— ccswitch「真实消耗 Tokens」含缓存
+- 背景：与 ccswitch 用量面板对比时，两边头号指标不可比 —— ccswitch 用量面板的消耗总量含缓存
   （新增输入 + 输出 + 创建 + 命中），Metria 的「总 Token」不含缓存。用户要求对齐。
 - 口径（v2）：`总 Token = input + output + reasoning + cache_read + cache_write`，与 ccswitch 等值
   （已在同日数据上验证：Codex 115,840,385 vs 115,401,305，差 0.4% 为时点差）。**BREAKING 展示口径**：
@@ -95,7 +95,7 @@
   `handlers_query.rs` 的 `tokens` 字段（并给 `ActivityCell`/`DailyActivity` 补 `cache_write_tokens`
   字段与查询）、`report/aggregate.rs:total_tokens()`（`token_components()` 并入）与报告排行 SQL、
   `report/render.rs` 卡片/文本/Webhook、`report/pdf.rs`；分层堆叠图统一为五层
-  （`DailyUsageChart`、总览趋势，后者补齐原本缺失的推理与缓存写入）；总览卡片改名「真实消耗 Token」。
+  （`DailyUsageChart`、总览趋势，后者补齐原本缺失的推理与缓存写入）；总览卡片改名「Token 消耗」（不额外强调「真实」，其余指标同样是真实数据）。
 - 不改：缓存命中率公式、费用三口径、流量估算、缓存节省费用、定价规则、采集层、数据库结构
   （总 Token 是读取期派生值，无需迁移）。
 - 注意：线上 `cache_write_tokens` 目前恒为 0，故本次实际增量仅来自缓存读取；「缓存写入」图层与

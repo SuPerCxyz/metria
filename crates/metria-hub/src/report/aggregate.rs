@@ -31,7 +31,7 @@ pub struct ReportMetrics {
 }
 
 impl ReportMetrics {
-    /// 总 Token（v2，2026-09-16 起）：含缓存读写，等价于 ccswitch 的「真实消耗 Tokens」。
+    /// 总 Token（v2，2026-09-16 起）：含缓存读写，等价于 ccswitch 用量面板的消耗总量口径。
     pub fn total_tokens(&self) -> i64 {
         self.input_tokens
             + self.output_tokens

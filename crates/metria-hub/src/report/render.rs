@@ -143,7 +143,7 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.sessions)
     ));
     s.push_str(&format!(
-        "真实消耗 Token：{}（输入 {} / 输出 {} / 缓存读 {} / 缓存写 {} / 推理 {}）\n",
+        "Token 消耗：{}（输入 {} / 输出 {} / 缓存读 {} / 缓存写 {} / 推理 {}）\n",
         n(m.total_tokens()),
         n(m.input_tokens),
         n(m.output_tokens),
@@ -232,7 +232,7 @@ fn kpi_cards(m: &ReportMetrics) -> String {
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>{}{}{}</tr></table>",
         card("模型调用", &n(m.calls), "次"),
         card("会话", &n(m.sessions), "个"),
-        card("真实消耗 Token", &n(m.total_tokens()), "含缓存读写"),
+        card("Token 消耗", &n(m.total_tokens()), "含缓存读写"),
     );
     let detail = format!(
         "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {} · 推理 {}</div>",
@@ -742,7 +742,7 @@ mod tests {
         };
         let h = render_html(&m, &meta(), &[]);
         assert!(h.contains("claude-sonnet-4.5"));
-        assert!(h.contains("真实消耗 Token"));
+        assert!(h.contains("Token 消耗"));
         assert!(h.contains("#6366f1"));
         assert!(h.contains("估算</span>"));
         assert!(h.contains("计算费用"));
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(m.total_tokens(), 1_080);
 
         let text = render_text(&m, &meta());
-        assert!(text.contains("真实消耗 Token：1,080"));
+        assert!(text.contains("Token 消耗：1,080"));
         assert!(!text.contains("不含缓存读写"));
         let payload = webhook_payload(&m, &meta());
         assert_eq!(payload["tokens"]["total"], 1_080);

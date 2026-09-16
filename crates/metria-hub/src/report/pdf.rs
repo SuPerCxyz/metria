@@ -479,7 +479,7 @@ pub fn render_pdf(
         ("模型调用".into(), n(m.calls), "次".into()),
         ("会话".into(), n(m.sessions), "个".into()),
         (
-            "真实消耗 Token".into(),
+            "Token 消耗".into(),
             n(m.total_tokens()),
             "含缓存读写".into(),
         ),

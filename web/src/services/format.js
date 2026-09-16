@@ -20,7 +20,7 @@ export function fmtTokens(t) {
 
 /**
  * 统一 Token 总计口径（v2）：input + output + reasoning + cache_read + cache_write。
- * 全站「总 Token / Token 列」必须使用本函数；等价于 ccswitch 的「真实消耗 Tokens」。
+ * 全站「总 Token / Token 列」必须使用本函数；等价于 ccswitch 用量面板的消耗总量口径。
  * v1（2026-09-15 之前）不含缓存读写，跨版本对比时数值不可比。
  */
 export function sumTokens(o) {

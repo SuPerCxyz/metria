@@ -191,7 +191,7 @@ export default function Overview() {
         <div className="grid grid-cols-12 gap-6">
           <MetricCard
             span="xl:col-span-4"
-            label="真实消耗 Token"
+            label="Token 消耗"
             value={fmtTokens(sumTokens(o))}
             {...compare(sumTokens(o), previous ? sumTokens(previous) : null)}
             sub={
