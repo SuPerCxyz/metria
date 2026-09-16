@@ -74,6 +74,13 @@
   并用 `input >= cache`、`output >= reasoning` 必要条件守卫兜底；新装实例窗口为空不受影响。
   修复版本号提升至 4 触发重新计价、流量重估与 rollup 重建。dry-run：input 85,954,610 →
   959,538（386 行）、output 60,763 → 28,060（173 行）。
+- 首版迁移 019 用 EXISTS 相关子查询，在 model_calls.usage_event_id 无索引时按 usage_events 每行
+  全表扫 model_calls，线上跑满单核 20 分钟未完成、Hub 无法服务；已回滚旧镜像恢复服务，改为
+  `event_id IN (SELECT usage_event_id ...)` 并在线上数据副本实测四语句 0.05s/0.03s/0.03s/0.04s。
+- 修复后核对（同日 Asia/Shanghai，Hub 对 ccswitch）：Codex 请求数 530 vs 529、fresh 输入
+  1,593,759 vs 1,592,820、cache_read 113,961,472 vs 113,524,480、输出+推理 285,154 vs 284,005、
+  luna 成本 $2.678 vs $2.668（原 $18.63，差 0.4%）；OpenCode 输入/cache_read/输出+推理与 ccswitch
+  完全一致。Hub 的「总 Token」等于 ccswitch 的「fresh 输入 + 输出」（不含缓存，口径差异）。
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 
