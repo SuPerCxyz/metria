@@ -53,7 +53,8 @@ fn golden_full_parses_session_events() {
     assert_eq!(session.cache_read_tokens.unwrap(), 21000);
     assert_eq!(session.cache_write_tokens.unwrap(), 1500);
     assert_eq!(session.reasoning_tokens.unwrap(), 107 + 260);
-    // 总 Token 口径 input + output + reasoning 与扣减前恒等
+    // 归一化后 output + reasoning 等于归一化前的 output：推理只计一次
+    // （归一化前 reasoning ⊆ output，总 Token input+output+reasoning 把推理算了两遍）
     assert_eq!(
         session.input_tokens.unwrap()
             + session.output_tokens.unwrap()

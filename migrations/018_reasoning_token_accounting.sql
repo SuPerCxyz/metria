@@ -8,7 +8,9 @@
 --
 -- 说明：
 --   本迁移只改原始字段，费用、流量与 rollup 由启动修复（修复版本号提升）重新计算。
---   总 Token = input + output + reasoning 在扣减前后恒等，故总 Token 数值不变。
+--   归一化后 output + reasoning 等于归一化前的 output，即推理只计一次；归一化前
+--   reasoning 同时被计入 output，总 Token = input + output + reasoning 把推理算了两遍，
+--   故修复后 Codex 的总 Token 会按 reasoning 的量下降（这是去重，不是数据丢失）。
 
 UPDATE usage_events
 SET output_tokens = MAX(0, COALESCE(output_tokens, 0) - COALESCE(reasoning_tokens, 0))

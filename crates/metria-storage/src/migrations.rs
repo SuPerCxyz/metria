@@ -162,7 +162,9 @@ mod tests {
         let applied2 = migrate_embedded(&mut conn, None).unwrap();
         assert!(applied2.is_empty());
         assert_eq!(current_version(&conn).unwrap(), *applied.last().unwrap());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]
@@ -184,7 +186,9 @@ mod tests {
         let err = migrate(&mut conn, &[bad], None).unwrap_err();
         assert!(err.to_string().contains("99"));
         assert_eq!(current_version(&conn).unwrap(), 0);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// 018 只把 Codex 的 output_tokens 扣减为不含推理的生成 Token，
@@ -264,9 +268,11 @@ mod tests {
         assert_eq!(read_call("c1"), (263, Some(107)));
         assert_eq!(read_call("c2"), (370, Some(107)));
 
-        // 总 Token = input + output + reasoning 扣减前后恒等
+        // 归一化后 output + reasoning 等于归一化前的 output（推理只计一次）
         assert_eq!(100 + 263 + 107, 100 + 370);
 
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

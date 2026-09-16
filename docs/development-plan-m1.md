@@ -47,13 +47,24 @@
   漏 `cache_write`，有缓存写入的客户端命中率虚高。
 - 方向取舍：曾评估把推理并入 `output`（对齐 OpenAI 语义），但会把双算转移到 OpenCode，并让流量
   估算把推理全量换算为响应字节（违反项目硬性约束）。最终改为镜像归一化：Codex 的 `output`
-  扣除推理，`reasoning` 单独保留。总 Token 口径 `input + output + reasoning` 不变，故总 Token
-  数值不变，仅「输出/推理」拆分、费用与估算流量修正。
+  扣除推理，`reasoning` 单独保留。总 Token 口径仍为 `input + output + reasoning`，但归一化后
+  `output + reasoning` 等于归一化前的 `output`，即推理只计一次；归一化前推理同时存在于
+  `output` 中，总数把推理算了两遍，因此修复后 Codex 的总 Token 会按推理量下降（去重，非丢失）。
 - 实现：`fresh_output` 于 Codex 采集层归一化；迁移 018 回填历史 `usage_events`/`model_calls`；
   修复版本号提升至 3 触发重新计价、流量重估与 rollup 重建；缓存命中率收敛为
   `cache_read/(input+cache_write+cache_read)`，前后端共用同一口径。
 - 验证：Codex golden/单测、迁移 018 回填测试、命中率前后端单测、fmt/clippy/workspace test 与
-  Web 测试/构建；lstable 部署与线上核对见部署记录。
+  Web 测试/构建全部通过。lstable 已部署（迁移 018、修复版本 3、重算完成），用部署前备份逐行核对
+  55,374 条历史 Codex 行：`input`/`reasoning` 零变化、`output` 全部等于 `max(0, 旧 output − 旧
+  reasoning)`、钳 0 行数为 0，总 Token 316,996,221 → 304,507,896（差 12,488,325 = 原推理总量，
+  即去掉双算）；逐小时 rollup 与明细 drift 为 0；费用下降。
+- 命中率的可观测性：线上三个客户端的 `cache_write_tokens` 均为 0，故命中率数值不变；改为本地
+  demo 实例（1847 条调用、613 条 `cache_write > 0`）验证：`/api/v1/models` 的 `cache_hit_rate`
+  与新分母逐模型零不匹配且低于旧分母，总览/分析/模型/模型详情/节点/节点详情/Agent 七个页面
+  渲染正常、命中率跨页一致、Console 无 error、每日趋势 4 层堆叠柱正常。
+- 遗留：`aitools` 节点的 metria-agent 容器仍是旧镜像，且 Hub 不做 ingest 归一化，故**新采集的
+  Codex 行仍按旧口径落库**（实测 raw `input 130333/cached 128768/output 158/reasoning 16` 对应
+  库内 `input 130333/output 158/reasoning 16`）。需更新该 agent 容器后新数据才生效。
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 

@@ -203,7 +203,7 @@ export default function Overview() {
             label="缓存命中率"
             value={cacheHitRate(o) != null ? fmtPct100(cacheHitRate(o)) : '—'}
             {...compare(cacheHitRate(o), previous ? cacheHitRate(previous) : null)}
-            sub="缓存读取 / (输入 + 缓存)"
+            sub="缓存读取 / (输入 + 缓存写入 + 缓存读取)"
             hint="缓存读取 Token 占请求上下文比例"
           />
           <MetricCard
