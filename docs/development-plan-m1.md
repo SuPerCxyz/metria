@@ -37,7 +37,7 @@
 | 总 Token 口径修正：排除缓存读写，统一 Web、排行、趋势与用量报告并保留缓存明细 | ✅ 完成 | 2026-09-15 |
 | 总览分析增强：同期对比、Agent/模型/项目/节点全局筛选、日分层趋势、小时热力图、时长/消息量、数据新鲜度与排行费用副指标（OpenSpec `add-dashboard-usage-insights`） | ✅ 实现与可用门禁完成（Web 无 `typecheck` 脚本） | 2026-09-15 |
 | 价格目录与 Codex Token 口径修复：目录只保留最新快照与规则、规则列表过滤历史并区分「价格关联」、Codex `input_tokens` 归一化为非缓存输入 + 历史回填重算（OpenSpec `fix-pricing-retention-and-codex-tokens`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-15 |
-| rollup 范围口径修复：整点边界统一 julianday 比较、总览不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
+| rollup 范围口径修复：整点边界统一 julianday 比较；总览及使用趋势/流量/节点/客户端/模型页面不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
 
 ### Codex 实时增量用量修复记录（2026-08-13）
 

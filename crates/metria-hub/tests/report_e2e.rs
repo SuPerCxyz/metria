@@ -141,7 +141,10 @@ fn config_webhook(port: u16) -> report::ReportConfig {
 }
 
 fn insert_chart_rollup(db: &HubDb) {
-    let bucket = chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string();
+    // 不完整小时现由明细补齐；本测试只写 rollup，故种到最后一个完整小时。
+    let bucket = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
     let c = db.conn();
     c.execute(
         "INSERT INTO hourly_rollups (
