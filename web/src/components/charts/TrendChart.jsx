@@ -7,8 +7,11 @@ import { downsampleIndices, formatTimeLabel, isRangeLongerThanDay } from './tren
 import chartTheme from '../../../chart-theme.json'
 
 export const PALETTE = chartTheme.palette
+/** 固定语义色（唯一来源 web/chart-theme.json），图表禁止硬编码 hex。 */
+export const COLORS = chartTheme.colors
+export const TOKEN_COLORS = COLORS.token
 
-export default function TrendChart({ labels, values, datasets, tooltipLabels, range, height = 320, color = '#6366f1', formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true, chartType = 'line', stacked = false }) {
+export default function TrendChart({ labels, values, datasets, tooltipLabels, range, height = 320, color = TOKEN_COLORS.input, formatY, prefix = '', ariaLabel = '趋势图', onLegendClick, legendDisplay = true, chartType = 'line', stacked = false }) {
   const ref = useRef(null)
   const chartRef = useRef(null)
   const showDateOnAxis = isRangeLongerThanDay(range)

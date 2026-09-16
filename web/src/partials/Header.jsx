@@ -1,12 +1,13 @@
 // Metria 顶部栏：页面标题 + 汉堡（移动端）+ 全局时间范围 + 主题切换 + 退出登录。
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import ThemeToggle from '../components/ThemeToggle'
 import UserAvatar from '../components/common/UserAvatar'
 import TimeRangePicker from '../components/filters/TimeRangePicker'
 import UsageFilterPicker from '../components/filters/UsageFilterPicker'
 import { usePageMeta } from '../hooks/usePageMeta'
+import { useQueryActivity } from '../hooks/useQuery'
 import { useTimeRange } from '../hooks/useTimeRange'
 import { api, setToken } from '../services/api'
 
@@ -16,6 +17,9 @@ function Header({ sidebarOpen, setSidebarOpen }) {
   const [user, setUser] = useState(null)
   const { subtitle } = usePageMeta()
   const { refreshRange } = useTimeRange()
+  const [refreshing, setRefreshing] = useState(false)
+  const activity = useQueryActivity()
+  const startedRef = useRef(false)
 
   useEffect(() => {
     const load = () => api('/auth/me').then(setUser).catch(() => setUser(null))
@@ -31,7 +35,33 @@ function Header({ sidebarOpen, setSidebarOpen }) {
     navigate('/login')
   }
 
+  // 刷新态：等到本次刷新触发的请求全部结束再恢复，避免看不出进度。
+  useEffect(() => {
+    if (!refreshing) return undefined
+    if (activity > 0) {
+      startedRef.current = true
+      return undefined
+    }
+    // 已发起过的请求全部结束
+    if (startedRef.current) {
+      setRefreshing(false)
+      return undefined
+    }
+    // 兜底：当前页面没有可刷新的查询
+    const timer = window.setTimeout(() => setRefreshing(false), 400)
+    return () => window.clearTimeout(timer)
+  }, [activity, refreshing])
+
+  // 兜底：异常情况下最长转 15s
+  useEffect(() => {
+    if (!refreshing) return undefined
+    const timer = window.setTimeout(() => setRefreshing(false), 15000)
+    return () => window.clearTimeout(timer)
+  }, [refreshing])
+
   const refreshPage = () => {
+    startedRef.current = false
+    setRefreshing(true)
     // 先通知查询记录旧 key，再重算快捷范围；自定义范围不会被改写。
     window.dispatchEvent(new CustomEvent('metria:refresh'))
     refreshRange()
@@ -58,11 +88,13 @@ function Header({ sidebarOpen, setSidebarOpen }) {
             <button
               type="button"
               onClick={refreshPage}
-              className="w-8 h-8 shrink-0 flex items-center justify-center rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-700/60"
-              aria-label="刷新页面"
-              title="刷新当前页面数据"
+              disabled={refreshing}
+              aria-busy={refreshing}
+              className="w-8 h-8 shrink-0 flex items-center justify-center rounded-full text-gray-500 hover:text-gray-700 hover:bg-gray-100 disabled:cursor-default disabled:hover:bg-transparent dark:text-gray-400 dark:hover:text-gray-200 dark:hover:bg-gray-700/60 dark:disabled:hover:bg-transparent"
+              aria-label={refreshing ? '正在刷新' : '刷新页面'}
+              title={refreshing ? '正在刷新…' : '刷新当前页面数据'}
             >
-              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <svg className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M3 12a9 9 0 0 1 15.5-6.3L21 8" />
                 <path d="M21 3v5h-5" />
                 <path d="M21 12a9 9 0 0 1-15.5 6.3L3 16" />

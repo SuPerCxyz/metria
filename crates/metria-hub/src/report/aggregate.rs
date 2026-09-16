@@ -271,18 +271,27 @@ pub fn daily_token_chart(
 ) -> ChartSeries {
     let points = query_points(db, from, to, tz, None);
     let (buckets, days) = axis(&points, from, to, tz);
-    // 输出含推理（与页面、ccswitch 口径一致），四段之和即总 Token
-    let names = ["输入", "输出（含推理）", "缓存读取", "缓存写入"];
-    let keys: [&[&str]; 4] = [
-        &["input_tokens"],
-        &["output_tokens", "reasoning_tokens"],
-        &["cache_read_tokens"],
-        &["cache_write_tokens"],
+    // 输出含推理（与页面、ccswitch 口径一致），各段之和即总 Token。
+    // 缓存写入为 0 时不占序列（非 0 时自动恢复）。
+    let mut names = vec!["输入", "输出（含推理）", "缓存读取"];
+    let mut keys: Vec<Vec<&str>> = vec![
+        vec!["input_tokens"],
+        vec!["output_tokens", "reasoning_tokens"],
+        vec!["cache_read_tokens"],
     ];
-    let series = (0..4)
-        .map(|i| NamedSeries {
-            name: names[i].to_string(),
-            values: overall_values_sum(&points, &buckets, keys[i]),
+    if points
+        .iter()
+        .any(|point| value(point, "cache_write_tokens") > 0)
+    {
+        names.push("缓存写入");
+        keys.push(vec!["cache_write_tokens"]);
+    }
+    let series = names
+        .iter()
+        .zip(keys.iter())
+        .map(|(name, key)| NamedSeries {
+            name: name.to_string(),
+            values: overall_values_sum(&points, &buckets, key),
         })
         .collect();
     ChartSeries { days, series }

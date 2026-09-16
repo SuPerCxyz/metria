@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
-import TrendChart from '../../components/charts/TrendChart'
+import TrendChart, { TOKEN_COLORS } from '../../components/charts/TrendChart'
 import DailyUsageChart from '../../components/charts/DailyUsageChart'
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap'
 import RankingList from '../../components/cards/RankingList'
@@ -106,10 +106,13 @@ export default function Overview() {
           labels,
           tooltipLabels,
           datasets: [
-            { label: '输入', values: sorted.map((p) => p.input_tokens) },
-            { label: '输出（含推理）', values: sorted.map((p) => outputTokens(p)) },
-            { label: '缓存读取', values: sorted.map((p) => p.cache_read_tokens) },
-            { label: '缓存写入', values: sorted.map((p) => p.cache_write_tokens) },
+            { label: '输入', color: TOKEN_COLORS.input, values: sorted.map((p) => p.input_tokens) },
+            { label: '输出（含推理）', color: TOKEN_COLORS.output, values: sorted.map((p) => outputTokens(p)) },
+            { label: '缓存读取', color: TOKEN_COLORS.cacheRead, values: sorted.map((p) => p.cache_read_tokens) },
+            // 缓存写入为 0 时不占图层
+            ...(sorted.some((p) => (p.cache_write_tokens ?? 0) > 0)
+              ? [{ label: '缓存写入', color: TOKEN_COLORS.cacheWrite, values: sorted.map((p) => p.cache_write_tokens) }]
+              : []),
           ],
         }
       }
@@ -195,7 +198,7 @@ export default function Overview() {
             {...compare(sumTokens(o), previous ? sumTokens(previous) : null)}
             sub={
               <span className="tabular-nums">
-                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)} · 缓存写入 {fmtTokensShort(o.cache_write_tokens)}</span>
+                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)}{(o.cache_write_tokens ?? 0) > 0 ? ` · 缓存写入 ${fmtTokensShort(o.cache_write_tokens)}` : ''}</span>
               </span>
             }
           />

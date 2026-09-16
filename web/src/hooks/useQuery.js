@@ -2,6 +2,26 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+// 全局在飞请求计数：供顶栏刷新按钮等展示「刷新中」。
+let inFlight = 0
+const activityListeners = new Set()
+
+function bumpActivity(delta) {
+  inFlight = Math.max(0, inFlight + delta)
+  activityListeners.forEach((listener) => listener(inFlight))
+}
+
+/** 订阅当前在飞请求数（任何页面任一 useQuery 发起的请求）。 */
+export function useQueryActivity() {
+  const [count, setCount] = useState(inFlight)
+  useEffect(() => {
+    activityListeners.add(setCount)
+    setCount(inFlight)
+    return () => { activityListeners.delete(setCount) }
+  }, [])
+  return count
+}
+
 export function useQuery(key, fetcher, { enabled = true } = {}) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -24,6 +44,7 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
     let cancelled = false
     setLoading(true)
     setError(null)
+    bumpActivity(1)
     fetcherRef.current()
       .then((d) => {
         if (!cancelled) {
@@ -37,6 +58,7 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
           setLoading(false)
         }
       })
+      .finally(() => bumpActivity(-1))
     return () => { cancelled = true }
   }, [key]) // eslint-disable-line react-hooks/exhaustive-deps
 

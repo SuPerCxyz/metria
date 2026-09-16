@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import MetricCard from '../../components/cards/MetricCard'
-import TrendChart from '../../components/charts/TrendChart'
+import TrendChart, { COLORS, PALETTE } from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
 import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
@@ -77,9 +77,9 @@ export default function Analytics() {
     return {
       labels,
       datasets: [
-        { label: 'P50', values: pick('p50_ms'), color: '#10b981' },
-        { label: 'P95', values: pick('p95_ms'), color: '#f59e0b' },
-        { label: '平均', values: pick('avg_ms'), color: '#6366f1' },
+        { label: 'P50', values: pick('p50_ms'), color: COLORS.latency.p50 },
+        { label: 'P95', values: pick('p95_ms'), color: COLORS.latency.p95 },
+        { label: '平均', values: pick('avg_ms'), color: COLORS.latency.avg },
       ],
     }
   }, [latencySeries.data])
@@ -199,7 +199,7 @@ export default function Analytics() {
             <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
             <MetricCard label="缓存命中率" value={fmtPct100(cacheHit)} {...compare(cacheHit, cacheHitRate(previous))} />
             <MetricCard label="缓存节省费用" value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'} {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)} sub={o.cache_savings_micro_usd > 0 ? '按缓存读取单价估算' : '无价格规则或缓存数据'} />
-            <MetricCard label="缓存写入" value={fmtTokensShort(o.cache_write_tokens)} {...compare(o.cache_write_tokens, previous?.cache_write_tokens)} />
+            {(o.cache_write_tokens ?? 0) > 0 && <MetricCard label="缓存写入" value={fmtTokensShort(o.cache_write_tokens)} {...compare(o.cache_write_tokens, previous?.cache_write_tokens)} />}
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">缓存趋势</h2>
@@ -296,7 +296,7 @@ export default function Analytics() {
   )
 }
 
-const DETAIL_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#8b5cf6', '#ec4899', '#84cc16']
+const DETAIL_COLORS = PALETTE
 
 function DetailAnalysis({
   tab,

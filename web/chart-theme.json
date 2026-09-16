@@ -9,6 +9,25 @@
     "#ec4899",
     "#84cc16"
   ],
+  "colors": {
+    "token": {
+      "input": "#6366f1",
+      "output": "#10b981",
+      "cacheRead": "#f59e0b",
+      "cacheWrite": "#06b6d4",
+      "reasoning": "#8b5cf6"
+    },
+    "metric": {
+      "cost": "#f59e0b",
+      "duration": "#06b6d4",
+      "requests": "#8b5cf6"
+    },
+    "latency": {
+      "p50": "#10b981",
+      "p95": "#f59e0b",
+      "avg": "#6366f1"
+    }
+  },
   "gridColor": "rgba(156,163,175,0.12)",
   "axisColor": "#9ca3af",
   "lineWidth": 2,

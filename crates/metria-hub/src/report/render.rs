@@ -21,11 +21,26 @@ pub struct ReportMeta {
 }
 
 // 与 Web Chart 调色板一致
-pub(crate) const C_INPUT: &str = "#6366f1";
-pub(crate) const C_OUTPUT: &str = "#10b981";
-pub(crate) const C_CACHE_R: &str = "#f59e0b";
-pub(crate) const C_CACHE_W: &str = "#06b6d4";
-pub(crate) const C_REASON: &str = "#8b5cf6";
+// Token 分类色唯一来源 web/chart-theme.json（见 docs/design-system.md），禁止在此硬编码。
+pub(crate) fn c_input() -> &'static str {
+    &chart_theme().colors.token.input
+}
+
+pub(crate) fn c_output() -> &'static str {
+    &chart_theme().colors.token.output
+}
+
+pub(crate) fn c_cache_read() -> &'static str {
+    &chart_theme().colors.token.cache_read
+}
+
+pub(crate) fn c_cache_write() -> &'static str {
+    &chart_theme().colors.token.cache_write
+}
+
+pub(crate) fn c_reasoning() -> &'static str {
+    &chart_theme().colors.token.reasoning
+}
 pub(crate) const C_REPORTED: &str = "#6366f1";
 pub(crate) const C_CALCULATED: &str = "#10b981";
 pub(crate) const C_ESTIMATED: &str = "#f59e0b";
@@ -61,6 +76,24 @@ pub(crate) struct ChartTheme {
     pub(crate) y_tick_count: usize,
     #[serde(rename = "fontSize")]
     pub(crate) font_size: u32,
+    pub(crate) colors: ThemeColors,
+}
+
+/// `chart-theme.json` 的固定语义色（前端与报告共用同一来源）。
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThemeColors {
+    pub(crate) token: TokenColors,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenColors {
+    pub(crate) input: String,
+    pub(crate) output: String,
+    #[serde(rename = "cacheRead")]
+    pub(crate) cache_read: String,
+    #[serde(rename = "cacheWrite")]
+    pub(crate) cache_write: String,
+    pub(crate) reasoning: String,
 }
 
 pub(crate) fn chart_theme() -> &'static ChartTheme {
@@ -142,14 +175,20 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.calls),
         n(m.sessions)
     ));
+    // 缓存写入为 0 时不占位（非 0 时自动恢复）
+    let cache_write_part = if m.cache_write_tokens > 0 {
+        format!(" / 缓存写 {}", n(m.cache_write_tokens))
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "Token 消耗：{}（输入 {} / 输出 {}（其中推理 {}）/ 缓存读 {} / 缓存写 {}）\n",
+        "Token 消耗：{}（输入 {} / 输出 {}（其中推理 {}）/ 缓存读 {}{}）\n",
         n(m.total_tokens()),
         n(m.input_tokens),
         n(m.output_tokens + m.reasoning_tokens),
         n(m.reasoning_tokens),
         n(m.cache_read_tokens),
-        n(m.cache_write_tokens)
+        cache_write_part
     ));
     if m.total_tokens() == 0 {
         s.push_str("（未采集到 Token 数据）\n");
@@ -234,13 +273,19 @@ fn kpi_cards(m: &ReportMetrics) -> String {
         card("会话", &n(m.sessions), "个"),
         card("Token 消耗", &n(m.total_tokens()), "含缓存读写"),
     );
+    // 缓存写入为 0 时不占位（非 0 时自动恢复）
+    let cache_write_detail = if m.cache_write_tokens > 0 {
+        format!(" · 缓存写 {}", n(m.cache_write_tokens))
+    } else {
+        String::new()
+    };
     let detail = format!(
-        "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {}（其中推理 {}）· 缓存读 {} · 缓存写 {}</div>",
+        "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {}（其中推理 {}）· 缓存读 {}{}</div>",
         n(m.input_tokens),
         n(m.output_tokens + m.reasoning_tokens),
         n(m.reasoning_tokens),
         n(m.cache_read_tokens),
-        n(m.cache_write_tokens)
+        cache_write_detail
     );
     format!("{kpis}{detail}")
 }
@@ -265,11 +310,11 @@ fn token_section(m: &ReportMetrics) -> String {
     let mut barh = String::from(
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-radius:6px;overflow:hidden;\"><tr>",
     );
-    barh.push_str(&seg(m.input_tokens, C_INPUT));
+    barh.push_str(&seg(m.input_tokens, c_input()));
     // 输出段含推理，四段之和等于总 Token
-    barh.push_str(&seg(m.output_tokens + m.reasoning_tokens, C_OUTPUT));
-    barh.push_str(&seg(m.cache_read_tokens, C_CACHE_R));
-    barh.push_str(&seg(m.cache_write_tokens, C_CACHE_W));
+    barh.push_str(&seg(m.output_tokens + m.reasoning_tokens, c_output()));
+    barh.push_str(&seg(m.cache_read_tokens, c_cache_read()));
+    barh.push_str(&seg(m.cache_write_tokens, c_cache_write()));
     barh.push_str("</tr></table>");
 
     let legend_row = |label: &str, v: i64, color: &str| -> String {
@@ -287,11 +332,11 @@ fn token_section(m: &ReportMetrics) -> String {
     };
     let legend = format!(
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:10px;\">{}{}{}{}{}</table>",
-        legend_row("输入", m.input_tokens, C_INPUT),
-        legend_row("输出（含推理）", m.output_tokens + m.reasoning_tokens, C_OUTPUT),
-        legend_row("缓存读取", m.cache_read_tokens, C_CACHE_R),
-        legend_row("缓存写入", m.cache_write_tokens, C_CACHE_W),
-        legend_row("其中推理", m.reasoning_tokens, C_REASON),
+        legend_row("输入", m.input_tokens, c_input()),
+        legend_row("输出（含推理）", m.output_tokens + m.reasoning_tokens, c_output()),
+        legend_row("缓存读取", m.cache_read_tokens, c_cache_read()),
+        legend_row("缓存写入", m.cache_write_tokens, c_cache_write()),
+        legend_row("其中推理", m.reasoning_tokens, c_reasoning()),
     );
     format!("{}{}{}", section_title("Token 构成"), barh, legend)
 }
@@ -341,7 +386,14 @@ fn top_section(title: &str, items: &[DimCount], show_tokens: bool) -> String {
     }
     let max = items.iter().map(|d| d.calls).max().unwrap_or(1).max(1);
     let palette = [
-        C_INPUT, C_OUTPUT, C_CACHE_R, C_CACHE_W, C_REASON, "#ec4899", "#84cc16", "#06b6d4",
+        c_input(),
+        c_output(),
+        c_cache_read(),
+        c_cache_write(),
+        c_reasoning(),
+        "#ec4899",
+        "#84cc16",
+        "#06b6d4",
     ];
     let mut s = section_title(title);
     s.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">");
@@ -652,7 +704,7 @@ mod tests {
     fn html_chart_is_inline_svg_without_cid_image() {
         let svg = inline_chart_svg(
             &["09-10".into(), "09-11".into()],
-            &[("输入".into(), C_INPUT.into(), vec![10, 20])],
+            &[("输入".into(), c_input().into(), vec![10, 20])],
             "Token 趋势",
         );
         assert!(svg.starts_with("<svg"));
@@ -673,7 +725,7 @@ mod tests {
                 title: "Token 趋势".into(),
                 png: Vec::new(),
                 svg,
-                series: vec![("输入".into(), C_INPUT.into())],
+                series: vec![("输入".into(), c_input().into())],
                 days: vec!["09-10".into(), "09-11".into()],
             }],
         );
@@ -747,6 +799,65 @@ mod tests {
         assert!(h.contains("估算</span>"));
         assert!(h.contains("计算费用"));
         assert!(!h.contains("上报费用"));
+    }
+
+    #[test]
+    fn token_colors_come_from_chart_theme() {
+        let token = &chart_theme().colors.token;
+        // 与 docs/design-system.md 的标准一致（防止 chart-theme.json 被悄悄改掉）
+        assert_eq!(token.input, "#6366f1");
+        assert_eq!(token.output, "#10b981");
+        assert_eq!(token.cache_read, "#f59e0b");
+        assert_eq!(token.cache_write, "#06b6d4");
+        assert_eq!(token.reasoning, "#8b5cf6");
+
+        let m = ReportMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            reasoning_tokens: 10,
+            cache_read_tokens: 900,
+            cache_write_tokens: 20,
+            has_data: true,
+            ..Default::default()
+        };
+        let html = render_html(&m, &meta(), &[]);
+        for color in [
+            &token.input,
+            &token.output,
+            &token.cache_read,
+            &token.cache_write,
+        ] {
+            assert!(
+                html.contains(color.as_str()),
+                "报告 HTML 应使用标准色 {color}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_detail_omits_cache_write_when_zero() {
+        let m = ReportMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            reasoning_tokens: 2,
+            cache_read_tokens: 3,
+            cache_write_tokens: 0,
+            has_data: true,
+            ..Default::default()
+        };
+        let text = render_text(&m, &meta());
+        assert!(text.contains("缓存读 3）"), "{text}");
+        assert!(!text.contains("缓存写"), "{text}");
+
+        let html = render_html(&m, &meta(), &[]);
+        assert!(!html.contains("· 缓存写"), "{html}");
+
+        // 非 0 时恢复展示
+        let m2 = ReportMetrics {
+            cache_write_tokens: 7,
+            ..m
+        };
+        assert!(render_text(&m2, &meta()).contains("缓存写 7"));
     }
 
     #[test]

@@ -196,6 +196,46 @@ fn insert_hourly_rollups(db: &HubDb, from: chrono::DateTime<chrono::Utc>, count:
 }
 
 #[test]
+fn token_chart_hides_cache_write_when_zero() {
+    let (db, _cfg, _dir) = temp_db();
+    let from = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    // 跨度 > 24h 才会走小时 rollup（≤24h 走明细）
+    let to = from + chrono::Duration::days(3);
+    insert_hourly_rollups(&db, from, 24);
+
+    let names = |cs: &report::aggregate::ChartSeries| -> Vec<String> {
+        cs.series.iter().map(|s| s.name.clone()).collect()
+    };
+    let chart = report::aggregate::daily_token_chart(&db, from, to, chrono_tz::UTC);
+    assert!(
+        !names(&chart).contains(&"缓存写入".to_string()),
+        "{:?}",
+        names(&chart)
+    );
+
+    // 出现非零缓存写入后恢复该序列（取锁限定在作用域内，避免与随后查询互等）
+    {
+        let c = db.conn();
+        c.execute(
+            "INSERT INTO hourly_rollups (
+                bucket, node_id, collector_id, client_id, source_id, model,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, session_count, model_call_count
+            ) VALUES (?1, 'n2', 'c2', 'cl2', 's2', 'm2', 10, 5, 2, 7, 1, 1)",
+            metria_storage::rusqlite::params![from.to_rfc3339()],
+        )
+        .unwrap();
+    }
+    let chart2 = report::aggregate::daily_token_chart(&db, from, to, chrono_tz::UTC);
+    assert!(
+        names(&chart2).contains(&"缓存写入".to_string()),
+        "{:?}",
+        names(&chart2)
+    );
+}
+
+#[test]
 fn report_chart_density_matches_web_policy_for_seven_and_fourteen_days() {
     let (db, _cfg, _dir) = temp_db();
     let from = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
