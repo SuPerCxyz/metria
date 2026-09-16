@@ -41,8 +41,8 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
         </div>
         <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">按展示时区聚合；点击有数据的单元格下钻到最近匹配小时</p>
       </div>
-      {loading && cells.length === 0 ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-amber-600 dark:text-amber-400">热力图加载失败，请刷新重试。</div> : <div className="flex flex-1 items-center overflow-x-auto pb-1">
-        <div className="grid w-full grid-rows-[auto_repeat(7,auto)] grid-cols-[2.5rem_repeat(24,minmax(0.75rem,1fr))] gap-1 text-[10px] text-gray-400 dark:text-gray-500">
+      {loading && cells.length === 0 ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-amber-600 dark:text-amber-400">热力图加载失败，请刷新重试。</div> : <div className="flex-1 overflow-x-auto pb-1">
+        <div className="grid h-full w-full grid-rows-[auto_repeat(7,1fr)] grid-cols-[2.5rem_repeat(24,minmax(0.75rem,1fr))] gap-1 text-[10px] text-gray-400 dark:text-gray-500">
           <span aria-hidden="true" />
           {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center tabular-nums">{hour}</span>)}
           {WEEKDAYS.map((weekday, day) => (
@@ -61,7 +61,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
                     onClick={() => onCellClick?.(cell)}
                     title={label}
                     aria-label={label}
-                    className="aspect-square w-full rounded-sm border border-transparent transition hover:border-indigo-400 disabled:cursor-default"
+                    className="aspect-square w-[78%] justify-self-center self-center rounded-sm border border-transparent transition hover:border-indigo-400 disabled:cursor-default"
                     style={alpha ? { backgroundColor: `rgba(99, 102, 241, ${alpha})` } : undefined}
                   />
                 )
@@ -69,9 +69,6 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
             </React.Fragment>
           ))}
         </div>
-      </div>}
-      {!error && !(loading && cells.length === 0) && <div className="mt-3 flex items-center justify-end gap-2 text-[10px] text-gray-400 dark:text-gray-500">
-        <span>低</span><span className="h-2.5 w-8 rounded-sm bg-indigo-100 dark:bg-indigo-400/20" /><span className="h-2.5 w-8 rounded-sm bg-indigo-500" /><span>高</span>
       </div>}
     </div>
   )

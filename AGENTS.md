@@ -153,6 +153,7 @@ METRIA_TIMEZONE=Asia/Shanghai ./target/debug/metria hub --demo
 - `--demo` 是 CLI 开关；`METRIA_DEMO=1` 会被 CLI 覆盖，不生效。demo 数据含非零 `cache_write`，适合验证缓存相关口径。
 - 未配置 OIDC 时可用密码登录；`POST /api/v1/auth/login` 返回 JSON `token`，前端从 `localStorage['metria-token']` 读取，浏览器验证时注入该 token 可免走登录表单。
 - 页面主滚动容器是 `div.app-scroll-container`，截图前需要滚动它而不是 `window`。
+- 前端产物是编译期嵌入的（`crates/metria-hub/src/assets.rs` 嵌入 `web/dist`）。**只改前端而不改 Rust 时，本地 debug 二进制不会重编译，会继续提供旧 bundle**；本地验证前先 `touch crates/metria-hub/src/assets.rs` 再 `cargo build -p metria-cli`，并用「服务端 index.html 引用的 hash == `web/dist/assets/*.js` 的 hash」确认。Docker 构建是全新编译，线上部署不受影响。
 
 ### 12.4 线上数据核对
 

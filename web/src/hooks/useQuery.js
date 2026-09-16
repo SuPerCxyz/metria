@@ -11,6 +11,28 @@ function bumpActivity(delta) {
   activityListeners.forEach((listener) => listener(inFlight))
 }
 
+// 刷新窗口：记录「本次刷新触发的请求是否有失败」，供顶栏提示成功/失败。
+let refreshPending = false
+let refreshFailed = false
+
+export function beginRefreshWindow() {
+  refreshPending = true
+  refreshFailed = false
+}
+
+/** 供内部与测试标记本次刷新中出现过失败请求。 */
+export function markRefreshFailure() {
+  if (refreshPending) refreshFailed = true
+}
+
+/** 结束刷新窗口，返回本次刷新是否出现过失败。 */
+export function endRefreshWindow() {
+  const failed = refreshFailed
+  refreshPending = false
+  refreshFailed = false
+  return failed
+}
+
 /** 订阅当前在飞请求数（任何页面任一 useQuery 发起的请求）。 */
 export function useQueryActivity() {
   const [count, setCount] = useState(inFlight)
@@ -53,6 +75,7 @@ export function useQuery(key, fetcher, { enabled = true } = {}) {
         }
       })
       .catch((e) => {
+        markRefreshFailure()
         if (!cancelled) {
           setError(e)
           setLoading(false)

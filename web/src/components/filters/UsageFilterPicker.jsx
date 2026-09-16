@@ -1,6 +1,6 @@
 // 全局用量筛选：Agent、模型、项目、节点。状态由 NodeFilterProvider 跨页面保持。
 
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useQuery } from '../../hooks/useQuery'
 import { api } from '../../services/api'
@@ -31,6 +31,24 @@ function SelectField({ label, value, onChange, options, disabled }) {
 
 export default function UsageFilterPicker({ className = '' }) {
   const [open, setOpen] = useState(false)
+  const boxRef = useRef(null)
+
+  // 点击页面其他区域或按 Esc 自动收起，无需额外确认
+  useEffect(() => {
+    if (!open) return undefined
+    const onPointerDown = (event) => {
+      if (boxRef.current && !boxRef.current.contains(event.target)) setOpen(false)
+    }
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
   const {
     nodeId, clientId, model, projectId,
     setNodeId, setClientId, setModel, setProjectId, clearFilters,
@@ -43,7 +61,7 @@ export default function UsageFilterPicker({ className = '' }) {
   const active = [nodeId, clientId, model, projectId].filter(Boolean).length
 
   return (
-    <div className={`relative shrink-0 ${className}`}>
+    <div ref={boxRef} className={`relative shrink-0 ${className}`}>
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}

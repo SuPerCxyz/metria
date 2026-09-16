@@ -17,7 +17,7 @@ export function ToastProvider({ children }) {
   const notify = useCallback((message, type = 'success') => {
     const id = ++nextToastId
     setToasts((items) => [...items.slice(-3), { id, message, type }])
-    timers.current.set(id, window.setTimeout(() => dismiss(id), 4500))
+    timers.current.set(id, window.setTimeout(() => dismiss(id), 3000))
   }, [dismiss])
 
   useEffect(() => () => {
@@ -27,19 +27,42 @@ export function ToastProvider({ children }) {
   return (
     <ToastContext.Provider value={{ notify }}>
       {children}
-      <div className="pointer-events-none fixed right-4 top-4 z-[100] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-3" aria-label="通知" aria-live="polite" aria-atomic="false">
+      <div className="pointer-events-none fixed right-4 top-20 z-[100] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-3" aria-label="通知" aria-live="polite" aria-atomic="false">
         {toasts.map((toast) => {
           const failed = toast.type === 'error'
           return (
             <div
               key={toast.id}
               role={failed ? 'alert' : 'status'}
-              className={`pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 text-sm shadow-lg ${failed
-                ? 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800/70 dark:bg-rose-950/80 dark:text-rose-200'
-                : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800/70 dark:bg-emerald-950/80 dark:text-emerald-200'}`}
+              className="pointer-events-auto flex items-start gap-2.5 rounded-xl border border-gray-200 bg-white py-3 pl-3.5 pr-3 text-sm text-gray-700 shadow-lg dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200"
             >
+              <svg
+                aria-hidden="true"
+                className={`mt-0.5 h-4 w-4 shrink-0 ${failed ? 'text-rose-500' : 'text-emerald-500'}`}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                {failed ? (
+                  <>
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="M12 8v4.5" />
+                    <path d="M12 16h.01" />
+                  </>
+                ) : (
+                  <path d="M20 6 9 17l-5-5" />
+                )}
+              </svg>
               <span className="min-w-0 flex-1 break-words">{toast.message}</span>
-              <button type="button" onClick={() => dismiss(toast.id)} className="shrink-0 text-current opacity-70 hover:opacity-100" aria-label="关闭通知">
+              <button
+                type="button"
+                onClick={() => dismiss(toast.id)}
+                className="-mt-0.5 shrink-0 text-gray-400 transition hover:text-gray-600 dark:hover:text-gray-200"
+                aria-label="关闭通知"
+              >
                 ×
               </button>
             </div>
