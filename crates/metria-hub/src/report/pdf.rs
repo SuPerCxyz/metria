@@ -271,12 +271,12 @@ fn token_sections(p: &mut Pdf, m: &ReportMetrics) {
         Rect::new(Mm(MARGIN), Mm(top - h), Mm(MARGIN + CONTENT_W), Mm(top))
             .with_mode(PaintMode::Fill),
     );
+    // 输出段含推理，四段之和等于总 Token
     let segs = [
         (m.input_tokens, C_INPUT),
-        (m.output_tokens, C_OUTPUT),
+        (m.output_tokens + m.reasoning_tokens, C_OUTPUT),
         (m.cache_read_tokens, C_CACHE_R),
         (m.cache_write_tokens, C_CACHE_W),
-        (m.reasoning_tokens, C_REASON),
     ];
     let mut x = MARGIN;
     for (v, color) in segs {
@@ -294,10 +294,14 @@ fn token_sections(p: &mut Pdf, m: &ReportMetrics) {
     p.gap(3.0);
     for (label, v, color) in [
         ("输入", m.input_tokens, C_INPUT),
-        ("输出", m.output_tokens, C_OUTPUT),
+        (
+            "输出（含推理）",
+            m.output_tokens + m.reasoning_tokens,
+            C_OUTPUT,
+        ),
         ("缓存读取", m.cache_read_tokens, C_CACHE_R),
         ("缓存写入", m.cache_write_tokens, C_CACHE_W),
-        ("推理", m.reasoning_tokens, C_REASON),
+        ("其中推理", m.reasoning_tokens, C_REASON),
     ] {
         if v <= 0 {
             continue;
@@ -487,12 +491,12 @@ pub fn render_pdf(
     p.gap(2.0);
     p.text(
         &format!(
-            "Token 明细：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {} · 推理 {}",
+            "Token 明细：输入 {} · 输出 {}（其中推理 {}）· 缓存读 {} · 缓存写 {}",
             n(m.input_tokens),
-            n(m.output_tokens),
+            n(m.output_tokens + m.reasoning_tokens),
+            n(m.reasoning_tokens),
             n(m.cache_read_tokens),
-            n(m.cache_write_tokens),
-            n(m.reasoning_tokens)
+            n(m.cache_write_tokens)
         ),
         9.0,
         REPORT_FAINT,

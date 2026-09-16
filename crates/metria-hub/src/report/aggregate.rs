@@ -237,6 +237,20 @@ fn value(point: &Value, key: &str) -> i64 {
     point.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// 单桶多字段求和（用于「输出含推理」这类派生序列）。
+fn overall_values_sum(points: &[Value], buckets: &[String], keys: &[&str]) -> Vec<i64> {
+    let mut by_bucket: HashMap<&str, i64> = HashMap::new();
+    for point in points {
+        let Some(b) = bucket(point) else { continue };
+        let sum: i64 = keys.iter().map(|key| value(point, key)).sum();
+        *by_bucket.entry(b).or_insert(0) += sum;
+    }
+    buckets
+        .iter()
+        .map(|bucket| by_bucket.get(bucket.as_str()).copied().unwrap_or(0))
+        .collect()
+}
+
 fn overall_values(points: &[Value], buckets: &[String], key: &str) -> Vec<i64> {
     let by_bucket: HashMap<&str, i64> = points
         .iter()
@@ -257,15 +271,18 @@ pub fn daily_token_chart(
 ) -> ChartSeries {
     let points = query_points(db, from, to, tz, None);
     let (buckets, days) = axis(&points, from, to, tz);
-    let names = ["输入", "输出", "缓存读取"];
-    let series = (0..3)
+    // 输出含推理（与页面、ccswitch 口径一致），四段之和即总 Token
+    let names = ["输入", "输出（含推理）", "缓存读取", "缓存写入"];
+    let keys: [&[&str]; 4] = [
+        &["input_tokens"],
+        &["output_tokens", "reasoning_tokens"],
+        &["cache_read_tokens"],
+        &["cache_write_tokens"],
+    ];
+    let series = (0..4)
         .map(|i| NamedSeries {
             name: names[i].to_string(),
-            values: overall_values(
-                &points,
-                &buckets,
-                ["input_tokens", "output_tokens", "cache_read_tokens"][i],
-            ),
+            values: overall_values_sum(&points, &buckets, keys[i]),
         })
         .collect();
     ChartSeries { days, series }

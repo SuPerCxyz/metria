@@ -15,7 +15,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
 const TREND_TABS = [
@@ -107,10 +107,9 @@ export default function Overview() {
           tooltipLabels,
           datasets: [
             { label: '输入', values: sorted.map((p) => p.input_tokens) },
-            { label: '输出', values: sorted.map((p) => p.output_tokens) },
+            { label: '输出（含推理）', values: sorted.map((p) => outputTokens(p)) },
             { label: '缓存读取', values: sorted.map((p) => p.cache_read_tokens) },
             { label: '缓存写入', values: sorted.map((p) => p.cache_write_tokens) },
-            { label: '推理', values: sorted.map((p) => p.reasoning_tokens) },
           ],
         }
       }
@@ -196,7 +195,7 @@ export default function Overview() {
             {...compare(sumTokens(o), previous ? sumTokens(previous) : null)}
             sub={
               <span className="tabular-nums">
-                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(o.output_tokens)} · 缓存读取 {fmtTokensShort(o.cache_read_tokens)} · 缓存写入 {fmtTokensShort(o.cache_write_tokens)} · 推理 {fmtTokensShort(o.reasoning_tokens)}</span>
+                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)} · 缓存写入 {fmtTokensShort(o.cache_write_tokens)}</span>
               </span>
             }
           />

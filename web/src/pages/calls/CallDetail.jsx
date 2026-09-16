@@ -8,7 +8,7 @@ import StatusBadge from '../../components/common/StatusBadge'
 import { DataQualityNote, ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, outputTokens } from '../../services/format'
 
 export default function CallDetail() {
   const { id } = useParams()
@@ -41,7 +41,7 @@ export default function CallDetail() {
           { label: '开始时间', value: fmtDateTime(c.started_at) },
           { label: '响应时间', value: fmtDuration(c.duration_ms) },
           { label: '输入 Token', value: fmtTokensShort(c.input_tokens) },
-          { label: '输出 Token', value: fmtTokensShort(c.output_tokens) },
+          { label: '输出 Token', value: fmtTokensShort(outputTokens(c)) },
           { label: '缓存 Token', value: fmtTokensShort(c.cache_read_tokens) },
           { label: '费用', value: fmtUsd(c.reported_cost_micro_usd ?? c.calculated_cost_micro_usd ?? c.estimated_cost_micro_usd) },
         ]}

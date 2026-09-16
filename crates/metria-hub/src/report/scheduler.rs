@@ -175,7 +175,7 @@ fn build_charts(
     };
 
     let token = aggregate::daily_token_chart(db, from, to, tz);
-    if let Some(c) = mk(&token, &palette[..3], "chart-token", "Token 趋势", true) {
+    if let Some(c) = mk(&token, &palette[..4], "chart-token", "Token 趋势", true) {
         out.push(c);
     }
     let calls = aggregate::daily_calls_chart(db, from, to, tz);

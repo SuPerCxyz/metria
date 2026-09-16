@@ -13,7 +13,7 @@ import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens, outputTokens } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -58,7 +58,7 @@ export default function SessionDetail() {
     { key: 'started_at', label: '调用时间', sortable: true, render: (r) => fmtDateTime(r.started_at) },
     { key: 'model', label: '模型', render: (r) => r.model || '—' },
     { key: 'input_tokens', label: '输入 Token', render: (r) => fmtTokensShort(r.input_tokens) },
-    { key: 'output_tokens', label: '输出 Token', render: (r) => fmtTokensShort(r.output_tokens) },
+    { key: 'output_tokens', label: '输出 Token', render: (r) => fmtTokensShort(outputTokens(r)) },
     { key: 'cache_read_tokens', label: '缓存 Token', render: (r) => fmtTokensShort(r.cache_read_tokens) },
     { key: 'calculated_cost_micro_usd', label: '费用', render: (r) => fmtUsd(r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
     { key: 'duration_ms', label: '响应时间', render: (r) => fmtDuration(r.duration_ms) },
@@ -114,8 +114,8 @@ export default function SessionDetail() {
             <span className="text-sm text-gray-500 dark:text-gray-400">输入</span>
           </div>
           <div className="flex items-baseline gap-2">
-            <span className="text-2xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtTokensShort(s.output_tokens)}</span>
-            <span className="text-sm text-gray-500 dark:text-gray-400">输出</span>
+            <span className="text-2xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtTokensShort(outputTokens(s))}</span>
+            <span className="text-sm text-gray-500 dark:text-gray-400">输出（含推理）</span>
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-2xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtTokensShort(s.cache_read_tokens)}</span>
@@ -123,7 +123,7 @@ export default function SessionDetail() {
           </div>
           <div className="flex items-baseline gap-2">
             <span className="text-2xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtTokensShort(s.reasoning_tokens)}</span>
-            <span className="text-sm text-gray-500 dark:text-gray-400">推理</span>
+            <span className="text-sm text-gray-500 dark:text-gray-400">其中推理</span>
           </div>
         </div>
       </div>

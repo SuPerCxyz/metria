@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, percentChange, sumTokens } from './format.js'
+import { cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, outputTokens, percentChange, sumTokens } from './format.js'
 
 test('includes cache tokens in the total (v2 semantics)', () => {
   assert.equal(sumTokens({
@@ -10,6 +10,13 @@ test('includes cache tokens in the total (v2 semantics)', () => {
     cache_read_tokens: 900,
     cache_write_tokens: 20,
   }), 1080)
+})
+
+test('sums reasoning into output tokens', () => {
+  assert.equal(outputTokens({ output_tokens: 2000, reasoning_tokens: 30 }), 2030)
+  assert.equal(outputTokens({ output_tokens: 2000 }), 2000)
+  assert.equal(outputTokens({ reasoning_tokens: 30 }), 30)
+  assert.equal(outputTokens(null), 0)
 })
 
 test('counts cache-only objects and handles missing values', () => {

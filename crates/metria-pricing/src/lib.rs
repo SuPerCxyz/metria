@@ -207,7 +207,11 @@ impl PricingEngine {
                 usage.cache_write.unwrap_or(0) as u64,
                 rule.cache_write_price,
             ),
-            (usage.reasoning.unwrap_or(0) as u64, rule.reasoning_price),
+            // 推理按输出价计费（主流口径）；显式配置的推理价优先
+            (
+                usage.reasoning.unwrap_or(0) as u64,
+                rule.reasoning_price.or(rule.output_price),
+            ),
         ] {
             if let Some(p) = price {
                 match MicroUsd::from_price_per_m(p, tokens) {
@@ -709,8 +713,52 @@ mod tests {
             )
             .unwrap();
         let calc = r.calculated_micro_usd.unwrap();
-        // 1000*1 + 2000*2 = 5000
-        assert_eq!(calc, 5_000);
+        // 1000*1 + 2000*2 + 推理 30*2（未配推理价时回退输出价）
+        assert_eq!(calc, 5_060);
+    }
+
+    #[test]
+    fn explicit_reasoning_price_beats_output_price() {
+        let mut e = PricingEngine::new();
+        let mut rule = PricingRule {
+            id: Id::new(),
+            snapshot_id: None,
+            source: PricingSource::UserOverride,
+            channel: PricingChannel::VendorDirect,
+            provider_pattern: "*".into(),
+            model_pattern: "reasoning-priced-*".into(),
+            client_pattern: "*".into(),
+            region_pattern: None,
+            service_tier: None,
+            currency: "usd".into(),
+            unit: "per_million_tokens".into(),
+            input_price: Some(1_000_000),
+            output_price: Some(2_000_000),
+            cache_read_price: None,
+            cache_write_price: None,
+            reasoning_price: Some(5_000_000),
+            request_price: None,
+            effective_from: None,
+            effective_to: None,
+            priority: 10,
+            enabled: true,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        rule.id = Id::new();
+        e.add_user_rule(rule);
+        let r = e
+            .compute(
+                &usage(),
+                Some("reasoning-priced-model"),
+                Some("custom"),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+        // 1000*1 + 2000*2 + 推理 30*5（显式推理价优先于输出价）
+        assert_eq!(r.calculated_micro_usd, Some(5_150));
     }
 
     #[test]
@@ -782,7 +830,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(r.calculated_micro_usd, Some(5_000));
+        // 含推理按输出价：5000 + 30*2
+        assert_eq!(r.calculated_micro_usd, Some(5_060));
         assert_eq!(
             e.pricing_source(
                 Some("opencode-go/deepseek-v4-flash"),
@@ -831,7 +880,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(r.calculated_micro_usd, Some(5_000));
+        // 含推理按输出价：5000 + 30*2
+        assert_eq!(r.calculated_micro_usd, Some(5_060));
         assert_eq!(
             e.pricing_source(Some("mimo-v2.5-free"), Some("opencode-go"), Utc::now()),
             Some("user_override".into())
@@ -905,7 +955,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(result.calculated_micro_usd, Some(10_000));
+        // 含推理按输出价：10000 + 30*4
+        assert_eq!(result.calculated_micro_usd, Some(10_120));
         assert_eq!(result.rule_id, Some(alias_id.as_str().to_string()));
         assert_eq!(
             e.pricing_source(Some("my-custom-model"), Some("custom"), Utc::now()),
@@ -1054,6 +1105,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(after.calculated_micro_usd, Some(5_000));
+        // 含推理按输出价：5000 + 30*2
+        assert_eq!(after.calculated_micro_usd, Some(5_060));
     }
 }

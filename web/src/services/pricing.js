@@ -3,7 +3,7 @@ export const PRICE_FIELDS = [
   ['output_price', '输出 / 百万 Token（美元）'],
   ['cache_read_price', 'Cache Read / 百万 Token（美元）'],
   ['cache_write_price', 'Cache Write / 百万 Token（美元）'],
-  ['reasoning_price', 'Reasoning / 百万 Token（美元）'],
+  ['reasoning_price', 'Reasoning / 百万 Token（美元，默认同输出价）'],
   ['request_price', '每次请求固定费用（美元）'],
 ]
 

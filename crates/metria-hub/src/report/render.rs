@@ -143,13 +143,13 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
         n(m.sessions)
     ));
     s.push_str(&format!(
-        "Token 消耗：{}（输入 {} / 输出 {} / 缓存读 {} / 缓存写 {} / 推理 {}）\n",
+        "Token 消耗：{}（输入 {} / 输出 {}（其中推理 {}）/ 缓存读 {} / 缓存写 {}）\n",
         n(m.total_tokens()),
         n(m.input_tokens),
-        n(m.output_tokens),
+        n(m.output_tokens + m.reasoning_tokens),
+        n(m.reasoning_tokens),
         n(m.cache_read_tokens),
-        n(m.cache_write_tokens),
-        n(m.reasoning_tokens)
+        n(m.cache_write_tokens)
     ));
     if m.total_tokens() == 0 {
         s.push_str("（未采集到 Token 数据）\n");
@@ -235,12 +235,12 @@ fn kpi_cards(m: &ReportMetrics) -> String {
         card("Token 消耗", &n(m.total_tokens()), "含缓存读写"),
     );
     let detail = format!(
-        "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {} · 缓存读 {} · 缓存写 {} · 推理 {}</div>",
+        "<div style=\"margin-top:10px;font-size:12px;color:#9ca3af;\">Token 明细：输入 {} · 输出 {}（其中推理 {}）· 缓存读 {} · 缓存写 {}</div>",
         n(m.input_tokens),
-        n(m.output_tokens),
+        n(m.output_tokens + m.reasoning_tokens),
+        n(m.reasoning_tokens),
         n(m.cache_read_tokens),
-        n(m.cache_write_tokens),
-        n(m.reasoning_tokens)
+        n(m.cache_write_tokens)
     );
     format!("{kpis}{detail}")
 }
@@ -266,10 +266,10 @@ fn token_section(m: &ReportMetrics) -> String {
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border-radius:6px;overflow:hidden;\"><tr>",
     );
     barh.push_str(&seg(m.input_tokens, C_INPUT));
-    barh.push_str(&seg(m.output_tokens, C_OUTPUT));
+    // 输出段含推理，四段之和等于总 Token
+    barh.push_str(&seg(m.output_tokens + m.reasoning_tokens, C_OUTPUT));
     barh.push_str(&seg(m.cache_read_tokens, C_CACHE_R));
     barh.push_str(&seg(m.cache_write_tokens, C_CACHE_W));
-    barh.push_str(&seg(m.reasoning_tokens, C_REASON));
     barh.push_str("</tr></table>");
 
     let legend_row = |label: &str, v: i64, color: &str| -> String {
@@ -288,10 +288,10 @@ fn token_section(m: &ReportMetrics) -> String {
     let legend = format!(
         "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:10px;\">{}{}{}{}{}</table>",
         legend_row("输入", m.input_tokens, C_INPUT),
-        legend_row("输出", m.output_tokens, C_OUTPUT),
+        legend_row("输出（含推理）", m.output_tokens + m.reasoning_tokens, C_OUTPUT),
         legend_row("缓存读取", m.cache_read_tokens, C_CACHE_R),
         legend_row("缓存写入", m.cache_write_tokens, C_CACHE_W),
-        legend_row("推理", m.reasoning_tokens, C_REASON),
+        legend_row("其中推理", m.reasoning_tokens, C_REASON),
     );
     format!("{}{}{}", section_title("Token 构成"), barh, legend)
 }
@@ -765,10 +765,18 @@ mod tests {
 
         let text = render_text(&m, &meta());
         assert!(text.contains("Token 消耗：1,080"));
+        // 输出含推理（50 + 10），推理以「其中推理」出现，不参与相加
+        assert!(text.contains("输出 60（其中推理 10）"));
         assert!(!text.contains("不含缓存读写"));
+
+        let html = render_html(&m, &meta(), &[]);
+        assert!(html.contains("输出（含推理）"));
+        assert!(html.contains("其中推理"));
+
         let payload = webhook_payload(&m, &meta());
         assert_eq!(payload["tokens"]["total"], 1_080);
         assert_eq!(payload["tokens"]["cache_read"], 900);
         assert_eq!(payload["tokens"]["cache_write"], 20);
+        assert_eq!(payload["tokens"]["reasoning"], 10);
     }
 }

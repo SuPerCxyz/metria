@@ -14,7 +14,7 @@ import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -161,9 +161,9 @@ export default function Analytics() {
       {tab === 'tokens' && (
         <>
           <div className="grid grid-cols-12 gap-6">
-            <MetricCard label="总 Token" value={fmtTokensShort(sumTokens(o))} {...compare(sumTokens(o), previous ? sumTokens(previous) : null)} sub={`输入 ${fmtTokensShort(o.input_tokens)} · 输出 ${fmtTokensShort(o.output_tokens)}`} />
+            <MetricCard label="Token 消耗" value={fmtTokensShort(sumTokens(o))} {...compare(sumTokens(o), previous ? sumTokens(previous) : null)} sub={`输入 ${fmtTokensShort(o.input_tokens)} · 输出 ${fmtTokensShort(outputTokens(o))} · 缓存 ${fmtTokensShort((o.cache_read_tokens ?? 0) + (o.cache_write_tokens ?? 0))}`} />
             <MetricCard label="输入 Token" value={fmtTokensShort(o.input_tokens)} {...compare(o.input_tokens, previous?.input_tokens)} sub="请求上下文" />
-            <MetricCard label="输出 Token" value={fmtTokensShort(o.output_tokens)} {...compare(o.output_tokens, previous?.output_tokens)} sub="模型生成" />
+            <MetricCard label="输出 Token" value={fmtTokensShort(outputTokens(o))} {...compare(outputTokens(o), previous ? outputTokens(previous) : null)} sub="模型生成（含推理）" />
             <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
