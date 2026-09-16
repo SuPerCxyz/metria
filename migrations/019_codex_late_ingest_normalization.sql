@@ -13,6 +13,10 @@
 --   - 另加 input >= cache_read + cache_write、output >= reasoning 的必要条件守卫，
 --     已归一化的行在这些条件下可能仍成立，所以窗口是必需的主判据，守卫用于兜底避免二次扣减。
 --   新装实例上 017/018/019 同时应用，窗口为空，不会误改数据。
+--
+-- 性能：usage_events 侧必须写成 `event_id IN (SELECT usage_event_id ...)`，让窗口子查询只扫
+--   model_calls 一次并物化少量 id；写成相关子查询 EXISTS(...) 会按 usage_events 每行全表扫
+--   model_calls（model_calls.usage_event_id 无索引），在线上 30 万级行数下会跑到分钟级以上。
 
 UPDATE usage_events
 SET input_tokens = MAX(
@@ -21,11 +25,12 @@ SET input_tokens = MAX(
     )
 WHERE client_id = 'codex'
   AND COALESCE(input_tokens, 0) >= COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)
-  AND EXISTS (
-        SELECT 1 FROM model_calls m
-        WHERE m.usage_event_id = usage_events.event_id
-          AND julianday(m.created_at) > julianday((SELECT applied_at FROM schema_migrations WHERE version = 17))
-          AND julianday(m.created_at) <= julianday('2026-09-16T05:40:00Z')
+  AND event_id IN (
+        SELECT usage_event_id FROM model_calls
+        WHERE client_id = 'codex'
+          AND usage_event_id IS NOT NULL
+          AND julianday(created_at) > julianday((SELECT applied_at FROM schema_migrations WHERE version = 17))
+          AND julianday(created_at) <= julianday('2026-09-16T05:40:00Z')
     );
 
 UPDATE model_calls
@@ -42,11 +47,12 @@ UPDATE usage_events
 SET output_tokens = MAX(0, COALESCE(output_tokens, 0) - COALESCE(reasoning_tokens, 0))
 WHERE client_id = 'codex'
   AND COALESCE(output_tokens, 0) >= COALESCE(reasoning_tokens, 0)
-  AND EXISTS (
-        SELECT 1 FROM model_calls m
-        WHERE m.usage_event_id = usage_events.event_id
-          AND julianday(m.created_at) > julianday((SELECT applied_at FROM schema_migrations WHERE version = 18))
-          AND julianday(m.created_at) <= julianday('2026-09-16T05:40:00Z')
+  AND event_id IN (
+        SELECT usage_event_id FROM model_calls
+        WHERE client_id = 'codex'
+          AND usage_event_id IS NOT NULL
+          AND julianday(created_at) > julianday((SELECT applied_at FROM schema_migrations WHERE version = 18))
+          AND julianday(created_at) <= julianday('2026-09-16T05:40:00Z')
     );
 
 UPDATE model_calls
