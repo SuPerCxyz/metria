@@ -99,3 +99,56 @@ docker compose -f docker/compose.full.yaml config
 
 - 遵循全局 Commit 规范：首行 subject ≤50 字符、祈使句、无 `feat:` 前缀（除非项目另有约定）、正文每行 ≤72 字符、不手写 Change-Id。
 - 每次提交前检查 `git status` / `git diff`，只暂存本任务相关文件，禁止提交 secrets。
+
+## 11. 本地测试与 lstable 部署
+
+功能验证优先在本地做，再部署到 `lstable` 验收；**默认不要等 CI**（CI 只在 push 后跑，多架构镜像约 15–17 分钟，本地单架构约 6 分钟）。
+
+### 11.1 本地构建镜像并推送到 lstable
+
+本地与 `lstable` 同为 `x86_64`，可直接传单架构镜像，无需 ghcr 凭据：
+
+```bash
+# 1. 构建 hub 镜像（与 CI 同一 Dockerfile 与 target）
+docker build -f docker/Dockerfile --target hub -t ghcr.io/supercxyz/metria:dev-latest .
+
+# 2. 传到 lstable（lstable 无 zstd，用 gzip；只传新增层）
+docker save ghcr.io/supercxyz/metria:dev-latest | gzip -1 | ssh lstable 'gunzip | docker load'
+
+# 3. 在 lstable 重建 hub
+ssh lstable 'cd /root/code/polyhedron/docker/docker-compose/metria_hub && docker compose up -d metria-hub'
+```
+
+- 回滚：lstable 上仍留有上一条镜像（`<none>` 标签）；`docker tag <旧镜像ID> ghcr.io/supercxyz/metria:dev-latest` 后重新 `docker compose up -d metria-hub` 即可（迁移已应用则不会回退数据）。
+- 本地 `dev-latest` 标签会被这次构建覆盖，下次 `docker pull` 由 CI 版本接管，属预期。
+- `lstable` 的 watchtower 每天 06:00 自动拉取 `dev-latest`；手动部署后无需额外操作，但要注意它会在次日覆盖为 CI 版本。
+
+### 11.2 迁移类改动必须先验证性能
+
+写迁移或历史修复前，先取线上数据库副本并在副本上跑一遍，确认耗时与影响行数：
+
+```bash
+ssh lstable 'docker exec metria-hub /app/metria backup --out /data/deploy-before-<日期>.db.zst'
+scp lstable:/data/docker/metria_hub/data/deploy-before-<日期>.db.zst /tmp/ && zstd -d -f /tmp/deploy-before-<日期>.db.zst -o /tmp/copy.db
+```
+
+- 本项目曾因迁移里对无索引列（`model_calls.usage_event_id`）写相关子查询 `EXISTS`，导致 Hub 启动时单核跑满、服务中断；`usage_events` 侧必须写成 `event_id IN (SELECT usage_event_id ...)`，让窗口子查询只扫一次。
+- 迁移涉及数据修正时，边界要能用库内自证的值推导（如 `schema_migrations.applied_at`），不要硬编码实例相关的相对时间；无法避免的上界常量必须在注释里说明来源。
+
+### 11.3 本地 Hub 实例（前端与口径验证）
+
+```bash
+cargo build -p metria-cli
+METRIA_DATA_DIR=/tmp/metria-local/data METRIA_DATABASE_URL=sqlite:///tmp/metria-local/data/metria.db \
+METRIA_LISTEN=127.0.0.1:18081 METRIA_ADMIN_USER=admin METRIA_ADMIN_PASSWORD=local-test-pass \
+METRIA_TIMEZONE=Asia/Shanghai ./target/debug/metria hub --demo
+```
+
+- `--demo` 是 CLI 开关；`METRIA_DEMO=1` 会被 CLI 覆盖，不生效。demo 数据含非零 `cache_write`，适合验证缓存相关口径。
+- 未配置 OIDC 时可用密码登录；`POST /api/v1/auth/login` 返回 JSON `token`，前端从 `localStorage['metria-token']` 读取，浏览器验证时注入该 token 可免走登录表单。
+- 页面主滚动容器是 `div.app-scroll-container`，截图前需要滚动它而不是 `window`。
+
+### 11.4 线上数据核对
+
+- 核对口径类改动时，与 `~/.cc-switch/cc-switch.db`（`proxy_request_logs`）对照同一时间窗；注意两边口径差异（ccswitch 的 `input_token_semantics`：`codex`/`gemini`/`grokbuild` 的 `input_tokens` 含缓存，需扣 `cache_read`/`cache_creation` 才是 fresh 输入）。
+- 时间窗以 `Asia/Shanghai` 为准，并说明两边快照时点不同会带来百分之几的差。
