@@ -159,3 +159,11 @@ METRIA_TIMEZONE=Asia/Shanghai ./target/debug/metria hub --demo
 
 - 核对口径类改动时，与 `~/.cc-switch/cc-switch.db`（`proxy_request_logs`）对照同一时间窗；注意两边口径差异（ccswitch 的 `input_token_semantics`：`codex`/`gemini`/`grokbuild` 的 `input_tokens` 含缓存，需扣 `cache_read`/`cache_creation` 才是 fresh 输入）。
 - 时间窗以 `Asia/Shanghai` 为准，并说明两边快照时点不同会带来百分之几的差。
+
+## 13. OpenSpec 变更与归档
+
+- **归档前必须把 `MODIFIED` 需求的正文与当前主 spec 合并**：`MODIFIED` 会整块替换该需求，而 OpenSpec 只校验「场景是否被丢掉」，**不校验正文**；直接用旧 delta 的正文归档会静默覆盖后来新增的描述（曾因此丢掉 `poll_interval_seconds`、`METRIA_POLL_INTERVAL`、必填 `ip` 等正文）。
+- 归档顺序按时间**从早到晚**，每个归档后立即跑 `openspec validate --all`；如出现「MODIFIED omits scenario」错误，先把主 spec 里同名需求的场景全部并回 delta 再归档。
+- 同一需求被两个 change 分别 `ADDED`（重名）会让归档失败：后者改为 `MODIFIED` 并合并两边内容（正文与场景都要合并）。
+- 归档后做一次结构自检：主 spec 无重复需求、无重复场景、无「有需求无场景」。
+- `openspec/` 在 `.gitignore` 内，归档与 spec 调整不进入提交。
