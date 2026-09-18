@@ -55,8 +55,6 @@ pub(crate) const REPORT_CARD: &str = "#ffffff";
 pub(crate) const REPORT_BRAND: &str = "#4f46e5";
 pub(crate) const REPORT_BRAND_LIGHT: &str = "#c7d2fe";
 pub(crate) const REPORT_BRAND_SUB: &str = "#e0e7ff";
-pub(crate) const REPORT_WARNING: &str = "#b45309";
-pub(crate) const REPORT_WARNING_BG: &str = "#fef3c7";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChartTheme {
@@ -110,22 +108,6 @@ pub(crate) fn chart_palette() -> &'static [String] {
 
 pub(super) fn usd(micro: i64) -> String {
     format!("${:.4}", micro as f64 / 1_000_000.0)
-}
-
-pub(super) fn bytes_human(b: i64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let v = b as f64;
-    if v >= GB {
-        format!("{:.2} GB", v / GB)
-    } else if v >= MB {
-        format!("{:.2} MB", v / MB)
-    } else if v >= KB {
-        format!("{:.2} KB", v / KB)
-    } else {
-        format!("{b} B")
-    }
 }
 
 pub(super) fn n(v: i64) -> String {
@@ -202,14 +184,6 @@ pub fn render_text(m: &ReportMetrics, meta: &ReportMeta) -> String {
             .map(|(k, v, _)| format!("{k} {}", usd(*v)))
             .collect();
         s.push_str(&format!("费用：{}\n", items.join(" / ")));
-    }
-    if m.estimated_total_bytes > 0 {
-        s.push_str(&format!(
-            "估算流量：{}（区间 {} – {}，均为估算）\n",
-            bytes_human(m.estimated_total_bytes),
-            bytes_human(m.estimated_lower_bound_bytes),
-            bytes_human(m.estimated_upper_bound_bytes)
-        ));
     }
     if !m.top_models.is_empty() {
         s.push_str("\nTop 模型：\n");
@@ -362,22 +336,6 @@ fn cost_section(m: &ReportMetrics) -> String {
     }
     s.push_str("</table>");
     s
-}
-
-fn traffic_section(m: &ReportMetrics) -> String {
-    if m.estimated_total_bytes <= 0 {
-        return String::new();
-    }
-    format!(
-        "{}<div style=\"border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;\">\
-         <div style=\"font-size:20px;font-weight:700;color:#1f2937;font-variant-numeric:tabular-nums;\">{total} \
-         <span style=\"display:inline-block;font-size:11px;font-weight:600;color:#b45309;background:#fef3c7;border-radius:999px;padding:2px 8px;margin-left:6px;vertical-align:middle;\">估算</span></div>\
-         <div style=\"font-size:12px;color:#9ca3af;margin-top:6px;\">区间 {lo} – {hi}（均为估算，非实际网卡流量）</div></div>",
-        section_title("估算流量"),
-        total = bytes_human(m.estimated_total_bytes),
-        lo = bytes_human(m.estimated_lower_bound_bytes),
-        hi = bytes_human(m.estimated_upper_bound_bytes),
-    )
 }
 
 fn top_section(title: &str, items: &[DimCount], show_tokens: bool) -> String {
@@ -632,7 +590,6 @@ pub fn render_html(m: &ReportMetrics, meta: &ReportMeta, charts: &[ReportChart])
         }
         h.push_str(&token_section(m));
         h.push_str(&cost_section(m));
-        h.push_str(&traffic_section(m));
         h.push_str(&top_section("Top 模型", &m.top_models, true));
         h.push_str(&top_section("Top 客户端", &m.top_clients, false));
     }
@@ -642,7 +599,7 @@ pub fn render_html(m: &ReportMetrics, meta: &ReportMeta, charts: &[ReportChart])
     h.push_str(&format!(
         "<tr><td style=\"padding:16px 28px;background:#f9fafb;border-top:1px solid #e5e7eb;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,'PingFang SC','Microsoft YaHei',sans-serif;\">\
          <div style=\"font-size:12px;color:#9ca3af;\">生成时间：{}</div>\
-         <div style=\"font-size:11px;color:#c0c4cc;margin-top:6px;\">「估算」为估算值；缺失口径不显示，不代表为 0；流量为估算而非实际网卡流量。</div></td></tr>",
+         <div style=\"font-size:11px;color:#c0c4cc;margin-top:6px;\">缺失口径不显示，不代表为 0。</div></td></tr>",
         esc(&meta.generated_at)
     ));
 
@@ -673,12 +630,6 @@ pub fn webhook_payload(m: &ReportMetrics, meta: &ReportMeta) -> serde_json::Valu
             "reported": if m.reported_cost_micro_usd > 0 { Some(m.reported_cost_micro_usd) } else { None },
             "calculated": if m.calculated_cost_micro_usd > 0 { Some(m.calculated_cost_micro_usd) } else { None },
             "estimated": if m.estimated_cost_micro_usd > 0 { Some(m.estimated_cost_micro_usd) } else { None },
-        },
-        "traffic": {
-            "estimated_total_bytes": m.estimated_total_bytes,
-            "estimated_lower_bound_bytes": m.estimated_lower_bound_bytes,
-            "estimated_upper_bound_bytes": m.estimated_upper_bound_bytes,
-            "is_estimate": true,
         },
         "top_models": m.top_models,
         "top_clients": m.top_clients,
@@ -755,24 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn estimates_are_labeled() {
-        let m = ReportMetrics {
-            calls: 2,
-            input_tokens: 10,
-            has_data: true,
-            estimated_total_bytes: 2048,
-            estimated_lower_bound_bytes: 1024,
-            estimated_upper_bound_bytes: 4096,
-            ..Default::default()
-        };
-        assert!(render_text(&m, &meta()).contains("估算流量"));
-        assert!(render_text(&m, &meta()).contains("均为估算"));
-        let w = webhook_payload(&m, &meta());
-        assert_eq!(w["traffic"]["is_estimate"], true);
-        assert!(w["cost_micro_usd"]["reported"].is_null());
-    }
-
-    #[test]
     fn html_has_design_and_labels() {
         let m = ReportMetrics {
             calls: 12,
@@ -782,9 +715,6 @@ mod tests {
             cache_read_tokens: 300,
             has_data: true,
             calculated_cost_micro_usd: 1_500_000,
-            estimated_total_bytes: 2_097_152,
-            estimated_lower_bound_bytes: 1_048_576,
-            estimated_upper_bound_bytes: 3_145_728,
             top_models: vec![DimCount {
                 name: "claude-sonnet-4.5".into(),
                 calls: 8,
@@ -796,7 +726,7 @@ mod tests {
         assert!(h.contains("claude-sonnet-4.5"));
         assert!(h.contains("Token 消耗"));
         assert!(h.contains("#6366f1"));
-        assert!(h.contains("估算</span>"));
+        assert!(!h.contains("估算流量"));
         assert!(h.contains("计算费用"));
         assert!(!h.contains("上报费用"));
     }

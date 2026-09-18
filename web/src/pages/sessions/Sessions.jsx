@@ -12,7 +12,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { fmtDateTime, fmtDuration, fmtSessionTitle, fmtTokensShort, fmtUsd, fmtBytes, sumTokens } from '../../services/format'
+import { fmtDateTime, fmtDuration, fmtSessionTitle, fmtTokensShort, fmtUsd, sumTokens } from '../../services/format'
 
 export default function Sessions() {
   const { range } = useTimeRange()
@@ -38,26 +38,26 @@ export default function Sessions() {
   if (query.loading) return <LoadingSkeleton rows={8} />
 
 const columns = [
-  { key: 'title', label: '标题', sortable: true, render: (r) => (
+  { key: 'title', label: '标题', sortValue: (r) => fmtSessionTitle(r.title, r.started_at), render: (r) => (
     <span className="block min-w-[8rem] max-w-[18rem] truncate" title={fmtSessionTitle(r.title, r.started_at)}>{fmtSessionTitle(r.title, r.started_at)}</span>
   ) },
   { key: 'started_at', label: '开始时间', sortable: true, render: (r) => fmtDateTime(r.started_at) },
-  { key: 'client_id', label: 'Agent', sortable: true, render: (r) => r.client_id || '—' },
-  { key: 'model', label: '模型', sortable: true, render: (r) => (
+  { key: 'client_id', label: 'Agent', render: (r) => r.client_id || '—' },
+  { key: 'model', label: '模型', hideWhenEmpty: true, render: (r) => (
     <span className="block max-w-[18rem] truncate" title={r.model || ''}>{r.model || '—'}</span>
   ) },
-  { key: 'node_id', label: '节点', sortable: true, render: (r) => (
+  { key: 'node_id', label: '节点', sortValue: (r) => nodeNames[r.node_id] || r.node_id, render: (r) => (
     <span className="block max-w-[9rem] truncate" title={nodeNames[r.node_id] || r.node_id || ''}>{nodeNames[r.node_id] || r.node_id || '—'}</span>
   ) },
-  { key: 'duration', label: '持续时间', render: (r) => fmtDuration(r.duration_ms) },
-  { key: 'input_tokens', label: 'Token', sortable: true, render: (r) => fmtTokensShort(sumTokens(r)) },
-  { key: 'calculated_cost_micro_usd', label: '费用', sortable: true, render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
+  { key: 'duration', label: '持续时间', hideWhenEmpty: true, sortValue: (r) => r.duration_ms, render: (r) => fmtDuration(r.duration_ms) },
+  { key: 'input_tokens', label: 'Token', sortValue: (r) => sumTokens(r), render: (r) => fmtTokensShort(sumTokens(r)) },
+  { key: 'calculated_cost_micro_usd', label: '费用', sortValue: (r) => r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd, render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
   { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
 ]
 
   return (
     <>
-      <PageHeader title="会话" subtitle="查看所有 Agent 会话的 Token、费用与流量" />
+      <PageHeader title="会话" subtitle="查看所有 Agent 会话的 Token、费用与调用性能" />
       <FilterBar searchPlaceholder="搜索标题或 Agent…" onSearch={setSearch} />
       <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <DataTable

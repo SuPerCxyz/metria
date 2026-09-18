@@ -32,7 +32,9 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/overview` | 汇总统计卡片（读 rollup） |
-| GET | `/usage/timeseries` | Token/Cost/Traffic 时间序列 |
+| GET | `/usage/timeseries` | Token/Cost 时间序列 |
+| GET | `/usage/performance` | TTFT、首字节、生成时长、Token/s、ITL、停顿、可靠性与观测字节汇总；返回来源和覆盖率 |
+| GET | `/usage/performance/timeseries` | 按现有时间粒度返回性能指标趋势，空桶指标为 `null` |
 | GET | `/usage/breakdown` | 按 Node 汇总 |
 | GET | `/nodes` `/nodes/{id}` | Node 列表 / 详情 |
 | GET | `/nodes/{id}/install` | Admin 生成节点专属 Token、动态 Hub 地址和平台安装命令；可传 `hub_url` 查询参数覆盖当前地址 |
@@ -44,7 +46,6 @@
 | GET | `/calls` `/calls/{id}` | 调用列表/详情 |
 | GET | `/sessions` `/sessions/{id}` | 会话列表/详情 |
 | GET | `/sessions/{id}/calls` `/tools` `/timeline` `/subagents` | 会话明细 |
-| GET | `/traffic/summary` `/traffic/by-node|client|model|provider` | 流量汇总与分维 |
 | GET | `/data-quality` | 数据来源分布与解析告警 |
 | GET | `/system/info` | 当前内容保存模式、时区和数据保留状态（只读） |
 | GET | `/export` | 导出（JSON/NDJSON/CSV） |
@@ -89,15 +90,10 @@
 
 `attachments_enabled` 的含义是“邮件附带图表”，只控制 HTML 正文中的内嵌 SVG，不会发送 PDF 附件。自动调度对同一 `类型 + 周期` 只尝试一次，失败后不会在当前周期持续重试；测试发送使用独立的测试周期。
 
-## Traffic Profiles / Pricing / Share
+## Pricing / Share
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | `/traffic/profiles` | 列表 / 新建用户 profile |
-| DELETE | `/traffic/profiles/{id}` | 删除用户 profile |
-| POST | `/traffic/profiles/learn` | 从样本聚合 learned profile（P50/P75/P90） |
-| POST | `/traffic/profiles/test` | 匹配测试 |
-| POST | `/traffic/reestimate` | 历史重新估算（保留新版本） |
 | GET | `/pricing/catalogs` `/snapshots` `/rules` | 目录/快照/规则列表 |
 | POST | `/pricing/rules` | 新建用户规则 |
 | POST | `/pricing/catalogs/{id}/refresh` | 手动同步外部目录（OpenRouter/LiteLLM/Custom） |
@@ -109,8 +105,19 @@
 
 ## SSE
 
-`GET /stream`：推送 `usage.created / call.updated / session.updated / traffic.estimated / rollup.updated`；
+`GET /stream`：推送 `usage.created / call.updated / session.updated / rollup.updated`；
 30 秒心跳 ping。前端据此 invalidate 对应查询（增量刷新，不整站刷新）。
+
+## 运行时观测
+
+原生 Linux/Windows Agent 可用 `metria observe --client <client> -- <command...>` 临时包裹
+Claude Code、Codex 或 OpenCode。观测结果写入普通 call/usage 事件，并在 call 上提供
+`ttft_ms`、`first_byte_latency_ms`、`generation_duration_ms`、`output_tokens_per_second_milli`、
+ITL/停顿、可靠性、路由和 `observed_*_bytes`。请求/响应正文只在受限内存缓冲中短暂解析，
+不持久化、不上传；命令退出、Agent 停止或租约到期后本地端口和临时配置都会清理。
+
+Docker Agent 只做只读日志/SQLite 的普通采集，上述运行时字段保持 `null` 或覆盖率不可用。
+旧版本的估算流量事件在过渡期可被 Hub 接受但会直接忽略，不再写入或通过查询接口暴露。
 
 ## 错误格式
 

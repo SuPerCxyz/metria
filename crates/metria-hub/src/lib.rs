@@ -1,5 +1,6 @@
 //! metria-hub: Metria Hub 服务。
 #![warn(missing_debug_implementations, rust_2018_idioms)]
+#![recursion_limit = "256"]
 
 pub mod api;
 pub mod assets;
@@ -131,34 +132,23 @@ fn spawn_integrity_repair(db: db::HubDb) {
         let _heap_release = crate::memory::HeapReleaseGuard;
         const KEY: &str = "observability_integrity_version";
         const TIMING_KEY: &str = "observability_timing_repair_version";
-        // v2：Codex input 归一化回填后，需重新计价、重估流量并重建 rollup。
-        // v3：Codex output 归一化（扣除推理）回填后，同样需要重算全链路。
-        // v4：旧 Agent 期间入库的 Codex 行补扣缓存/推理后，同样需要重算全链路。
+        // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
         const VERSION: &str = "4";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
         let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
         if !full_needed && !timing_needed {
             return;
         }
-        let result = (|| -> Result<(usize, i64), String> {
+        let result = (|| -> Result<usize, String> {
             let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
-            let traffic = if full_needed {
+            if full_needed {
                 crate::catalog::reprice_from_rules(&db, false)?;
-                let traffic = db.reestimate_calls(None).map_err(|e| e.to_string())?;
                 db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
                 db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
-                db.rebuild_all_traffic_rollups()
-                    .map_err(|e| e.to_string())?;
-                traffic
             } else if timings > 0 {
                 db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
                 db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
-                db.rebuild_all_traffic_rollups()
-                    .map_err(|e| e.to_string())?;
-                0
-            } else {
-                0
-            };
+            }
             if full_needed {
                 db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
             }
@@ -166,10 +156,10 @@ fn spawn_integrity_repair(db: db::HubDb) {
                 db.setting_set(TIMING_KEY, VERSION)
                     .map_err(|e| e.to_string())?;
             }
-            Ok((timings, traffic))
+            Ok(timings)
         })();
         match result {
-            Ok((timings, traffic)) => info!(timings, traffic, "历史统计一致性修复完成"),
+            Ok(timings) => info!(timings, "历史统计一致性修复完成"),
             Err(error) => warn!(%error, "历史统计一致性修复失败，将在下次启动重试"),
         }
     });
@@ -297,10 +287,7 @@ fn spawn_maintenance(db: db::HubDb) {
                             drift = report.drift_buckets,
                             "rollup 对账发现漂移，触发重建"
                         );
-                        // 先重建 session/call/traffic 计数，再重建 usage 的 token/cost
-                        // （rebuild_drift 只重建 session/call，token 与 traffic 为 0；
-                        //  必须补 usage 与 traffic 重建，否则维护任务会清空既有
-                        //  usage token / 流量数据）
+                        // 重建 session/call 计数，再重建 usage 的 token/cost。
                         match db.rebuild_drift(1) {
                             Ok(rebuilt) => info!("rollup 重建完成: {rebuilt} 条"),
                             Err(e) => warn!("rollup 重建失败: {e}"),
@@ -308,10 +295,6 @@ fn spawn_maintenance(db: db::HubDb) {
                         match db.rebuild_usage_rollups(1) {
                             Ok(rebuilt) => info!("usage rollup 重建完成: {rebuilt} 条"),
                             Err(e) => warn!("usage rollup 重建失败: {e}"),
-                        }
-                        match db.rebuild_traffic_rollups(1) {
-                            Ok(rebuilt) => info!("traffic rollup 重建完成: {rebuilt} 条"),
-                            Err(e) => warn!("traffic rollup 重建失败: {e}"),
                         }
                     }
                 }

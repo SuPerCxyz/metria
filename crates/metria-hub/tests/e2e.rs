@@ -1,6 +1,7 @@
 //! Hub 端到端集成测试：注册 → 上传（zstd/raw）→ 幂等 → rollup → 查询。
 //!
 //! 使用真实 HTTP 服务器 + 内存临时 SQLite，验证完整链路。
+#![recursion_limit = "256"]
 
 use metria_hub::api::AppState;
 use metria_hub::config::HubConfig;
@@ -252,7 +253,7 @@ async fn full_ingest_rollup_query_cycle() {
         .unwrap()
         .into_json()
         .unwrap();
-    if upload["ok"] != true || upload["accepted"].as_array().unwrap().len() != 7 {
+    if upload["ok"] != true || upload["accepted"].as_array().unwrap().len() != 5 {
         panic!("upload 未全部接受: {upload}");
     }
 
@@ -290,11 +291,11 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(overview["reasoning_tokens"], 10);
     assert_eq!(overview["projects"], 1);
     assert_eq!(overview["calculated_cost_micro_usd"], 33218 + 11100);
-    assert_eq!(overview["estimated_total_bytes"], 7000 + 4000);
+    assert!(overview.get("estimated_total_bytes").is_none());
     assert_eq!(overview["pricing_coverage"]["priced_calls"], 2);
     assert_eq!(overview["pricing_coverage"]["total_calls"], 2);
-    assert_eq!(overview["traffic_coverage"]["estimated_calls"], 2);
-    assert_eq!(overview["traffic_coverage"]["total_calls"], 2);
+    assert_eq!(overview["token_calls"], 2);
+    assert!(overview.get("traffic_coverage").is_none());
     assert_eq!(overview["message_count"], 4);
     assert_eq!(overview["tool_call_count"], 1);
     assert!(overview["active_duration_ms"].is_null());
@@ -593,7 +594,7 @@ async fn unpriced_dimension_cost_is_unavailable() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(upload["accepted"].as_array().unwrap().len(), 7);
+    assert_eq!(upload["accepted"].as_array().unwrap().len(), 5);
 
     let token = admin_token(&base);
     let from = "2026-08-01T00:00:00Z";
@@ -1394,7 +1395,7 @@ async fn agent_download_returns_binary() {
 #[tokio::test(flavor = "multi_thread")]
 async fn latency_timeseries_buckets_aggregates_and_gapfills() {
     let dir = tempfile::tempdir().unwrap();
-    let (base, _state) = spawn_hub(dir.path()).await;
+    let (base, state) = spawn_hub(dir.path()).await;
 
     let reg_resp = ureq::post(&format!("{base}/api/v1/collectors/register"))
         .set("Authorization", "Bearer testtok")
@@ -1432,8 +1433,21 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
                     "provider_raw": "anthropic",
                     "provider_normalized": "anthropic",
                     "started_at": "2026-08-05T01:00:05Z",
+                    "first_byte_at": "2026-08-05T01:00:05.100Z",
+                    "first_token_at": "2026-08-05T01:00:05.200Z",
                     "first_response_at": "2026-08-05T01:00:05.200Z",
+                    "last_output_at": "2026-08-05T01:00:05.700Z",
                     "completed_at": "2026-08-05T01:00:05.800Z",
+                    "first_byte_latency_ms": 100,
+                    "ttft_ms": 200,
+                    "generation_duration_ms": 500,
+                    "output_tokens_per_second_milli": 83333,
+                    "observability_source": "runtime_http",
+                    "observability_quality": "observed",
+                    "observed_request_payload_bytes": 1200,
+                    "observed_response_payload_bytes": 2400,
+                    "observed_request_wire_bytes": 1300,
+                    "observed_response_wire_bytes": 2500,
                     "timing_source": "test_event_timestamps",
                     "timing_quality": "observed",
                     "status": "success",
@@ -1563,6 +1577,20 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
         .as_f64()
         .unwrap();
     assert!((avg_speed - 69.44).abs() < 0.1, "avg_speed={avg_speed}");
+
+    let performance_series: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/performance/timeseries?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    let first_bucket = &performance_series["series"][0];
+    assert_eq!(first_bucket["ttft_avg_ms"], 200);
+    assert_eq!(first_bucket["first_byte_avg_ms"], 100);
+    assert_eq!(first_bucket["generation_avg_ms"], 500);
+    assert_eq!(state.db.count("traffic_estimates"), 0);
 }
 
 /// 游标同步闭环：注册 → 读空 → 推进 → 读回一致 → 幂等 → 未认证 401 → 删节点清理。

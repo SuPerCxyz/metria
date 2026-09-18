@@ -82,18 +82,8 @@ fn golden_full_parses_session_events() {
         assert_eq!(c.status_code, Some(200));
     }
 
-    // 流量估算：每条调用都有估算（部分重建 / token profile）
-    assert_eq!(s.batch.traffic_estimates.len(), 3);
-    for te in &s.batch.traffic_estimates {
-        assert!(te.estimated_total_wire_bytes.is_some(), "应产生估算流量");
-        let (lo, mid, hi) = (
-            te.lower_bound_bytes.unwrap(),
-            te.estimated_total_wire_bytes.unwrap(),
-            te.upper_bound_bytes.unwrap(),
-        );
-        assert!(lo < mid && mid < hi, "禁止下界=中值=上界");
-        assert!(te.confidence.is_some());
-    }
+    // 普通 Agent 不再生成估算流量；实时字节只来自原生临时观测。
+    assert!(s.batch.traffic_estimates.is_empty());
     assert!(s.new_cursor.is_some());
 }
 

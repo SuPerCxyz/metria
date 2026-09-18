@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::api::{handlers_query::query_usage_timeseries, RangeParams};
 use crate::db::HubDb;
 
-/// 报告聚合结果。费用/流量为微美元与字节；0 表示该口径无数据。
+/// 报告聚合结果。金额为微美元；0 表示该口径无数据。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReportMetrics {
     pub input_tokens: i64,
@@ -22,9 +22,6 @@ pub struct ReportMetrics {
     pub reported_cost_micro_usd: i64,
     pub calculated_cost_micro_usd: i64,
     pub estimated_cost_micro_usd: i64,
-    pub estimated_total_bytes: i64,
-    pub estimated_lower_bound_bytes: i64,
-    pub estimated_upper_bound_bytes: i64,
     pub top_models: Vec<DimCount>,
     pub top_clients: Vec<DimCount>,
     pub has_data: bool,
@@ -87,7 +84,6 @@ pub fn aggregate(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>, top_n: i64)
             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
             COALESCE(SUM(reasoning_tokens),0),
             COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
-            COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0),
             COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0)
          FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2)",
         [&from_s, &to_s],
@@ -103,9 +99,6 @@ pub fn aggregate(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>, top_n: i64)
                 r.get::<_, i64>(7)?,
                 r.get::<_, i64>(8)?,
                 r.get::<_, i64>(9)?,
-                r.get::<_, i64>(10)?,
-                r.get::<_, i64>(11)?,
-                r.get::<_, i64>(12)?,
             ))
         },
     );
@@ -118,11 +111,8 @@ pub fn aggregate(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>, top_n: i64)
         m.reported_cost_micro_usd = t.5;
         m.calculated_cost_micro_usd = t.6;
         m.estimated_cost_micro_usd = t.7;
-        m.estimated_total_bytes = t.8;
-        m.estimated_lower_bound_bytes = t.9;
-        m.estimated_upper_bound_bytes = t.10;
-        m.calls = t.11;
-        m.sessions = t.12;
+        m.calls = t.8;
+        m.sessions = t.9;
     }
 
     m.top_models = dim_breakdown(&c, &from_s, &to_s, "model", top_n);

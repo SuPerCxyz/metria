@@ -4,6 +4,7 @@ import React, { useMemo, useState } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
+import SortableList from '../../components/common/SortableList'
 import StatusBadge from '../../components/common/StatusBadge'
 import DataTable from '../../components/tables/DataTable'
 import TrendChart from '../../components/charts/TrendChart'
@@ -13,12 +14,11 @@ import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens, outputTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens, outputTokens } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
   { key: 'cost', label: '费用' },
-  { key: 'traffic', label: '估算流量' },
   { key: 'latency', label: '延迟' },
 ]
 
@@ -40,9 +40,8 @@ export default function SessionDetail() {
     const pts = callList
     switch (trendTab) {
       case 'tokens': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => sumTokens(p)) }
-      case 'cost': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.reported_cost_micro_usd ?? p.calculated_cost_micro_usd ?? p.estimated_cost_micro_usd ?? 0) }
-      case 'traffic': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.estimated_total_bytes ?? 0) }
-      case 'latency': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.duration_ms ?? 0) }
+      case 'cost': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.reported_cost_micro_usd ?? p.calculated_cost_micro_usd ?? p.estimated_cost_micro_usd ?? null) }
+      case 'latency': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.duration_ms ?? null) }
       default: return { labels: [], values: [] }
     }
   }, [callList, trendTab])
@@ -50,18 +49,24 @@ export default function SessionDetail() {
   const formatY = (v) => {
     if (trendTab === 'tokens') return fmtTokensShort(v)
     if (trendTab === 'cost') return fmtUsd(v)
-    if (trendTab === 'traffic') return fmtBytes(v)
-    return `${v}ms`
+    return fmtDuration(v)
   }
 
   const callColumns = [
     { key: 'started_at', label: '调用时间', sortable: true, render: (r) => fmtDateTime(r.started_at) },
     { key: 'model', label: '模型', render: (r) => r.model || '—' },
     { key: 'input_tokens', label: '输入 Token', render: (r) => fmtTokensShort(r.input_tokens) },
-    { key: 'output_tokens', label: '输出 Token', render: (r) => fmtTokensShort(outputTokens(r)) },
+    { key: 'output_tokens', label: '输出 Token', sortValue: (r) => outputTokens(r), render: (r) => fmtTokensShort(outputTokens(r)) },
     { key: 'cache_read_tokens', label: '缓存 Token', render: (r) => fmtTokensShort(r.cache_read_tokens) },
-    { key: 'calculated_cost_micro_usd', label: '费用', render: (r) => fmtUsd(r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
-    { key: 'duration_ms', label: '响应时间', render: (r) => fmtDuration(r.duration_ms) },
+    { key: 'calculated_cost_micro_usd', label: '费用', sortValue: (r) => r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd, render: (r) => fmtUsd(r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
+    { key: 'duration_ms', label: '响应时间', hideWhenEmpty: true, render: (r) => fmtDuration(r.duration_ms) },
+    { key: 'ttft_ms', label: 'TTFT', hideWhenEmpty: true, render: (r) => fmtDuration(r.ttft_ms) },
+    { key: 'first_byte_latency_ms', label: '首字节', hideWhenEmpty: true, render: (r) => fmtDuration(r.first_byte_latency_ms) },
+    { key: 'generation_duration_ms', label: '生成耗时', hideWhenEmpty: true, render: (r) => fmtDuration(r.generation_duration_ms) },
+    { key: 'inter_token_latency_avg_ms', label: 'Token 间延迟', hideWhenEmpty: true, render: (r) => fmtDuration(r.inter_token_latency_avg_ms) },
+    { key: 'stall_count', label: '停顿次数', hideWhenEmpty: true, render: (r) => r.stall_count != null ? String(r.stall_count) : '—' },
+    { key: 'output_tokens_per_second_milli', label: '输出速度', hideWhenEmpty: true, render: (r) => r.output_tokens_per_second_milli != null ? `${(r.output_tokens_per_second_milli / 1000).toFixed(1)} Token/s` : '—' },
+    { key: 'observability_source', label: '观测来源', hideWhenEmpty: true, render: (r) => r.observability_source || '—' },
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
   ]
 
@@ -91,7 +96,6 @@ export default function SessionDetail() {
           { label: '调用次数', value: String(s.model_call_count ?? 0) },
           { label: '总 Token', value: fmtTokensShort(sumTokens(s)) },
           { label: '总费用', value: fmtUsd(s.reported_cost_micro_usd ?? s.calculated_cost_micro_usd ?? s.estimated_cost_micro_usd) },
-          { label: '总估算流量', value: fmtBytes(s.estimated_total_bytes) },
           { label: '模型', value: s.model || '—' },
         ]}
       />
@@ -138,14 +142,22 @@ export default function SessionDetail() {
       {errors.length > 0 && (
         <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-red-200 dark:border-red-800/60 p-6">
           <h2 className="text-lg font-bold text-red-600 dark:text-red-400 mb-4">错误和异常</h2>
-          <div className="space-y-2">
-            {errors.slice(0, 10).map((e) => (
+          <SortableList
+            items={errors}
+            limit={10}
+            options={[
+              { key: 'started_at', label: '时间', getValue: (e) => e.started_at },
+              { key: 'model', label: '模型', getValue: (e) => e.model },
+              { key: 'status', label: '状态', getValue: (e) => e.status },
+            ]}
+            className="space-y-2"
+            renderItem={(e) => (
               <div key={e.id} className="flex items-center justify-between px-3 py-2 rounded-lg bg-red-50 dark:bg-red-400/5 text-sm">
                 <span className="text-gray-700 dark:text-gray-200">{e.model || '—'} · {fmtDateTime(e.started_at)}</span>
                 <StatusBadge status={e.status} />
               </div>
-            ))}
-          </div>
+            )}
+          />
         </div>
       )}
     </>

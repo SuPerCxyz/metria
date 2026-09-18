@@ -15,13 +15,13 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
+import { isAvailable } from '../../services/dataAvailability'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
   { key: 'cost', label: '费用' },
-  { key: 'traffic', label: '估算流量' },
   { key: 'requests', label: '请求数' },
 ]
 
@@ -58,6 +58,7 @@ export default function Overview() {
   const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model, projectId })
 
   const overview = useQuery(`overview${q(overviewParams)}`, () => api(`/overview${q(overviewParams)}`))
+  const performance = useQuery(`overview-performance${q(overviewParams)}`, () => api(`/usage/performance${q(overviewParams)}`))
   const previousOverview = useQuery(
     `overview-previous${q({ ...previousParams, ...excludedParams })}`,
     () => api(`/overview${q({ ...previousParams, ...excludedParams })}`),
@@ -88,7 +89,6 @@ export default function Overview() {
     switch (tab) {
       case 'tokens': return sumTokens(p)
       case 'cost': return p.cost_micro_usd
-      case 'traffic': return p.estimated_traffic_bytes
       default: return p.model_calls
     }
   }
@@ -143,7 +143,6 @@ export default function Overview() {
   const formatY = (v) => {
     if (trendTab === 'tokens') return fmtTokensShort(v)
     if (trendTab === 'cost') return fmtUsd(v)
-    if (trendTab === 'traffic') return fmtBytes(v)
     return v.toLocaleString()
   }
 
@@ -180,166 +179,238 @@ export default function Overview() {
   const previousModelCalls = previous?.model_calls ?? null
   const previousFailed = previous?.failed_calls ?? null
   const previousErrorRate = previousModelCalls > 0 ? (previousFailed / previousModelCalls) * 100 : null
-  const totalCost = o.calculated_cost_micro_usd ?? o.estimated_cost_micro_usd
-  const previousCost = previous?.calculated_cost_micro_usd ?? previous?.estimated_cost_micro_usd
+  const totalCost = (o.reported_cost_micro_usd ?? 0) + (o.calculated_cost_micro_usd ?? 0) + (o.estimated_cost_micro_usd ?? 0)
+  const previousCost = previous
+    ? (previous.reported_cost_micro_usd ?? 0) + (previous.calculated_cost_micro_usd ?? 0) + (previous.estimated_cost_micro_usd ?? 0)
+    : null
+  const pricingCoverage = o.pricing_coverage || {}
+  const previousPricingCoverage = previous?.pricing_coverage || {}
+  const averageCallCost = pricingCoverage.priced_calls > 0 && totalCost != null
+    ? totalCost / pricingCoverage.priced_calls
+    : null
+  const previousAverageCallCost = previousPricingCoverage.priced_calls > 0 && previousCost != null
+    ? previousCost / previousPricingCoverage.priced_calls
+    : null
+  const performanceData = performance.data || {}
+  const performanceCoverage = (key) => {
+    const metric = performanceData[key]
+    return metric?.count != null
+      ? `覆盖 ${fmtPct(metric.coverage)} · ${metric.count}/${performanceData.total_calls ?? 0} 次调用`
+      : '暂无实时观测数据'
+  }
+  const observedBytesCoverage = (key) => {
+    const metric = performanceData.observed_bytes?.[key]
+    return metric?.count > 0
+      ? `${metric.count}/${performanceData.total_calls ?? 0} 次调用有观测`
+      : '暂无实时观测数据'
+  }
+  const performanceSources = (performanceData.sources || [])
+    .map((source) => `${source.source}（${source.quality}，${source.count}）`)
+    .join('、') || '暂无实时观测样本'
+  const tokenTotal = sumTokens(o)
+  const previousTokenTotal = previous ? sumTokens(previous) : null
+  const averageTokenCount = o.token_calls ?? 0
+  const averageTokensPerCall = averageTokens(tokenTotal, averageTokenCount)
+  const previousAverageTokensPerCall = previous
+    ? averageTokens(previousTokenTotal, previous.token_calls)
+    : null
+  const cacheRate = cacheHitRate(o)
+  const hasTokenData = averageTokenCount > 0
+  const hasCacheSavings = Number(o.cache_savings_micro_usd) > 0
+  const hasCostData = pricingCoverage.priced_calls > 0
+  const hasActivityData = modelCalls > 0 || Number(o.sessions) > 0 || Number(o.collectors) > 0 || isAvailable(o.active_duration_ms) || isAvailable(o.session_duration_ms)
+  const hasMessageData = Number(o.message_count) > 0 || Number(o.user_message_count) > 0 || Number(o.tool_call_count) > 0
+  const performanceMetric = (key, valueKey = 'avg_ms') => {
+    const metric = performanceData[key]
+    return metric?.count > 0 && isAvailable(metric[valueKey])
+  }
+  const performanceCards = [
+    performanceMetric('ttft') && <MetricCard key="ttft" span="xl:col-span-2" label="首个可观察输出" value={fmtDuration(performanceData.ttft.avg_ms)} sub={performanceCoverage('ttft')} hint="首 Token 延迟；普通 metria agent 未通过 observe 时不产生该样本" />,
+    performanceMetric('first_byte') && <MetricCard key="first-byte" span="xl:col-span-2" label="首字节延迟" value={fmtDuration(performanceData.first_byte.avg_ms)} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节的观测时长" />,
+    performanceMetric('generation') && <MetricCard key="generation" span="xl:col-span-2" label="生成耗时" value={fmtDuration(performanceData.generation.avg_ms)} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件的观测时长" />,
+    performanceMetric('output_speed', 'avg_tokens_per_second') && <MetricCard key="speed" span="xl:col-span-2" label="输出速度" value={`${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s`} sub={performanceCoverage('output_speed')} hint="仅使用首 Token 后的生成区间计算" />,
+    performanceMetric('inter_token_latency') && <MetricCard key="itl" span="xl:col-span-2" label="Token 间延迟" value={fmtDuration(performanceData.inter_token_latency.avg_ms)} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔" />,
+    performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) && <MetricCard key="stalls" span="xl:col-span-2" label="平均停顿次数" value={Number(performanceData.stalls.avg_count).toFixed(1)} sub={`${performanceData.stalls.count} 次调用有停顿统计`} hint="观测到的生成停顿次数，不包含未观测调用" />,
+    ...[
+      ['request_payload', '观测请求字节'],
+      ['response_payload', '观测响应字节'],
+      ['request_wire', '观测请求 Wire 字节'],
+      ['response_wire', '观测响应 Wire 字节'],
+    ].map(([key, label]) => {
+      const metric = performanceData.observed_bytes?.[key]
+      return metric?.count > 0 && isAvailable(metric.bytes)
+        ? <MetricCard key={key} span="xl:col-span-2" label={label} value={fmtBytes(metric.bytes)} sub={observedBytesCoverage(key)} hint="仅表示运行时观测链路看到的字节，不是估算流量" />
+        : null
+    }),
+  ].filter(Boolean)
 
   return (
     <>
-      <PageHeader title="总览" subtitle="AI 编程 Agent 用量、费用与流量概览" />
+      <PageHeader title="总览" subtitle="AI 编程 Agent 用量、费用与性能概览" />
 
-      {/* 第一行：用量 */}
-      <div className="mt-0">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
-        <div className="grid grid-cols-12 gap-6">
-          <MetricCard
-            span="xl:col-span-4"
-            label="Token 消耗"
-            value={fmtTokens(sumTokens(o))}
-            {...compare(sumTokens(o), previous ? sumTokens(previous) : null)}
-            sub={
-              <span className="tabular-nums">
-                <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)}{(o.cache_write_tokens ?? 0) > 0 ? ` · 缓存写入 ${fmtTokensShort(o.cache_write_tokens)}` : ''}</span>
-              </span>
-            }
-          />
-          <MetricCard
-            span="xl:col-span-4"
-            label="缓存命中率"
-            value={cacheHitRate(o) != null ? fmtPct100(cacheHitRate(o)) : '—'}
-            {...compare(cacheHitRate(o), previous ? cacheHitRate(previous) : null)}
-            sub="缓存读取 / (输入 + 缓存写入 + 缓存读取)"
-            hint="缓存读取 Token 占请求上下文比例"
-          />
-          <MetricCard
-            span="xl:col-span-4"
-            label="调用时长"
-            value={o.duration_p50_ms != null ? fmtDuration(o.duration_p50_ms) : '—'}
-            {...compare(o.duration_p50_ms, previous?.duration_p50_ms)}
-            sub={
-              o.duration_p50_ms != null ? (
+      {hasTokenData && (
+        <div className="mt-0">
+          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
+          <div className="grid grid-cols-12 gap-6">
+            <MetricCard
+              span="xl:col-span-4"
+              label="Token 消耗"
+              value={fmtTokens(tokenTotal)}
+              {...compare(tokenTotal, previousTokenTotal)}
+              sub={
                 <span className="tabular-nums">
-                  P50 {fmtDuration(o.duration_p50_ms)} · P95 {fmtDuration(o.duration_p95_ms)} · P99 {fmtDuration(o.duration_p99_ms)}
+                  <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)}{(o.cache_write_tokens ?? 0) > 0 ? ` · 缓存写入 ${fmtTokensShort(o.cache_write_tokens)}` : ''}</span>
                 </span>
-              ) : undefined
-            }
-            hint="整次调用时长分布（从发起到完成，非首 token 延迟）；客户端日志缺失时长则显示 —"
-          />
+              }
+            />
+            {cacheRate != null && <MetricCard
+              span="xl:col-span-4"
+              label="缓存命中率"
+              value={fmtPct100(cacheRate)}
+              {...compare(cacheRate, previous ? cacheHitRate(previous) : null)}
+              sub="缓存读取 / (输入 + 缓存写入 + 缓存读取)"
+              hint="缓存读取 Token 占请求上下文比例"
+            />}
+            {averageTokensPerCall != null && <MetricCard
+              span="xl:col-span-4"
+              label="平均每次调用 Token"
+              value={fmtTokensShort(averageTokensPerCall)}
+              {...compare(averageTokensPerCall, previousAverageTokensPerCall)}
+              sub={`${averageTokenCount} 次有 Token 数据的调用`}
+              hint="总 Token 除以有 Token 数据的调用数；缺失 Token 的调用不计入分母"
+            />}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* 第二行：成本与流量 */}
-      <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本与流量</h2>
-        <div className="grid grid-cols-12 gap-6">
-          <MetricCard
-            span="xl:col-span-4"
-            label="总费用"
-            value={fmtUsd(totalCost)}
-            {...compare(totalCost, previousCost)}
-            sub="估算费用"
-            hint="按 Token 与价格目录估算"
-          />
-          <MetricCard
-            span="xl:col-span-4"
-            label="估算流量"
-            value={fmtBytes(o.estimated_total_bytes)}
-            {...compare(o.estimated_total_bytes, previous?.estimated_total_bytes)}
-            sub="估算流量（含上下界）"
-            hint={`范围 ${fmtBytes(o.traffic_lower_bound_bytes)} ~ ${fmtBytes(o.traffic_upper_bound_bytes)}`}
-          />
-          <MetricCard
-            span="xl:col-span-4"
-            label="缓存节省费用"
-            value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'}
-            {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)}
-            sub="按缓存读取单价估算"
-            hint="缓存命中带来的成本节省"
-          />
+      {hasCostData && (
+        <div className="mt-3">
+          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本</h2>
+          <div className="grid grid-cols-12 gap-6">
+            <MetricCard
+              span="xl:col-span-4"
+              label="总费用"
+              value={fmtUsd(totalCost)}
+              {...compare(totalCost, previousCost)}
+              sub={`${pricingCoverage.priced_calls} 次有费用口径调用`}
+              hint="合计客户端上报、规则计算和估算三种费用口径；未定价调用不计入"
+            />
+            {hasCacheSavings && <MetricCard
+              span="xl:col-span-4"
+              label="缓存节省费用"
+              value={fmtUsd(o.cache_savings_micro_usd)}
+              {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)}
+              sub="按缓存读取单价估算"
+              hint="缓存命中带来的成本节省"
+            />}
+            {averageCallCost != null && <MetricCard
+              span="xl:col-span-4"
+              label="平均单次调用费用"
+              value={fmtUsd(averageCallCost)}
+              {...compare(averageCallCost, previousAverageCallCost)}
+              sub={`${pricingCoverage.priced_calls} 次有费用口径调用`}
+              hint="当前范围总费用除以有费用口径的调用数；未定价调用不按 0 计入"
+            />}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* 第三行：活动与健康 */}
-      <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
-        <div className="grid grid-cols-12 gap-6">
-          <MetricCard
-            span="xl:col-span-2"
-            label="请求数"
-            value={String(modelCalls)}
-            {...compare(modelCalls, previousModelCalls)}
-            sub="模型调用次数"
-            hint={`涉及 ${o.models ?? 0} 个模型`}
-          />
-          <MetricCard
-            span="xl:col-span-2"
-            label="错误率"
-            value={errorRate != null ? fmtPct100(errorRate) : '—'}
-            {...compare(errorRate, previousErrorRate, true)}
-            sub={`成功 ${successRate != null ? fmtPct100(successRate) : '—'} · 失败 ${failed} 次`}
-            hint="失败请求占全部请求比例；下降表示改善"
-          />
-          <MetricCard
-            span="xl:col-span-2"
-            label="新建会话"
-            value={String(o.sessions ?? 0)}
-            {...compare(o.sessions, previous?.sessions)}
-            sub={`${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器`}
-            hint="当前 Agent 新建的会话数"
-          />
-          <MetricCard
-            span="xl:col-span-2"
-            label="活跃时长"
-            value={fmtDuration(o.active_duration_ms)}
-            {...compare(o.active_duration_ms, previous?.active_duration_ms)}
-            sub="模型调用耗时合计"
-            hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠"
-          />
-          <MetricCard
-            span="xl:col-span-2"
-            label="会话总时长"
-            value={fmtDuration(o.session_duration_ms)}
-            {...compare(o.session_duration_ms, previous?.session_duration_ms)}
-            sub="会话持续跨度合计"
-            hint="从会话开始到最后活动/结束；不去重重叠会话"
-          />
-          <MetricCard
-            span="xl:col-span-2"
-            label="节点在线"
-            value={`${o.collectors_online ?? 0} / ${o.collectors ?? 0}`}
-            sub={`${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目`}
-            hint="在线采集器 / 总数"
-          />
+      {performance.loading ? <div className="mt-3"><LoadingSkeleton rows={2} /></div> : performance.error ? <div className="mt-3"><ErrorState error={performance.error} onRetry={performance.refresh} /></div> : performanceCards.length > 0 && (
+        <div className="mt-3">
+          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">实时性能观测</h2>
+          <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
+          <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">
+            观测来源：{performanceSources}；普通日志调用缺失这些字段时保持不可用，不使用推算值补齐。
+          </p>
         </div>
-      </div>
+      )}
 
-      {/* 消息统计与数据新鲜度 */}
-      <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
-        <div className="grid grid-cols-12 gap-6">
-          <MetricCard
-            span="xl:col-span-3"
-            label="总消息数"
-            value={fmtTokensShort(o.message_count)}
-            {...compare(o.message_count, previous?.message_count)}
-            sub="用户、助手和系统消息"
-          />
-          <MetricCard
-            span="xl:col-span-3"
-            label="用户消息数"
-            value={fmtTokensShort(o.user_message_count)}
-            {...compare(o.user_message_count, previous?.user_message_count)}
-            sub="可识别 role=user"
-          />
-          <MetricCard
-            span="xl:col-span-3"
-            label="工具调用消息"
-            value={fmtTokensShort(o.tool_call_count)}
-            {...compare(o.tool_call_count, previous?.tool_call_count)}
-            sub="会话工具调用计数"
-          />
-          <FreshnessCard freshness={o.freshness} />
+      {hasActivityData && (
+        <div className="mt-3">
+          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
+          <div className="grid grid-cols-12 gap-6">
+            {modelCalls > 0 && <MetricCard
+              span="xl:col-span-2"
+              label="请求数"
+              value={String(modelCalls)}
+              {...compare(modelCalls, previousModelCalls)}
+              sub="模型调用次数"
+              hint={`涉及 ${o.models ?? 0} 个模型`}
+            />}
+            {errorRate != null && <MetricCard
+              span="xl:col-span-2"
+              label="错误率"
+              value={fmtPct100(errorRate)}
+              {...compare(errorRate, previousErrorRate, true)}
+              sub={`成功 ${fmtPct100(successRate)} · 失败 ${failed} 次`}
+              hint="失败请求占全部请求比例；下降表示改善"
+            />}
+            {Number(o.sessions) > 0 && <MetricCard
+              span="xl:col-span-2"
+              label="新建会话"
+              value={String(o.sessions)}
+              {...compare(o.sessions, previous?.sessions)}
+              sub={`${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器`}
+              hint="当前 Agent 新建的会话数"
+            />}
+            {isAvailable(o.active_duration_ms) && <MetricCard
+              span="xl:col-span-2"
+              label="活跃时长"
+              value={fmtDuration(o.active_duration_ms)}
+              {...compare(o.active_duration_ms, previous?.active_duration_ms)}
+              sub="模型调用耗时合计"
+              hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠"
+            />}
+            {isAvailable(o.session_duration_ms) && <MetricCard
+              span="xl:col-span-2"
+              label="会话总时长"
+              value={fmtDuration(o.session_duration_ms)}
+              {...compare(o.session_duration_ms, previous?.session_duration_ms)}
+              sub="会话持续跨度合计"
+              hint="从会话开始到最后活动/结束；不去重重叠会话"
+            />}
+            {Number(o.collectors) > 0 && <MetricCard
+              span="xl:col-span-2"
+              label="节点在线"
+              value={`${o.collectors_online ?? 0} / ${o.collectors}`}
+              sub={`${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目`}
+              hint="在线采集器 / 总数"
+            />}
+          </div>
         </div>
-      </div>
+      )}
+
+      {(hasMessageData || o.freshness) && (
+        <div className="mt-3">
+          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
+          <div className="grid grid-cols-12 gap-6">
+            {hasMessageData && <>
+              <MetricCard
+                span="xl:col-span-3"
+                label="总消息数"
+                value={fmtTokensShort(o.message_count)}
+                {...compare(o.message_count, previous?.message_count)}
+                sub="用户、助手和系统消息"
+              />
+              <MetricCard
+                span="xl:col-span-3"
+                label="用户消息数"
+                value={fmtTokensShort(o.user_message_count)}
+                {...compare(o.user_message_count, previous?.user_message_count)}
+                sub="可识别 role=user"
+              />
+              <MetricCard
+                span="xl:col-span-3"
+                label="工具调用消息"
+                value={fmtTokensShort(o.tool_call_count)}
+                {...compare(o.tool_call_count, previous?.tool_call_count)}
+                sub="会话工具调用计数"
+              />
+            </>}
+            <FreshnessCard freshness={o.freshness} />
+          </div>
+        </div>
+      )}
 
       {/* 第二行：主趋势图 */}
       <div className="mt-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
@@ -396,29 +467,27 @@ export default function Overview() {
         </div>
       </div>
 
-      {/* 第三行：模型排行（Token / 调用） */}
-      <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+      {(modelTokenItems.length > 0 || costItems.length > 0) && <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {modelTokenItems.length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">模型 Token 排行</h2>
           <RankingList items={modelTokenItems} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
-        </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+        </div>}
+        {costItems.length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">模型调用排行</h2>
-          <RankingList items={costItems} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
-        </div>
-      </div>
+          <RankingList items={costItems} valueKey="value" labelKey="name" format={(value) => value.toLocaleString()} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
+        </div>}
+      </div>}
 
-      {/* 第四行：Agent 排行（使用分布 / Token） */}
-      <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+      {(agentItems.length > 0 || agentTokenItems.length > 0) && <div className="mt-3 grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {agentItems.length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">Agent 使用分布</h2>
-          <RankingList items={agentItems} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />
-        </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+          <RankingList items={agentItems} valueKey="value" labelKey="name" format={(value) => value.toLocaleString()} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />
+        </div>}
+        {agentTokenItems.length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-3">Agent Token 排行</h2>
           <RankingList items={agentTokenItems} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={5} onItemClick={(a) => navigate(`/agents/${encodeURIComponent(a.id)}`)} />
-        </div>
-      </div>
+        </div>}
+      </div>}
 
     </>
   )

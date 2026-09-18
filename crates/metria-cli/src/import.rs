@@ -46,36 +46,42 @@ pub fn run_import(
         total.sessions += batch.sessions.len() as u64;
         total.calls += batch.model_calls.len() as u64;
         total.usage += batch.usage_events.len() as u64;
-        total.traffic += batch.traffic_estimates.len() as u64;
 
         eprintln!(
-            "{}: sessions={} calls={} usage={} traffic={} warnings={}",
+            "{}: sessions={} calls={} usage={} warnings={}",
             src.canonical_path.display(),
             batch.sessions.len(),
             batch.model_calls.len(),
             batch.usage_events.len(),
-            batch.traffic_estimates.len(),
             batch.warnings.len()
         );
         if dry_run {
             continue;
         }
         for s in &batch.sessions {
-            write_event(&mut writer, "session", s)?;
+            let mut payload = serde_json::to_value(s).map_err(|e| e.to_string())?;
+            for key in [
+                "estimated_request_bytes",
+                "estimated_response_bytes",
+                "estimated_total_bytes",
+                "traffic_confidence",
+            ] {
+                payload[key] = serde_json::Value::Null;
+            }
+            write_value_event(&mut writer, "session", payload)?;
         }
         for c in &batch.model_calls {
-            write_event(&mut writer, "call", c)?;
+            let mut payload = serde_json::to_value(c).map_err(|e| e.to_string())?;
+            payload["traffic_estimate_id"] = serde_json::Value::Null;
+            write_value_event(&mut writer, "call", payload)?;
         }
         for u in &batch.usage_events {
             write_event(&mut writer, "usage", u)?;
         }
-        for t in &batch.traffic_estimates {
-            write_event(&mut writer, "traffic", t)?;
-        }
     }
     eprintln!(
-        "完成：sessions={} calls={} usage={} traffic={}",
-        total.sessions, total.calls, total.usage, total.traffic
+        "完成：sessions={} calls={} usage={}",
+        total.sessions, total.calls, total.usage
     );
     Ok(())
 }
@@ -85,13 +91,23 @@ struct ImportTotals {
     sessions: u64,
     calls: u64,
     usage: u64,
-    traffic: u64,
 }
 
 fn write_event<W: Write, T: serde::Serialize>(
     w: &mut W,
     kind: &str,
     value: &T,
+) -> Result<(), String> {
+    let line = serde_json::json!({ "kind": kind, "data": value });
+    serde_json::to_writer(&mut *w, &line).map_err(|e| e.to_string())?;
+    w.write_all(b"\n").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_value_event<W: Write>(
+    w: &mut W,
+    kind: &str,
+    value: serde_json::Value,
 ) -> Result<(), String> {
     let line = serde_json::json!({ "kind": kind, "data": value });
     serde_json::to_writer(&mut *w, &line).map_err(|e| e.to_string())?;

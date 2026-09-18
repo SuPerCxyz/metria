@@ -16,3 +16,16 @@ test('sorts rankings by value before applying the limit and keeps ties stable', 
   )
   assert.deepEqual(items.map((item) => item.id), ['small', 'tie-a', 'large', 'tie-b'])
 })
+
+test('sorts rankings by another field before applying the limit', () => {
+  const items = [
+    { id: 'alpha', value: 100, name: 'Alpha' },
+    { id: 'charlie', value: 1, name: 'Charlie' },
+    { id: 'bravo', value: 50, name: 'Bravo' },
+  ]
+
+  assert.deepEqual(
+    sortRankingItems(items, 'value', 2, 'name', 1).map((item) => item.id),
+    ['alpha', 'bravo'],
+  )
+})

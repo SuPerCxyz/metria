@@ -219,6 +219,9 @@ pub fn validate_batch(batch: &UploadBatch) -> Result<(), String> {
     }
     let mut total: usize = 0;
     for e in &batch.events {
+        if e.kind == "call" {
+            validate_call_payload(&e.payload)?;
+        }
         let s = serde_json::to_string(&e.payload).map_err(|e| e.to_string())?;
         if s.len() > limits::MAX_EVENT_BYTES {
             return Err(format!(
@@ -239,6 +242,90 @@ pub fn validate_batch(batch: &UploadBatch) -> Result<(), String> {
     }
     if total > limits::MAX_UNCOMPRESSED_BODY {
         return Err("解压后超过大小上限".into());
+    }
+    Ok(())
+}
+
+/// 校验调用观测字段的边界；旧调用没有这些字段时保持兼容。
+fn validate_call_payload(payload: &serde_json::Value) -> Result<(), String> {
+    const NON_NEGATIVE: &[&str] = &[
+        "duration_ms",
+        "first_byte_latency_ms",
+        "ttft_ms",
+        "generation_duration_ms",
+        "output_tokens_per_second_milli",
+        "inter_token_latency_avg_ms",
+        "inter_token_latency_p95_ms",
+        "stall_count",
+        "stall_duration_ms",
+        "observed_request_payload_bytes",
+        "observed_response_payload_bytes",
+        "observed_request_wire_bytes",
+        "observed_response_wire_bytes",
+    ];
+    for key in NON_NEGATIVE {
+        if let Some(value) = payload.get(*key).filter(|v| !v.is_null()) {
+            let Some(number) = value.as_i64() else {
+                return Err(format!("call.{key} 必须是整数"));
+            };
+            if number < 0 {
+                return Err(format!("call.{key} 不得为负数"));
+            }
+        }
+    }
+
+    if let Some(value) = payload.get("rate_limited").filter(|v| !v.is_null()) {
+        if !value.is_boolean() {
+            return Err("call.rate_limited 必须是布尔值".into());
+        }
+    }
+
+    let timestamps = [
+        "started_at",
+        "first_byte_at",
+        "first_token_at",
+        "last_output_at",
+        "completed_at",
+    ];
+    let mut previous = None;
+    for key in timestamps {
+        let Some(raw) = payload.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+            .map_err(|_| format!("call.{key} 必须是 RFC3339 时间"))?;
+        if let Some(before) = previous {
+            if parsed < before {
+                return Err(format!("call.{key} 时间早于前一阶段"));
+            }
+        }
+        previous = Some(parsed);
+    }
+
+    for key in ["observability_source", "observability_quality"] {
+        if let Some(value) = payload.get(key).filter(|v| !v.is_null()) {
+            let Some(text) = value.as_str() else {
+                return Err(format!("call.{key} 必须是字符串"));
+            };
+            if text.is_empty() || text.len() > 64 {
+                return Err(format!("call.{key} 长度非法"));
+            }
+            let allowed = match key {
+                "observability_source" => [
+                    "runtime_http",
+                    "runtime_sdk",
+                    "runtime_cli",
+                    "ordinary_log",
+                    "unknown",
+                ]
+                .as_slice(),
+                "observability_quality" => ["observed", "partial", "unavailable"].as_slice(),
+                _ => &[],
+            };
+            if !allowed.contains(&text) {
+                return Err(format!("call.{key} 值不受支持: {text}"));
+            }
+        }
     }
     Ok(())
 }
@@ -270,4 +357,71 @@ pub fn valid_kind(kind: &str) -> bool {
             | "subagent"
             | "traffic_sample"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(payload: serde_json::Value) -> UploadBatch {
+        UploadBatch {
+            schema_version: limits::SCHEMA_VERSION,
+            batch_id: "batch-observe".into(),
+            node_id: "node-1".into(),
+            collector_id: "collector-1".into(),
+            agent_version: "test".into(),
+            events: vec![BatchEvent {
+                kind: "call".into(),
+                event_id: "blake3:call-observe".into(),
+                payload,
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_observed_call_and_legacy_call() {
+        let observed = serde_json::json!({
+            "started_at": "2026-09-18T00:00:00Z",
+            "first_byte_at": "2026-09-18T00:00:00.100Z",
+            "first_token_at": "2026-09-18T00:00:00.200Z",
+            "last_output_at": "2026-09-18T00:00:01Z",
+            "completed_at": "2026-09-18T00:00:01.100Z",
+            "ttft_ms": 200,
+            "observed_response_wire_bytes": 1024,
+            "observability_source": "runtime_http",
+            "observability_quality": "observed"
+        });
+        assert!(validate_batch(&batch(observed)).is_ok());
+        assert!(validate_batch(&batch(serde_json::json!({
+            "started_at": "2026-09-18T00:00:00Z"
+        })))
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_or_out_of_order_observation() {
+        let negative = serde_json::json!({"ttft_ms": -1});
+        assert!(validate_batch(&batch(negative))
+            .unwrap_err()
+            .contains("不得为负"));
+        let out_of_order = serde_json::json!({
+            "started_at": "2026-09-18T00:00:02Z",
+            "first_token_at": "2026-09-18T00:00:01Z"
+        });
+        assert!(validate_batch(&batch(out_of_order))
+            .unwrap_err()
+            .contains("早于"));
+    }
+
+    #[test]
+    fn rejects_unknown_observability_enum() {
+        assert!(validate_batch(&batch(serde_json::json!({
+            "observability_source": "guessing"
+        })))
+        .is_err());
+        assert!(validate_batch(&batch(serde_json::json!({
+            "observability_quality": "estimated"
+        })))
+        .is_err());
+    }
 }

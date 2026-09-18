@@ -112,11 +112,6 @@ impl Spool {
                 last_error  TEXT,
                 client_id   TEXT
             );
-            CREATE TABLE IF NOT EXISTS traffic_profile_samples (
-                sample_id  TEXT PRIMARY KEY,
-                sample_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
             CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_events(created_at);
             "#,
         )?;

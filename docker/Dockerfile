@@ -20,13 +20,14 @@ COPY web/ ./
 RUN npm run build
 
 # ---- Rust build（原生运行，交叉编译目标架构） ----
-FROM --platform=$BUILDPLATFORM rust:1.96-slim AS build
+FROM --platform=$BUILDPLATFORM rust:1.96-slim-bookworm AS build
 WORKDIR /src
 ARG TARGETARCH
 # 构建 profile：本地开发默认 release 也缓存复用；需要快速迭代时
 #   docker build --build-arg PROFILE=dev ...
 # 即用 dev profile（无 LTO/低优化），显著加快编译；正式发布保持 release 全量 LTO。
 ARG PROFILE=release
+ARG TARGET_CACHE_VERSION=bookworm-v1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config ca-certificates \
        gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-mingw-w64-x86-64 \
@@ -43,7 +44,8 @@ COPY --from=web /build/dist ./web/dist
 # target 通过 CARGO_TARGET_DIR 指向缓存挂载，避免其内容进入层快照导致 COPY 拿不到二进制；
 # 最终产物显式拷贝到层内 /src/target/release/metria 与 /src/agent-binaries，供 hub 阶段 COPY。
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/cargo-target \
+    --mount=type=cache,id=cargo-target-bookworm-${TARGETARCH},target=/cargo-target \
+    echo "target cache ${TARGET_CACHE_VERSION}"; \
     profile="$PROFILE"; target_dir=release; [ "$profile" = "dev" ] && target_dir=debug; \
     mkdir -p target/release agent-binaries; \
     if [ "$TARGETARCH" = "arm64" ]; then \

@@ -279,12 +279,11 @@ fn scanner_loop(
                 let t = scanner.scan_all(&mut spool);
                 if t.usage > 0 || t.calls > 0 {
                     tracing::debug!(
-                        "增量扫描: sources={} sessions={} calls={} usage={} traffic={} errors={}",
+                        "增量扫描: sources={} sessions={} calls={} usage={} errors={}",
                         t.sources,
                         t.sessions,
                         t.calls,
                         t.usage,
-                        t.traffic,
                         t.errors
                     );
                 }

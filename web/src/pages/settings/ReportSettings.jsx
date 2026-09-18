@@ -1,6 +1,7 @@
 // 设置页「用量报告」区块：全局时区、收件人、SMTP/Webhook 渠道、三独立调度、测试发送与发送历史。
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import DataTable from '../../components/tables/DataTable'
 import { api } from '../../services/api'
 import { LoadingSkeleton, ErrorState } from '../../components/feedback/Feedback'
 import { useToast } from '../../components/feedback/Toast'
@@ -16,7 +17,6 @@ const COMMON_TZ = [
   'UTC',
 ]
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
-const HISTORY_PAGE_SIZE = 10
 const TLS_OPTIONS = [
   { value: 'starttls', label: 'STARTTLS' },
   { value: 'tls', label: 'SSL/TLS' },
@@ -89,7 +89,6 @@ export default function ReportSettings() {
   const [testing, setTesting] = useState(false)
   const [testResults, setTestResults] = useState(null)
   const [history, setHistory] = useState([])
-  const [historyPage, setHistoryPage] = useState(1)
   const { notify } = useToast()
   const scheduleFieldRefs = useRef({})
   const [scheduleFieldWidth, setScheduleFieldWidth] = useState(null)
@@ -133,7 +132,6 @@ export default function ReportSettings() {
         timezone_default: res.timezone_default || '',
       })
       setHistory(hist.sends || [])
-      setHistoryPage(1)
       if (announce) notify('发送历史已刷新')
     } catch (e) {
       setError(e.message || '加载失败')
@@ -208,7 +206,6 @@ export default function ReportSettings() {
       else notify('测试发送未成功，请查看结果', 'error')
       const hist = await api('/settings/report/history').catch(() => ({ sends: [] }))
       setHistory(hist.sends || [])
-      setHistoryPage(1)
     } catch (e) {
       setTestResults([{ channel: 'system', ok: false, detail: e.message || '测试发送请求失败' }])
       notify(e.message || '测试发送请求失败', 'error')
@@ -220,12 +217,13 @@ export default function ReportSettings() {
   if (loading) return <LoadingSkeleton rows={5} />
   if (error) return <ErrorState error={error} onRetry={() => load()} />
   const testFailed = !!testResults && (testResults.length === 0 || testResults.some((result) => !result.ok))
-  const historyPageCount = Math.max(1, Math.ceil(history.length / HISTORY_PAGE_SIZE))
-  const currentHistoryPage = Math.min(historyPage, historyPageCount)
-  const visibleHistory = history.slice(
-    (currentHistoryPage - 1) * HISTORY_PAGE_SIZE,
-    currentHistoryPage * HISTORY_PAGE_SIZE,
-  )
+  const historyColumns = [
+    { key: 'created_at', label: '时间', render: (h) => h.created_at?.replace('T', ' ').slice(0, 19) },
+    { key: 'period', label: '周期', sortValue: (h) => `${h.kind || ''} / ${h.period || ''}`, render: (h) => `${h.kind} / ${h.period}` },
+    { key: 'channel', label: '渠道', render: (h) => h.channel },
+    { key: 'status', label: '结果', render: (h) => <span className={h.status === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>{h.status}</span> },
+    { key: 'detail', label: '详情', render: (h) => <span className="text-gray-500 dark:text-gray-400">{h.detail || '—'}</span> },
+  ]
 
   return (
     <div className="space-y-4">
@@ -390,52 +388,8 @@ export default function ReportSettings() {
         {history.length === 0 ? (
           <p className="mt-3 text-sm text-gray-400 dark:text-gray-500">暂无发送记录。</p>
         ) : (
-          <div className="mt-3 overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs text-gray-400 dark:text-gray-500">
-                  <th className="py-1 pr-4">时间</th>
-                  <th className="py-1 pr-4">周期</th>
-                  <th className="py-1 pr-4">渠道</th>
-                  <th className="py-1 pr-4">结果</th>
-                  <th className="py-1">详情</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleHistory.map((h, i) => (
-                  <tr key={i} className="border-t border-gray-100 dark:border-gray-700/60">
-                    <td className="py-1.5 pr-4 whitespace-nowrap">{h.created_at?.replace('T', ' ').slice(0, 19)}</td>
-                    <td className="py-1.5 pr-4">{h.kind} / {h.period}</td>
-                    <td className="py-1.5 pr-4">{h.channel}</td>
-                    <td className={`py-1.5 pr-4 ${h.status === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>{h.status}</td>
-                    <td className="py-1.5 text-gray-500 dark:text-gray-400">{h.detail || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        {history.length > 0 && historyPageCount > 1 && (
-          <div className="mt-3 flex items-center justify-between gap-3 text-xs text-gray-500 dark:text-gray-400">
-            <span>第 {currentHistoryPage} / {historyPageCount} 页（每页 {HISTORY_PAGE_SIZE} 条）</span>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={currentHistoryPage === 1}
-                onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}
-                className="rounded border border-gray-300 px-2 py-1 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-700/40"
-              >
-                上一页
-              </button>
-              <button
-                type="button"
-                disabled={currentHistoryPage === historyPageCount}
-                onClick={() => setHistoryPage((page) => Math.min(historyPageCount, page + 1))}
-                className="rounded border border-gray-300 px-2 py-1 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-700/40"
-              >
-                下一页
-              </button>
-            </div>
+          <div className="mt-3">
+            <DataTable columns={historyColumns} data={history} pageSize={10} />
           </div>
         )}
       </div>

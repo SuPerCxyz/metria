@@ -10,7 +10,7 @@ import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
-import { fmtTokensShort, fmtUsd, fmtPct100, fmtDuration, sumTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct100, fmtDuration, sumTokens, sumCosts } from '../../services/format'
 
 export default function Models() {
   const { range } = useTimeRange()
@@ -33,13 +33,13 @@ export default function Models() {
 
   const columns = [
     { key: 'model', label: '模型名称', sortable: true, render: (r) => r.model },
-    { key: 'provider', label: '供应商', render: (r) => r.provider || '—' },
+    { key: 'provider', label: '供应商', hideWhenEmpty: true, render: (r) => r.provider || '—' },
     { key: 'model_calls', label: '请求数', sortable: true, render: (r) => String(r.model_calls ?? 0) },
-    { key: 'input_tokens', label: 'Token', sortable: true, render: (r) => fmtTokensShort(sumTokens(r)) },
-    { key: 'cost', label: '费用', render: (r) => r.pricing_source === 'unavailable' ? '价格未配置' : fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
-    { key: 'clients', label: '缓存命中率', render: (r) => r.cache_hit_rate != null ? fmtPct100(r.cache_hit_rate * 100) : '—' },
-    { key: 'bpo', label: '平均响应时间', render: (r) => r.avg_duration_ms != null ? fmtDuration(r.avg_duration_ms) : '—' },
-    { key: 'errors', label: '错误率', render: (r) => r.error_rate != null && r.error_rate > 0 ? fmtPct100(r.error_rate * 100) : (r.error_rate === 0 ? '0%' : '—') },
+    { key: 'input_tokens', label: 'Token', sortValue: (r) => sumTokens(r), render: (r) => fmtTokensShort(sumTokens(r)) },
+    { key: 'cost', label: '费用', hideWhenEmpty: true, sortValue: (r) => r.pricing_source === 'unavailable' ? null : sumCosts(r), render: (r) => r.pricing_source === 'unavailable' ? '价格未配置' : fmtUsd(sumCosts(r)) },
+    { key: 'clients', label: '缓存命中率', hideWhenEmpty: true, sortValue: (r) => r.cache_hit_rate != null ? r.cache_hit_rate * 100 : null, render: (r) => r.cache_hit_rate != null ? fmtPct100(r.cache_hit_rate * 100) : '—' },
+    { key: 'bpo', label: '平均响应时间', hideWhenEmpty: true, sortValue: (r) => r.avg_duration_ms, render: (r) => r.avg_duration_ms != null ? fmtDuration(r.avg_duration_ms) : '—' },
+    { key: 'errors', label: '错误率', sortValue: (r) => r.error_rate, render: (r) => r.error_rate != null && r.error_rate > 0 ? fmtPct100(r.error_rate * 100) : (r.error_rate === 0 ? '0%' : '—') },
   ]
 
   return (

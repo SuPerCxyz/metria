@@ -27,29 +27,21 @@ Agent 本地先脱敏，Hub 二次脱敏（纵深防御）。
 
 ## 4. 数据诚实性硬性规则
 
-- 流量必须标记「估算流量」，禁止标记为实际/精确/网卡/账单流量。
+- 新的字节字段必须标记为 `observed_*_bytes`，仅表示临时观测链路看到的 payload/wire 字节，禁止标记为实际/精确/网卡/账单流量。
 - 缺失 Token 用 `null`，禁止默认填 0。
-- 禁止把估算 Token 冒充 reported、calculated cost 冒充 reported cost、估算流量冒充实际流量。
+- 禁止把估算 Token 冒充 reported、calculated cost 冒充 reported cost；旧估算流量不再进入新采集链路。
 - 禁止把 Session 级统计伪装成单次 Model Call；`call_granularity` 必须诚实标注。
 - 费用三口径并存：`reported_cost` / `calculated_cost` / `estimated_cost`，各自可追溯。
 - 禁止把 Cache Token 直接等同于网络字节；禁止把 Reasoning Token 全部换算为响应字节。
-- 禁止用固定「1 Token = 4 Bytes」作为唯一估算算法；系数必须版本化（TrafficProfile 版本化）。
-- 禁止生成下界=中值=上界的估算区间；缺数据时标记 `unavailable`，不硬造。
+- 观测字节不可由 Token 或固定系数推算；缺数据时标记 `unavailable`，不硬造。
 - 外部价格目录必须保存来源与快照；OpenRouter 价格标记 channel，LiteLLM 提示为第三方数据。
-- 价格更新 / Profile 更新不得覆盖历史快照与历史估算（重新计价/重新估算保留新旧版本）。
+- 价格更新不得覆盖历史快照；历史 Traffic Profile/估算表仅为升级兼容保留，不再由当前版本更新。
 
-## 5. 估算来源（estimation_source，7 级）
+## 5. 运行时观测质量
 
-```
-reconstructed > partial > content_bytes > token_profile > user_profile > builtin > unavailable
-```
-
-- `reconstructed`：基于请求/响应内容重建
-- `partial`：部分重建（缺隐藏内容，降 confidence）
-- `content_bytes`：基于可见内容字节
-- `token_profile`：Token × bytes-per-token 系数（版本化 Profile，含 cache/reasoning 因子）
-- `user_profile` / `builtin`：用户或内置 Profile 估算
-- `unavailable`：缺数据，不硬造
+- `observed`：原生临时观测链路直接看到并派生；
+- `partial`：只能证明部分阶段或字节层级；
+- `unavailable`：Docker/普通日志采集无法证明，保持 `null`，不以估算值替代。
 
 ## 6. 访问控制
 
@@ -60,7 +52,7 @@ reconstructed > partial > content_bytes > token_profile > user_profile > builtin
 
 ## 7. 用量报告的数据边界
 
-- 报告只发送周期汇总指标、费用口径、排行和估算流量，不包含会话正文、提示词、代码或完整客户端路径。
+- 报告只发送周期汇总指标、费用口径和排行，不包含会话正文、提示词、代码或完整客户端路径；观测字节不进入旧流量报表。
 - SMTP 邮件和 Webhook 都是主动向外部目标投递数据；管理员应确认收件人、Webhook URL 和第三方服务的隐私策略。
 - SMTP 密码和 Webhook Secret 保存在 Hub 本地 SQLite，读取配置的 API 不回传 SMTP 密码；应像保护数据库和备份文件一样保护 `/data` 卷。
 - 邮件图表是 HTML 正文中的内嵌 SVG；PDF 渲染能力不会改变报告的数据边界，也不会作为邮件附件发送。

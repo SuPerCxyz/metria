@@ -1,4 +1,4 @@
-//! 查询 API handlers：overview / nodes / clients / models / calls / sessions / traffic / data-quality。
+//! 查询 API handlers：overview / nodes / clients / models / calls / sessions / data-quality。
 //!
 //! 作为 `api` 模块的子模块，通过 `crate::api::*` 复用类型与工具函数。
 
@@ -34,8 +34,6 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                 COALESCE(SUM(reasoning_tokens),0),
                 COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
-                COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
-                COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0),
                 COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
                 COALESCE(SUM(message_count),0), COALESCE(SUM(tool_call_count),0)
              FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}"
@@ -51,15 +49,10 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
                 "reported_cost_micro_usd": r.get::<_, i64>(5)?,
                 "calculated_cost_micro_usd": r.get::<_, i64>(6)?,
                 "estimated_cost_micro_usd": r.get::<_, i64>(7)?,
-                "estimated_request_bytes": r.get::<_, i64>(8)?,
-                "estimated_response_bytes": r.get::<_, i64>(9)?,
-                "estimated_total_bytes": r.get::<_, i64>(10)?,
-                "traffic_lower_bound_bytes": r.get::<_, i64>(11)?,
-                "traffic_upper_bound_bytes": r.get::<_, i64>(12)?,
-                "model_calls": r.get::<_, i64>(13)?,
-                "sessions": r.get::<_, i64>(14)?,
-                "message_count": r.get::<_, i64>(15)?,
-                "tool_call_count": r.get::<_, i64>(16)?,
+                "model_calls": r.get::<_, i64>(8)?,
+                "sessions": r.get::<_, i64>(9)?,
+                "message_count": r.get::<_, i64>(10)?,
+                "tool_call_count": r.get::<_, i64>(11)?,
             }))
         },
     );
@@ -184,25 +177,19 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         "ratio": if total_cost_calls > 0 { Some(priced_calls as f64 / total_cost_calls as f64) } else { None },
         "unpriced_models": unpriced_models,
     });
-    let estimated_calls = c
+    body["token_calls"] = c
         .query_row(
             &format!(
-                "SELECT COALESCE(SUM(CASE WHEN traffic_estimate_id IS NOT NULL
-                    AND EXISTS (SELECT 1 FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id AND t.estimated_total_wire_bytes IS NOT NULL)
-                    THEN 1 ELSE 0 END),0)
-                 FROM model_calls WHERE {range_clause}
-                   AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
+                "SELECT COUNT(*) FROM model_calls WHERE {range_clause}
+                 AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+                      OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
+                      OR reasoning_tokens IS NOT NULL) {call_filter}"
             ),
             params_from_iter(range_args(&from, &to, call_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
-        .unwrap_or(0);
-    body["traffic_coverage"] = serde_json::json!({
-        "estimated_calls": estimated_calls,
-        "total_calls": total_cost_calls,
-        "unavailable_calls": total_cost_calls.saturating_sub(estimated_calls),
-        "ratio": if total_cost_calls > 0 { Some(estimated_calls as f64 / total_cost_calls as f64) } else { None },
-    });
+        .unwrap_or(0)
+        .into();
     // S3.9：范围内平均调用延迟（duration_ms 均值的毫秒数）。数据缺失时返回 null，前端诚实标注。
     body["avg_duration_ms"] = c
         .query_row(
@@ -691,8 +678,8 @@ pub(crate) fn query_usage_timeseries(
     // 仅细粒度（<1h）从原始事件表分桶，其余走 rollup
     let use_raw = bucket_secs < 3600;
 
-    // 维度列：raw 路径从 usage_events(u) 分桶，需要 u. 前缀避免与
-    // LEFT JOIN 的 traffic_estimates 同名列歧义；rollup 路径列名不带前缀。
+    // 维度列：raw 路径从 usage_events(u) 分桶，需要 u. 前缀；rollup
+    // 路径列名不带前缀。
     let (dim_col, dim_group) = match p.dim.as_deref() {
         Some("client") => {
             if use_raw {
@@ -743,7 +730,7 @@ pub(crate) fn query_usage_timeseries(
     } else {
         range_filter(p)
     };
-    // raw 路径带 LEFT JOIN，过滤条件需加 u. 前缀消除同名列歧义
+    // raw 路径使用 u/tm 前缀消除同名列歧义。
     let prefixed_filter = if use_raw {
         prefix_usage_filter(&filter)
     } else {
@@ -752,8 +739,7 @@ pub(crate) fn query_usage_timeseries(
 
     let c = db.conn();
     let points: Vec<serde_json::Value> = if use_raw {
-        // 原始事件细粒度分桶（usage_events + traffic_estimates 关联字节）
-        // 所有列加 u. 前缀，避免与 LEFT JOIN 的 traffic_estimates 列名歧义
+        // 原始事件细粒度分桶；不读取历史估算流量表。
         let mut stmt = c.prepare(&format!(
             "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00',
                         datetime((CAST(strftime('%s', u.timestamp) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b{dim_sql},
@@ -761,11 +747,9 @@ pub(crate) fn query_usage_timeseries(
                 COALESCE(SUM(u.cache_read_tokens),0), COALESCE(SUM(u.cache_write_tokens),0),
                 COALESCE(SUM(u.reasoning_tokens),0),
                 COALESCE(SUM(COALESCE(u.reported_cost_micro_usd,0)+COALESCE(u.calculated_cost_micro_usd,0)+COALESCE(u.estimated_cost_micro_usd,0)),0),
-                COALESCE(SUM(t.estimated_total_wire_bytes),0),
                 COUNT(*)
              FROM usage_events u
              LEFT JOIN model_calls tm ON tm.id = u.model_call_id
-             LEFT JOIN traffic_estimates t ON t.id = tm.traffic_estimate_id
              WHERE u.timestamp >= ?1 AND u.timestamp < ?2 {prefixed_filter}
              GROUP BY {group_sql} ORDER BY b"
         ))
@@ -781,8 +765,7 @@ pub(crate) fn query_usage_timeseries(
                     "cache_write_tokens": r.get::<_, i64>(5)?,
                     "reasoning_tokens": r.get::<_, i64>(6)?,
                     "cost_micro_usd": r.get::<_, i64>(7)?,
-                    "estimated_traffic_bytes": r.get::<_, i64>(8)?,
-                    "model_calls": r.get::<_, i64>(9)?,
+                    "model_calls": r.get::<_, i64>(8)?,
                 }))
             })
             .map_err(|e| e.to_string())?;
@@ -806,7 +789,7 @@ pub(crate) fn query_usage_timeseries(
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                 COALESCE(SUM(reasoning_tokens),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0)
+                COALESCE(SUM(model_call_count),0)
              FROM {source} WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}
              GROUP BY {group_sql} ORDER BY b"
             ))
@@ -822,8 +805,7 @@ pub(crate) fn query_usage_timeseries(
                     "cache_write_tokens": r.get::<_, i64>(5)?,
                     "reasoning_tokens": r.get::<_, i64>(6)?,
                     "cost_micro_usd": r.get::<_, i64>(7)?,
-                    "estimated_traffic_bytes": r.get::<_, i64>(8)?,
-                    "model_calls": r.get::<_, i64>(9)?,
+                    "model_calls": r.get::<_, i64>(8)?,
                 }))
             })
             .map_err(|e| e.to_string())?;
@@ -1059,8 +1041,8 @@ fn freshness_summary(
     })
 }
 
-/// 为 raw 分桶查询（usage_events u LEFT JOIN traffic_estimates t）的过滤条件
-/// 加 u. 前缀，避免两表同名列（client_id/node_id/model_normalized 等）歧义。
+/// 为 raw 分桶查询（usage_events u LEFT JOIN model_calls tm）的过滤条件
+/// 加 u/tm 前缀，避免两表同名列歧义。
 fn prefix_usage_filter(filter: &str) -> String {
     // 仅替换过滤条件中出现的裸列名；条件形如 " AND node_id = ?3 AND client_id = ?4"
     filter
@@ -1123,7 +1105,6 @@ fn zero_point(bucket: &str, _has_dim: bool) -> serde_json::Value {
         "cache_write_tokens": 0,
         "reasoning_tokens": 0,
         "cost_micro_usd": 0,
-        "estimated_traffic_bytes": 0,
         "model_calls": 0,
     })
 }
@@ -1155,8 +1136,7 @@ pub(crate) async fn usage_breakdown(
     let mut stmt = q!(c.prepare(&format!(
         "{cte}SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-            COALESCE(SUM(reasoning_tokens),0),
-            COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+            COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(model_call_count),0),
             COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
             COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0),
             COUNT(CASE WHEN pricing_source != '' THEN 1 END)
@@ -1172,13 +1152,12 @@ pub(crate) async fn usage_breakdown(
                 "cache_read_tokens": r.get::<_, i64>(3)?,
                 "cache_write_tokens": r.get::<_, i64>(4)?,
                 "reasoning_tokens": r.get::<_, i64>(5)?,
-                "estimated_traffic_bytes": r.get::<_, i64>(6)?,
-                "model_calls": r.get::<_, i64>(7)?,
-                "sessions": r.get::<_, i64>(8)?,
-                "cost_micro_usd": available_cost(r.get::<_, i64>(9)?, r.get::<_, i64>(13)?),
-                "calculated_cost_micro_usd": r.get::<_, i64>(10)?,
-                "estimated_cost_micro_usd": r.get::<_, i64>(11)?,
-                "reported_cost_micro_usd": r.get::<_, i64>(12)?,
+                "model_calls": r.get::<_, i64>(6)?,
+                "sessions": r.get::<_, i64>(7)?,
+                "cost_micro_usd": available_cost(r.get::<_, i64>(8)?, r.get::<_, i64>(12)?),
+                "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
+                "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
+                "reported_cost_micro_usd": r.get::<_, i64>(11)?,
             }))
         },)
     );
@@ -1269,18 +1248,17 @@ pub(crate) async fn node_detail(
     }
     let mut by_project = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(estimated_total_bytes),0),
+        "SELECT COALESCE(project_id,'(none)'), COUNT(*),
                 COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
                 COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
          FROM sessions WHERE node_id = ?1 GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
     ) {
         if let Ok(rows) = stmt.query_map([&id], |r| {
-            let cost = r.get::<_, i64>(3)?;
-            let priced_sessions = r.get::<_, i64>(4)?;
+            let cost = r.get::<_, i64>(2)?;
+            let priced_sessions = r.get::<_, i64>(3)?;
             Ok(serde_json::json!({
                 "project_id": r.get::<_, String>(0)?,
                 "sessions": r.get::<_, i64>(1)?,
-                "estimated_total_bytes": r.get::<_, i64>(2)?,
                 "cost_micro_usd": available_cost(cost, priced_sessions),
             }))
         }) {
@@ -1341,13 +1319,12 @@ pub(crate) async fn node_detail(
         }
     }
 
-    // S3.4：时间范围统计（token/cost/traffic/calls/sessions/cache）
+    // S3.4：时间范围统计（token/cost/calls/sessions/cache）
     let range_summary = c
         .query_row(
             &format!(
                 "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                    COALESCE(SUM(estimated_total_bytes),0),
                     COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                     COALESCE(SUM(reasoning_tokens),0)
@@ -1359,12 +1336,11 @@ pub(crate) async fn node_detail(
                     "input_tokens": r.get::<_, i64>(0)?,
                     "output_tokens": r.get::<_, i64>(1)?,
                     "cost_micro_usd": r.get::<_, i64>(2)?,
-                    "estimated_total_bytes": r.get::<_, i64>(3)?,
-                    "model_calls": r.get::<_, i64>(4)?,
-                    "sessions": r.get::<_, i64>(5)?,
-                    "cache_read_tokens": r.get::<_, i64>(6)?,
-                    "cache_write_tokens": r.get::<_, i64>(7)?,
-                    "reasoning_tokens": r.get::<_, i64>(8)?,
+                    "model_calls": r.get::<_, i64>(3)?,
+                    "sessions": r.get::<_, i64>(4)?,
+                    "cache_read_tokens": r.get::<_, i64>(5)?,
+                    "cache_write_tokens": r.get::<_, i64>(6)?,
+                    "reasoning_tokens": r.get::<_, i64>(7)?,
                 }))
             },
         )
@@ -1388,7 +1364,7 @@ pub(crate) async fn node_clients(
 ) -> Response {
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(
-        "SELECT client_id, adapter_id, adapter_version, source_path_hash, status, client_version, last_scan_at, last_error, last_event_at
+        "SELECT client_id, adapter_id, adapter_version, source_path_hash, capabilities, status, client_version, last_scan_at, last_error, last_event_at
          FROM sources WHERE node_id = ?1 ORDER BY client_id",
     ));
     let rows = q!(stmt.query_map([&id], |r| {
@@ -1397,11 +1373,12 @@ pub(crate) async fn node_clients(
             "adapter_id": r.get::<_, String>(1)?,
             "adapter_version": r.get::<_, String>(2)?,
             "source_path_hash": r.get::<_, String>(3)?,
-            "status": r.get::<_, String>(4)?,
-            "client_version": r.get::<_, Option<String>>(5)?,
-            "last_scan_at": r.get::<_, Option<String>>(6)?,
-            "last_error": r.get::<_, Option<String>>(7)?,
-            "last_event_at": r.get::<_, Option<String>>(8)?,
+            "capabilities": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(4)?).unwrap_or_else(|_| serde_json::json!([])),
+            "status": r.get::<_, String>(5)?,
+            "client_version": r.get::<_, Option<String>>(6)?,
+            "last_scan_at": r.get::<_, Option<String>>(7)?,
+            "last_error": r.get::<_, Option<String>>(8)?,
+            "last_event_at": r.get::<_, Option<String>>(9)?,
         }))
     }));
     let sources: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -1421,7 +1398,7 @@ pub(crate) async fn node_sessions(
         match crate::api::decode_cursor(cur) {
             Some((ts, sid)) => (
                 format!(
-                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
                      FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
                        AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
                      ORDER BY {tcol} DESC, id DESC LIMIT ?6",
@@ -1446,7 +1423,7 @@ pub(crate) async fn node_sessions(
     } else {
         (
             format!(
-                "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+                "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
                  FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
             ),
             vec![
@@ -1471,7 +1448,6 @@ pub(crate) async fn node_sessions(
             "model_call_count": r.get::<_, i64>(8)?,
             "input_tokens": r.get::<_, Option<i64>>(9)?,
             "output_tokens": r.get::<_, Option<i64>>(10)?,
-            "estimated_total_bytes": r.get::<_, Option<i64>>(11)?,
         }))
     },));
     let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -1567,7 +1543,7 @@ pub(crate) async fn list_clients(
     let cte = rollup_source_cte(1, 2);
     let mut stmt = q!(c.prepare(&format!(
         "{cte}SELECT client_id,
-            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
+            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
             COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0)
          FROM rollup_src WHERE 1=1 {filter} GROUP BY client_id ORDER BY 2 DESC"
     )));
@@ -1577,10 +1553,9 @@ pub(crate) async fn list_clients(
                 "client_id": r.get::<_, String>(0)?,
                 "input_tokens": r.get::<_, i64>(1)?,
                 "output_tokens": r.get::<_, i64>(2)?,
-                "estimated_traffic_bytes": r.get::<_, i64>(3)?,
-                "model_calls": r.get::<_, i64>(4)?,
-                "sessions": r.get::<_, i64>(5)?,
-                "cost_micro_usd": r.get::<_, i64>(6)?,
+                "model_calls": r.get::<_, i64>(3)?,
+                "sessions": r.get::<_, i64>(4)?,
+                "cost_micro_usd": r.get::<_, i64>(5)?,
             }))
         },)
     );
@@ -1597,21 +1572,20 @@ pub(crate) async fn client_detail(
     let c = st.db.conn();
     let cte = rollup_source_cte(2, 3);
     let mut stmt = q!(c.prepare(&format!(
-        "{cte}SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+        "{cte}SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0), COUNT(CASE WHEN pricing_source != '' THEN 1 END)
          FROM rollup_src WHERE client_id = ?1 GROUP BY node_id ORDER BY 2 DESC"
     )));
     let rows = q!(
         stmt.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-            let cost = r.get::<_, i64>(6)?;
-            let priced_rows = r.get::<_, i64>(7)?;
+            let cost = r.get::<_, i64>(5)?;
+            let priced_rows = r.get::<_, i64>(6)?;
             Ok(serde_json::json!({
                 "node_id": r.get::<_, String>(0)?,
                 "input_tokens": r.get::<_, i64>(1)?,
                 "output_tokens": r.get::<_, i64>(2)?,
-                "estimated_traffic_bytes": r.get::<_, i64>(3)?,
-                "model_calls": r.get::<_, i64>(4)?,
-                "sessions": r.get::<_, i64>(5)?,
+                "model_calls": r.get::<_, i64>(3)?,
+                "sessions": r.get::<_, i64>(4)?,
                 "cost_micro_usd": available_cost(cost, priced_rows),
             }))
         },)
@@ -1622,7 +1596,7 @@ pub(crate) async fn client_detail(
     let recent: Vec<serde_json::Value> = {
         let mut st = q!(c.prepare(
             "SELECT id, source_session_id, node_id, title, primary_model_normalized, started_at,
-                    model_call_count, input_tokens, output_tokens, estimated_total_bytes
+                    model_call_count, input_tokens, output_tokens
              FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
              ORDER BY started_at DESC LIMIT 20",
         ));
@@ -1638,21 +1612,22 @@ pub(crate) async fn client_detail(
                     "model_call_count": r.get::<_, i64>(6)?,
                     "input_tokens": r.get::<_, Option<i64>>(7)?,
                     "output_tokens": r.get::<_, Option<i64>>(8)?,
-                    "estimated_total_bytes": r.get::<_, Option<i64>>(9)?,
                 }))
             },)
         );
         r.filter_map(|x| x.ok()).collect()
     };
 
-    // 汇总（三口径 cost / 流量 / token / 缓存命中率）
+    // 汇总（三口径 cost / token / 缓存命中率）
     let summary = c
         .query_row(
             &format!(
-            "{cte}SELECT COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_total_bytes),0),
+                "{cte}SELECT COALESCE(SUM(reported_cost),0),
+                    COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
-             FROM rollup_src WHERE client_id = ?1"),
+             FROM rollup_src WHERE client_id = ?1"
+            ),
             params![id, from.to_rfc3339(), to.to_rfc3339()],
             |r| {
                 Ok((
@@ -1662,17 +1637,18 @@ pub(crate) async fn client_detail(
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             },
         )
-        .unwrap_or((0, 0, 0, 0, 0, 0));
-    let (calc_cost, est_bytes, in_tok, out_tok, cr_tok, cw_tok) = summary;
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+    let (reported_cost, calculated_cost, estimated_cost, in_tok, out_tok, cr_tok, cw_tok) = summary;
 
     // S3.5：按 Project 分布
     let by_project: Vec<serde_json::Value> = {
         let mut st = q!(c.prepare(
             "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(model_call_count),0),
-                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
+                    COALESCE(SUM(input_tokens),0),
                     COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
                     COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
              FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
@@ -1680,14 +1656,13 @@ pub(crate) async fn client_detail(
         ));
         let r = q!(
             st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-                let cost = r.get::<_, i64>(5)?;
-                let priced_sessions = r.get::<_, i64>(6)?;
+                let cost = r.get::<_, i64>(4)?;
+                let priced_sessions = r.get::<_, i64>(5)?;
                 Ok(serde_json::json!({
                     "project_id": r.get::<_, String>(0)?,
                     "sessions": r.get::<_, i64>(1)?,
                     "model_calls": r.get::<_, i64>(2)?,
                     "input_tokens": r.get::<_, i64>(3)?,
-                    "estimated_total_bytes": r.get::<_, i64>(4)?,
                     "cost_micro_usd": available_cost(cost, priced_sessions),
                 }))
             },)
@@ -1753,6 +1728,33 @@ pub(crate) async fn client_detail(
         r.filter_map(|x| x.ok()).collect()
     };
 
+    let observation_modes: Vec<&str> = {
+        let mut modes = Vec::new();
+        if let Ok(mut stmt) = c.prepare("SELECT capabilities FROM sources WHERE client_id = ?1") {
+            if let Ok(rows) = stmt.query_map([&id], |r| r.get::<_, String>(0)) {
+                for value in rows.flatten() {
+                    let runtime = serde_json::from_str::<serde_json::Value>(&value)
+                        .ok()
+                        .and_then(|v| v.as_array().cloned())
+                        .is_some_and(|items| {
+                            items
+                                .iter()
+                                .any(|item| item.as_str() == Some("runtime_observation"))
+                        });
+                    let mode = if runtime {
+                        "native_runtime"
+                    } else {
+                        "ordinary"
+                    };
+                    if !modes.contains(&mode) {
+                        modes.push(mode);
+                    }
+                }
+            }
+        }
+        modes
+    };
+
     Json(serde_json::json!({
         "client_id": id,
         "by_node": by_node,
@@ -1761,8 +1763,11 @@ pub(crate) async fn client_detail(
         "recent_calls": recent_calls,
         "source_health": source_health,
         "version_dist": version_dist,
-        "calculated_cost_micro_usd": calc_cost,
-        "estimated_total_bytes": est_bytes,
+        "observation_modes": observation_modes,
+        "reported_cost_micro_usd": reported_cost,
+        "calculated_cost_micro_usd": calculated_cost,
+        "estimated_cost_micro_usd": estimated_cost,
+        "cost_micro_usd": reported_cost + calculated_cost + estimated_cost,
         "input_tokens": in_tok,
         "output_tokens": out_tok,
         "cache_read_tokens": cr_tok,
@@ -1830,7 +1835,7 @@ pub(crate) async fn list_models(
         let cte = rollup_source_cte(1, 2);
         let mut stmt = q!(c.prepare(&format!(
             "{cte}SELECT model, MAX(provider),
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_total_bytes),0),
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                 COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id),
                 COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
                 COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cache_write_tokens),0)
@@ -1843,42 +1848,23 @@ pub(crate) async fn list_models(
                     "provider": r.get::<_, String>(1)?,
                     "input_tokens": r.get::<_, i64>(2)?,
                     "output_tokens": r.get::<_, i64>(3)?,
-                    "estimated_traffic_bytes": r.get::<_, i64>(4)?,
-                    "model_calls": r.get::<_, i64>(5)?,
-                    "sessions": r.get::<_, i64>(6)?,
-                    "clients": r.get::<_, i64>(7)?,
-                    "nodes": r.get::<_, i64>(8)?,
-                    "cache_read_tokens": r.get::<_, i64>(9)?,
-                    "calculated_cost_micro_usd": r.get::<_, i64>(10)?,
-                    "estimated_cost_micro_usd": r.get::<_, i64>(11)?,
-                    "reported_cost_micro_usd": r.get::<_, i64>(12)?,
-                    "reasoning_tokens": r.get::<_, i64>(13)?,
-                    "cache_write_tokens": r.get::<_, i64>(14)?,
+                    "model_calls": r.get::<_, i64>(4)?,
+                    "sessions": r.get::<_, i64>(5)?,
+                    "clients": r.get::<_, i64>(6)?,
+                    "nodes": r.get::<_, i64>(7)?,
+                    "cache_read_tokens": r.get::<_, i64>(8)?,
+                    "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
+                    "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
+                    "reported_cost_micro_usd": r.get::<_, i64>(11)?,
+                    "reasoning_tokens": r.get::<_, i64>(12)?,
+                    "cache_write_tokens": r.get::<_, i64>(13)?,
                 }))
             },)
         );
         let mut models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-        // S3.6：Bytes per Input/Output Token（估算流量 ÷ tokens，tokens 为 0 时置空）
+        // 缓存命中率：cache_read / (input + cache_write + cache_read)
         for m in &mut models {
             let in_t = m.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            let out_t = m.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            let bytes = m
-                .get("estimated_traffic_bytes")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let bpi = if in_t > 0 {
-                serde_json::json!((bytes as f64) / (in_t as f64))
-            } else {
-                serde_json::Value::Null
-            };
-            let bpo = if out_t > 0 {
-                serde_json::json!((bytes as f64) / (out_t as f64))
-            } else {
-                serde_json::Value::Null
-            };
-            m["bytes_per_input_token"] = bpi;
-            m["bytes_per_output_token"] = bpo;
-            // 缓存命中率：cache_read / (input + cache_write + cache_read)
             let cr = m
                 .get("cache_read_tokens")
                 .and_then(|v| v.as_i64())
@@ -1981,14 +1967,14 @@ pub(crate) async fn model_detail(
         }));
         let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
-        // 汇总（Token/Cost/Traffic/Cache Hit）
+        // 汇总（Token/Cost/Cache Hit）
         let summary = match c.query_row(
             &format!(
                 "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                     COALESCE(SUM(reasoning_tokens),0),
                     COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                    COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+                    COALESCE(SUM(model_call_count),0),
                     COALESCE(SUM(session_count),0)
              FROM rollup_src WHERE model = ?1"
             ),
@@ -2001,9 +1987,8 @@ pub(crate) async fn model_detail(
                     "cache_write_tokens": r.get::<_, i64>(3)?,
                     "reasoning_tokens": r.get::<_, i64>(4)?,
                     "cost_micro_usd": r.get::<_, i64>(5)?,
-                    "estimated_total_bytes": r.get::<_, i64>(6)?,
-                    "model_calls": r.get::<_, i64>(7)?,
-                    "sessions": r.get::<_, i64>(8)?,
+                    "model_calls": r.get::<_, i64>(6)?,
+                    "sessions": r.get::<_, i64>(7)?,
                 }))
             },
         ) {
@@ -2018,7 +2003,7 @@ pub(crate) async fn model_detail(
         let recent_sessions: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(
                 "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at,
-                        model_call_count, input_tokens, output_tokens, cache_read_tokens, estimated_total_bytes,
+                        model_call_count, input_tokens, output_tokens, cache_read_tokens,
                         reasoning_tokens
                  FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3
                  ORDER BY started_at DESC LIMIT 20",
@@ -2036,8 +2021,7 @@ pub(crate) async fn model_detail(
                         "input_tokens": r.get::<_, Option<i64>>(7)?,
                         "output_tokens": r.get::<_, Option<i64>>(8)?,
                         "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
-                        "estimated_total_bytes": r.get::<_, Option<i64>>(10)?,
-                        "reasoning_tokens": r.get::<_, Option<i64>>(11)?,
+                        "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
                     }))
                 },)
             );
@@ -2048,8 +2032,8 @@ pub(crate) async fn model_detail(
         let recent_calls: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(
                 "SELECT m.id, m.session_id, m.provider_normalized, m.model_normalized, m.started_at, m.status,
-                        m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd, t.estimated_total_wire_bytes
-                 FROM model_calls m LEFT JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
+                        m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd
+                 FROM model_calls m
                  WHERE m.model_normalized = ?1 AND m.started_at >= ?2 AND m.started_at < ?3
                  ORDER BY m.started_at DESC LIMIT 20",
             ));
@@ -2065,20 +2049,19 @@ pub(crate) async fn model_detail(
                         "input_tokens": r.get::<_, Option<i64>>(6)?,
                         "output_tokens": r.get::<_, Option<i64>>(7)?,
                         "calculated_cost_micro_usd": r.get::<_, Option<i64>>(8)?,
-                        "estimated_total_bytes": r.get::<_, Option<i64>>(9)?,
                     }))
                 },)
             );
             r.filter_map(|x| x.ok()).collect()
         };
 
-        // S3.6：Token/Cost/Traffic 时间序列（按小时）
+        // Token/Cost 时间序列（按小时）
         let series: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(&format!(
                 "{cte}SELECT bucket,
                         COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                         COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                        COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(model_call_count),0),
                         COALESCE(SUM(reasoning_tokens),0)
                  FROM rollup_src WHERE model = ?1
                  GROUP BY bucket ORDER BY bucket"
@@ -2090,9 +2073,8 @@ pub(crate) async fn model_detail(
                         "input_tokens": r.get::<_, i64>(1)?,
                         "output_tokens": r.get::<_, i64>(2)?,
                         "cost_micro_usd": r.get::<_, i64>(3)?,
-                        "estimated_traffic_bytes": r.get::<_, i64>(4)?,
-                        "model_calls": r.get::<_, i64>(5)?,
-                        "reasoning_tokens": r.get::<_, i64>(6)?,
+                        "model_calls": r.get::<_, i64>(4)?,
+                        "reasoning_tokens": r.get::<_, i64>(5)?,
                     }))
                 },)
             );
@@ -2151,7 +2133,10 @@ pub(crate) async fn list_calls(
                 format!(
                     "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
                         input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
-                        reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
+                        reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                        ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
+                        observability_source, observability_quality, observed_request_payload_bytes,
+                        observed_response_payload_bytes
                      FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
                        AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
                      ORDER BY {tcol} DESC, id DESC LIMIT ?5"
@@ -2177,7 +2162,10 @@ pub(crate) async fn list_calls(
             format!(
                 "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
                     input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
-                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
+                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                    ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
+                    observability_source, observability_quality, observed_request_payload_bytes,
+                    observed_response_payload_bytes
                  FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
                  ORDER BY {tcol} DESC, id DESC LIMIT ?3"
             ),
@@ -2205,6 +2193,14 @@ pub(crate) async fn list_calls(
             "reported_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
             "calculated_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
             "estimated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+            "ttft_ms": r.get::<_, Option<i64>>(14)?,
+            "output_tokens_per_second_milli": r.get::<_, Option<i64>>(15)?,
+            "first_byte_latency_ms": r.get::<_, Option<i64>>(16)?,
+            "generation_duration_ms": r.get::<_, Option<i64>>(17)?,
+            "observability_source": r.get::<_, Option<String>>(18)?,
+            "observability_quality": r.get::<_, Option<String>>(19)?,
+            "observed_request_payload_bytes": r.get::<_, Option<i64>>(20)?,
+            "observed_response_payload_bytes": r.get::<_, Option<i64>>(21)?,
         }))
     },));
     let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -2229,7 +2225,14 @@ pub(crate) async fn call_detail(
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
                 COALESCE(reported_cost_micro_usd, (SELECT u.reported_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
                 COALESCE(calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
-                COALESCE(estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1))
+                COALESCE(estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
+                first_byte_at, first_token_at, last_output_at, first_byte_latency_ms, ttft_ms,
+                generation_duration_ms, output_tokens_per_second_milli, inter_token_latency_avg_ms,
+                inter_token_latency_p95_ms, stall_count, stall_duration_ms, observability_source,
+                observability_quality, endpoint, finish_reason, error_kind, rate_limited,
+                observed_request_payload_bytes, observed_response_payload_bytes,
+                observed_request_wire_bytes, observed_response_wire_bytes, streaming, stream_completed, retry_count,
+                status_code
              FROM model_calls WHERE id = ?1",
             [&id],
             |r| {
@@ -2254,39 +2257,37 @@ pub(crate) async fn call_detail(
                     "reported_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
                     "calculated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
                     "estimated_cost_micro_usd": r.get::<_, Option<i64>>(19)?,
+                    "first_byte_at": r.get::<_, Option<String>>(20)?,
+                    "first_token_at": r.get::<_, Option<String>>(21)?,
+                    "last_output_at": r.get::<_, Option<String>>(22)?,
+                    "first_byte_latency_ms": r.get::<_, Option<i64>>(23)?,
+                    "ttft_ms": r.get::<_, Option<i64>>(24)?,
+                    "generation_duration_ms": r.get::<_, Option<i64>>(25)?,
+                    "output_tokens_per_second_milli": r.get::<_, Option<i64>>(26)?,
+                    "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(27)?,
+                    "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(28)?,
+                    "stall_count": r.get::<_, Option<i64>>(29)?,
+                    "stall_duration_ms": r.get::<_, Option<i64>>(30)?,
+                    "observability_source": r.get::<_, Option<String>>(31)?,
+                    "observability_quality": r.get::<_, Option<String>>(32)?,
+                    "endpoint": r.get::<_, Option<String>>(33)?,
+                    "finish_reason": r.get::<_, Option<String>>(34)?,
+                    "error_kind": r.get::<_, Option<String>>(35)?,
+                    "rate_limited": r.get::<_, Option<bool>>(36)?,
+                    "observed_request_payload_bytes": r.get::<_, Option<i64>>(37)?,
+                    "observed_response_payload_bytes": r.get::<_, Option<i64>>(38)?,
+                    "observed_request_wire_bytes": r.get::<_, Option<i64>>(39)?,
+                    "observed_response_wire_bytes": r.get::<_, Option<i64>>(40)?,
+                    "streaming": r.get::<_, bool>(41)?,
+                    "stream_completed": r.get::<_, Option<bool>>(42)?,
+                    "retry_count": r.get::<_, i64>(43)?,
+                    "status_code": r.get::<_, Option<i64>>(44)?,
                 }))
             },
         )
         .ok()
         .unwrap_or(serde_json::json!({}));
-    let traffic = c
-        .query_row(
-            "SELECT estimated_request_wire_bytes, estimated_response_wire_bytes, estimated_total_wire_bytes, lower_bound_bytes, upper_bound_bytes, estimation_source, context_transport_mode, cache_transport_behavior, confidence,
-                    request_reconstruction_quality, response_reconstruction_quality, profile_id, profile_version
-             FROM traffic_estimates
-             WHERE id = (SELECT traffic_estimate_id FROM model_calls WHERE id = ?1)",
-            [&id],
-            |r| {
-                Ok(serde_json::json!({
-                    "estimated_request_wire_bytes": r.get::<_, Option<i64>>(0)?,
-                    "estimated_response_wire_bytes": r.get::<_, Option<i64>>(1)?,
-                    "estimated_total_wire_bytes": r.get::<_, Option<i64>>(2)?,
-                    "lower_bound_bytes": r.get::<_, Option<i64>>(3)?,
-                    "upper_bound_bytes": r.get::<_, Option<i64>>(4)?,
-                    "estimation_source": r.get::<_, String>(5)?,
-                    "context_transport_mode": r.get::<_, String>(6)?,
-                    "cache_transport_behavior": r.get::<_, String>(7)?,
-                    "confidence": r.get::<_, Option<f64>>(8)?,
-                    "request_reconstruction_quality": r.get::<_, Option<String>>(9)?,
-                    "response_reconstruction_quality": r.get::<_, Option<String>>(10)?,
-                    "profile_id": r.get::<_, Option<String>>(11)?,
-                    "profile_version": r.get::<_, Option<i64>>(12)?,
-                }))
-            },
-        )
-        .ok()
-        .unwrap_or(serde_json::json!({}));
-    Json(serde_json::json!({ "call": call, "traffic": traffic })).into_response()
+    Json(serde_json::json!({ "call": call })).into_response()
 }
 
 pub(crate) async fn list_sessions(
@@ -2319,7 +2320,7 @@ pub(crate) async fn list_sessions(
                     "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
                         message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
                         reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                        estimated_total_bytes, status,
+                        status,
                         CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                              THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
                         reasoning_tokens
@@ -2342,7 +2343,7 @@ pub(crate) async fn list_sessions(
                 "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
                     message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
                     reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                    estimated_total_bytes, status,
+                    status,
                     CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                          THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
                     reasoning_tokens
@@ -2374,10 +2375,9 @@ pub(crate) async fn list_sessions(
             "reported_cost_micro_usd": r.get::<_, Option<i64>>(16)?,
             "calculated_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
             "estimated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
-            "estimated_total_bytes": r.get::<_, Option<i64>>(19)?,
-            "status": r.get::<_, String>(20)?,
-            "duration_ms": r.get::<_, Option<i64>>(21)?,
-            "reasoning_tokens": r.get::<_, Option<i64>>(22)?,
+            "status": r.get::<_, String>(19)?,
+            "duration_ms": r.get::<_, Option<i64>>(20)?,
+            "reasoning_tokens": r.get::<_, Option<i64>>(21)?,
         }))
     },));
     let sessions: Vec<serde_json::Value> = rows
@@ -2427,8 +2427,7 @@ pub(crate) async fn session_detail(
                 started_at, ended_at, last_activity_at, status,
                 message_count, tool_call_count, subagent_count, model_call_count,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                estimated_request_bytes, estimated_response_bytes, estimated_total_bytes, traffic_confidence
+                reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
              FROM sessions WHERE id = ?1",
             [&id],
             |r| {
@@ -2457,10 +2456,6 @@ pub(crate) async fn session_detail(
                     "reported_cost_micro_usd": r.get::<_, Option<i64>>(21)?,
                     "calculated_cost_micro_usd": r.get::<_, Option<i64>>(22)?,
                     "estimated_cost_micro_usd": r.get::<_, Option<i64>>(23)?,
-                    "estimated_request_bytes": r.get::<_, Option<i64>>(24)?,
-                    "estimated_response_bytes": r.get::<_, Option<i64>>(25)?,
-                    "estimated_total_bytes": r.get::<_, Option<i64>>(26)?,
-                    "traffic_confidence": r.get::<_, Option<f64>>(27)?,
                     "startup_command": serde_json::Value::Null,
                 }))
             },
@@ -2502,8 +2497,15 @@ pub(crate) async fn session_calls(
                 COALESCE(m.reported_cost_micro_usd, (SELECT u.reported_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
                 COALESCE(m.calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
                 COALESCE(m.estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
-                t.estimated_total_wire_bytes, m.duration_ms
-         FROM model_calls m LEFT JOIN traffic_estimates t ON t.id = m.traffic_estimate_id WHERE m.session_id = ?1 ORDER BY m.started_at",
+                m.duration_ms, m.ttft_ms, m.output_tokens_per_second_milli,
+                m.observability_source, m.observability_quality,
+                m.observed_request_payload_bytes, m.observed_response_payload_bytes,
+                m.observed_request_wire_bytes, m.observed_response_wire_bytes,
+                m.first_byte_latency_ms, m.generation_duration_ms,
+                m.inter_token_latency_avg_ms, m.inter_token_latency_p95_ms,
+                m.stall_count, m.stall_duration_ms, m.status_code, m.endpoint,
+                m.finish_reason, m.error_kind, m.rate_limited, m.retry_count
+         FROM model_calls m WHERE m.session_id = ?1 ORDER BY m.started_at",
     ));
     let rows = q!(stmt.query_map([&id], |r| {
         Ok(serde_json::json!({
@@ -2519,8 +2521,27 @@ pub(crate) async fn session_calls(
             "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
             "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
             "estimated_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
-            "estimated_total_bytes": r.get::<_, Option<i64>>(12)?,
-            "duration_ms": r.get::<_, Option<i64>>(13)?,
+            "duration_ms": r.get::<_, Option<i64>>(12)?,
+            "ttft_ms": r.get::<_, Option<i64>>(13)?,
+            "output_tokens_per_second_milli": r.get::<_, Option<i64>>(14)?,
+            "observability_source": r.get::<_, Option<String>>(15)?,
+            "observability_quality": r.get::<_, Option<String>>(16)?,
+            "observed_request_payload_bytes": r.get::<_, Option<i64>>(17)?,
+            "observed_response_payload_bytes": r.get::<_, Option<i64>>(18)?,
+            "observed_request_wire_bytes": r.get::<_, Option<i64>>(19)?,
+            "observed_response_wire_bytes": r.get::<_, Option<i64>>(20)?,
+            "first_byte_latency_ms": r.get::<_, Option<i64>>(21)?,
+            "generation_duration_ms": r.get::<_, Option<i64>>(22)?,
+            "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(23)?,
+            "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(24)?,
+            "stall_count": r.get::<_, Option<i64>>(25)?,
+            "stall_duration_ms": r.get::<_, Option<i64>>(26)?,
+            "status_code": r.get::<_, Option<i64>>(27)?,
+            "endpoint": r.get::<_, Option<String>>(28)?,
+            "finish_reason": r.get::<_, Option<String>>(29)?,
+            "error_kind": r.get::<_, Option<String>>(30)?,
+            "rate_limited": r.get::<_, Option<bool>>(31)?,
+            "retry_count": r.get::<_, Option<i64>>(32)?,
         }))
     }));
     let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
@@ -2585,7 +2606,7 @@ pub(crate) async fn session_subagents(
     } else {
         let placeholders = child_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, source_session_id, title, primary_model_normalized, message_count, model_call_count, input_tokens, output_tokens, estimated_total_bytes
+            "SELECT id, source_session_id, title, primary_model_normalized, message_count, model_call_count, input_tokens, output_tokens
              FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})"
         );
         let mut params: Vec<&str> = Vec::new();
@@ -2607,7 +2628,6 @@ pub(crate) async fn session_subagents(
                     "model_call_count": r.get::<_, i64>(5)?,
                     "input_tokens": r.get::<_, Option<i64>>(6)?,
                     "output_tokens": r.get::<_, Option<i64>>(7)?,
-                    "estimated_total_bytes": r.get::<_, Option<i64>>(8)?,
                 }))
             })
         );
@@ -2641,73 +2661,6 @@ pub(crate) async fn session_timeline(
     Json(serde_json::json!({ "messages": messages })).into_response()
 }
 
-pub(crate) async fn traffic_summary(
-    State(st): State<AppState>,
-    Query(p): Query<RangeParams>,
-) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter(&p);
-    let c = st.db.conn();
-    let cte = rollup_source_cte(1, 2);
-    let row = c.query_row(
-        &format!(
-            "{cte}SELECT COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
-                COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0), COALESCE(SUM(model_call_count),0)
-             FROM rollup_src WHERE 1=1 {filter}"
-        ),
-        params_from_iter(range_args(&from, &to, fargs)),
-        |r| {
-            Ok(serde_json::json!({
-                "estimated_request_bytes": r.get::<_, i64>(0)?,
-                "estimated_response_bytes": r.get::<_, i64>(1)?,
-                "estimated_total_bytes": r.get::<_, i64>(2)?,
-                "lower_bound_bytes": r.get::<_, i64>(3)?,
-                "upper_bound_bytes": r.get::<_, i64>(4)?,
-                "model_calls": r.get::<_, i64>(5)?,
-            }))
-        },
-    );
-    Json(row.unwrap_or_else(|_| serde_json::json!({}))).into_response()
-}
-
-macro_rules! traffic_by_dim {
-    ($name:ident, $dim:expr) => {
-        pub(crate) async fn $name(State(st): State<AppState>, Query(p): Query<RangeParams>) -> Response {
-            let (from, to) = parse_range(&p);
-            let (filter, fargs) = range_filter(&p);
-            let c = st.db.conn();
-            let cte = rollup_source_cte(1, 2);
-            let mut stmt = q!(c.prepare(&format!(
-                "{cte}SELECT $dim AS d,
-                    COALESCE(SUM(estimated_request_bytes),0), COALESCE(SUM(estimated_response_bytes),0), COALESCE(SUM(estimated_total_bytes),0),
-                    COALESCE(SUM(estimated_lower_bound_bytes),0), COALESCE(SUM(estimated_upper_bound_bytes),0), COALESCE(SUM(model_call_count),0)
-                 FROM rollup_src WHERE 1=1 {filter} GROUP BY d ORDER BY 4 DESC"
-            )));
-            let rows = q!(stmt.query_map(
-                params_from_iter(range_args(&from, &to, fargs)),
-                |r| {
-                    Ok(serde_json::json!({
-                        "dimension": r.get::<_, String>(0)?,
-                        "estimated_request_bytes": r.get::<_, i64>(1)?,
-                        "estimated_response_bytes": r.get::<_, i64>(2)?,
-                        "estimated_total_bytes": r.get::<_, i64>(3)?,
-                        "lower_bound_bytes": r.get::<_, i64>(4)?,
-                        "upper_bound_bytes": r.get::<_, i64>(5)?,
-                        "model_calls": r.get::<_, i64>(6)?,
-                    }))
-                },
-            ));
-            let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-            Json(serde_json::json!({ "items": items })).into_response()
-        }
-    };
-}
-
-traffic_by_dim!(traffic_by_node, "node_id");
-traffic_by_dim!(traffic_by_client, "client_id");
-traffic_by_dim!(traffic_by_model, "model");
-traffic_by_dim!(traffic_by_provider, "provider");
-
 pub(crate) async fn data_quality(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
@@ -2727,24 +2680,6 @@ pub(crate) async fn data_quality(
                 usage_dist.push(serde_json::json!({
                     "usage_source": row.0,
                     "tokens": row.1,
-                    "calls": row.2,
-                }));
-            }
-        }
-    }
-
-    let mut traffic_dist = Vec::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT traffic_estimation_source, COALESCE(SUM(estimated_total_bytes),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) AND traffic_estimation_source != '' GROUP BY traffic_estimation_source",
-    ) {
-        if let Ok(rows) = stmt.query_map(
-            params![from.to_rfc3339(), to.to_rfc3339()],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-        ) {
-            for row in rows.flatten() {
-                traffic_dist.push(serde_json::json!({
-                    "estimation_source": row.0,
-                    "bytes": row.1,
                     "calls": row.2,
                 }));
             }
@@ -2826,33 +2761,6 @@ pub(crate) async fn data_quality(
         out
     };
 
-    // S3.8：估算置信度占比（traffic_estimates.confidence 分级）
-    let confidence_dist: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT CASE
-                        WHEN confidence >= 0.8 THEN 'high'
-                        WHEN confidence >= 0.5 THEN 'medium'
-                        WHEN confidence IS NOT NULL THEN 'low'
-                        ELSE 'unknown' END AS level,
-                    COUNT(*)
-             FROM model_calls m
-             JOIN traffic_estimates t ON t.id = m.traffic_estimate_id
-             GROUP BY level",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "level": r.get::<_, String>(0)?,
-                    "count": r.get::<_, i64>(1)?,
-                }))
-            }) {
-                out = rows.filter_map(|x| x.ok()).collect();
-            }
-        }
-        out
-    };
-
     // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康）
     let cursor_status: Vec<serde_json::Value> = {
         let st = c.prepare(
@@ -2904,12 +2812,10 @@ pub(crate) async fn data_quality(
 
     Json(serde_json::json!({
         "usage_distribution": usage_dist,
-        "traffic_distribution": traffic_dist,
         "parse_warnings": parse_warnings,
         "source_errors": source_errors,
         "source_scan": source_scan,
         "clock_skew_warnings": clock_skew_warns,
-        "confidence_distribution": confidence_dist,
         "cursor_status": cursor_status,
         "alerts": alerts,
     }))
@@ -2955,7 +2861,7 @@ pub(crate) async fn usage_latency(
     .into_response()
 }
 
-/// 首个可观察输出延迟与估算输出速度；仅聚合时间关系有效的调用。
+/// Runtime/日志性能指标；缺失字段保持 null，并按来源分别统计覆盖率。
 pub(crate) async fn usage_performance(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
@@ -2964,8 +2870,12 @@ pub(crate) async fn usage_performance(
     let (filter, fargs) = range_filter_usage(&p);
     let c = st.db.conn();
     let mut stmt = q!(c.prepare(&format!(
-        "SELECT started_at, first_response_at, completed_at, output_tokens,
-                timing_source, timing_quality
+        "SELECT started_at, first_byte_at, first_token_at, first_response_at, last_output_at,
+                completed_at, output_tokens, output_tokens_per_second_milli, generation_duration_ms,
+                inter_token_latency_avg_ms, inter_token_latency_p95_ms, stall_count, stall_duration_ms,
+                observability_source, observability_quality, timing_source, timing_quality,
+                observed_request_payload_bytes, observed_response_payload_bytes,
+                observed_request_wire_bytes, observed_response_wire_bytes, status, status_code, rate_limited
          FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 {filter}"
     )));
     let rows = q!(
@@ -2974,16 +2884,42 @@ pub(crate) async fn usage_performance(
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, Option<i64>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<String>>(15)?,
+                r.get::<_, Option<String>>(16)?,
+                r.get::<_, Option<i64>>(17)?,
+                r.get::<_, Option<i64>>(18)?,
+                r.get::<_, Option<i64>>(19)?,
+                r.get::<_, Option<i64>>(20)?,
+                r.get::<_, String>(21)?,
+                r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<bool>>(23)?,
             ))
         })
     );
     let mut total = 0usize;
+    let mut success = 0usize;
+    let mut errors = 0usize;
     let mut ttft = Vec::new();
+    let mut first_byte = Vec::new();
+    let mut generation = Vec::new();
     let mut speeds = Vec::new();
+    let mut inter_token = Vec::new();
+    let mut stalls = Vec::new();
     let mut sources: std::collections::HashMap<(String, String), i64> = Default::default();
+    let mut observed_bytes = [0i64; 4];
+    let mut observed_counts = [0usize; 4];
     for row in rows.flatten() {
         total += 1;
         let parse = |value: &str| {
@@ -2994,37 +2930,120 @@ pub(crate) async fn usage_performance(
         let Some(started) = parse(&row.0) else {
             continue;
         };
-        let first = row.1.as_deref().and_then(parse);
-        let completed = row.2.as_deref().and_then(parse);
-        let source = row.4.unwrap_or_else(|| "unknown".into());
-        let quality = row.5.unwrap_or_else(|| "unknown".into());
+        let byte_at = row.1.as_deref().and_then(parse);
+        let token_at = row.2.as_deref().and_then(parse);
+        let legacy_first = row.3.as_deref().and_then(parse);
+        let last_output = row.4.as_deref().and_then(parse);
+        let completed = row.5.as_deref().and_then(parse);
+        if row.21 == "success" || row.21 == "ok" || row.21 == "completed" {
+            success += 1;
+        } else {
+            errors += 1;
+        }
+        if let Some(value) = row.22.filter(|value| *value >= 400) {
+            let _ = value;
+        }
+        for (index, value) in [row.17, row.18, row.19, row.20].into_iter().enumerate() {
+            if let Some(value) = value.filter(|value| *value >= 0) {
+                observed_bytes[index] += value;
+                observed_counts[index] += 1;
+            }
+        }
+        let first = token_at.or(legacy_first);
+        let source = row
+            .13
+            .clone()
+            .or(row.15.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let quality = row
+            .14
+            .clone()
+            .or(row.16.clone())
+            .unwrap_or_else(|| "unknown".into());
+        if let Some(byte_at) = byte_at.filter(|at| *at >= started) {
+            first_byte.push((byte_at - started).num_milliseconds());
+        }
         if let Some(first) = first.filter(|first| *first >= started) {
             ttft.push((first - started).num_milliseconds());
             *sources
                 .entry((source.clone(), quality.clone()))
                 .or_default() += 1;
-            if let (Some(completed), Some(tokens)) = (completed, row.3.filter(|v| *v > 0)) {
-                let generation_ms = (completed - first).num_milliseconds();
+            if let Some(value) = row.8.filter(|value| *value > 0) {
+                generation.push(value);
+            } else if let Some(last) = last_output.or(completed).filter(|last| *last > first) {
+                generation.push((last - first).num_milliseconds());
+            }
+            let generation_ms = row.8.or_else(|| {
+                last_output
+                    .or(completed)
+                    .filter(|last| *last > first)
+                    .map(|last| (last - first).num_milliseconds())
+            });
+            if let Some(value) = row.7.filter(|value| *value > 0) {
+                speeds.push(value as f64 / 1000.0);
+            } else if let (Some(generation_ms), Some(tokens)) =
+                (generation_ms, row.6.filter(|value| *value > 0))
+            {
                 if generation_ms > 0 {
                     speeds.push(tokens as f64 * 1000.0 / generation_ms as f64);
                 }
             }
         }
+        if let Some(value) = row.9.filter(|value| *value >= 0) {
+            inter_token.push(value);
+        }
+        if let Some(value) = row.10.filter(|value| *value >= 0) {
+            inter_token.push(value);
+        }
+        if let Some(value) = row.11.filter(|value| *value >= 0) {
+            stalls.push(value);
+        }
+        if row.23 == Some(true) {
+            *sources
+                .entry(("rate_limited".into(), "observed".into()))
+                .or_default() += 1;
+        }
     }
-    ttft.sort_unstable();
-    speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let percentile_i64 = |values: &[i64], p: f64| -> Option<i64> {
         if values.is_empty() {
             None
         } else {
-            Some(values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)])
+            Some(
+                values[((values.len() as f64 * p).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(values.len() - 1)],
+            )
         }
     };
     let percentile_f64 = |values: &[f64], p: f64| -> Option<f64> {
         if values.is_empty() {
             None
         } else {
-            Some(values[((values.len() as f64 * p).ceil() as usize).saturating_sub(1)])
+            Some(
+                values[((values.len() as f64 * p).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(values.len() - 1)],
+            )
+        }
+    };
+    first_byte.sort_unstable();
+    ttft.sort_unstable();
+    generation.sort_unstable();
+    speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    inter_token.sort_unstable();
+    stalls.sort_unstable();
+    let avg_i64 = |values: &[i64]| {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<i64>() / values.len() as i64)
+        }
+    };
+    let avg_f64 = |values: &[f64]| {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
         }
     };
     let ttft_count = ttft.len();
@@ -3038,24 +3057,165 @@ pub(crate) async fn usage_performance(
     source_rows.sort_by_key(|row| std::cmp::Reverse(row["count"].as_i64().unwrap_or(0)));
     Json(serde_json::json!({
         "total_calls": total,
+        "reliability": {
+            "success_count": success,
+            "error_count": errors,
+            "success_rate": if total > 0 { Some(success as f64 / total as f64) } else { None },
+            "error_rate": if total > 0 { Some(errors as f64 / total as f64) } else { None },
+        },
+        "first_byte": {
+            "count": first_byte.len(),
+            "avg_ms": avg_i64(&first_byte),
+            "p50_ms": percentile_i64(&first_byte, 0.50),
+            "p95_ms": percentile_i64(&first_byte, 0.95),
+            "p99_ms": percentile_i64(&first_byte, 0.99),
+            "coverage": if total > 0 { Some(first_byte.len() as f64 / total as f64) } else { None },
+        },
         "ttft": {
             "count": ttft_count,
-            "avg_ms": if ttft_count > 0 { Some(ttft.iter().sum::<i64>() / ttft_count as i64) } else { None },
+            "avg_ms": avg_i64(&ttft),
             "p50_ms": percentile_i64(&ttft, 0.50),
             "p95_ms": percentile_i64(&ttft, 0.95),
             "p99_ms": percentile_i64(&ttft, 0.99),
             "coverage": if total > 0 { Some(ttft_count as f64 / total as f64) } else { None },
         },
+        "generation": {
+            "count": generation.len(),
+            "avg_ms": avg_i64(&generation),
+            "p50_ms": percentile_i64(&generation, 0.50),
+            "p95_ms": percentile_i64(&generation, 0.95),
+            "p99_ms": percentile_i64(&generation, 0.99),
+            "coverage": if total > 0 { Some(generation.len() as f64 / total as f64) } else { None },
+        },
         "output_speed": {
             "count": speed_count,
-            "avg_tokens_per_second": if speed_count > 0 { Some(speeds.iter().sum::<f64>() / speed_count as f64) } else { None },
+            "avg_tokens_per_second": avg_f64(&speeds),
             "p50_tokens_per_second": percentile_f64(&speeds, 0.50),
             "p95_tokens_per_second": percentile_f64(&speeds, 0.95),
             "coverage": if total > 0 { Some(speed_count as f64 / total as f64) } else { None },
         },
+        "inter_token_latency": {
+            "count": inter_token.len(),
+            "avg_ms": avg_i64(&inter_token),
+            "p50_ms": percentile_i64(&inter_token, 0.50),
+            "p95_ms": percentile_i64(&inter_token, 0.95),
+            "p99_ms": percentile_i64(&inter_token, 0.99),
+            "coverage": if total > 0 { Some(inter_token.len() as f64 / total as f64) } else { None },
+        },
+        "stalls": {
+            "count": stalls.len(),
+            "avg_count": avg_i64(&stalls),
+            "p95_count": percentile_i64(&stalls, 0.95),
+        },
+        "observed_bytes": {
+            "request_payload": { "bytes": observed_counts[0].gt(&0).then_some(observed_bytes[0]), "count": observed_counts[0] },
+            "response_payload": { "bytes": observed_counts[1].gt(&0).then_some(observed_bytes[1]), "count": observed_counts[1] },
+            "request_wire": { "bytes": observed_counts[2].gt(&0).then_some(observed_bytes[2]), "count": observed_counts[2] },
+            "response_wire": { "bytes": observed_counts[3].gt(&0).then_some(observed_bytes[3]), "count": observed_counts[3] },
+        },
         "sources": source_rows,
     }))
     .into_response()
+}
+
+/// 按时间桶返回运行时性能指标；空桶使用 null，避免把没有观测误报为 0。
+pub(crate) async fn usage_performance_timeseries(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    let (from, to) = parse_range(&p);
+    let bucket_secs = bucket_granularity(&p, from, to);
+    let (filter, fargs) = range_filter_usage(&p);
+    let c = st.db.conn();
+    let mut stmt = q!(c.prepare(&format!(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00',
+                    datetime((CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b,
+                ttft_ms, first_byte_latency_ms, generation_duration_ms,
+                output_tokens_per_second_milli, inter_token_latency_avg_ms
+         FROM model_calls
+         WHERE started_at >= ?1 AND started_at < ?2 {filter}"
+    )));
+    let rows = q!(
+        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+            ))
+        })
+    );
+    let mut buckets: std::collections::HashMap<String, Vec<[Option<i64>; 5]>> = Default::default();
+    for row in rows.flatten() {
+        buckets
+            .entry(row.0)
+            .or_default()
+            .push([row.1, row.2, row.3, row.4, row.5]);
+    }
+    let mut points = Vec::new();
+    for (bucket, values) in buckets {
+        let avg = |index: usize| -> Option<i64> {
+            let values: Vec<i64> = values.iter().filter_map(|row| row[index]).collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().sum::<i64>() / values.len() as i64)
+            }
+        };
+        points.push(serde_json::json!({
+            "bucket": bucket,
+            "count": values.len(),
+            "ttft_avg_ms": avg(0),
+            "first_byte_avg_ms": avg(1),
+            "generation_avg_ms": avg(2),
+            "output_tokens_per_second_milli_avg": avg(3),
+            "inter_token_latency_avg_ms": avg(4),
+        }));
+    }
+    points.sort_by(|a, b| a["bucket"].as_str().cmp(&b["bucket"].as_str()));
+    Json(serde_json::json!({
+        "series": fill_performance_timeseries(points, from, to, bucket_secs)
+    }))
+    .into_response()
+}
+
+fn fill_performance_timeseries(
+    points: Vec<serde_json::Value>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    bucket_secs: i64,
+) -> Vec<serde_json::Value> {
+    let mut by_bucket = std::collections::HashMap::new();
+    for point in points {
+        if let Some(bucket) = point.get("bucket").and_then(|v| v.as_str()) {
+            by_bucket.insert(bucket.to_string(), point);
+        }
+    }
+    let mut current = floor_ts(from, bucket_secs);
+    let end = floor_ts(to, bucket_secs);
+    let mut output = Vec::new();
+    while current <= end {
+        let bucket = if bucket_secs >= 86_400 {
+            current.format("%Y-%m-%d").to_string()
+        } else {
+            current.to_rfc3339()
+        };
+        output.push(by_bucket.remove(&bucket).unwrap_or_else(|| {
+            serde_json::json!({
+                "bucket": bucket,
+                "count": 0,
+                "ttft_avg_ms": serde_json::Value::Null,
+                "first_byte_avg_ms": serde_json::Value::Null,
+                "generation_avg_ms": serde_json::Value::Null,
+                "output_tokens_per_second_milli_avg": serde_json::Value::Null,
+                "inter_token_latency_avg_ms": serde_json::Value::Null,
+            })
+        }));
+        current += chrono::Duration::seconds(bucket_secs);
+    }
+    output
 }
 
 pub(crate) async fn usage_latency_timeseries(
@@ -3188,7 +3348,7 @@ fn edge_windows(
     windows
 }
 
-/// 用原始明细补齐总览在两端不完整小时的聚合（token/费用/调用数/流量/会话/消息）。
+/// 用原始明细补齐总览在两端不完整小时的聚合（token/费用/调用数/会话/消息）。
 #[allow(clippy::too_many_arguments)]
 fn add_overview_raw_edges(
     body: &mut serde_json::Value,
@@ -3210,25 +3370,19 @@ fn add_overview_raw_edges(
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                     COALESCE(SUM(reasoning_tokens),0),
                     COALESCE(SUM(reported_cost_micro_usd),0), COALESCE(SUM(calculated_cost_micro_usd),0), COALESCE(SUM(estimated_cost_micro_usd),0),
-                    COALESCE(SUM((SELECT estimated_request_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
-                    COALESCE(SUM((SELECT estimated_response_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
-                    COALESCE(SUM((SELECT estimated_total_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
-                    COALESCE(SUM((SELECT lower_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
-                    COALESCE(SUM((SELECT upper_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id)),0),
                     COUNT(*)
                  FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 {call_filter}"
             ),
             params_from_iter(range_args(&w_from, &w_to, call_fargs.to_vec())),
             |r| {
-                let mut out = Vec::with_capacity(14);
-                for i in 0..13 {
+                let mut out = Vec::with_capacity(9);
+                for i in 0..9 {
                     out.push(r.get::<_, i64>(i).unwrap_or(0));
                 }
-                out.push(r.get::<_, i64>(13).unwrap_or(0));
                 Ok(out)
             },
         ) {
-            const CALL_KEYS: [&str; 14] = [
+            const CALL_KEYS: [&str; 9] = [
                 "input_tokens",
                 "output_tokens",
                 "cache_read_tokens",
@@ -3237,11 +3391,6 @@ fn add_overview_raw_edges(
                 "reported_cost_micro_usd",
                 "calculated_cost_micro_usd",
                 "estimated_cost_micro_usd",
-                "estimated_request_bytes",
-                "estimated_response_bytes",
-                "estimated_total_bytes",
-                "traffic_lower_bound_bytes",
-                "traffic_upper_bound_bytes",
                 "model_calls",
             ];
             for (key, value) in CALL_KEYS.iter().zip(values.iter()) {
@@ -3284,17 +3433,15 @@ fn add_json_number(body: &mut serde_json::Value, key: &str, delta: i64) {
 ///
 /// 列名与 `hourly_rollups` 对齐，便于把查询里的 `hourly_rollups` 直接换成 `rollup_src`；
 /// `from_ph`/`to_ph` 指定 from/to 绑定的参数序号（只使用这两个参数）。
-/// 明细侧无法提供的字段（usage_source/pricing_source/traffic_estimation_source、
+/// 明细侧无法提供的字段（usage_source/pricing_source、
 /// session/message/tool/turn/subagent 计数）以空串或 0 补齐。
 fn rollup_source_cte(from_ph: u8, to_ph: u8) -> String {
     format!(
         r#"WITH rollup_src AS (
             SELECT bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
-                   usage_source, usage_granularity, pricing_source, traffic_estimation_source, traffic_confidence_level,
+                   usage_source, usage_granularity, pricing_source,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
                    reported_cost, calculated_cost, estimated_cost,
-                   estimated_request_bytes, estimated_response_bytes, estimated_total_bytes,
-                   estimated_lower_bound_bytes, estimated_upper_bound_bytes,
                    session_count, model_call_count, turn_count, message_count, tool_call_count, subagent_count
             FROM hourly_rollups
             WHERE CAST(strftime('%s', bucket) AS INTEGER) >= CAST(strftime('%s', ?{from_ph}) AS INTEGER)
@@ -3302,14 +3449,9 @@ fn rollup_source_cte(from_ph: u8, to_ph: u8) -> String {
             UNION ALL
             SELECT strftime('%Y-%m-%dT%H:00:00+00:00', started_at), node_id, collector_id, client_id, source_id,
                    COALESCE(project_id,''), COALESCE(provider_normalized,''), COALESCE(model_normalized,''),
-                   '', '', '', '', '',
+                   '', '', '',
                    COALESCE(input_tokens,0), COALESCE(output_tokens,0), COALESCE(cache_read_tokens,0), COALESCE(cache_write_tokens,0), COALESCE(reasoning_tokens,0),
                    COALESCE(reported_cost_micro_usd,0), COALESCE(calculated_cost_micro_usd,0), COALESCE(estimated_cost_micro_usd,0),
-                   COALESCE((SELECT estimated_request_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id),0),
-                   COALESCE((SELECT estimated_response_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id),0),
-                   COALESCE((SELECT estimated_total_wire_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id),0),
-                   COALESCE((SELECT lower_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id),0),
-                   COALESCE((SELECT upper_bound_bytes FROM traffic_estimates t WHERE t.id = model_calls.traffic_estimate_id),0),
                    0, 1, 0, 0, 0, 0
             FROM model_calls
             WHERE started_at >= ?{from_ph} AND started_at < ?{to_ph}

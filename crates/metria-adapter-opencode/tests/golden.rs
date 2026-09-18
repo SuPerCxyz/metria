@@ -172,15 +172,11 @@ fn golden_full_reads_session_usage_tools_subagents() {
             .as_str()
     );
 
-    // usage + tools + traffic
+    // usage + tools；普通采集不生成估算流量
     assert_eq!(batch.usage_events.len(), 2);
     assert_eq!(batch.tool_events.len(), 1);
     assert_eq!(batch.tool_events[0].name, "grep");
-    assert!(!batch.traffic_estimates.is_empty());
-    let te = &batch.traffic_estimates[0];
-    assert!(te.estimated_total_wire_bytes.is_some());
-    assert!(te.lower_bound_bytes.unwrap() < te.estimated_total_wire_bytes.unwrap());
-    assert!(te.upper_bound_bytes.unwrap() > te.estimated_total_wire_bytes.unwrap());
+    assert!(batch.traffic_estimates.is_empty());
 
     // OpenCode assistant.created 是首个可观察输出；耗时从对应 user turn 起点计算。
     let call = batch

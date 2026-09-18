@@ -11,7 +11,7 @@ import { ErrorState, LoadingSkeleton, EmptyState, DataQualityNote } from '../../
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtDateTime, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
@@ -41,10 +41,9 @@ export default function ModelDetail() {
 
   const recentColumns = [
     { key: 'started_at', label: '时间', render: (r) => fmtDateTime(r.started_at) },
-    { key: 'model', label: '模型', render: (r) => r.model || '—' },
-    { key: 'client_id', label: 'Agent', render: (r) => r.client_id || '—' },
-    { key: 'input_tokens', label: 'Token', render: (r) => fmtTokensShort(sumTokens(r)) },
-    { key: 'estimated_total_bytes', label: '估算流量', render: (r) => fmtBytes(r.estimated_total_bytes) },
+    { key: 'model', label: '模型', hideWhenEmpty: true, render: (r) => r.model || '—' },
+    { key: 'client_id', label: 'Agent', hideWhenEmpty: true, render: (r) => r.client_id || '—' },
+    { key: 'input_tokens', label: 'Token', sortValue: (r) => sumTokens(r), render: (r) => fmtTokensShort(sumTokens(r)) },
   ]
 
   return (
@@ -63,7 +62,6 @@ export default function ModelDetail() {
             { label: '请求数', value: String(s.model_calls ?? 0) },
             { label: 'Token', value: fmtTokensShort(sumTokens(s)) },
             { label: '费用', value: fmtUsd(s.cost_micro_usd) },
-            { label: '估算流量', value: fmtBytes(s.estimated_total_bytes) },
             { label: '缓存命中率', value: fmtPct100(cacheHitRate(s)) },
           ]}
         />
@@ -76,10 +74,10 @@ export default function ModelDetail() {
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={tab === 'cost' ? fmtUsd : fmtTokensShort} />}
       </div>
 
-      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
+      {(d.recent_sessions || []).length > 0 && <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 p-2">最近会话</h2>
         <DataTable columns={recentColumns} data={d.recent_sessions || []} pageSize={12} onRowClick={(r) => navigate(`/sessions/${encodeURIComponent(r.id)}`)} />
-      </div>
+      </div>}
     </>
   )
 }

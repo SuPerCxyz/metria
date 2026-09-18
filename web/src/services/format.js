@@ -43,6 +43,20 @@ export function sumTokens(o) {
   )
 }
 
+/** 平均每次有 Token 数据的调用 Token；无有效分母时保持不可用。 */
+export function averageTokens(total, tokenCalls) {
+  if (total === null || total === undefined || tokenCalls == null || Number(tokenCalls) <= 0) return null
+  return Number(total) / Number(tokenCalls)
+}
+
+/** 汇总三种费用口径；调用级字段全缺失时保持不可用。 */
+export function sumCosts(value) {
+  if (!value) return null
+  const fields = ['reported_cost_micro_usd', 'calculated_cost_micro_usd', 'estimated_cost_micro_usd']
+  if (!fields.some((field) => value[field] !== null && value[field] !== undefined)) return null
+  return fields.reduce((total, field) => total + Number(value[field] ?? 0), 0)
+}
+
 /** Token 简写（表格用）：12.8M */
 export function fmtTokensShort(t) {
   if (t === null || t === undefined || Number.isNaN(t)) return '—'

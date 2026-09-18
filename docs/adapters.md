@@ -20,7 +20,9 @@ pub trait SourceAdapter {
 ```
 
 `ScanBatch` 输出：`sessions / turns / messages / model_calls / usage_events / tool_events /
-subagent_relations / traffic_estimates / traffic_profile_samples / next_cursor / warnings / source_errors`。
+subagent_relations / next_cursor / warnings / source_errors`。类型中的旧
+`traffic_estimates` / `traffic_profile_samples` 仅为协议升级兼容保留，普通 Agent 不填充；
+实时 TTFT/Token/s/观测字节由原生 `metria observe` 单独产生。
 
 ## 2. 已实现 Adapter
 
@@ -52,7 +54,7 @@ Adapter 必须把客户端上报的 Token 归一到 Metria 的统一口径后再
 
 每个 Adapter 必须有：
 
-- **Golden Fixture**：完整事件 → 断言关键字段（session/model_call/usage/traffic 数量与取值）。
+- **Golden Fixture**：完整事件 → 断言关键字段（session/model_call/usage/tool/subagent 数量与取值）。
 - **Malformed Fixture**：截断 JSON / 未知字段 / 非 UTF-8 / 超大行 / 重复事件 / 轮转 / 游标失效 / 锁 / Schema Drift / 时间倒序 / 负数溢出。
 - 增量扫描测试：游标续扫不重复解析。
 
@@ -60,7 +62,7 @@ Adapter 必须把客户端上报的 Token 归一到 Metria 的统一口径后再
 
 新增 Adapter 步骤：
 
-1. `crates/metria-adapter-<name>`（独立 crate，依赖 metria-adapter-api/core/traffic）。
+1. `crates/metria-adapter-<name>`（独立 crate，依赖 metria-adapter-api/core）。
 2. 实现 `SourceAdapter` + 容错解析。
 3. 注册到 `metria-cli/src/registry.rs`。
 4. 编写 fixtures + golden/malformed 测试。

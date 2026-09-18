@@ -45,6 +45,7 @@ docker compose -f docker/compose.full.yaml --profile demo --profile agent up -d
 | `METRIA_POLL_INTERVAL` | 60s | **Push 模式**无状态轮询周期（拉游标→扫描→上传→推游标，5~86400 秒；可在「添加节点」时配置，随安装命令注入） |
 | `METRIA_TOKEN_REFRESH_INTERVAL` | 6 天 | Agent 重新注册续期周期（< 7 天 token 有效期） |
 | `METRIA_MAX_PENDING_EVENTS` / `MAX_SPOOL_BYTES` | 200 万 / 512MiB | Spool 上限 |
+| `METRIA_OBSERVE_LEASE_SECONDS` | 86400s | 原生临时观测最长租约；命令退出或租约到期即清理 |
 | `METRIA_LOG` | `info` | 日志级别 |
 
 ## 4. 网络与安全
@@ -90,7 +91,28 @@ Agent 支持两种采集模式（同一镜像/二进制，按环境变量自动�
 > 节点级 Token 使用 `METRIA_SESSION_SECRET` 派生密钥加密存储于 Hub；轮换该密钥后需在 Web
 > 重新生成安装命令以刷新节点 Token。
 
-### 4.2 OIDC 单用户登录
+### 4.2 原生运行时观测与 Docker 能力边界
+
+Docker Agent 只读取只读挂载的日志/SQLite，提供普通 Token、调用、费用和会话观测，
+不接管客户端模型请求。原生 Linux/Windows Agent 额外支持临时运行时观测：
+
+```bash
+METRIA_HUB_URL=https://hub.example.com \
+METRIA_AGENT_TOKEN=<collector-token> \
+metria observe --client codex --upstream https://api.openai.com/v1 -- codex
+```
+
+Claude Code 使用 `ANTHROPIC_BASE_URL`，Codex 使用 `OPENAI_BASE_URL`，OpenCode 使用临时
+副本配置并要求 `--upstream`（多 provider 时再指定 `--provider`）。观测器只在命令进程
+生命周期内绑定 `127.0.0.1`，请求/响应正文仅短暂保存在有上限的内存缓冲中，Hub 只接收
+派生指标：TTFT、首字节/生成时长、Token/s、ITL/停顿、可靠性、路由和观测 payload/wire
+字节。客户端原配置不被修改；正常退出、观测失败、Agent 停止或租约到期都会删除临时
+配置并关闭本地端口。未通过 `metria observe` 启动的客户端不会获得运行时指标。
+
+该模式不安装代理、CA、eBPF、透明转发或 Docker Socket，也不采集网卡账单流量。Hub
+性能页面会按 `observability_source` 和覆盖率区分原生运行时样本与 Docker/日志样本。
+
+### 4.3 OIDC 单用户登录
 
 Metria 支持通过任意标准 OIDC Provider（Keycloak / Authentik / Auth0 / Google / Entra 等）登录 Web 控制台，**仅允许一个白名单账号**（单用户模式，不支持多用户）。
 
@@ -155,7 +177,7 @@ SMTP 密码和 Webhook Secret 只保存在 Hub 本地数据库，读取 API 不�
 ## 7. 健康检查与诊断
 
 - `metria healthcheck`（容器内 CMD）：打开数据库并读取 schema 版本，作为轻量存活检查；完整数据库 `quick_check` 通过 `metria doctor --database` 执行。
-- `metria doctor --adapter|--traffic|--hub|--database|--spool`：环境诊断。
+- `metria doctor --adapter|--hub|--database|--spool`：环境诊断；`metria observe --help` 查看原生临时观测用法。
 
 ## 8. 前端添加节点与安装 Agent
 
@@ -164,14 +186,17 @@ Web 端「节点 → 添加节点」可预先创建节点并生成安装命令�
 1. **添加节点**：填写名称/描述/标签、平台（Linux/Windows）、架构（amd64/arm64）；Hub 地址自动使用当前页面 origin，Pull 模式下再填写 Agent IP/域名及可选端口。
 2. **获取安装命令**：创建后自动展示一次性专属 Token 与两种安装命令（可切换、一键复制）。
 3. **目标机安装**：
-   - **Docker**：`docker run -d --name metria-agent ... ghcr.io/supercxyz/metria:latest agent`（命令已注入 node_id/token/hub_url 与客户端只读挂载）。
-   - **原生 Linux**：页面命令从节点专属地址 `/api/v1/nodes/{node_id}/agent/download` 公开下载对应架构的 `metria-linux-amd64` 或 `metria-linux-arm64`，Hub 镜像已内置资产，无需额外配置或 Token；命令会强制安装 `metria-agent.service`，将配置保存到 root-only 的 `/etc/metria/metria-agent.env`，并通过 systemd 设置开机启动。
+   - **Docker**：`docker run -d --name metria-agent ... ghcr.io/supercxyz/metria:latest agent`（仅普通只读采集，命令已注入 node_id/token/hub_url 与客户端只读挂载）。
+   - **原生 Linux**：页面命令从节点专属地址 `/api/v1/nodes/{node_id}/agent/download` 公开下载对应架构的 `metria-linux-amd64` 或 `metria-linux-arm64`，Hub 镜像已内置资产，无需额外配置或 Token；命令会强制安装 `metria-agent.service`，将配置保存到 root-owned、仅服务用户可读的 `/etc/metria/metria-agent.env`，并通过 systemd 设置开机启动。
    - **原生 Windows**：页面生成的 PowerShell 命令从当前 Hub 下载内置的 `metria-windows-amd64.exe` 到 `%LOCALAPPDATA%\Metria`，生成持久化启动配置，并注册 `Metria Agent` 登录自启动计划任务。
    - **命令复制**：Docker 命令预览为带 shell 续行符的多行格式，复制按钮会折叠为单行；原生 Linux/Windows 命令保留多行脚本格式。
 4. **接入确认**：Agent 用专属 token 注册后，节点变为「在线」，名称保持创建/编辑时设置的值。
 5. **节点维护**：列表行支持「编辑」（改名称/描述/标签/Agent 地址）与「删除」（移除身份与令牌，历史用量数据保留）。
 
 > 说明：二进制下载接口公开，只根据节点 ID 读取平台/架构并选择文件，不接收 Token；Hub 镜像包含 Linux amd64、Linux arm64、Windows amd64 三个资产。专属 Token 明文仅创建或生成安装命令时展示，Hub 只存哈希。Token 过期后可在节点详情重新生成安装命令（自动签发新 token，不吊销正在使用的旧 token）。
+
+> 原生 Agent 的 `observe` 是显式、临时的客户端启动方式，不由 Docker 安装命令自动启用；
+> 普通 `metria agent` 与 Docker Agent 均不会拦截客户端请求。
 
 ## 9. 规模与性能
 

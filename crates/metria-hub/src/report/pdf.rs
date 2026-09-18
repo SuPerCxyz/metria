@@ -13,10 +13,10 @@ use printpdf::*;
 
 use super::aggregate::{DimCount, ReportMetrics};
 use super::render::{
-    bytes_human, c_cache_read, c_cache_write, c_input, c_output, c_reasoning, chart_palette, n,
-    usd, ReportChart, ReportMeta, C_CALCULATED, C_ESTIMATED, C_REPORTED, REPORT_BORDER,
-    REPORT_BRAND, REPORT_BRAND_LIGHT, REPORT_BRAND_SUB, REPORT_CARD, REPORT_FAINT, REPORT_INK,
-    REPORT_MUTED, REPORT_SECTION, REPORT_SURFACE, REPORT_TRACK, REPORT_WARNING, REPORT_WARNING_BG,
+    c_cache_read, c_cache_write, c_input, c_output, c_reasoning, chart_palette, n, usd,
+    ReportChart, ReportMeta, C_CALCULATED, C_ESTIMATED, C_REPORTED, REPORT_BORDER, REPORT_BRAND,
+    REPORT_BRAND_LIGHT, REPORT_BRAND_SUB, REPORT_CARD, REPORT_FAINT, REPORT_INK, REPORT_MUTED,
+    REPORT_SECTION, REPORT_SURFACE, REPORT_TRACK,
 };
 
 const A4_W: f32 = 210.0;
@@ -323,59 +323,6 @@ fn cost_section(p: &mut Pdf, m: &ReportMetrics) {
     }
 }
 
-fn traffic_section(p: &mut Pdf, m: &ReportMetrics) {
-    if m.estimated_total_bytes <= 0 {
-        return;
-    }
-    p.section("估算流量");
-    let h = 20.0;
-    p.ensure(h + 2.0);
-    let top = p.y;
-    let layer = p.layer();
-    layer.set_outline_color(rgb(REPORT_BORDER));
-    layer.set_outline_thickness(0.6);
-    layer.add_rect(
-        Rect::new(Mm(MARGIN), Mm(top - h), Mm(MARGIN + CONTENT_W), Mm(top))
-            .with_mode(PaintMode::Stroke),
-    );
-    p.text_at(
-        &bytes_human(m.estimated_total_bytes),
-        20.0,
-        MARGIN + 5.0,
-        top - 11.0,
-        REPORT_INK,
-        true,
-    );
-    let total_w = text_width_mm(&bytes_human(m.estimated_total_bytes), 20.0);
-    let badge_x = MARGIN + 7.0 + total_w;
-    let badge_w = text_width_mm("估算", 9.5) + 6.0;
-    let badge_layer = p.layer();
-    badge_layer.set_fill_color(rgb(REPORT_WARNING_BG));
-    badge_layer.add_rect(
-        Rect::new(
-            Mm(badge_x),
-            Mm(top - 14.5),
-            Mm(badge_x + badge_w),
-            Mm(top - 7.5),
-        )
-        .with_mode(PaintMode::Fill),
-    );
-    p.text_at("估算", 9.5, badge_x + 3.0, top - 10.5, REPORT_WARNING, true);
-    p.text_at(
-        &format!(
-            "区间 {} – {}（均为估算，非实际网卡流量）",
-            bytes_human(m.estimated_lower_bound_bytes),
-            bytes_human(m.estimated_upper_bound_bytes)
-        ),
-        9.5,
-        MARGIN + 5.0,
-        top - 16.5,
-        REPORT_FAINT,
-        false,
-    );
-    p.y = top - h;
-}
-
 fn top_section(p: &mut Pdf, title: &str, items: &[DimCount], show_tokens: bool) {
     if items.is_empty() {
         return;
@@ -515,7 +462,6 @@ pub fn render_pdf(
 
     token_sections(&mut p, m);
     cost_section(&mut p, m);
-    traffic_section(&mut p, m);
     top_section(&mut p, "Top 模型", &m.top_models, true);
     top_section(&mut p, "Top 客户端", &m.top_clients, false);
 
@@ -547,9 +493,6 @@ mod tests {
             cache_write_tokens: 40_000,
             reasoning_tokens: 12_000,
             calculated_cost_micro_usd: 1_500_000,
-            estimated_total_bytes: 2_097_152,
-            estimated_lower_bound_bytes: 1_048_576,
-            estimated_upper_bound_bytes: 3_145_728,
             top_models: vec![DimCount {
                 name: "claude-sonnet-4.5".into(),
                 calls: 80,

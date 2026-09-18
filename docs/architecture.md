@@ -2,9 +2,9 @@
 
 ## 1. 定位
 
-Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 / 网络流量估算平台。
-统一采集 Claude Code / Codex / OpenCode 的 Token、调用次数、费用与估算流量，多节点汇总展示。
-**零侵入采集**：不修改任何客户端配置、网络链路或数据源，仅通过只读挂载读取客户端已有日志。
+Metria 是轻量、可自托管的 AI 编程 Agent 用量监控、费用分析与模型性能观测平台。
+统一采集 Claude Code / Codex / OpenCode 的 Token、调用次数、费用和可证明的运行时性能，多节点汇总展示。
+普通模式只读挂载读取客户端已有日志；原生 Agent 另提供显式、临时的运行时观测入口。
 
 ## 2. 核心概念
 
@@ -14,7 +14,7 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 | Collector | 运行在 Node 上的 Agent 容器实例 |
 | Client | 被监控的 AI 编程客户端（Claude Code / Codex / OpenCode） |
 | Source | 某 Node 上某 Client 的具体本地数据源（JSONL 文件 / SQLite 库） |
-| Model Call | 一次可识别的模型调用，关联 Node/Client/Source/Session/Provider/Model/Usage/Cost/Traffic |
+| Model Call | 一次可识别的模型调用，关联 Node/Client/Source/Session/Provider/Model/Usage/Cost/Runtime observation |
 
 ## 3. 架构分层
 
@@ -22,7 +22,7 @@ Metria 是轻量、可自托管的 AI 编程 Agent 用量监控 / 费用分析 /
 |---|---|---|
 | Web | React 19 + Vite + Tailwind CSS + Chart.js | Web UI，构建产物由 rust-embed 嵌入 Hub |
 | Hub | axum + tokio + SQLite | 认证、Ingest 校验、幂等落库、Rollup、查询 API 和报告调度 |
-| Agent | blocking 采集栈 | Push/Pull 采集、增量游标、流量/费用估算和批量上传 |
+| Agent | blocking 采集栈 | Push/Pull 普通采集、增量游标、费用计算和原生临时运行时观测 |
 | Adapter | Claude Code / Codex / OpenCode 独立 crate | 只读发现和解析各客户端数据源 |
 | 报告 | SMTP + JSON Webhook | 日 / 周 / 月聚合、HTML/纯文本渲染、渠道结果记录 |
 
@@ -30,10 +30,10 @@ Hub 数据库使用 SQLite WAL 和版本化迁移，目前包含 32 张表；Age
 
 ## 4. 数据流
 
-1. **采集**：Adapter 通过只读挂载扫描客户端日志，归一化为统一事件
-   （session / source / call / usage / traffic / tool / subagent / traffic_sample）。
-2. **估算**：Agent 本地做 traffic 估算（reconstructed/partial/content_bytes/token_profile）与
-   pricing 计算（reported > user > catalog > builtin）。
+1. **普通采集**：Adapter 通过只读挂载扫描客户端日志/SQLite，归一化为 session / source /
+   call / usage / tool / subagent 事件；Docker 与普通原生 Agent 不拦截请求，也不生成估算流量。
+2. **运行时观测（原生显式入口）**：`metria observe` 为单个客户端进程设置进程级本地
+   base URL，转发期间在有界内存中提取 TTFT、Token/s、可靠性、路由和观测字节，原文不落盘。
 3. **上传（Push 无状态轮询）**：按周期「拉 Hub 游标 → 增量扫描 → 直传 → 确认后推游标」；
    事件确认在前、游标推进在后，失败不推进、下轮重扫（event_id 幂等去重）。
    Hub 离线时暂停扫描，恢复后按最新游标补齐。Pull 模式：事件 + 游标写本地 SQLite
@@ -49,7 +49,7 @@ Hub 数据库使用 SQLite WAL 和版本化迁移，目前包含 32 张表；Age
 | 金额用 i64 微美元 | 禁止浮点累计误差 |
 | 时间存 UTC，展示用 IANA | 不依赖容器系统时区 |
 | Agent 用 blocking 栈（无 tokio） | 满足空闲 RSS ≤35MiB 目标 |
-| 流量标记「估算流量」 | 数据诚实性硬性规则，不冒充实际/网卡流量 |
+| 观测字节单独命名 | 区分 payload/wire 与历史估算流量，不冒充实际网卡/账单流量 |
 | 缺失 Token 用 `null` 不填 0 | 数据诚实性 |
 | 会话引用统一规范键 `node:source_session_id` | 跨表 join 与幂等 |
 | 版本化迁移（`migrations/N_name.sql`） | 数据库升级可控、可回滚 |

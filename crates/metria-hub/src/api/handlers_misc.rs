@@ -1,4 +1,4 @@
-//! 补充 handlers：Traffic Profiles / Pricing / Share / Export。
+//! 补充 handlers：Pricing / Share / Export。
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -8,150 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::net::IpAddr;
 
-use crate::api::{json_err, AppState, RangeParams};
-
-// ============ Traffic Profiles ============
-
-pub(crate) async fn traffic_profiles_list(State(st): State<AppState>) -> Response {
-    Json(serde_json::json!({ "profiles": st.db.list_traffic_profiles(None) })).into_response()
-}
-
-pub(crate) async fn traffic_profiles_create(
-    State(st): State<AppState>,
-    Json(v): Json<serde_json::Value>,
-) -> Response {
-    match st.db.insert_user_profile(&v) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "profile_failed",
-            &e.to_string(),
-        ),
-    }
-}
-
-pub(crate) async fn traffic_profiles_delete(
-    State(st): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
-    match st.db.delete_user_profile(&id) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "delete_failed",
-            &e.to_string(),
-        ),
-    }
-}
-
-pub(crate) async fn traffic_profiles_learn(
-    State(st): State<AppState>,
-    Query(p): Query<RangeParams>,
-) -> Response {
-    let min_samples = p.limit.unwrap_or(1).max(1);
-    match st.db.aggregate_learned_profiles(min_samples) {
-        Ok(n) => {
-            st.sse.publish("traffic.profile_updated", "{}");
-            Json(serde_json::json!({ "ok": true, "profiles_created": n })).into_response()
-        }
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "learn_failed",
-            &e.to_string(),
-        ),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ProfileTestRequest {
-    client: Option<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    cache_read_tokens: Option<i64>,
-    cache_write_tokens: Option<i64>,
-    reasoning_tokens: Option<i64>,
-}
-
-pub(crate) async fn traffic_profiles_test(
-    State(st): State<AppState>,
-    Json(req): Json<ProfileTestRequest>,
-) -> Response {
-    let profiles = st.db.load_traffic_profiles_parsed();
-    let client = req.client.clone().unwrap_or_else(|| "claude-code".into());
-    let est = metria_traffic::estimate_with_candidates(
-        &metria_traffic::EstimateInput {
-            client: &client,
-            provider: req.provider.as_deref(),
-            model: req.model.as_deref(),
-            input_tokens: req.input_tokens,
-            output_tokens: req.output_tokens,
-            cache_read_tokens: req.cache_read_tokens,
-            cache_write_tokens: req.cache_write_tokens,
-            reasoning_tokens: req.reasoning_tokens,
-            streaming: true,
-            request_text: None,
-            response_text: None,
-            request_reconstruction_quality: metria_core::model::ReconstructionQuality::None,
-            response_reconstruction_quality: metria_core::model::ReconstructionQuality::None,
-            context_transport_mode: metria_core::model::ContextTransportMode::Unknown,
-            cache_transport_behavior: metria_core::model::CacheTransportBehavior::Unknown,
-        },
-        &profiles,
-    );
-    match est {
-        Ok(out) => Json(serde_json::json!({
-            "ok": true,
-            "estimated_total_wire_bytes": out.estimated_total_wire_bytes,
-            "lower_bound_bytes": out.lower_bound_bytes,
-            "upper_bound_bytes": out.upper_bound_bytes,
-            "confidence": out.confidence,
-            "estimation_source": serde_json::to_value(out.estimation_source).unwrap_or(serde_json::json!("unknown")),
-            "notes": out.notes,
-        }))
-        .into_response(),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "test_failed",
-            &e.to_string(),
-        ),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ReestimateRequest {
-    model: Option<String>,
-}
-
-pub(crate) async fn traffic_reestimate(
-    State(st): State<AppState>,
-    Json(req): Json<ReestimateRequest>,
-) -> Response {
-    match st.db.reestimate_calls(req.model.as_deref()) {
-        Ok(n) => {
-            if let Err(e) = st.db.rebuild_all_traffic_rollups() {
-                return json_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "traffic_rollup_failed",
-                    &e.to_string(),
-                );
-            }
-            st.sse.publish("traffic.profile_updated", "{}");
-            Json(serde_json::json!({
-                "ok": true,
-                "reestimated": n,
-                "note": "重新估算生成新版本并保留旧版本",
-            }))
-            .into_response()
-        }
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reestimate_failed",
-            &e.to_string(),
-        ),
-    }
-}
+use crate::api::{json_err, AppState};
 
 // ============ Pricing ============
 
@@ -1109,6 +966,14 @@ fn linux_native_install_command(env_lines: &[String], download_url: &str, summar
         env_lines,
         summary
     )
+    .replace(
+        "# 3) 写入 root-only 运行时配置",
+        "# 3) 写入仅服务用户可读的运行时配置",
+    )
+    .replace(
+        "\n\n# 4) 注册并立即启动 systemd 服务",
+        "\nsudo chown root:\"$(id -gn)\" /etc/metria/metria-agent.env\nsudo chmod 0640 /etc/metria/metria-agent.env\n\n# 4) 注册并立即启动 systemd 服务",
+    )
 }
 
 /// Pull 模式原生命令：下载二进制后配置 token 与客户端路径，并持久化启动。
@@ -1526,6 +1391,7 @@ mod pricing_rule_validation_tests {
         assert!(native.contains("METRIA_AGENT_TOKEN"));
         assert!(native.contains("METRIA_POLL_INTERVAL"));
         assert!(native.contains("EnvironmentFile=/etc/metria/metria-agent.env"));
+        assert!(native.contains("sudo chmod 0640 /etc/metria/metria-agent.env"));
         assert!(native.contains("systemctl enable --now metria-agent.service"));
         assert!(!native.contains("nohup"));
 

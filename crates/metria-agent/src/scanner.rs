@@ -20,7 +20,6 @@ pub struct ScanTotals {
     pub sessions: usize,
     pub calls: usize,
     pub usage: usize,
-    pub traffic: usize,
     pub sources: usize,
     pub errors: usize,
     pub skipped_full: usize,
@@ -120,7 +119,6 @@ impl Scanner {
                         totals.sessions += st.sessions;
                         totals.calls += st.calls;
                         totals.usage += st.usage;
-                        totals.traffic += st.traffic;
                         if st.skipped_full {
                             totals.skipped_full += 1;
                         }
@@ -165,7 +163,6 @@ impl Scanner {
             sessions: events.iter().filter(|e| e.kind == "session").count(),
             calls: events.iter().filter(|e| e.kind == "call").count(),
             usage: events.iter().filter(|e| e.kind == "usage").count(),
-            traffic: events.iter().filter(|e| e.kind == "traffic").count(),
             skipped_full,
         })
     }
@@ -245,14 +242,13 @@ pub struct SourceScan {
     pub sessions: usize,
     pub calls: usize,
     pub usage: usize,
-    pub traffic: usize,
     pub skipped_full: bool,
 }
 
 /// 将 ScanBatch 归一化为待上传事件（含定价）。
 ///
-/// 精简模式：只上传 session 概要（聚合计数，无正文）、call、usage、traffic、
-/// traffic_sample；不采集 message/tool/subagent 等会话详细内容，聚焦 Token/Cost/Traffic。
+/// 精简模式：只上传 session 概要（聚合计数，无正文）、call、usage；
+/// 不采集 message/tool/subagent 等会话详细内容。
 pub fn normalize_batch(
     batch: &ScanBatch,
     _content_mode: ContentMode,
@@ -264,19 +260,25 @@ pub fn normalize_batch(
     for s in &batch.sessions {
         let event_id =
             EventId::from_content(&format!("session:{}:{}", s.source_session_id, s.node_id));
+        let mut payload = serde_json::to_value(s).unwrap_or_default();
+        // 历史 Session 模型仍保留估算流量列以兼容旧库，但新 Agent 不再
+        // 计算、上传或展示这些字段。
+        clear_legacy_traffic_fields(&mut payload);
         out.push(PendingEvent {
             event_id: event_id.as_str().to_string(),
             kind: "session".into(),
-            payload: serde_json::to_value(s).unwrap_or_default(),
+            payload,
         });
     }
 
     for c in &batch.model_calls {
         let event_id = EventId::from_content(&format!("call:{}", c.id.as_str()));
+        let mut payload = serde_json::to_value(c).unwrap_or_default();
+        clear_legacy_traffic_fields(&mut payload);
         out.push(PendingEvent {
             event_id: event_id.as_str().to_string(),
             kind: "call".into(),
-            payload: serde_json::to_value(c).unwrap_or_default(),
+            payload,
         });
     }
 
@@ -315,88 +317,46 @@ pub fn normalize_batch(
         });
     }
 
-    for t in &batch.traffic_estimates {
-        let event_id = EventId::from_content(&format!("traffic:{}", t.id.as_str()));
-        out.push(PendingEvent {
-            event_id: event_id.as_str().to_string(),
-            kind: "traffic".into(),
-            payload: serde_json::to_value(t).unwrap_or_default(),
-        });
-    }
-
-    // Traffic 自动学习样本：调用同时有 token 与 payload 字节时生成
-    for s in &batch.traffic_estimates {
-        let Some(call) = batch.model_calls.iter().find(|c| c.id == s.model_call_id) else {
-            continue;
-        };
-        if let (Some(in_tok), Some(req_bytes)) = (call.input_tokens, s.request_payload_bytes) {
-            // 仅从完整重建生成学习样本（partial 重建会系统性低估字节）
-            if in_tok > 0
-                && req_bytes > 0
-                && s.request_reconstruction_quality
-                    == metria_core::model::ReconstructionQuality::Complete
-            {
-                let bpt = (req_bytes as f64 / in_tok as f64 * 100.0).round() / 100.0;
-                let event_id = EventId::from_content(&format!(
-                    "tps:{client}|{provider:?}|{model:?}|request|{in_tok}|{req_bytes}",
-                    client = s.client_id,
-                    provider = s.provider,
-                    model = s.model,
-                ));
-                out.push(PendingEvent {
-                    event_id: event_id.as_str().to_string(),
-                    kind: "traffic_sample".into(),
-                    payload: serde_json::json!({
-                        "id": event_id.as_str(),
-                        "client": s.client_id,
-                        "provider": s.provider,
-                        "model": s.model,
-                        "content_profile": "unknown",
-                        "direction": "request",
-                        "token_count": in_tok,
-                        "payload_bytes": req_bytes,
-                        "bytes_per_token": bpt,
-                        "reconstruction_quality": format!("{:?}", s.request_reconstruction_quality).to_ascii_lowercase(),
-                        "source_hash": event_id.as_str(),
-                    }),
-                });
-            }
-        }
-        if let (Some(out_tok), Some(resp_bytes)) = (call.output_tokens, s.response_payload_bytes) {
-            if out_tok > 0
-                && resp_bytes > 0
-                && s.response_reconstruction_quality
-                    == metria_core::model::ReconstructionQuality::Complete
-            {
-                let bpt = (resp_bytes as f64 / out_tok as f64 * 100.0).round() / 100.0;
-                let event_id = EventId::from_content(&format!(
-                    "tps:{client}|{provider:?}|{model:?}|response|{out_tok}|{resp_bytes}",
-                    client = s.client_id,
-                    provider = s.provider,
-                    model = s.model,
-                ));
-                out.push(PendingEvent {
-                    event_id: event_id.as_str().to_string(),
-                    kind: "traffic_sample".into(),
-                    payload: serde_json::json!({
-                        "id": event_id.as_str(),
-                        "client": s.client_id,
-                        "provider": s.provider,
-                        "model": s.model,
-                        "content_profile": "unknown",
-                        "direction": "response",
-                        "token_count": out_tok,
-                        "payload_bytes": resp_bytes,
-                        "bytes_per_token": bpt,
-                        "reconstruction_quality": format!("{:?}", s.response_reconstruction_quality).to_ascii_lowercase(),
-                        "source_hash": event_id.as_str(),
-                    }),
-                });
-            }
-        }
-    }
-
     // source_id 附注（用于 hub 关联；payload 内已有）
     let _ = source_id;
     out
+}
+
+fn clear_legacy_traffic_fields(payload: &mut serde_json::Value) {
+    for key in [
+        "estimated_request_bytes",
+        "estimated_response_bytes",
+        "estimated_total_bytes",
+        "traffic_confidence",
+        "traffic_estimate_id",
+    ] {
+        payload[key] = serde_json::Value::Null;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_legacy_traffic_fields;
+    use serde_json::json;
+
+    #[test]
+    fn ordinary_agent_never_emits_estimated_traffic_fields() {
+        let mut payload = json!({
+            "estimated_request_bytes": 1,
+            "estimated_response_bytes": 2,
+            "estimated_total_bytes": 3,
+            "traffic_confidence": 0.9,
+            "traffic_estimate_id": "legacy"
+        });
+        clear_legacy_traffic_fields(&mut payload);
+        for key in [
+            "estimated_request_bytes",
+            "estimated_response_bytes",
+            "estimated_total_bytes",
+            "traffic_confidence",
+            "traffic_estimate_id",
+        ] {
+            assert!(payload[key].is_null(), "{key} must be null");
+        }
+    }
 }

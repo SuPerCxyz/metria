@@ -1,4 +1,4 @@
-// 节点列表：节点名称/状态/Agent数/会话数/Token/费用/流量/最后上报。
+// 节点列表：节点名称/状态/Agent数/会话数/Token/费用/最后上报。
 // 支持前端添加节点（生成安装命令）、编辑与删除。
 
 import React, { useMemo, useState } from 'react'
@@ -13,7 +13,7 @@ import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
-import { fmtDateTime, fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtRelative, fmtAgentAddress, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtDateTime, fmtTokensShort, fmtUsd, fmtPct100, fmtRelative, fmtAgentAddress, sumTokens, cacheHitRate } from '../../services/format'
 
 function agentUrlForSubmit(value, previous = '') {
   const address = value.trim()
@@ -68,19 +68,18 @@ export default function Nodes() {
   if (query.loading) return <LoadingSkeleton rows={6} />
 
   const columns = [
-    { key: 'name', label: '节点名称', sortable: true, render: (r) => r.name || r.id },
+    { key: 'name', label: '节点名称', sortValue: (r) => r.name || r.id, render: (r) => r.name || r.id },
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
-    { key: 'collector_count', label: 'Agent 数量', render: (r) => String(r.collector_count ?? r.detected_clients ?? '—') },
-    { key: 'sessions', label: '会话数', render: (r) => String(usageMap.get(r.id)?.sessions ?? '—') },
-    { key: 'tokens', label: 'Token', render: (r) => fmtTokensShort(sumTokens(usageMap.get(r.id))) },
-    { key: 'cache', label: '缓存命中率', render: (r) => cacheHitRate(usageMap.get(r.id)) != null ? fmtPct100(cacheHitRate(usageMap.get(r.id))) : '—' },
-    { key: 'cost', label: '费用', render: (r) => fmtUsd(usageMap.get(r.id)?.calculated_cost_micro_usd) },
-    { key: 'traffic', label: '估算流量', render: (r) => fmtBytes(usageMap.get(r.id)?.estimated_traffic_bytes) },
+    { key: 'collector_count', label: 'Agent 数量', sortValue: (r) => r.collector_count ?? r.detected_clients, render: (r) => String(r.collector_count ?? r.detected_clients ?? '—') },
+    { key: 'sessions', label: '会话数', hideWhenEmpty: true, sortValue: (r) => usageMap.get(r.id)?.sessions, render: (r) => String(usageMap.get(r.id)?.sessions ?? '—') },
+    { key: 'tokens', label: 'Token', hideWhenEmpty: true, availabilityValue: (r) => usageMap.has(r.id) ? sumTokens(usageMap.get(r.id)) : null, sortValue: (r) => usageMap.has(r.id) ? sumTokens(usageMap.get(r.id)) : null, render: (r) => fmtTokensShort(sumTokens(usageMap.get(r.id))) },
+    { key: 'cache', label: '缓存命中率', hideWhenEmpty: true, availabilityValue: (r) => cacheHitRate(usageMap.get(r.id)), sortValue: (r) => cacheHitRate(usageMap.get(r.id)), render: (r) => cacheHitRate(usageMap.get(r.id)) != null ? fmtPct100(cacheHitRate(usageMap.get(r.id))) : '—' },
+    { key: 'cost', label: '费用', hideWhenEmpty: true, sortValue: (r) => usageMap.get(r.id)?.cost_micro_usd, render: (r) => fmtUsd(usageMap.get(r.id)?.cost_micro_usd) },
     {
-      key: 'last_seen_at', label: '最后上报', sortable: true, render: (r) => <span title={fmtDateTime(r.last_seen_at)}>{fmtRelative(r.last_seen_at)}</span>,
+      key: 'last_seen_at', label: '最后上报', render: (r) => <span title={fmtDateTime(r.last_seen_at)}>{fmtRelative(r.last_seen_at)}</span>,
     },
     {
-      key: 'actions', label: '操作', render: (r) => (
+      key: 'actions', label: '操作', sortable: false, render: (r) => (
         <div className="flex items-center gap-2">
           <button
             type="button"

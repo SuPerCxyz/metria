@@ -68,8 +68,7 @@ fn session_dto(db: &HubDb, session_key: &str) -> serde_json::Value {
             "SELECT source_session_id, client_id, title, started_at, ended_at, message_count,
                     tool_call_count, subagent_count, model_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    estimated_request_bytes, estimated_response_bytes, estimated_total_bytes,
-                    traffic_confidence
+                    content_available
              FROM sessions WHERE id = ?1",
             [session_key],
             |r| {
@@ -88,10 +87,7 @@ fn session_dto(db: &HubDb, session_key: &str) -> serde_json::Value {
                     "cache_read_tokens": r.get::<_, Option<i64>>(11)?,
                     "cache_write_tokens": r.get::<_, Option<i64>>(12)?,
                     "reasoning_tokens": r.get::<_, Option<i64>>(13)?,
-                    "estimated_request_bytes": r.get::<_, Option<i64>>(14)?,
-                    "estimated_response_bytes": r.get::<_, Option<i64>>(15)?,
-                    "estimated_total_bytes": r.get::<_, Option<i64>>(16)?,
-                    "traffic_confidence": r.get::<_, Option<f64>>(17)?,
+                    "content_available": r.get::<_, bool>(14)?,
                 }))
             },
         )

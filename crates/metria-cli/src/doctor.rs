@@ -12,15 +12,11 @@ pub fn run_doctor(
     hub: bool,
     database: bool,
     spool: bool,
-    traffic: bool,
 ) -> Result<(), String> {
     let mut failures = 0usize;
 
     if let Some(name) = adapter {
         failures += check_adapter(name)?;
-    }
-    if traffic {
-        check_traffic();
     }
     if hub && check_hub().is_err() {
         failures += 1;
@@ -31,10 +27,8 @@ pub fn run_doctor(
     if spool && check_spool().is_err() {
         failures += 1;
     }
-    if adapter.is_none() && !traffic && !hub && !database && !spool {
-        eprintln!(
-            "用法：metria doctor [--adapter <name>] [--traffic] [--hub] [--database] [--spool]"
-        );
+    if adapter.is_none() && !hub && !database && !spool {
+        eprintln!("用法：metria doctor [--adapter <name>] [--hub] [--database] [--spool]");
     }
 
     if failures > 0 {
@@ -114,22 +108,6 @@ fn env_key(name: &str) -> String {
         "codex" => "METRIA_CODEX_PATH".into(),
         "opencode" => "METRIA_OPENCODE_PATH".into(),
         _ => "METRIA_SOURCES_PATH".into(),
-    }
-}
-
-fn check_traffic() {
-    println!("== Traffic 估算能力 ==");
-    for a in registry::all() {
-        let caps = a.capabilities();
-        println!(
-            "- {}: request_reconstruction={} response_reconstruction={} context_transport_detection={} cache_tokens={} reasoning_tokens={}",
-            a.display_name(),
-            caps.request_reconstruction,
-            caps.response_reconstruction,
-            caps.context_transport_detection,
-            caps.cache_tokens,
-            caps.reasoning_tokens,
-        );
     }
 }
 

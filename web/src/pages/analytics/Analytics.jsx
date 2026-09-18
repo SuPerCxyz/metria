@@ -15,6 +15,7 @@ import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
+import { isAvailable } from '../../services/dataAvailability'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -68,6 +69,7 @@ export default function Analytics() {
   const latency = useQuery(`latency${q(scopedParams)}`, () => api(`/usage/latency${q(scopedParams)}`))
   const latencySeries = useQuery(`latency-ts${q(scopedParams)}`, () => api(`/usage/latency/timeseries${q(scopedParams)}`))
   const performance = useQuery(`performance${q(scopedParams)}`, () => api(`/usage/performance${q(scopedParams)}`))
+  const performanceSeries = useQuery(`performance-ts${q(scopedParams)}`, () => api(`/usage/performance/timeseries${q(scopedParams)}`))
   const nodeNames = useNodeNames()
 
   const latencyTrend = useMemo(() => {
@@ -84,12 +86,26 @@ export default function Analytics() {
     }
   }, [latencySeries.data])
 
+  const performanceTrend = useMemo(() => {
+    const pts = performanceSeries.data?.series || []
+    const pick = (key) => pts.map((p) => p[key] ?? null)
+    return {
+      labels: pts.map((p) => p.bucket),
+      latency: [
+        { label: 'TTFT', values: pick('ttft_avg_ms'), color: COLORS.latency.p50 },
+        { label: '首字节', values: pick('first_byte_avg_ms'), color: COLORS.latency.p95 },
+        { label: '生成耗时', values: pick('generation_avg_ms'), color: COLORS.latency.avg },
+        { label: 'Token 间延迟', values: pick('inter_token_latency_avg_ms'), color: PALETTE[3] },
+      ],
+      speed: [{ label: '输出 Token/s', values: pts.map((p) => p.output_tokens_per_second_milli_avg == null ? null : p.output_tokens_per_second_milli_avg / 1000), color: COLORS.output }],
+    }
+  }, [performanceSeries.data])
+
   const trendData = useMemo(() => {
     const pts = series.data?.series || []
     switch (trendTab) {
       case 'tokens': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => sumTokens(p)) }
       case 'cost': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.cost_micro_usd) }
-      case 'traffic': return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.estimated_traffic_bytes) }
       default: return { labels: pts.map((p) => p.bucket), values: pts.map((p) => p.model_calls) }
     }
   }, [series.data, trendTab])
@@ -102,7 +118,6 @@ export default function Analytics() {
       switch (detailMetric) {
         case 'requests': return point?.model_calls ?? 0
         case 'cost': return point?.cost_micro_usd ?? 0
-        case 'traffic': return point?.estimated_traffic_bytes ?? 0
         default: return sumTokens(point)
       }
     }
@@ -140,6 +155,22 @@ export default function Analytics() {
   })
 
   const cacheHit = cacheHitRate(o)
+  const hasTokenData = (o.token_calls ?? 0) > 0
+  const hasRequestData = (o.model_calls ?? 0) > 0
+  const hasCacheData = cacheHit != null || (o.cache_read_tokens ?? 0) > 0 || (o.cache_write_tokens ?? 0) > 0
+  const performanceMetric = (key, valueKey = 'avg_ms') => {
+    const metric = performance.data?.[key]
+    return metric?.count > 0 && isAvailable(metric[valueKey])
+  }
+  const performanceHasSamples = [
+    performanceMetric('ttft'),
+    performanceMetric('first_byte'),
+    performanceMetric('generation'),
+    performanceMetric('output_speed', 'avg_tokens_per_second'),
+    performanceMetric('inter_token_latency'),
+    performance.data?.stalls?.count > 0,
+    ...['request_payload', 'response_payload', 'request_wire', 'response_wire'].map((key) => performance.data?.observed_bytes?.[key]?.count > 0),
+  ].some(Boolean)
 
   const modelItems = (byModel.data?.by || [])
     .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
@@ -159,7 +190,7 @@ export default function Analytics() {
       </div>
 
       {tab === 'tokens' && (
-        <>
+        hasTokenData ? <>
           <div className="grid grid-cols-12 gap-6">
             <MetricCard label="Token 消耗" value={fmtTokensShort(sumTokens(o))} {...compare(sumTokens(o), previous ? sumTokens(previous) : null)} sub={`输入 ${fmtTokensShort(o.input_tokens)} · 输出 ${fmtTokensShort(outputTokens(o))} · 缓存 ${fmtTokensShort((o.cache_read_tokens ?? 0) + (o.cache_write_tokens ?? 0))}`} />
             <MetricCard label="输入 Token" value={fmtTokensShort(o.input_tokens)} {...compare(o.input_tokens, previous?.input_tokens)} sub="请求上下文" />
@@ -175,11 +206,11 @@ export default function Analytics() {
             <RankingCard title="模型 Token 排行" items={modelItems} onClick={(i) => navigate(`/models/${encodeURIComponent(i.id)}`)} />
             <RankingCard title="节点 Token 排行" items={nodeItems} onClick={(i) => navigate(`/nodes/${encodeURIComponent(i.id)}`)} />
           </div>
-        </>
+        </> : <EmptyState title="当前范围暂无 Token 数据" desc="所选范围没有带有效 Token 的模型调用。" />
       )}
 
       {tab === 'requests' && (
-        <>
+        hasRequestData ? <>
           <div className="grid grid-cols-12 gap-6">
             <MetricCard label="请求总数" value={fmtTokensShort(o.model_calls)} {...compare(o.model_calls, previous?.model_calls)} />
             <MetricCard label="成功请求" value={fmtTokensShort((o.model_calls ?? 0) - (o.failed_calls ?? 0))} {...compare((o.model_calls ?? 0) - (o.failed_calls ?? 0), previous ? (previous.model_calls ?? 0) - (previous.failed_calls ?? 0) : null)} sub={`失败 ${o.failed_calls ?? 0} 次`} />
@@ -190,11 +221,11 @@ export default function Analytics() {
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">请求趋势</h2>
             <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={(v) => v.toLocaleString()} />
           </div>
-        </>
+        </> : <EmptyState title="当前范围暂无请求数据" desc="所选范围没有模型调用。" />
       )}
 
       {tab === 'cache' && (
-        <>
+        hasCacheData ? <>
           <div className="grid grid-cols-12 gap-6">
             <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
             <MetricCard label="缓存命中率" value={fmtPct100(cacheHit)} {...compare(cacheHit, cacheHitRate(previous))} />
@@ -205,7 +236,7 @@ export default function Analytics() {
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">缓存趋势</h2>
             <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={fmtTokensShort} />
           </div>
-        </>
+        </> : <EmptyState title="当前范围暂无缓存数据" desc="所选范围没有可识别的缓存读取或缓存写入 Token。" />
       )}
 
       {detailMode && (
@@ -227,39 +258,95 @@ export default function Analytics() {
 
       {tab === 'latency' && (
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">延迟分析</h2>
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">性能分析</h2>
           {performance.loading ? <LoadingSkeleton rows={2} /> : performance.error ? (
             <ErrorState error={performance.error} onRetry={performance.refresh} />
-          ) : (
+          ) : performanceHasSamples ? (
             <>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <PerformanceCard
-                  label="首个可观察输出延迟"
-                  value={performance.data?.ttft?.avg_ms != null ? fmtDuration(performance.data.ttft.avg_ms) : '不可用'}
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                {performanceMetric('ttft') && <PerformanceCard
+                  label="TTFT"
+                  value={fmtDuration(performance.data.ttft.avg_ms)}
                   count={performance.data?.ttft?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.ttft?.coverage}
-                  hint="从客户端只读日志的请求起点到首个可观察输出事件，不等同服务端精确首 Token。"
-                />
-                <PerformanceCard
-                  label="估算输出速度"
-                  value={performance.data?.output_speed?.avg_tokens_per_second != null ? `${performance.data.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '不可用'}
+                  hint="优先使用原生实时首 Token；日志来源会单独标记。"
+                />}
+                {performanceMetric('output_speed', 'avg_tokens_per_second') && <PerformanceCard
+                  label="输出速度"
+                  value={`${performance.data.output_speed.avg_tokens_per_second.toFixed(1)} Token/s`}
                   count={performance.data?.output_speed?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.output_speed?.coverage}
-                  hint="仅在首输出、完成时间和输出 Token 均可用时计算。"
-                />
+                  hint="只计算首 Token 之后的生成区间，不把等待时间算入速度。"
+                />}
+                {performanceMetric('first_byte') && <PerformanceCard
+                  label="首字节延迟"
+                  value={fmtDuration(performance.data.first_byte.avg_ms)}
+                  count={performance.data?.first_byte?.count}
+                  total={performance.data?.total_calls}
+                  coverage={performance.data?.first_byte?.coverage}
+                  hint="请求开始到首个响应字节。"
+                />}
+                {performanceMetric('generation') && <PerformanceCard
+                  label="生成耗时"
+                  value={fmtDuration(performance.data.generation.avg_ms)}
+                  count={performance.data?.generation?.count}
+                  total={performance.data?.total_calls}
+                  coverage={performance.data?.generation?.coverage}
+                  hint="首 Token 到最后输出事件。"
+                />}
+                {performanceMetric('inter_token_latency') && <PerformanceCard
+                  label="Token 间延迟"
+                  value={fmtDuration(performance.data.inter_token_latency.avg_ms)}
+                  count={performance.data.inter_token_latency.count}
+                  total={performance.data.total_calls}
+                  coverage={performance.data.inter_token_latency.coverage}
+                  hint="相邻输出 Token 之间的观测间隔。"
+                />}
+              </div>
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                {performance.data?.reliability?.success_rate != null && <SimpleMetric label="成功率" value={`${(performance.data.reliability.success_rate * 100).toFixed(1)}%`} />}
+                {performance.data?.stalls?.count > 0 && isAvailable(performance.data.stalls.avg_count) && <SimpleMetric label="平均停顿次数" value={Number(performance.data.stalls.avg_count).toFixed(1)} />}
+                {['request_payload', 'response_payload', 'request_wire', 'response_wire'].map((key) => {
+                  const metric = performance.data?.observed_bytes?.[key]
+                  if (metric?.count <= 0 || !isAvailable(metric.bytes)) return null
+                  const labels = {
+                    request_payload: '观测请求字节',
+                    response_payload: '观测响应字节',
+                    request_wire: '观测请求 Wire 字节',
+                    response_wire: '观测响应 Wire 字节',
+                  }
+                  return <SimpleMetric key={key} label={labels[key]} value={fmtBytes(metric.bytes)} />
+                })}
               </div>
               <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">
                 观测来源：{formatTimingSources(performance.data?.sources)}；不支持的调用保持不可用，不按 0 计入。
               </p>
+              {performanceSeries.loading ? <LoadingSkeleton rows={3} /> : performanceSeries.error ? (
+                <ErrorState error={performanceSeries.error} onRetry={performanceSeries.refresh} />
+              ) : (
+                <div className="mt-6 space-y-6">
+                  {performanceTrend.latency.some((dataset) => dataset.values.some((value) => value != null)) && <div>
+                    <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">实时性能趋势</h3>
+                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首字节、首 Token、生成耗时和 Token 间延迟趋势" />
+                  </div>}
+                  {performanceTrend.speed[0].values.some((value) => value != null) && <div>
+                    <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">输出速度趋势</h3>
+                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.speed} range={range} height={220} formatY={(value) => `${Number(value).toFixed(1)} Token/s`} ariaLabel="输出 Token 每秒趋势" />
+                  </div>}
+                </div>
+              )}
             </>
+          ) : (
+            <EmptyState title="暂无可用观测数据" desc="普通 Agent 只读取日志；需要原生 Agent 通过 observe 启动且存在可证明的性能样本。" />
           )}
 
-          <h3 className="mb-3 mt-6 text-sm font-semibold text-gray-500 dark:text-gray-400">端到端调用时长</h3>
+          {(latency.data?.count ?? 0) > 0 && <>
+          <h3 className="mb-3 mt-6 text-sm font-semibold text-gray-500 dark:text-gray-400">日志端到端调用时长</h3>
           {latency.loading ? <LoadingSkeleton rows={3} /> : latency.error ? (
             <ErrorState error={latency.error} onRetry={latency.refresh} />
-          ) : (latency.data?.count ?? 0) > 0 ? (
+          ) : (
             <>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <LatencyCard label="P50" ms={latency.data.p50_ms} />
@@ -287,9 +374,8 @@ export default function Analytics() {
                 )}
               </div>
             </>
-          ) : (
-            <EmptyState title="暂无延迟数据" desc="客户端日志未记录调用时长（duration_ms 缺失），暂无法计算 P50/P95/P99。" />
           )}
+          </>}
         </div>
       )}
     </>
@@ -316,13 +402,10 @@ function DetailAnalysis({
     { key: 'tokens', label: 'Token' },
     { key: 'requests', label: '请求' },
     { key: 'cost', label: '费用' },
-    { key: 'traffic', label: '估算流量' },
   ]
   const formatY = metric === 'cost'
     ? fmtUsd
-    : metric === 'traffic'
-      ? fmtBytes
-      : metric === 'requests'
+    : metric === 'requests'
         ? (value) => value.toLocaleString()
         : fmtTokensShort
   const title = tab === 'agent-detail' ? '按 Agent 详细分析' : '按模型详细分析'
@@ -335,10 +418,10 @@ function DetailAnalysis({
   return (
     <>
       <div className="grid grid-cols-12 gap-6">
-        <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} {...detailDelta(sumTokens(overview), previousOverview ? sumTokens(previousOverview) : null)} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />
-        <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} {...detailDelta(overview.model_calls, previousOverview?.model_calls)} sub={`会话 ${fmtTokensShort(overview.sessions)}`} />
-        <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} {...detailDelta(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd, previousOverview?.calculated_cost_micro_usd ?? previousOverview?.estimated_cost_micro_usd)} sub="当前范围" />
-        <MetricCard label="平均延迟" value={latency?.avg_ms != null ? fmtDuration(latency.avg_ms) : '—'} sub="有记录的请求" />
+        {sumTokens(overview) > 0 && <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} {...detailDelta(sumTokens(overview), previousOverview ? sumTokens(previousOverview) : null)} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />}
+        {(overview.model_calls ?? 0) > 0 && <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} {...detailDelta(overview.model_calls, previousOverview?.model_calls)} sub={`会话 ${fmtTokensShort(overview.sessions)}`} />}
+        {isAvailable(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd) && <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} {...detailDelta(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd, previousOverview?.calculated_cost_micro_usd ?? previousOverview?.estimated_cost_micro_usd)} sub="当前范围" />}
+        {latency?.avg_ms != null && <MetricCard label="平均日志时长" value={fmtDuration(latency.avg_ms)} sub="有记录的请求" />}
       </div>
 
       <div className="mt-4 rounded-2xl border border-gray-200 bg-white p-6 shadow-xs dark:border-gray-700/60 dark:bg-gray-800">
@@ -372,6 +455,15 @@ function LatencyCard({ label, ms }) {
     <div className="bg-gray-50 dark:bg-gray-700/30 rounded-xl p-4">
       <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
       <div className="mt-1 text-xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{ms != null ? fmtDuration(ms) : '—'}</div>
+    </div>
+  )
+}
+
+function SimpleMetric({ label, value }) {
+  return (
+    <div className="bg-gray-50 dark:bg-gray-700/30 rounded-xl p-4">
+      <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
+      <div className="mt-1 text-xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{value}</div>
     </div>
   )
 }

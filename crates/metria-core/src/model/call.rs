@@ -26,13 +26,39 @@ pub struct ModelCall {
     pub model_raw: Option<String>,
     pub model_normalized: Option<String>,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub first_byte_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub first_token_at: Option<DateTime<Utc>>,
     pub first_response_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_output_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub first_byte_latency_ms: Option<i64>,
+    #[serde(default)]
+    pub ttft_ms: Option<i64>,
+    #[serde(default)]
+    pub generation_duration_ms: Option<i64>,
+    #[serde(default)]
+    pub output_tokens_per_second_milli: Option<i64>,
+    #[serde(default)]
+    pub inter_token_latency_avg_ms: Option<i64>,
+    #[serde(default)]
+    pub inter_token_latency_p95_ms: Option<i64>,
+    #[serde(default)]
+    pub stall_count: Option<i64>,
+    #[serde(default)]
+    pub stall_duration_ms: Option<i64>,
     #[serde(default)]
     pub timing_source: Option<String>,
     #[serde(default)]
     pub timing_quality: Option<String>,
+    #[serde(default)]
+    pub observability_source: Option<String>,
+    #[serde(default)]
+    pub observability_quality: Option<String>,
     pub status: String,
     pub status_code: Option<i64>,
     pub streaming: bool,
@@ -48,6 +74,22 @@ pub struct ModelCall {
     pub reported_cost_micro_usd: Option<i64>,
     pub calculated_cost_micro_usd: Option<i64>,
     pub estimated_cost_micro_usd: Option<i64>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    #[serde(default)]
+    pub rate_limited: Option<bool>,
+    #[serde(default)]
+    pub observed_request_payload_bytes: Option<i64>,
+    #[serde(default)]
+    pub observed_response_payload_bytes: Option<i64>,
+    #[serde(default)]
+    pub observed_request_wire_bytes: Option<i64>,
+    #[serde(default)]
+    pub observed_response_wire_bytes: Option<i64>,
     pub usage_event_id: Option<String>,
     pub traffic_estimate_id: Option<Id>,
     pub created_at: DateTime<Utc>,
@@ -81,11 +123,24 @@ mod tests {
             model_raw: None,
             model_normalized: None,
             started_at: t(),
+            first_byte_at: None,
+            first_token_at: None,
             first_response_at: None,
+            last_output_at: None,
             completed_at: None,
             duration_ms: None,
+            first_byte_latency_ms: None,
+            ttft_ms: None,
+            generation_duration_ms: None,
+            output_tokens_per_second_milli: None,
+            inter_token_latency_avg_ms: None,
+            inter_token_latency_p95_ms: None,
+            stall_count: None,
+            stall_duration_ms: None,
             timing_source: None,
             timing_quality: None,
+            observability_source: None,
+            observability_quality: None,
             status: "success".into(),
             status_code: Some(200),
             streaming: false,
@@ -101,6 +156,14 @@ mod tests {
             reported_cost_micro_usd: None,
             calculated_cost_micro_usd: None,
             estimated_cost_micro_usd: None,
+            endpoint: None,
+            finish_reason: None,
+            error_kind: None,
+            rate_limited: None,
+            observed_request_payload_bytes: None,
+            observed_response_payload_bytes: None,
+            observed_request_wire_bytes: None,
+            observed_response_wire_bytes: None,
             usage_event_id: None,
             traffic_estimate_id: None,
             created_at: t(),

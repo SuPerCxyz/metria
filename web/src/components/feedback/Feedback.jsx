@@ -53,6 +53,7 @@ export function DataQualityNote({ text, kind = 'estimated' }) {
     estimated: 'text-sky-600 dark:text-sky-400 border-sky-200 dark:border-sky-800 bg-sky-50 dark:bg-sky-400/5',
     exact: 'text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-400/5',
     partial: 'text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-400/5',
+    missing: 'text-gray-600 dark:text-gray-400 border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/30',
   }
   return (
     <div className={`text-xs px-3 py-2 rounded-lg border ${colors[kind] || colors.estimated}`}>

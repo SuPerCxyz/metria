@@ -29,3 +29,6 @@ metria-adapter-opencode = { path = "../metria-adapter-opencode" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

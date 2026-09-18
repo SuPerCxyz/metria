@@ -1,4 +1,4 @@
-// Agents 列表：Agent 名称/客户端数/活跃节点/会话数/Token/费用/流量。
+// Agents 列表：Agent 名称/请求数/会话数/Token/费用。
 
 import React, { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -10,7 +10,7 @@ import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct100, sumTokens, cacheHitRate } from '../../services/format'
 
 const AGENT_LABELS = {
   'claude-code': 'Claude Code',
@@ -38,13 +38,12 @@ export default function Agents() {
   if (query.loading) return <LoadingSkeleton rows={5} />
 
   const columns = [
-    { key: 'dimension', label: 'Agent 名称', sortable: true, render: (r) => AGENT_LABELS[r.dimension] || r.dimension },
-    { key: 'input_tokens', label: 'Token', sortable: true, render: (r) => fmtTokensShort(sumTokens(r)) },
-    { key: 'cache', label: '缓存命中率', render: (r) => cacheHitRate(r) != null ? fmtPct100(cacheHitRate(r)) : '—' },
+    { key: 'dimension', label: 'Agent 名称', sortValue: (r) => AGENT_LABELS[r.dimension] || r.dimension, render: (r) => AGENT_LABELS[r.dimension] || r.dimension },
+    { key: 'input_tokens', label: 'Token', sortValue: (r) => sumTokens(r), render: (r) => fmtTokensShort(sumTokens(r)) },
+    { key: 'cache', label: '缓存命中率', hideWhenEmpty: true, sortValue: (r) => cacheHitRate(r), render: (r) => cacheHitRate(r) != null ? fmtPct100(cacheHitRate(r)) : '—' },
     { key: 'model_calls', label: '请求数', sortable: true, render: (r) => String(r.model_calls ?? 0) },
     { key: 'sessions', label: '会话数', render: (r) => String(r.sessions ?? 0) },
-    { key: 'cost', label: '费用', render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
-    { key: 'traffic', label: '估算流量', render: (r) => fmtBytes(r.estimated_traffic_bytes) },
+    { key: 'cost', label: '费用', hideWhenEmpty: true, sortValue: (r) => r.cost_micro_usd, render: (r) => fmtUsd(r.cost_micro_usd) },
   ]
 
   return (

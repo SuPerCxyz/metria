@@ -52,7 +52,7 @@ export default function Login() {
         <div className="mb-8 text-center">
           <img src="/static/metria-logo.png" alt="Metria" className="w-16 h-16 rounded-2xl object-cover mx-auto mb-4" />
           <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">Metria</h1>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">AI 编程 Agent 用量监控 · 费用分析 · 流量估算</p>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">AI 编程 Agent 用量监控 · 费用分析 · 性能观测</p>
         </div>
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           {showPasswordForm && (

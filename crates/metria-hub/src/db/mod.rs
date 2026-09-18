@@ -908,6 +908,10 @@ impl HubDb {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
         let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let capabilities = v
+            .get("capabilities")
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_else(|| "[]".into());
         let client_id = get("client_id");
         if !client_id.is_empty() {
             let _ = c.execute(
@@ -917,7 +921,7 @@ impl HubDb {
         }
         let n = c
             .execute(
-                "INSERT OR IGNORE INTO sources (id, node_id, collector_id, client_id, adapter_id, adapter_version, source_fingerprint, source_path_hash, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?9)",
+                "INSERT OR IGNORE INTO sources (id, node_id, collector_id, client_id, adapter_id, adapter_version, source_fingerprint, source_path_hash, capabilities, status, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'active',?10,?10)",
                 params![
                     get("id"),
                     get("node_id"),
@@ -927,10 +931,23 @@ impl HubDb {
                     get("adapter_version"),
                     get("source_fingerprint"),
                     get("source_path_hash"),
+                    capabilities,
                     now,
                 ],
             )
             .map_err(StorageError::from)?;
+        c.execute(
+            "UPDATE sources SET capabilities = CASE WHEN ?1 = '[]' THEN capabilities ELSE ?1 END, client_version = COALESCE(?2, client_version), updated_at = ?3 WHERE id = ?4",
+            params![
+                v.get("capabilities")
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .unwrap_or_else(|| "[]".into()),
+                v.get("client_version").and_then(|x| x.as_str()),
+                now,
+                get("id"),
+            ],
+        )
+        .map_err(StorageError::from)?;
         Ok(n > 0)
     }
 
@@ -1086,8 +1103,13 @@ impl HubDb {
                     client_aborted, retry_count, call_granularity, input_tokens, output_tokens, cache_read_tokens,
                     cache_write_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
                     estimated_cost_micro_usd, usage_event_id, traffic_estimate_id, created_at, updated_at,
-                    timing_source, timing_quality
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38)",
+                    timing_source, timing_quality, first_byte_at, first_token_at, last_output_at,
+                    first_byte_latency_ms, ttft_ms, generation_duration_ms, output_tokens_per_second_milli,
+                    inter_token_latency_avg_ms, inter_token_latency_p95_ms, stall_count, stall_duration_ms,
+                    observability_source, observability_quality, endpoint, finish_reason, error_kind, rate_limited,
+                    observed_request_payload_bytes, observed_response_payload_bytes,
+                    observed_request_wire_bytes, observed_response_wire_bytes
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,?56,?57,?58,?59)",
                 params![
                     g("id"),
                     opt(g("source_call_id")),
@@ -1127,6 +1149,27 @@ impl HubDb {
                     now,
                     opt(g("timing_source")),
                     opt(g("timing_quality")),
+                    opt(g("first_byte_at")),
+                    opt(g("first_token_at")),
+                    opt(g("last_output_at")),
+                    gn("first_byte_latency_ms"),
+                    gn("ttft_ms"),
+                    gn("generation_duration_ms"),
+                    gn("output_tokens_per_second_milli"),
+                    gn("inter_token_latency_avg_ms"),
+                    gn("inter_token_latency_p95_ms"),
+                    gn("stall_count"),
+                    gn("stall_duration_ms"),
+                    opt(g("observability_source")),
+                    opt(g("observability_quality")),
+                    opt(g("endpoint")),
+                    opt(g("finish_reason")),
+                    opt(g("error_kind")),
+                    opt_bool_i(v.get("rate_limited")),
+                    gn("observed_request_payload_bytes"),
+                    gn("observed_response_payload_bytes"),
+                    gn("observed_request_wire_bytes"),
+                    gn("observed_response_wire_bytes"),
                 ],
             )
             .map_err(StorageError::from)?;

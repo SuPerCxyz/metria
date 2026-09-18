@@ -4,6 +4,7 @@ import React, { useMemo } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
+import SortableList from '../../components/common/SortableList'
 import StatusBadge from '../../components/common/StatusBadge'
 import TrendChart from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
@@ -11,7 +12,7 @@ import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedba
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtDateTime, fmtRelative, fmtAgentAddress, fmtSessionTitle, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct100, fmtDateTime, fmtRelative, fmtAgentAddress, fmtSessionTitle, sumTokens, cacheHitRate } from '../../services/format'
 
 export default function NodeDetail() {
   const { id } = useParams()
@@ -65,22 +66,28 @@ export default function NodeDetail() {
           { label: 'Token', value: fmtTokensShort(sumTokens(rs)) },
           { label: '缓存命中率', value: cacheHitRate(rs) != null ? fmtPct100(cacheHitRate(rs)) : '—' },
           { label: '费用', value: fmtUsd(rs.cost_micro_usd) },
-          { label: '估算流量', value: fmtBytes(rs.estimated_total_bytes) },
           { label: '最后上报', value: fmtDateTime(n.last_seen_at) },
         ]}
       />
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token / 费用 / 估算流量趋势</h2>
+        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token / 费用趋势</h2>
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={fmtTokensShort} />}
       </div>
 
       <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">节点上的 Agent</h2>
-          {(query.data?.collectors || []).length === 0 && <EmptyState title="暂无 Agent" />}
-          <div className="space-y-2">
-            {(query.data?.collectors || []).map((c) => (
+          <SortableList
+            items={query.data?.collectors || []}
+            options={[
+              { key: 'id', label: 'Agent', getValue: (c) => c.id },
+              { key: 'version', label: '版本', getValue: (c) => c.agent_version },
+              { key: 'status', label: '状态', getValue: (c) => c.status },
+            ]}
+            empty={<EmptyState title="暂无 Agent" />}
+            className="space-y-2"
+            renderItem={(c) => (
               <div key={c.id} className="flex items-center justify-between px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-700/30">
                 <div>
                   <div className="text-sm font-medium text-gray-700 dark:text-gray-200">{c.id}</div>
@@ -88,27 +95,35 @@ export default function NodeDetail() {
                 </div>
                 <StatusBadge status={c.status} />
               </div>
-            ))}
-          </div>
+            )}
+          />
         </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+        {(query.data?.by_model || []).length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">使用的模型</h2>
           <RankingList items={(query.data?.by_model || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0, cost: m.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
-        </div>
+        </div>}
       </div>
 
-      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      {(query.data?.recent_sessions || query.data?.sessions || []).length > 0 && <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">最近会话</h2>
-        <div className="space-y-2">
-          {(query.data?.recent_sessions || query.data?.sessions || []).slice(0, 8).length === 0 && <EmptyState title="暂无会话" />}
-          {(query.data?.recent_sessions || query.data?.sessions || []).slice(0, 8).map((s) => (
+        <SortableList
+          items={query.data?.recent_sessions || query.data?.sessions || []}
+          limit={8}
+          options={[
+            { key: 'started_at', label: '时间', getValue: (s) => s.started_at },
+            { key: 'title', label: '标题', getValue: (s) => fmtSessionTitle(s.title, s.started_at) || s.source_session_id },
+            { key: 'input_tokens', label: 'Token', getValue: (s) => s.input_tokens },
+          ]}
+          empty={<EmptyState title="暂无会话" />}
+          className="space-y-2"
+          renderItem={(s) => (
             <button key={s.id} type="button" onClick={() => navigate(`/sessions/${encodeURIComponent(s.id)}`)} className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 text-left">
                 <span className="text-sm text-gray-700 dark:text-gray-200 truncate">{fmtSessionTitle(s.title, s.started_at) || s.source_session_id}</span>
               <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">{fmtDateTime(s.started_at)} · {fmtTokensShort(s.input_tokens)} tokens</span>
             </button>
-          ))}
-        </div>
-      </div>
+          )}
+        />
+      </div>}
     </>
   )
 }

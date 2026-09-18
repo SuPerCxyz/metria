@@ -220,43 +220,6 @@ fn gen_session(
         if db.insert_usage(&usage, &session_key).unwrap_or(false) {
             let _ = db.rollup_event("usage", &usage);
         }
-
-        // 流量（来源：token_profile / partial_reconstruction 混合，体现不同置信度）
-        let est_source = if rng.next() % 4 == 0 {
-            "token_profile"
-        } else {
-            "partial_reconstruction"
-        };
-        let conf = if est_source == "partial_reconstruction" {
-            0.65
-        } else {
-            0.5
-        };
-        let req = (input as f64 * 3.8).round() as i64;
-        let resp = (output as f64 * 4.0).round() as i64;
-        let total = req + resp;
-        let traffic = json!({
-            "id": format!("te-{call_id}"),
-            "model_call_id": call_id,
-            "node_id": node,
-            "client_id": client,
-            "session_id": format!("sess-{sid}"),
-            "model": metria_core::normalize::normalize_model(model),
-            "estimated_request_wire_bytes": req,
-            "estimated_response_wire_bytes": resp,
-            "estimated_total_wire_bytes": total,
-            "lower_bound_bytes": (total as f64 * 0.7).round() as i64,
-            "upper_bound_bytes": (total as f64 * 1.4).round() as i64,
-            "estimation_source": est_source,
-            "context_transport_mode": if client == "codex" && rng.next() % 2 == 0 { "stateful_reference" } else { "full_context" },
-            "cache_transport_behavior": if cache_read > 0 { "full_content_sent" } else { "unknown" },
-            "request_reconstruction_quality": "partial",
-            "response_reconstruction_quality": "complete",
-            "confidence": conf,
-            "calculated_at": ts.to_rfc3339(),
-        });
-        let _ = db.insert_traffic(&traffic);
-        let _ = db.rollup_event("traffic", &traffic);
     }
 
     let _ = total_input;

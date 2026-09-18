@@ -31,13 +31,12 @@ fn real_codex_smoke() {
         let batch = a.scan(s, None, &ScanIdentity::test()).expect("scan 失败");
         total_calls += batch.model_calls.len();
         println!(
-            "{}: sessions={} calls={} usage={} tools={} traffic={} warnings={}",
+            "{}: sessions={} calls={} usage={} tools={} warnings={}",
             s.canonical_path.display(),
             batch.sessions.len(),
             batch.model_calls.len(),
             batch.usage_events.len(),
             batch.tool_events.len(),
-            batch.traffic_estimates.len(),
             batch.warnings.len()
         );
     }

@@ -68,7 +68,7 @@ fn golden_full_parses_session_events() {
     assert_eq!(s.batch.usage_events.len(), 2);
     assert_eq!(s.batch.tool_events.len(), 2);
     assert_eq!(s.batch.messages.len(), 6);
-    assert!(!s.batch.traffic_estimates.is_empty());
+    assert!(s.batch.traffic_estimates.is_empty());
 
     // 所有调用 reasoning 已知
     for c in &s.batch.model_calls {

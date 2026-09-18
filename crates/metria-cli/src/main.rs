@@ -11,7 +11,7 @@ const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(
     name = "metria",
     version = PKG_VERSION,
-    about = "Metria - AI coding agent 用量监控、费用分析与流量估算平台",
+    about = "Metria - AI coding agent 用量监控、费用分析与模型性能观测平台",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -29,6 +29,24 @@ enum Command {
     },
     /// 启动 Metria Agent（Collector）
     Agent,
+    /// 以临时运行时观测启动一个本地客户端命令（仅原生 Agent）
+    #[command(
+        after_help = "示例：\n  metria observe --client codex --upstream https://api.openai.com/v1 -- codex\n  metria observe --client claude-code --upstream https://api.anthropic.com -- claude\n\n仅在命令生命周期内观测；退出、失败或租约到期后自动清理本地端口和临时配置。Docker Agent 不启用此模式。"
+    )]
+    Observe {
+        /// 客户端：claude | codex | opencode
+        #[arg(long, value_parser = ["claude", "claude-code", "codex", "opencode"])]
+        client: String,
+        /// 上游模型 API 基地址；OpenCode 通常必须显式提供
+        #[arg(long)]
+        upstream: Option<String>,
+        /// OpenCode 配置中的 provider ID（多 provider 时必填）
+        #[arg(long)]
+        provider: Option<String>,
+        /// 客户端命令及参数，使用 `--` 分隔
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// 将客户端数据源目录导入为归一化事件
     Import {
         /// 数据源客户端：claude | codex | opencode
@@ -55,8 +73,6 @@ enum Command {
         database: bool,
         #[arg(long, default_value_t = false)]
         spool: bool,
-        #[arg(long, default_value_t = false)]
-        traffic: bool,
     },
     /// 查看或生成配置
     Config,
@@ -120,6 +136,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Observe {
+            client,
+            upstream,
+            provider,
+            command,
+        } => match run_observe(&client, upstream.as_deref(), provider.as_deref(), &command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(%e, "observe 失败");
+                ExitCode::FAILURE
+            }
+        },
         Command::Hub { demo } => match run_hub(demo) {
             Ok(code) => code,
             Err(e) => {
@@ -144,17 +172,13 @@ fn main() -> ExitCode {
             hub,
             database,
             spool,
-            traffic,
-        } => {
-            match metria_cli::doctor::run_doctor(adapter.as_deref(), hub, database, spool, traffic)
-            {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("doctor 失败: {e}");
-                    ExitCode::FAILURE
-                }
+        } => match metria_cli::doctor::run_doctor(adapter.as_deref(), hub, database, spool) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("doctor 失败: {e}");
+                ExitCode::FAILURE
             }
-        }
+        },
         Command::Config => match run_config() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -318,6 +342,16 @@ fn run_agent() -> Result<ExitCode, metria_agent::AgentError> {
     let cfg = metria_agent::AgentConfig::from_env()?;
     metria_agent::run(cfg)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_observe(
+    client: &str,
+    upstream: Option<&str>,
+    provider: Option<&str>,
+    command: &[String],
+) -> Result<(), metria_agent::AgentError> {
+    let cfg = metria_agent::AgentConfig::from_env()?;
+    metria_agent::observer::run(cfg, client, upstream, provider, command)
 }
 
 fn run_hub(demo: bool) -> Result<ExitCode, metria_hub::HubError> {

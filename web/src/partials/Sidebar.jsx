@@ -1,4 +1,4 @@
-// Metria 侧边栏：总览 / 使用分析 / 会话 / 节点 / Agents / 模型 / 费用 / 估算流量 / 设置。
+// Metria 侧边栏：总览 / 使用分析 / 会话 / 节点 / Agents / 模型 / 费用 / 设置。
 
 import React, { useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
@@ -35,6 +35,10 @@ const NAV_ICONS = {
     <path d="M16 10a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 14.286V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
     <path d="M20 9a2 2 0 0 1 2 2v10.286a.71.71 0 0 1-1.212.502l-2.202-2.202A2 2 0 0 0 17.172 19H10a2 2 0 0 1-2-2v-1" />
   </>),
+  calls: navIcon(<>
+    <path d="M5 4h14v16H5z" />
+    <path d="M8 8h8M8 12h8M8 16h5" />
+  </>),
   nodes: navIcon(<>
     <rect width="16" height="7" x="4" y="3" rx="1.5" />
     <rect width="16" height="7" x="4" y="14" rx="1.5" />
@@ -54,14 +58,14 @@ const NAV_ICONS = {
     <path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z" />
     <path d="M16 8h-6M16 12h-6M13 16h-3" />
   </>),
-  traffic: navIcon(<>
-    <path d="m3 16 4 4 4-4M7 20V4" />
-    <path d="m21 8-4-4-4 4M17 4v16" />
-  </>),
   settings: navIcon(<>
     <path d="M20 7h-9M14 17H5" />
     <circle cx="17" cy="17" r="3" />
     <circle cx="7" cy="7" r="3" />
+  </>),
+  quality: navIcon(<>
+    <path d="M12 3 4 6v5c0 5 3.4 8.5 8 10 4.6-1.5 8-5 8-10V6l-8-3Z" />
+    <path d="m8.5 12 2.2 2.2 4.8-5" />
   </>),
 }
 
@@ -72,6 +76,7 @@ const NAV_GROUPS = [
       { to: '/', label: '总览', icon: NAV_ICONS.overview, end: true },
       { to: '/analytics', label: '使用分析', icon: NAV_ICONS.analytics },
       { to: '/sessions', label: '会话', icon: NAV_ICONS.sessions },
+      { to: '/calls', label: '调用', icon: NAV_ICONS.calls },
       { to: '/nodes', label: '节点', icon: NAV_ICONS.nodes },
     ],
   },
@@ -86,12 +91,14 @@ const NAV_GROUPS = [
     label: '分析',
     items: [
       { to: '/costs', label: '费用', icon: NAV_ICONS.costs },
-      { to: '/traffic', label: '估算流量', icon: NAV_ICONS.traffic },
     ],
   },
   {
     label: '系统',
-    items: [{ to: '/settings', label: '设置', icon: NAV_ICONS.settings }],
+    items: [
+      { to: '/data-quality', label: '数据质量', icon: NAV_ICONS.quality },
+      { to: '/settings', label: '设置', icon: NAV_ICONS.settings },
+    ],
   },
 ]
 
@@ -191,7 +198,7 @@ function Sidebar({ sidebarOpen, setSidebarOpen }) {
             {expanded && (
               <div className="rounded-xl border border-gray-200 dark:border-gray-700/60 p-3">
                 <div className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
-                  AI 编程 Agent 用量监控 · 费用分析 · 流量估算
+                  AI 编程 Agent 用量监控 · 费用分析 · 性能观测
                 </div>
               </div>
             )}

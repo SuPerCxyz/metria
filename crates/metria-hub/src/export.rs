@@ -36,8 +36,7 @@ pub fn export_sessions(
             "SELECT id, source_session_id, node_id, client_id, title, primary_model_normalized,
                     started_at, ended_at, message_count, tool_call_count, model_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                    estimated_total_bytes
+                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
              FROM sessions WHERE started_at >= ?1 AND started_at < ?2 ORDER BY started_at",
         )
         .map_err(|e| e.to_string())?;
@@ -63,7 +62,6 @@ pub fn export_sessions(
                 "reported_cost_micro_usd": r.get::<_, Option<i64>>(16)?,
                 "calculated_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
                 "estimated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
-                "estimated_total_bytes": r.get::<_, Option<i64>>(19)?,
             }))
         })
         .map_err(|e| e.to_string())?;

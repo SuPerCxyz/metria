@@ -9,15 +9,14 @@ Metria 默认**全量保留**原始事件与 rollup，无自动删除。可依�
 | `usage_events` / `model_calls` | 永久 | 单次调用明细，统计可追溯 |
 | `sessions` / `messages` | 永久 | 会话与（按 content_mode 的）消息元数据 |
 | `hourly_rollups` / `daily_rollups` | 永久 | Dashboard 读取的汇总 |
-| `traffic_estimates` | 永久 | 估算流量，保留版本以便重新估算对比 |
-| `traffic_profile_samples` | 永久 | 自动学习样本 |
+| `traffic_estimates` / `traffic_profiles` / `traffic_profile_samples` | 历史兼容 | 旧版本估算流量数据；当前版本不新增写入、不参与查询，可随数据库升级保留 |
 | `report_sends` | 最新 30 条 | 报告渠道、周期、状态和错误详情 |
 
 **建议**：
 
 - 若需限制磁盘占用，可对 `messages.content` 等大字段单独清理（保留元数据与 hash）。
 - Rollup 可通过 `DELETE FROM hourly_rollups WHERE bucket < ?` 归档早期聚合；原始事件仍保留。
-- 磁盘容量规划：100 万条 usage 事件约 300–500 MiB（含索引），流量估算约 100–200 MiB。
+- 磁盘容量规划：100 万条 usage 事件约 300–500 MiB（含索引）；运行时观测字节只保存在 `model_calls` 的数值列中。
 
 ## 备份与恢复
 
@@ -124,7 +123,7 @@ cargo test -p metria-hub --test bench -- --ignored --nocapture
 | 100 万 usage 事件批量写入 | ~13s（约 7.7 万/秒） |
 | Overview 查询（读 rollup） | ~20µs |
 | 价格匹配 | ~312 次/ms |
-| 流量重建估算 | ~29 次/ms |
+| 运行时性能查询 | 读取 `model_calls` 派生指标，不重建历史估算流量 |
 
 Dashboard 默认读 rollup，不在每次请求时扫描全部历史事件。
 

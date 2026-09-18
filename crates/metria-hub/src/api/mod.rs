@@ -123,6 +123,10 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/usage/latency", get(usage_latency))
         .route("/api/v1/usage/performance", get(usage_performance))
         .route(
+            "/api/v1/usage/performance/timeseries",
+            get(usage_performance_timeseries),
+        )
+        .route(
             "/api/v1/usage/latency/timeseries",
             get(usage_latency_timeseries),
         )
@@ -154,31 +158,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/sessions/{id}/tools", get(session_tools))
         .route("/api/v1/sessions/{id}/subagents", get(session_subagents))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
-        .route("/api/v1/traffic/summary", get(traffic_summary))
-        .route("/api/v1/traffic/by-node", get(traffic_by_node))
-        .route("/api/v1/traffic/by-client", get(traffic_by_client))
-        .route("/api/v1/traffic/by-model", get(traffic_by_model))
-        .route("/api/v1/traffic/by-provider", get(traffic_by_provider))
         .route("/api/v1/data-quality", get(data_quality))
         .route("/api/v1/shares", post(share_create).get(share_list))
         .route("/api/v1/shares/audits", get(share_audits))
         .route("/api/v1/shares/{slug}", axum::routing::delete(share_delete))
         .route("/api/v1/share/{slug}", get(share_view))
         .route("/api/v1/export", get(export_data))
-        .route(
-            "/api/v1/traffic/profiles",
-            get(traffic_profiles_list).post(traffic_profiles_create),
-        )
-        .route(
-            "/api/v1/traffic/profiles/{id}",
-            axum::routing::delete(traffic_profiles_delete),
-        )
-        .route(
-            "/api/v1/traffic/profiles/learn",
-            post(traffic_profiles_learn),
-        )
-        .route("/api/v1/traffic/profiles/test", post(traffic_profiles_test))
-        .route("/api/v1/traffic/reestimate", post(traffic_reestimate))
         .route("/api/v1/pricing/catalogs", get(pricing_catalogs))
         .route(
             "/api/v1/pricing/catalogs/{id}",
@@ -349,7 +334,6 @@ fn publish_ingest(st: &AppState, kind: &str) {
         "usage" => "usage.created",
         "call" => "call.updated",
         "session" => "session.updated",
-        "traffic" => "traffic.estimated",
         _ => "rollup.updated",
     };
     st.sse.publish(event, "{}");
@@ -1068,36 +1052,21 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
     let mut failed = Vec::new();
     // 每个批次只构造一次引擎，使新 usage 在落库和 rollup 前立即得到费用。
     let pricing_engine = crate::catalog::pricing_engine(&st.db);
-    let call_times: HashMap<&str, &str> = batch
-        .events
-        .iter()
-        .filter(|event| event.kind == "call")
-        .filter_map(|event| {
-            Some((
-                event.payload.get("id")?.as_str()?,
-                event.payload.get("started_at")?.as_str()?,
-            ))
-        })
-        .collect();
-
     let session_map = st.db.session_key_map(&serde_json::json!({
         "sessions": batch.events.iter().filter(|e| e.kind == "session").map(|e| e.payload.clone()).collect::<Vec<_>>()
     }));
 
     for ev in &batch.events {
+        if matches!(ev.kind.as_str(), "traffic" | "traffic_sample") {
+            // 旧 Agent 的积压流量事件按兼容性重复处理，不写入事件去重表、
+            // 旧估算表或新 rollup；返回 duplicate 让重试方停止反复上传。
+            duplicate.push(ev.event_id.clone());
+            continue;
+        }
         let mut payload = ev.payload.clone();
         if ev.kind == "usage" {
             if let Err(error) = crate::catalog::price_usage_payload(&pricing_engine, &mut payload) {
                 tracing::warn!(%error, event_id = %ev.event_id, "usage 即时计价失败，保留未定价状态");
-            }
-        }
-        if ev.kind == "traffic" {
-            if let Some(call_id) = payload.get("model_call_id").and_then(|v| v.as_str()) {
-                if let Some(started_at) = call_times.get(call_id) {
-                    payload["timestamp"] = serde_json::json!(started_at);
-                } else if let Some(started_at) = st.db.model_call_started_at(call_id) {
-                    payload["timestamp"] = serde_json::json!(started_at);
-                }
             }
         }
         let v = &payload;
@@ -1133,8 +1102,6 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
             "usage" => st
                 .db
                 .insert_usage(v, resolved.as_deref().unwrap_or_default()),
-            "traffic" => st.db.insert_traffic(v),
-            "traffic_sample" => st.db.insert_traffic_profile_sample(v),
             "tool" => st.db.insert_tool(v),
             "subagent" => st.db.insert_subagent(v),
             other => Err(metria_storage::StorageError::Query(format!(

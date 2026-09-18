@@ -19,6 +19,7 @@ import Overview from './pages/overview/Overview'
 import Analytics from './pages/analytics/Analytics'
 import Sessions from './pages/sessions/Sessions'
 import SessionDetail from './pages/sessions/SessionDetail'
+import Calls from './pages/calls/Calls'
 import Nodes from './pages/nodes/Nodes'
 import NodeDetail from './pages/nodes/NodeDetail'
 import Agents from './pages/agents/Agents'
@@ -26,9 +27,9 @@ import AgentDetail from './pages/agents/AgentDetail'
 import Models from './pages/models/Models'
 import ModelDetail from './pages/models/ModelDetail'
 import Costs from './pages/costs/Costs'
-import Traffic from './pages/traffic/Traffic'
 import Settings from './pages/settings/Settings'
 import CallDetail from './pages/calls/CallDetail'
+import DataQuality from './pages/data-quality/DataQuality'
 
 function RequireAuth({ children }) {
   const [authed, setAuthed] = useState(null)
@@ -87,6 +88,7 @@ function App() {
                 <Route path="/analytics" element={<ErrorBoundary><Analytics /></ErrorBoundary>} />
                 <Route path="/sessions" element={<ErrorBoundary><Sessions /></ErrorBoundary>} />
                 <Route path="/sessions/:id" element={<ErrorBoundary><SessionDetail /></ErrorBoundary>} />
+                <Route path="/calls" element={<ErrorBoundary><Calls /></ErrorBoundary>} />
                 <Route path="/nodes" element={<ErrorBoundary><Nodes /></ErrorBoundary>} />
                 <Route path="/nodes/:id" element={<ErrorBoundary><NodeDetail /></ErrorBoundary>} />
                 <Route path="/agents" element={<ErrorBoundary><Agents /></ErrorBoundary>} />
@@ -94,8 +96,8 @@ function App() {
                 <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
                 <Route path="/models/:id" element={<ErrorBoundary><ModelDetail /></ErrorBoundary>} />
                 <Route path="/costs" element={<ErrorBoundary><Costs /></ErrorBoundary>} />
-                <Route path="/traffic" element={<ErrorBoundary><Traffic /></ErrorBoundary>} />
                 <Route path="/calls/:id" element={<ErrorBoundary><CallDetail /></ErrorBoundary>} />
+                <Route path="/data-quality" element={<ErrorBoundary><DataQuality /></ErrorBoundary>} />
                 <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
               </Route>
               <Route path="*" element={<Navigate to="/" replace />} />

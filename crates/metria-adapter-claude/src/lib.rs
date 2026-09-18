@@ -138,7 +138,14 @@ impl SourceAdapter for ClaudeCodeAdapter {
         // 汇总所有构建器
         let mut batches = ScanBatch::default();
         for (_, b) in builders {
-            let (s, turns, messages, calls, usage, tools, subagents, traffic) = b.finish();
+            let (mut s, turns, messages, mut calls, usage, tools, subagents, _traffic) = b.finish();
+            s.estimated_request_bytes = None;
+            s.estimated_response_bytes = None;
+            s.estimated_total_bytes = None;
+            s.traffic_confidence = None;
+            for call in &mut calls {
+                call.traffic_estimate_id = None;
+            }
             batches.sessions.push(s);
             batches.turns.extend(turns);
             batches.messages.extend(messages);
@@ -146,7 +153,6 @@ impl SourceAdapter for ClaudeCodeAdapter {
             batches.usage_events.extend(usage);
             batches.tool_events.extend(tools);
             batches.subagent_relations.extend(subagents);
-            batches.traffic_estimates.extend(traffic);
         }
         batches.warnings = tolerance.warnings;
         batches.next_cursor = Some(jsonl_cursor(

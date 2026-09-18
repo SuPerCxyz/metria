@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DataTable from '../../components/tables/DataTable'
+import SortableList from '../../components/common/SortableList'
 import Segmented from '../../components/ui/Segmented'
 import UserAvatar from '../../components/common/UserAvatar'
 import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
@@ -324,10 +325,10 @@ export default function Settings() {
 
   const priceColumns = useMemo(() => [
     { key: 'model_pattern', label: '模型匹配', sortable: true, render: (rule) => <span title={rule.model_pattern} className="block max-w-[32rem] truncate">{rule.model_pattern}</span> },
-    { key: 'price_equivalent_to', label: '价格等价于', sortable: true, render: (rule) => rule.price_equivalent_to ? <span title={rule.price_equivalent_to} className="block max-w-[18rem] truncate">{rule.price_equivalent_to}{rule.price_equivalent_missing_as_free ? '（缺价按 0）' : ''}</span> : '—' },
+    { key: 'price_equivalent_to', label: '价格等价于', sortable: true, sortValue: (rule) => rule.price_equivalent_to, render: (rule) => rule.price_equivalent_to ? <span title={rule.price_equivalent_to} className="block max-w-[18rem] truncate">{rule.price_equivalent_to}{rule.price_equivalent_missing_as_free ? '（缺价按 0）' : ''}</span> : '—' },
     { key: 'input_price', label: '输入/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.input_price != null ? fmtUsd(rule.input_price) : '—'}</span> },
     { key: 'output_price', label: '输出/百万', sortable: true, render: (rule) => <span className="tabular-nums">{rule.output_price != null ? fmtUsd(rule.output_price) : '—'}</span> },
-    { key: 'source', label: '来源', sortable: true, render: (rule) => { const meta = pricingRuleKindMeta(rule); return <span className={`text-xs px-2 py-0.5 rounded-full ${meta.className}`}>{meta.label}</span> } },
+    { key: 'source', label: '来源', sortable: true, sortValue: (rule) => pricingRuleKindMeta(rule).label, render: (rule) => { const meta = pricingRuleKindMeta(rule); return <span className={`text-xs px-2 py-0.5 rounded-full ${meta.className}`}>{meta.label}</span> } },
   ], [])
 
   const sourceModelOptions = pricingOptions.data?.used_models || []
@@ -499,8 +500,15 @@ export default function Settings() {
             {catalogsError && <ErrorState error={catalogsError} onRetry={loadCatalogs} />}
             {catalogsLoading && <LoadingSkeleton rows={3} />}
             {!catalogsLoading && !catalogsError && (
-              <div className="flex flex-col gap-3">
-                {catalogs.map((c) => {
+              <SortableList
+                items={catalogs}
+                options={[
+                  { key: 'name', label: '名称', getValue: (c) => c.name },
+                  { key: 'kind', label: '类型', getValue: (c) => KIND_LABEL[c.kind] || c.kind },
+                  { key: 'last_success_at', label: '最近同步', getValue: (c) => c.last_success_at },
+                ]}
+                className="flex flex-col gap-3"
+                renderItem={(c) => {
                   const isBuiltin = c.kind === 'builtin'
                   const d = draft(c)
                   return (
@@ -551,8 +559,8 @@ export default function Settings() {
                       {c.last_success_at && !c.last_error && <div className="text-xs text-gray-400 dark:text-gray-500 mt-2">上次成功：<span className="tabular-nums whitespace-nowrap">{fmtDateTime(c.last_success_at, { second: '2-digit' })}</span></div>}
                     </div>
                   )
-                })}
-              </div>
+                }}
+              />
             )}
           </div>
 

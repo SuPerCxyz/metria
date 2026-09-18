@@ -11,12 +11,12 @@
 | Collector | id/agent_version/protocol_version/last_heartbeat/clock_skew_seconds/spool_pending/spool_size |
 | Client | canonical_name/display_name/category |
 | Source | adapter_id/version/fingerprint/path_hash/client_version/status/capabilities/scan 时间戳/last_error |
-| Session | 全量 spec 字段：tokens 四类+reasoning、cost 三值、traffic 三项、confidence、parent_session_id、status |
+| Session | tokens 四类+reasoning、cost 三值、content_available、parent_session_id、status |
 | Turn / Message | role/sequence/usage_source/granularity；content_type/content_hash/content_length/utf8_bytes/redacted |
-| ModelCall | call_granularity(message/call/turn/session)、streaming/stream_completed/retry_count、usage_event_id/traffic_estimate_id |
+| ModelCall | call_granularity(message/call/turn/session)、streaming/stream_completed/retry_count、TTFT/首字节/生成时长/Token 每秒、ITL/停顿、可靠性、路由、`observed_*_bytes`、usage_event_id；旧 `traffic_estimate_id` 仅为兼容字段 |
 | UsageEvent | event_id=blake3、usage 四值可 null、cost 三值、quality 三件套、不可变 |
-| TrafficEstimate | request/response payload/http/wire、total/lower/upper、estimation_source(7 级)、context_transport_mode(4 级)、profile_id/version、confidence |
-| TrafficProfile | p50/p75/p90、fixed、overhead ratio、cache transport factor、effective_from/to、version、source(5 类)、enabled |
+| Runtime observation | `first_byte_at`/`first_token_at`/`last_output_at`、`ttft_ms`、`generation_duration_ms`、`output_tokens_per_second_milli`、ITL/停顿、`observability_source`/`quality`、状态/限流/finish reason 与观测 payload/wire 字节 |
+| Legacy traffic | `traffic_estimates`、`traffic_profiles`、`traffic_profile_samples` 及旧字段仅为升级兼容保留；当前 Agent 不生成，Hub 不写入、不查询、不展示 |
 | PricingCatalog/Rule/Match | 金额微美元、priority/effective 区间、source 含 builtin_catalog/client_reported/user_override |
 
 ### 1.1 Token 口径
@@ -35,8 +35,8 @@ Adapter 落库前统一归一化，各客户端语义一致：
 |---|---|
 | 身份 | users / nodes / collectors / collector_tokens |
 | 来源 | clients / sources / projects / source_errors |
-| 会话事件 | sessions / turns / messages / model_calls / usage_events / tool_events / subagent_relations / traffic_estimates |
-| 流量 | traffic_profiles / traffic_profile_samples |
+| 会话事件 | sessions / turns / messages / model_calls / usage_events / tool_events / subagent_relations |
+| 历史兼容 | traffic_estimates / traffic_profiles / traffic_profile_samples（不再新增写入） |
 | 价格 | pricing_catalogs / pricing_snapshots / pricing_rules / pricing_matches |
 | 汇总 | hourly_rollups / daily_rollups |
 | 分享/上传 | share_links / share_audits / upload_batches |
@@ -56,7 +56,8 @@ Adapter 落库前统一归一化，各客户端语义一致：
 
 ## 3. 事件类型（Ingest 白名单）
 
-`session / source / call / usage / traffic / tool / subagent / traffic_sample`。
+当前事件为 `session / source / call / usage / tool / subagent`。为兼容旧 Agent，Hub
+过渡期仍识别 `traffic / traffic_sample`，但会标记为已接受并丢弃，不写入数据库或 rollup。
 
 各事件经过 `metria_protocol::validate_batch` 校验：schema 版本、事件数 ≤256、
 单事件 ≤2MiB、JSON 深度 ≤32、解压后 ≤8MiB（zstd 解码带大小上限，防 zip bomb）。
@@ -65,10 +66,10 @@ Adapter 落库前统一归一化，各客户端语义一致：
 
 - 缺失 Token 用 `null`，禁止默认填 0。
 - 费用三口径并存：`reported_cost` / `calculated_cost` / `estimated_cost`，各自可追溯。
-- 流量标记「估算流量」；`estimation_source` 7 级优先级：
-  reconstructed > partial > content_bytes > token_profile > user_profile > builtin > unavailable。
-- 禁止下界=中值=上界；缺数据标记 `unavailable`。
-- 价格更新 / 重新估算保留历史版本（快照 + 新 traffic_estimates）。
+- 运行时字节必须标记为 `observed_*_bytes`，区分 payload bytes 与 wire bytes；它们只表示
+  观测器看到的转发数据，不冒充网卡或账单流量。
+- Docker/日志采集无法证明 TTFT、Token/s 或字节时保持 `null`，不使用估算值补齐。
+- 价格更新保留历史快照；旧估算流量表不再参与新的费用或性能查询。
 
 ## 5. 迁移策略
 

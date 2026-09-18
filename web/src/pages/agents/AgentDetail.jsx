@@ -4,6 +4,7 @@ import React, { useMemo } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
+import SortableList from '../../components/common/SortableList'
 import TrendChart from '../../components/charts/TrendChart'
 import RankingList from '../../components/cards/RankingList'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
@@ -11,7 +12,7 @@ import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct100, fmtDateTime, fmtSessionTitle, sumTokens, cacheHitRate } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct100, fmtDateTime, fmtSessionTitle, sumTokens, cacheHitRate } from '../../services/format'
 
 const AGENT_LABELS = {
   'claude-code': 'Claude Code',
@@ -49,11 +50,11 @@ export default function AgentDetail() {
 
       <DetailSummary
         items={[
-          { label: '费用', value: fmtUsd(d.calculated_cost_micro_usd) },
-          { label: '估算流量', value: fmtBytes(d.estimated_total_bytes) },
+          { label: '费用', value: fmtUsd(d.cost_micro_usd) },
           { label: '缓存命中率', value: cacheHitRate(d) != null ? fmtPct100(cacheHitRate(d)) : '—' },
           { label: 'Source 健康', value: d.source_health ? `${d.source_health.healthy ?? 0}/${d.source_health.total ?? 0}` : '—' },
           { label: '版本数', value: String((d.version_dist || []).length) },
+          { label: '观测模式', value: (d.observation_modes || []).map((mode) => mode === 'native_runtime' ? '原生运行时' : '普通只读').join(' / ') || '普通只读' },
         ]}
       />
 
@@ -62,42 +63,56 @@ export default function AgentDetail() {
         {trend.labels.length === 0 ? <EmptyState title="当前范围无数据" /> : <TrendChart labels={trend.labels} values={trend.values} range={range} height={320} formatY={fmtTokensShort} />}
       </div>
 
-      <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      {((models.data?.models || []).length > 0 || (d.by_node || []).length > 0) && <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {(models.data?.models || []).length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">模型分布</h2>
           <RankingList items={(models.data?.models || []).map((m) => ({ id: m.model, name: m.model, value: m.calls ?? 0, cost: m.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(m) => navigate(`/models/${encodeURIComponent(m.id)}`)} />
-        </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+        </div>}
+        {(d.by_node || []).length > 0 && <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">节点分布</h2>
           <RankingList items={(d.by_node || []).map((n) => ({ id: n.node_id, name: nodeNames[n.node_id] || n.node_id, value: n.model_calls ?? 0, cost: n.cost_micro_usd }))} valueKey="value" labelKey="name" format={fmtTokensShort} secondaryKey="cost" secondaryFormat={fmtUsd} limit={6} onItemClick={(n) => navigate(`/nodes/${encodeURIComponent(n.id)}`)} />
-        </div>
-      </div>
+        </div>}
+      </div>}
 
       {d.version_dist?.length > 0 && (
         <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">版本分布</h2>
-          <div className="flex flex-wrap gap-2">
-            {d.version_dist.map((v) => (
+          <SortableList
+            items={d.version_dist}
+            options={[
+              { key: 'count', label: '数量', getValue: (v) => v.count },
+              { key: 'version', label: '版本', getValue: (v) => v.version },
+            ]}
+            className="flex flex-wrap gap-2"
+            renderItem={(v) => (
               <span key={v.version} className="px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-700/40 text-xs font-medium text-gray-600 dark:text-gray-300">
                 v{v.version} · {v.count}
               </span>
-            ))}
-          </div>
+            )}
+          />
         </div>
       )}
 
-      <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+      {(d.recent_sessions || []).length > 0 && <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">最近会话</h2>
-        <div className="space-y-2">
-          {(d.recent_sessions || []).length === 0 && <EmptyState title="暂无会话" />}
-          {(d.recent_sessions || []).slice(0, 8).map((s) => (
+        <SortableList
+          items={d.recent_sessions || []}
+          limit={8}
+          options={[
+            { key: 'started_at', label: '时间', getValue: (s) => s.started_at },
+            { key: 'title', label: '标题', getValue: (s) => fmtSessionTitle(s.title, s.started_at) || s.source_session_id },
+            { key: 'input_tokens', label: 'Token', getValue: (s) => s.input_tokens },
+          ]}
+          empty={<EmptyState title="暂无会话" />}
+          className="space-y-2"
+          renderItem={(s) => (
             <button key={s.id} type="button" onClick={() => navigate(`/sessions/${encodeURIComponent(s.id)}`)} className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 text-left">
               <span className="text-sm text-gray-700 dark:text-gray-200 truncate">{fmtSessionTitle(s.title, s.started_at) || s.source_session_id}</span>
               <span className="text-xs text-gray-400 dark:text-gray-500 tabular-nums">{fmtDateTime(s.started_at)} · {fmtTokensShort(s.input_tokens)} tokens</span>
             </button>
-          ))}
-        </div>
-      </div>
+          )}
+        />
+      </div>}
     </>
   )
 }

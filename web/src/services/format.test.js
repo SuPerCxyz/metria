@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, outputTokens, percentChange, sumTokens } from './format.js'
+import { averageTokens, cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, outputTokens, percentChange, sumCosts, sumTokens } from './format.js'
 
 test('includes cache tokens in the total (v2 semantics)', () => {
   assert.equal(sumTokens({
@@ -23,6 +23,17 @@ test('counts cache-only objects and handles missing values', () => {
   assert.equal(sumTokens({ cache_read_tokens: 900, cache_write_tokens: 20 }), 920)
   assert.equal(sumTokens({}), 0)
   assert.equal(sumTokens(null), 0)
+})
+
+test('averageTokens uses only calls with token data', () => {
+  assert.equal(averageTokens(100, 4), 25)
+  assert.equal(averageTokens(100, 0), null)
+  assert.equal(averageTokens(null, 4), null)
+})
+
+test('sumCosts keeps all available cost bases and preserves missing', () => {
+  assert.equal(sumCosts({ reported_cost_micro_usd: 2, calculated_cost_micro_usd: 3, estimated_cost_micro_usd: 5 }), 10)
+  assert.equal(sumCosts({}), null)
 })
 
 test('includes cache writes in the cache hit rate denominator', () => {

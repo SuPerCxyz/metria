@@ -1,14 +1,14 @@
-// 单次模型调用详情：全字段 + 估算区间 + 缺失说明。
+// 单次模型调用详情：运行时观测字段 + 缺失说明。
 
 import React from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
 import StatusBadge from '../../components/common/StatusBadge'
-import { DataQualityNote, ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
+import { DataQualityNote, EmptyState, ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtDateTime, fmtDuration, outputTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtDateTime, fmtDuration, outputTokens } from '../../services/format'
 
 export default function CallDetail() {
   const { id } = useParams()
@@ -18,12 +18,35 @@ export default function CallDetail() {
   if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={6} />
   const c = query.data?.call || {}
-  const tr = query.data?.traffic || {}
 
   const missing = []
   if (c.input_tokens == null) missing.push('usage 缺失：客户端日志未记录本次调用 Token')
   if (c.calculated_cost_micro_usd == null && c.reported_cost_micro_usd == null) missing.push('费用缺失：无 reported/calculated 成本')
-  if (!tr.estimation_source || tr.estimation_source === 'unavailable') missing.push('流量估算不可用（unavailable），未硬造数值')
+  if (c.observability_source == null) missing.push('暂无实时观测数据；当前调用可能来自普通日志采集')
+  const observedFields = [
+    ['首字节', c.first_byte_latency_ms != null ? fmtDuration(c.first_byte_latency_ms) : null],
+    ['首 Token', c.ttft_ms != null ? fmtDuration(c.ttft_ms) : null],
+    ['生成耗时', c.generation_duration_ms != null ? fmtDuration(c.generation_duration_ms) : null],
+    ['输出速度', c.output_tokens_per_second_milli != null ? `${(c.output_tokens_per_second_milli / 1000).toFixed(1)} Token/s` : null],
+    ['Token 间延迟（平均）', c.inter_token_latency_avg_ms != null ? fmtDuration(c.inter_token_latency_avg_ms) : null],
+    ['Token 间延迟（P95）', c.inter_token_latency_p95_ms != null ? fmtDuration(c.inter_token_latency_p95_ms) : null],
+    ['停顿次数', c.stall_count != null ? String(c.stall_count) : null],
+    ['停顿时长', c.stall_duration_ms != null ? fmtDuration(c.stall_duration_ms) : null],
+    ['请求 payload', c.observed_request_payload_bytes != null ? `${c.observed_request_payload_bytes.toLocaleString()} B` : null],
+    ['响应 payload', c.observed_response_payload_bytes != null ? `${c.observed_response_payload_bytes.toLocaleString()} B` : null],
+    ['请求 Wire', c.observed_request_wire_bytes != null ? `${c.observed_request_wire_bytes.toLocaleString()} B` : null],
+    ['响应 Wire', c.observed_response_wire_bytes != null ? `${c.observed_response_wire_bytes.toLocaleString()} B` : null],
+    ['观测来源', c.observability_source || null],
+    ['观测质量', c.observability_quality || null],
+    ['Endpoint', c.endpoint || null],
+    ['状态码', c.status_code != null ? String(c.status_code) : null],
+    ['Finish reason', c.finish_reason || null],
+    ['错误类型', c.error_kind || null],
+    ['限流', c.rate_limited != null ? (c.rate_limited ? '是' : '否') : null],
+    ['流式响应', c.streaming != null ? (c.streaming ? '是' : '否') : null],
+    ['流式完成', c.stream_completed != null ? (c.stream_completed ? '是' : '否') : null],
+    ['重试次数', c.retry_count != null ? String(c.retry_count) : null],
+  ].filter(([, value]) => value != null)
 
   return (
     <>
@@ -48,30 +71,16 @@ export default function CallDetail() {
       />
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">估算流量</h2>
-        <div className="flex items-baseline gap-4 flex-wrap">
-          <span className="text-3xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{fmtBytes(tr.estimated_total_wire_bytes)}</span>
-          <span className="text-sm text-gray-400 dark:text-gray-500">范围 {fmtBytes(tr.lower_bound_bytes)} ~ {fmtBytes(tr.upper_bound_bytes)}</span>
-          {tr.confidence != null && <span className="text-sm text-gray-400 dark:text-gray-500">置信度 {(tr.confidence * 100).toFixed(0)}%</span>}
-        </div>
-        <div className="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-4">
-          {[
-            ['请求估算流量', fmtBytes(tr.estimated_request_wire_bytes)],
-            ['响应估算流量', fmtBytes(tr.estimated_response_wire_bytes)],
-            ['估算来源', tr.estimation_source || '—'],
-            ['上下文传输', tr.context_transport_mode || '—'],
-            ['Cache 行为', tr.cache_transport_behavior || '—'],
-            ['Traffic Profile', tr.profile_id ? `${tr.profile_id} v${tr.profile_version ?? ''}` : '未命中'],
-          ].map(([label, value]) => (
+        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">实时观测</h2>
+        {observedFields.length > 0 ? <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          {observedFields.map(([label, value]) => (
             <div key={label} className="bg-gray-50 dark:bg-gray-700/30 rounded-xl p-3">
               <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
               <div className="mt-0.5 text-sm font-medium text-gray-700 dark:text-gray-200">{value}</div>
             </div>
           ))}
-        </div>
-        <div className="mt-4">
-          <DataQualityNote kind="estimated" text="以上为估算流量，不代表网卡真实流量或云厂商计费流量。" />
-        </div>
+        </div> : <EmptyState title="暂无实时观测字段" desc="该调用没有通过 observe 产生可证明的运行时样本。" />}
+        <div className="mt-4"><DataQualityNote kind="partial" text="仅展示运行时观测到的调用指标；普通日志调用保持不可用，不使用推算字节补值。" /></div>
       </div>
 
       {missing.length > 0 && (

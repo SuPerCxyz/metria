@@ -40,6 +40,7 @@
 | rollup 范围口径修复：整点边界统一 julianday 比较；总览及使用趋势/流量/节点/客户端/模型页面不完整小时用明细补齐（OpenSpec `fix-rollup-range-partial-hours`） | ✅ 实现与门禁完成，待部署 lstable | 2026-09-16 |
 | 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | ✅ 已部署并核对（含 Agent 更新与迁移 019 追加回填） | 2026-09-16 |
 | 总 Token 口径与 ccswitch 对齐：总 Token 改为含缓存读写、等值于 ccswitch 用量面板的消耗总量，全站 Web/报告/Webhook 同步，分层堆叠图补「缓存写入」层（OpenSpec `include-cache-in-total-tokens`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
+| Web 数据完整性与有效容器审计：首页稳定 KPI、性能空态、调用/数据质量页、可选列表列与观测字段补齐（OpenSpec `frontend-data-coverage-audit`） | ✅ 实现与门禁完成，未部署 lstable | 2026-09-18 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 
@@ -685,3 +686,19 @@ S0 → S1 → S2 → S3，每步完成后跑 0.4 总门禁；每次提交前 `fm
 - 性能：适配器记录可证明的首个可观察输出和完成时间；API/前端展示覆盖率，无法证明时保持不可用。
 - 图表：输入/输出/缓存、模型、Agent 等数据文案统一 TrendChart 图例样式；报告邮件图表改为内嵌 SVG，PDF 保留 PNG。
 - migration 015 增加 avatar/timing 字段并保留 pricing match 历史；lstable 完成全历史修复、备份、健康检查与明细/rollup 一致性核对。
+
+## 15. 临时 LLM 运行时观测与估算流量退役（2026-09-18）
+
+- 原生 Linux/Windows Agent 新增显式 `metria observe --client <client> -- <command...>`：仅在被包裹进程生命周期内绑定本地端口，临时转发并派生 TTFT、首字节/生成时长、输出 Token/s、ITL/停顿、可靠性、路由和观测 payload/wire 字节；正文不落盘、不上传，正常退出、失败、租约到期或 Agent 停止都会清理临时配置与端口。
+- Docker Agent 与普通 `metria agent` 保持只读日志/SQLite 采集，不提供请求级实时观测；Hub 通过 `observability_source`、`observability_quality`、来源能力和覆盖率区分两类数据。
+- Agent 不再生成或上传 `traffic` / `traffic_sample`，Hub 过渡期忽略旧流量事件；Traffic 路由、Profile/重估接口、页面、报告、导出、分享、MCP 和 doctor/import 流量面已移除。
+- `traffic_estimates`、旧 Session/ModelCall 流量列和 rollup 流量列仅为升级安全保留；新的观测字节使用独立的 `observed_*_bytes` 字段，不走 Traffic Profile 逻辑。
+- 新增 migration 020、性能 API 与 timeseries、原生观测清理测试及 Hub e2e 性能聚合覆盖；最终门禁按本仓库 AGENTS.md 执行。
+
+## 16. Web 数据完整性与有效容器审计（2026-09-18）
+
+- 首页移除跨客户端口径不稳定的「调用时长」核心卡，改为按有 Token 数据调用计算的平均 Token；无有效样本的性能、缓存、费用、排行和可选列表列不再渲染空容器，真实零值仍保留。
+- 使用分析补齐 ITL、停顿、payload/wire 字节、来源与覆盖率状态；调用详情展示已有的时序、可靠性、路由、限流、重试和观测字段，缺失值保持不可用。
+- 新增 `/calls` 调用列表和 `/data-quality` 数据质量页面及导航，复用现有只读 API；所有列表继续支持排序，普通 Agent/Docker Agent 采集边界不变。
+- Overview API 新增只读 `token_calls` 分母，客户端/模型/节点费用展示统一使用可追溯费用口径；无数据库迁移、无新增依赖、未部署 `lstable`。
+- 验证：Web test/build、浏览器全路由/Tab/详情/排序/移动端/Console、fmt、clippy、workspace test、Hub Docker build、Compose config、OpenSpec validate 全部通过。
