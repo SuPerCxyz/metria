@@ -36,6 +36,58 @@ export function withMinimumSpan(range, minSpanMs) {
   return { ...range, from: new Date(toMs - minSpanMs).toISOString() }
 }
 
+function zonedParts(date, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date)
+  const value = (type) => parts.find((part) => part.type === type)?.value
+  return {
+    weekday: value('weekday'),
+    year: Number(value('year')),
+    month: Number(value('month')),
+    day: Number(value('day')),
+    hour: Number(value('hour')),
+    minute: Number(value('minute')),
+    second: Number(value('second')),
+  }
+}
+
+function zonedWallTimeToUtc(parts, timezone) {
+  const wall = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour || 0, parts.minute || 0, parts.second || 0)
+  const offsetParts = zonedParts(new Date(wall), timezone)
+  const offsetWall = Date.UTC(offsetParts.year, offsetParts.month - 1, offsetParts.day, offsetParts.hour, offsetParts.minute, offsetParts.second)
+  return new Date(wall - (offsetWall - wall))
+}
+
+/** 当前自然周：周一 00:00 至 now，按展示时区计算。 */
+export function currentWeekRange(timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', now = new Date()) {
+  const current = zonedParts(now, timezone)
+  const weekday = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[current.weekday] ?? 0
+  const mondayOffset = (weekday + 6) % 7
+  const monday = new Date(Date.UTC(current.year, current.month - 1, current.day - mondayOffset))
+  return {
+    from: zonedWallTimeToUtc({
+      year: monday.getUTCFullYear(),
+      month: monday.getUTCMonth() + 1,
+      day: monday.getUTCDate(),
+      hour: 0,
+      minute: 0,
+      second: 0,
+    }, timezone).toISOString(),
+    to: new Date(now).toISOString(),
+    timezone,
+    presetKey: 'current-week',
+  }
+}
+
 // 生成当前范围之前的等长周期，用于总览 KPI 对比。
 export function previousTimeRange(range) {
   const from = new Date(range?.from || '')

@@ -14,7 +14,7 @@ import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
-import { previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
+import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
 import { isAvailable } from '../../services/dataAvailability'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
@@ -45,6 +45,7 @@ export default function Overview() {
   const [dim, setDim] = useState('all')
   const [dailyMetric, setDailyMetric] = useState('tokens')
   const [heatmapMetric, setHeatmapMetric] = useState('tokens')
+  const [selectedHeatmapCell, setSelectedHeatmapCell] = useState(null)
   const [hiddenByDimension, setHiddenByDimension] = useState({ model: [], client: [] })
   const hiddenDimensions = hiddenByDimension[dim] || EMPTY_HIDDEN
   const excludedParams = dim === 'model'
@@ -70,7 +71,9 @@ export default function Overview() {
   const dailyRange = useMemo(() => withMinimumSpan(range, DAILY_MIN_SPAN_MS), [range])
   const dailyParams = usageRangeParams(dailyRange, { nodeId, clientId, model, projectId })
   const daily = useQuery(`daily${q(dailyParams)}`, () => api(`/usage/daily${q(dailyParams)}`))
-  const heatmap = useQuery(`heatmap${q(params)}`, () => api(`/usage/heatmap${q(params)}`))
+  const heatmapRange = useMemo(() => currentWeekRange(range.timezone, new Date()), [range.timezone, range.to])
+  const heatmapParams = usageRangeParams(heatmapRange, { nodeId, clientId, model, projectId })
+  const heatmap = useQuery(`heatmap${q(heatmapParams)}`, () => api(`/usage/heatmap${q(heatmapParams)}`))
 
   const toggleHiddenDimension = useCallback((dimension) => {
     if (dim === 'all') return
@@ -215,202 +218,116 @@ export default function Overview() {
     ? averageTokens(previousTokenTotal, previous.token_calls)
     : null
   const cacheRate = cacheHitRate(o)
-  const hasTokenData = averageTokenCount > 0
   const hasCacheSavings = Number(o.cache_savings_micro_usd) > 0
-  const hasCostData = pricingCoverage.priced_calls > 0
-  const hasActivityData = modelCalls > 0 || Number(o.sessions) > 0 || Number(o.collectors) > 0 || isAvailable(o.active_duration_ms) || isAvailable(o.session_duration_ms)
-  const hasMessageData = Number(o.message_count) > 0 || Number(o.user_message_count) > 0 || Number(o.tool_call_count) > 0
   const performanceMetric = (key, valueKey = 'avg_ms') => {
     const metric = performanceData[key]
     return metric?.count > 0 && isAvailable(metric[valueKey])
   }
   const performanceCards = [
-    performanceMetric('ttft') && <MetricCard key="ttft" span="xl:col-span-2" label="首个可观察输出" value={fmtDuration(performanceData.ttft.avg_ms)} sub={performanceCoverage('ttft')} hint="首 Token 延迟；普通 metria agent 未通过 observe 时不产生该样本" />,
-    performanceMetric('first_byte') && <MetricCard key="first-byte" span="xl:col-span-2" label="首字节延迟" value={fmtDuration(performanceData.first_byte.avg_ms)} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节的观测时长" />,
-    performanceMetric('generation') && <MetricCard key="generation" span="xl:col-span-2" label="生成耗时" value={fmtDuration(performanceData.generation.avg_ms)} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件的观测时长" />,
-    performanceMetric('output_speed', 'avg_tokens_per_second') && <MetricCard key="speed" span="xl:col-span-2" label="输出速度" value={`${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s`} sub={performanceCoverage('output_speed')} hint="仅使用首 Token 后的生成区间计算" />,
-    performanceMetric('inter_token_latency') && <MetricCard key="itl" span="xl:col-span-2" label="Token 间延迟" value={fmtDuration(performanceData.inter_token_latency.avg_ms)} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔" />,
-    performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) && <MetricCard key="stalls" span="xl:col-span-2" label="平均停顿次数" value={Number(performanceData.stalls.avg_count).toFixed(1)} sub={`${performanceData.stalls.count} 次调用有停顿统计`} hint="观测到的生成停顿次数，不包含未观测调用" />,
-    ...[
-      ['request_payload', '观测请求字节'],
-      ['response_payload', '观测响应字节'],
-      ['request_wire', '观测请求 Wire 字节'],
-      ['response_wire', '观测响应 Wire 字节'],
-    ].map(([key, label]) => {
-      const metric = performanceData.observed_bytes?.[key]
-      return metric?.count > 0 && isAvailable(metric.bytes)
-        ? <MetricCard key={key} span="xl:col-span-2" label={label} value={fmtBytes(metric.bytes)} sub={observedBytesCoverage(key)} hint="仅表示运行时观测链路看到的字节，不是估算流量" />
-        : null
-    }),
-  ].filter(Boolean)
+    <MetricCard key="ttft" span="xl:col-span-3" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首 Token 延迟；普通 metria agent 未通过 observe 时不产生该样本" />,
+    <MetricCard key="first-byte" span="xl:col-span-3" label="首字节延迟" value={performanceMetric('first_byte') ? fmtDuration(performanceData.first_byte.avg_ms) : '—'} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节的观测时长" />,
+    <MetricCard key="generation" span="xl:col-span-3" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件的观测时长" />,
+    <MetricCard key="speed" span="xl:col-span-3" label="输出速度" value={performanceMetric('output_speed', 'avg_tokens_per_second') ? `${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '—'} sub={performanceCoverage('output_speed')} hint="仅使用首 Token 后的生成区间计算" />,
+    <MetricCard key="itl" span="xl:col-span-3" label="Token 间延迟" value={performanceMetric('inter_token_latency') ? fmtDuration(performanceData.inter_token_latency.avg_ms) : '—'} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔" />,
+    <MetricCard key="stalls" span="xl:col-span-3" label="平均停顿次数" value={performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) ? Number(performanceData.stalls.avg_count).toFixed(1) : '—'} sub={performanceData.stalls?.count > 0 ? `${performanceData.stalls.count} 次调用有停顿统计` : '暂无停顿样本'} hint="观测到的生成停顿次数，不包含未观测调用" />,
+    <MetricCard key="request-payload" span="xl:col-span-3" label="观测请求字节" value={fmtBytes(performanceData.observed_bytes?.request_payload?.bytes)} sub={observedBytesCoverage('request_payload')} hint="仅表示运行时观测链路看到的请求 payload 字节" />,
+    <MetricCard key="response-payload" span="xl:col-span-3" label="观测响应字节" value={fmtBytes(performanceData.observed_bytes?.response_payload?.bytes)} sub={observedBytesCoverage('response_payload')} hint="仅表示运行时观测链路看到的响应 payload 字节" />,
+  ]
 
   return (
     <>
       <PageHeader title="总览" subtitle="AI 编程 Agent 用量、费用与性能概览" />
 
-      {hasTokenData && (
-        <div className="mt-0">
-          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
-          <div className="grid grid-cols-12 gap-6">
-            <MetricCard
-              span="xl:col-span-4"
-              label="Token 消耗"
-              value={fmtTokens(tokenTotal)}
-              {...compare(tokenTotal, previousTokenTotal)}
-              sub={
-                <span className="tabular-nums">
-                  <span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)}{(o.cache_write_tokens ?? 0) > 0 ? ` · 缓存写入 ${fmtTokensShort(o.cache_write_tokens)}` : ''}</span>
-                </span>
-              }
-            />
-            {cacheRate != null && <MetricCard
-              span="xl:col-span-4"
-              label="缓存命中率"
-              value={fmtPct100(cacheRate)}
-              {...compare(cacheRate, previous ? cacheHitRate(previous) : null)}
-              sub="缓存读取 / (输入 + 缓存写入 + 缓存读取)"
-              hint="缓存读取 Token 占请求上下文比例"
-            />}
-            {averageTokensPerCall != null && <MetricCard
-              span="xl:col-span-4"
-              label="平均每次调用 Token"
-              value={fmtTokensShort(averageTokensPerCall)}
-              {...compare(averageTokensPerCall, previousAverageTokensPerCall)}
-              sub={`${averageTokenCount} 次有 Token 数据的调用`}
-              hint="总 Token 除以有 Token 数据的调用数；缺失 Token 的调用不计入分母"
-            />}
-          </div>
+      <div className="mt-0">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard
+            span="xl:col-span-4"
+            label="Token 消耗"
+            value={averageTokenCount > 0 ? fmtTokens(tokenTotal) : '—'}
+            {...compare(averageTokenCount > 0 ? tokenTotal : null, previousAverageTokensPerCall != null ? previousTokenTotal : null)}
+            sub={averageTokenCount > 0
+              ? <span className="tabular-nums"><span className="text-gray-400 dark:text-gray-500">输入 {fmtTokensShort(o.input_tokens)} · 输出 {fmtTokensShort(outputTokens(o))}（其中推理 {fmtTokensShort(o.reasoning_tokens)}）· 缓存读取 {fmtTokensShort(o.cache_read_tokens)}{(o.cache_write_tokens ?? 0) > 0 ? ` · 缓存写入 ${fmtTokensShort(o.cache_write_tokens)}` : ''}</span></span>
+              : '当前范围暂无 Token 数据'}
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="缓存命中率"
+            value={cacheRate != null ? fmtPct100(cacheRate) : '—'}
+            {...compare(cacheRate, previous ? cacheHitRate(previous) : null)}
+            sub={cacheRate != null ? '缓存读取 / (输入 + 缓存写入 + 缓存读取)' : '当前范围暂无缓存数据'}
+            hint="缓存读取 Token 占请求上下文比例"
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="平均每次调用 Token"
+            value={averageTokensPerCall != null ? fmtTokensShort(averageTokensPerCall) : '—'}
+            {...compare(averageTokensPerCall, previousAverageTokensPerCall)}
+            sub={averageTokensPerCall != null ? `${averageTokenCount} 次有 Token 数据的调用` : '当前范围暂无 Token 数据'}
+            hint="总 Token 除以有 Token 数据的调用数；缺失 Token 的调用不计入分母"
+          />
         </div>
-      )}
+      </div>
 
-      {hasCostData && (
-        <div className="mt-3">
-          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本</h2>
-          <div className="grid grid-cols-12 gap-6">
-            <MetricCard
-              span="xl:col-span-4"
-              label="总费用"
-              value={fmtUsd(totalCost)}
-              {...compare(totalCost, previousCost)}
-              sub={`${pricingCoverage.priced_calls} 次有费用口径调用`}
-              hint="合计客户端上报、规则计算和估算三种费用口径；未定价调用不计入"
-            />
-            {hasCacheSavings && <MetricCard
-              span="xl:col-span-4"
-              label="缓存节省费用"
-              value={fmtUsd(o.cache_savings_micro_usd)}
-              {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)}
-              sub="按缓存读取单价估算"
-              hint="缓存命中带来的成本节省"
-            />}
-            {averageCallCost != null && <MetricCard
-              span="xl:col-span-4"
-              label="平均单次调用费用"
-              value={fmtUsd(averageCallCost)}
-              {...compare(averageCallCost, previousAverageCallCost)}
-              sub={`${pricingCoverage.priced_calls} 次有费用口径调用`}
-              hint="当前范围总费用除以有费用口径的调用数；未定价调用不按 0 计入"
-            />}
-          </div>
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard
+            span="xl:col-span-4"
+            label="总费用"
+            value={pricingCoverage.priced_calls > 0 ? fmtUsd(totalCost) : '—'}
+            {...compare(pricingCoverage.priced_calls > 0 ? totalCost : null, previousCost)}
+            sub={pricingCoverage.priced_calls > 0 ? `${pricingCoverage.priced_calls} 次有费用口径调用` : '当前范围暂无费用口径'}
+            hint="合计客户端上报、规则计算和估算三种费用口径；未定价调用不计入"
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="缓存节省费用"
+            value={hasCacheSavings ? fmtUsd(o.cache_savings_micro_usd) : '—'}
+            {...compare(hasCacheSavings ? o.cache_savings_micro_usd : null, previous?.cache_savings_micro_usd)}
+            sub={hasCacheSavings ? '按缓存读取单价估算' : '当前范围暂无缓存节省费用'}
+            hint="缓存命中带来的成本节省"
+          />
+          <MetricCard
+            span="xl:col-span-4"
+            label="平均单次调用费用"
+            value={averageCallCost != null ? fmtUsd(averageCallCost) : '—'}
+            {...compare(averageCallCost, previousAverageCallCost)}
+            sub={averageCallCost != null ? `${pricingCoverage.priced_calls} 次有费用口径调用` : '当前范围暂无可计算费用'}
+            hint="当前范围总费用除以有费用口径的调用数；未定价调用不按 0 计入"
+          />
         </div>
-      )}
+      </div>
 
-      {performance.loading ? <div className="mt-3"><LoadingSkeleton rows={2} /></div> : performance.error ? <div className="mt-3"><ErrorState error={performance.error} onRetry={performance.refresh} /></div> : performanceCards.length > 0 && (
-        <div className="mt-3">
-          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">实时性能观测</h2>
-          <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
-          <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">
-            观测来源：{performanceSources}；普通日志调用缺失这些字段时保持不可用，不使用推算值补齐。
-          </p>
-        </div>
-      )}
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">实时性能观测</h2>
+        <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
+        {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
+        {performance.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">性能数据加载失败：{performance.error.message}</p>}
+        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；普通日志调用缺失这些字段时保持不可用，不使用推算值补齐。</p>}
+      </div>
 
-      {hasActivityData && (
-        <div className="mt-3">
-          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
-          <div className="grid grid-cols-12 gap-6">
-            {modelCalls > 0 && <MetricCard
-              span="xl:col-span-2"
-              label="请求数"
-              value={String(modelCalls)}
-              {...compare(modelCalls, previousModelCalls)}
-              sub="模型调用次数"
-              hint={`涉及 ${o.models ?? 0} 个模型`}
-            />}
-            {errorRate != null && <MetricCard
-              span="xl:col-span-2"
-              label="错误率"
-              value={fmtPct100(errorRate)}
-              {...compare(errorRate, previousErrorRate, true)}
-              sub={`成功 ${fmtPct100(successRate)} · 失败 ${failed} 次`}
-              hint="失败请求占全部请求比例；下降表示改善"
-            />}
-            {Number(o.sessions) > 0 && <MetricCard
-              span="xl:col-span-2"
-              label="新建会话"
-              value={String(o.sessions)}
-              {...compare(o.sessions, previous?.sessions)}
-              sub={`${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器`}
-              hint="当前 Agent 新建的会话数"
-            />}
-            {isAvailable(o.active_duration_ms) && <MetricCard
-              span="xl:col-span-2"
-              label="活跃时长"
-              value={fmtDuration(o.active_duration_ms)}
-              {...compare(o.active_duration_ms, previous?.active_duration_ms)}
-              sub="模型调用耗时合计"
-              hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠"
-            />}
-            {isAvailable(o.session_duration_ms) && <MetricCard
-              span="xl:col-span-2"
-              label="会话总时长"
-              value={fmtDuration(o.session_duration_ms)}
-              {...compare(o.session_duration_ms, previous?.session_duration_ms)}
-              sub="会话持续跨度合计"
-              hint="从会话开始到最后活动/结束；不去重重叠会话"
-            />}
-            {Number(o.collectors) > 0 && <MetricCard
-              span="xl:col-span-2"
-              label="节点在线"
-              value={`${o.collectors_online ?? 0} / ${o.collectors}`}
-              sub={`${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目`}
-              hint="在线采集器 / 总数"
-            />}
-          </div>
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard span="xl:col-span-2" label="请求数" value={String(modelCalls)} {...compare(modelCalls, previousModelCalls)} sub="模型调用次数" hint={`涉及 ${o.models ?? 0} 个模型`} />
+          <MetricCard span="xl:col-span-2" label="错误率" value={errorRate != null ? fmtPct100(errorRate) : '—'} {...compare(errorRate, previousErrorRate, true)} sub={errorRate != null ? `成功 ${fmtPct100(successRate)} · 失败 ${failed} 次` : '当前范围暂无请求数据'} hint="失败请求占全部请求比例；下降表示改善" />
+          <MetricCard span="xl:col-span-2" label="新建会话" value={isAvailable(o.sessions) ? String(o.sessions) : '—'} {...compare(o.sessions, previous?.sessions)} sub={isAvailable(o.sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据'} hint="当前 Agent 新建的会话数" />
+          <MetricCard span="xl:col-span-2" label="活跃时长" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub="模型调用耗时合计" hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠" />
+          <MetricCard span="xl:col-span-2" label="会话总时长" value={fmtDuration(o.session_duration_ms)} {...compare(o.session_duration_ms, previous?.session_duration_ms)} sub="会话持续跨度合计" hint="从会话开始到最后活动/结束；不去重重叠会话" />
+          <MetricCard span="xl:col-span-2" label="节点在线" value={isAvailable(o.collectors) ? `${o.collectors_online ?? 0} / ${o.collectors}` : '—'} sub={isAvailable(o.collectors) ? `${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目` : '当前范围暂无采集器数据'} hint="在线采集器 / 总数" />
         </div>
-      )}
+      </div>
 
-      {(hasMessageData || o.freshness) && (
-        <div className="mt-3">
-          <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
-          <div className="grid grid-cols-12 gap-6">
-            {hasMessageData && <>
-              <MetricCard
-                span="xl:col-span-3"
-                label="总消息数"
-                value={fmtTokensShort(o.message_count)}
-                {...compare(o.message_count, previous?.message_count)}
-                sub="用户、助手和系统消息"
-              />
-              <MetricCard
-                span="xl:col-span-3"
-                label="用户消息数"
-                value={fmtTokensShort(o.user_message_count)}
-                {...compare(o.user_message_count, previous?.user_message_count)}
-                sub="可识别 role=user"
-              />
-              <MetricCard
-                span="xl:col-span-3"
-                label="工具调用消息"
-                value={fmtTokensShort(o.tool_call_count)}
-                {...compare(o.tool_call_count, previous?.tool_call_count)}
-                sub="会话工具调用计数"
-              />
-            </>}
-            <FreshnessCard freshness={o.freshness} />
-          </div>
+      <div className="mt-3">
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
+        <div className="grid grid-cols-12 gap-6">
+          <MetricCard span="xl:col-span-3" label="总消息数" value={fmtTokensShort(o.message_count)} {...compare(o.message_count, previous?.message_count)} sub="用户、助手和系统消息" />
+          <MetricCard span="xl:col-span-3" label="用户消息数" value={fmtTokensShort(o.user_message_count)} {...compare(o.user_message_count, previous?.user_message_count)} sub="可识别 role=user" />
+          <MetricCard span="xl:col-span-3" label="工具调用消息" value={fmtTokensShort(o.tool_call_count)} {...compare(o.tool_call_count, previous?.tool_call_count)} sub="会话工具调用计数" />
+          <FreshnessCard freshness={o.freshness} />
         </div>
-      )}
+      </div>
 
       {/* 第二行：主趋势图 */}
       <div className="mt-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
@@ -458,12 +375,30 @@ export default function Overview() {
             onMetricChange={setHeatmapMetric}
             loading={heatmap.loading}
             error={heatmap.error}
+            selectedCell={selectedHeatmapCell}
             onCellClick={(cell) => {
               if (!cell.latest_from || !cell.latest_to) return
-              setRange({ from: cell.latest_from, to: cell.latest_to, timezone: range.timezone })
-              navigate('/analytics')
+              setSelectedHeatmapCell(cell)
             }}
           />
+          {selectedHeatmapCell?.latest_from && selectedHeatmapCell?.latest_to && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-100 bg-indigo-50/60 px-3 py-2 text-sm dark:border-indigo-900/60 dark:bg-indigo-500/10">
+              <div className="text-gray-700 dark:text-gray-200">
+                <span className="font-semibold">{formatHeatmapHour(selectedHeatmapCell)}</span>
+                <span className="ml-3 text-gray-500 dark:text-gray-400">Token {fmtTokensShort(selectedHeatmapCell.tokens)} · 请求 {Number(selectedHeatmapCell.model_calls ?? 0).toLocaleString()}</span>
+              </div>
+              <button
+                type="button"
+                className="btn-xs btn-secondary"
+                onClick={() => {
+                  setRange({ from: selectedHeatmapCell.latest_from, to: selectedHeatmapCell.latest_to, timezone: range.timezone })
+                  navigate('/analytics')
+                }}
+              >
+                进入分析
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -519,4 +454,9 @@ function FreshnessCard({ freshness }) {
       </div>
     </div>
   )
+}
+
+function formatHeatmapHour(cell) {
+  const weekday = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][cell.weekday] || '未知日期'
+  return `${weekday} ${String(cell.hour).padStart(2, '0')}:00–${String(cell.hour).padStart(2, '0')}:59`
 }

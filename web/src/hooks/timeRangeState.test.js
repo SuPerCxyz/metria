@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   createPresetRange,
+  currentWeekRange,
   isSameTimeRange,
   normalizeTimeRange,
   previousTimeRange,
@@ -64,6 +65,15 @@ test('withMinimumSpan extends a short range backwards and keeps its end and time
 test('withMinimumSpan leaves ranges at or above the minimum untouched', () => {
   const month = { from: '2026-07-01T00:00:00.000Z', to: '2026-08-01T00:00:00.000Z' }
   assert.equal(withMinimumSpan(month, 604_800_000), month)
+})
+
+test('currentWeekRange starts at Monday midnight in the display timezone', () => {
+  assert.deepEqual(currentWeekRange('Asia/Shanghai', NOW), {
+    from: '2026-08-09T16:00:00.000Z',
+    to: '2026-08-12T10:30:00.000Z',
+    timezone: 'Asia/Shanghai',
+    presetKey: 'current-week',
+  })
 })
 
 test('previous range is an equal-length period immediately before current range', () => {

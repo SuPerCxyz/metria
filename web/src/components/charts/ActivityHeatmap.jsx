@@ -28,7 +28,7 @@ function formatValue(value, metric) {
   return fmtTokensShort(value)
 }
 
-export default function ActivityHeatmap({ cells = [], metric, onMetricChange, onCellClick, loading = false, error = null }) {
+export default function ActivityHeatmap({ cells = [], metric, onMetricChange, onCellClick, selectedCell = null, loading = false, error = null }) {
   const byIndex = useMemo(() => new Map(cells.map((cell) => [cell.weekday * 24 + cell.hour, cell])), [cells])
   const max = useMemo(() => Math.max(...cells.map((cell) => valueOf(cell, metric) || 0), 0), [cells, metric])
 
@@ -39,7 +39,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">小时活跃热力图</h2>
           <Segmented items={METRICS} value={metric} onChange={onMetricChange} />
         </div>
-        <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">按展示时区聚合；点击有数据的单元格下钻到最近匹配小时</p>
+        <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">固定显示本周；点击有数据的单元格查看 Token、请求数和时间范围</p>
       </div>
       {loading && cells.length === 0 ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-amber-600 dark:text-amber-400">热力图加载失败，请刷新重试。</div> : <div className="flex-1 overflow-x-auto pb-1">
         <div className="grid h-full w-full grid-rows-[auto_repeat(7,1fr)] grid-cols-[2.5rem_repeat(24,minmax(0.75rem,1fr))] gap-1 text-[10px] text-gray-400 dark:text-gray-500">
@@ -53,6 +53,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
                 const value = valueOf(cell, metric)
                 const alpha = max > 0 && value > 0 ? 0.12 + (value / max) * 0.78 : 0
                 const label = `${weekday}${hour}时：${formatValue(value, metric)}${cell.latest_from ? `，最近 ${fmtDateTime(cell.latest_from)}` : ''}`
+                const selected = selectedCell?.weekday === day && selectedCell?.hour === hour
                 return (
                   <button
                     key={`${day}-${hour}`}
@@ -61,7 +62,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
                     onClick={() => onCellClick?.(cell)}
                     title={label}
                     aria-label={label}
-                    className="aspect-square w-[78%] justify-self-center self-center rounded-sm border border-transparent transition hover:border-indigo-400 disabled:cursor-default"
+                    className={`aspect-square w-[78%] justify-self-center self-center rounded-sm border transition hover:border-indigo-400 disabled:cursor-default ${selected ? 'border-indigo-600 ring-2 ring-indigo-300 dark:border-indigo-300 dark:ring-indigo-500/60' : 'border-transparent'}`}
                     style={alpha ? { backgroundColor: `rgba(99, 102, 241, ${alpha})` } : undefined}
                   />
                 )
