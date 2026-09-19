@@ -1101,6 +1101,25 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
         let result: Result<bool, metria_storage::StorageError> = match ev.kind.as_str() {
             "session" => st.db.upsert_session(v),
             "source" => st.db.upsert_source(v),
+            "source_sync" => {
+                let ids: Vec<String> = v
+                    .get("source_ids")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let collector = v
+                    .get("collector_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&batch.collector_id);
+                st.db
+                    .sync_collector_sources(collector, &ids, Utc::now())
+                    .map(|_| true)
+            }
             "message" => st
                 .db
                 .insert_message(v, resolved.as_deref().unwrap_or_default()),

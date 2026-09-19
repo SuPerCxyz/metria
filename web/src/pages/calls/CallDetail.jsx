@@ -1,4 +1,4 @@
-// 单次模型调用详情：运行时观测字段 + 缺失说明。
+// 单次模型调用详情：日志推导性能字段 + 缺失说明。
 
 import React from 'react'
 import { Link, useLocation, useParams } from 'react-router-dom'
@@ -9,6 +9,15 @@ import { DataQualityNote, EmptyState, ErrorState, LoadingSkeleton } from '../../
 import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { fmtTokensShort, fmtUsd, fmtDateTime, fmtDuration, outputTokens } from '../../services/format'
+
+/// 两个 RFC3339 时间之间的毫秒差；缺失或倒序返回 null。
+function msBetween(from, to) {
+  if (!from || !to) return null
+  const start = Date.parse(from)
+  const end = Date.parse(to)
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return null
+  return end - start
+}
 
 export default function CallDetail() {
   const { id } = useParams()
@@ -22,30 +31,17 @@ export default function CallDetail() {
   const missing = []
   if (c.input_tokens == null) missing.push('usage 缺失：客户端日志未记录本次调用 Token')
   if (c.calculated_cost_micro_usd == null && c.reported_cost_micro_usd == null) missing.push('费用缺失：无 reported/calculated 成本')
-  if (c.observability_source == null) missing.push('暂无实时观测数据；当前调用可能来自普通日志采集')
-  const observedFields = [
-    ['首字节', c.first_byte_latency_ms != null ? fmtDuration(c.first_byte_latency_ms) : null],
-    ['首 Token', c.ttft_ms != null ? fmtDuration(c.ttft_ms) : null],
-    ['生成耗时', c.generation_duration_ms != null ? fmtDuration(c.generation_duration_ms) : null],
-    ['输出速度', c.output_tokens_per_second_milli != null ? `${(c.output_tokens_per_second_milli / 1000).toFixed(1)} Token/s` : null],
-    ['Token 间延迟（平均）', c.inter_token_latency_avg_ms != null ? fmtDuration(c.inter_token_latency_avg_ms) : null],
-    ['Token 间延迟（P95）', c.inter_token_latency_p95_ms != null ? fmtDuration(c.inter_token_latency_p95_ms) : null],
-    ['停顿次数', c.stall_count != null ? String(c.stall_count) : null],
-    ['停顿时长', c.stall_duration_ms != null ? fmtDuration(c.stall_duration_ms) : null],
-    ['请求 payload', c.observed_request_payload_bytes != null ? `${c.observed_request_payload_bytes.toLocaleString()} B` : null],
-    ['响应 payload', c.observed_response_payload_bytes != null ? `${c.observed_response_payload_bytes.toLocaleString()} B` : null],
-    ['请求 Wire', c.observed_request_wire_bytes != null ? `${c.observed_request_wire_bytes.toLocaleString()} B` : null],
-    ['响应 Wire', c.observed_response_wire_bytes != null ? `${c.observed_response_wire_bytes.toLocaleString()} B` : null],
-    ['观测来源', c.observability_source || null],
-    ['观测质量', c.observability_quality || null],
-    ['Endpoint', c.endpoint || null],
+
+  const firstOutput = c.first_response_at || c.first_token_at || c.first_byte_at
+  const ttft = msBetween(c.started_at, firstOutput)
+  const generation = msBetween(firstOutput, c.last_output_at) ?? msBetween(firstOutput, c.completed_at)
+  const speed = generation > 0 && c.output_tokens > 0 ? (c.output_tokens * 1000) / generation : null
+
+  const performanceFields = [
+    ['首个可观察输出', ttft != null ? fmtDuration(ttft) : null],
+    ['生成耗时', generation != null ? fmtDuration(generation) : null],
+    ['输出速度', speed != null ? `${speed.toFixed(1)} Token/s` : null],
     ['状态码', c.status_code != null ? String(c.status_code) : null],
-    ['Finish reason', c.finish_reason || null],
-    ['错误类型', c.error_kind || null],
-    ['限流', c.rate_limited != null ? (c.rate_limited ? '是' : '否') : null],
-    ['流式响应', c.streaming != null ? (c.streaming ? '是' : '否') : null],
-    ['流式完成', c.stream_completed != null ? (c.stream_completed ? '是' : '否') : null],
-    ['重试次数', c.retry_count != null ? String(c.retry_count) : null],
   ].filter(([, value]) => value != null)
 
   return (
@@ -71,16 +67,16 @@ export default function CallDetail() {
       />
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">实时观测</h2>
-        {observedFields.length > 0 ? <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-          {observedFields.map(([label, value]) => (
+        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">性能</h2>
+        {performanceFields.length > 0 ? <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          {performanceFields.map(([label, value]) => (
             <div key={label} className="bg-gray-50 dark:bg-gray-700/30 rounded-xl p-3">
               <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
               <div className="mt-0.5 text-sm font-medium text-gray-700 dark:text-gray-200">{value}</div>
             </div>
           ))}
-        </div> : <EmptyState title="暂无实时观测字段" desc="该调用没有通过 observe 产生可证明的运行时样本。" />}
-        <div className="mt-4"><DataQualityNote kind="partial" text="仅展示运行时观测到的调用指标；普通日志调用保持不可用，不使用推算字节补值。" /></div>
+        </div> : <EmptyState title="暂无可推导的性能字段" desc="客户端日志没有记录本次调用的可证明时间事件。" />}
+        <div className="mt-4"><DataQualityNote kind="partial" text="性能值由客户端日志时间戳推导，缺失时保持不可用，不使用推算值补齐。" /></div>
       </div>
 
       {missing.length > 0 && (

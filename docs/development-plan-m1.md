@@ -44,6 +44,8 @@
 | Codex 新 rollout 时序解析与性能来源区分：`task_started`/`item_completed` 调用起点与首/末输出、`summary` 数组兼容、Hub 每指标来源分布、首页/分析页来源标注（OpenSpec `fix-codex-rollout-timing`） | ✅ 实现与门禁完成，已部署 lstable；非破坏性时序回填窗口覆盖率 68/802 → 745/802 | 2026-09-19 |
 | 会话明细上传恢复：Agent 按 `METRIA_CONTENT_MODE` 上传 message/tool/subagent、协议白名单补 `message`、Hub 按会话键关联工具事件（OpenSpec `restore-agent-content-upload`） | ✅ 实现与门禁完成，本机 Agent 以 `full` 运行，消息已带正文落库 | 2026-09-19 |
 | 归档 `frontend-data-coverage-audit`、`fix-codex-rollout-timing`、`restore-agent-content-upload`，并合并 `add-ephemeral-llm-observability` 冲突场景保持校验全绿 | ✅ 完成 | 2026-09-19 |
+| 展示面按可采集性收敛：首页性能观测保留 3 张日志可推导卡并改三列、分析/调用列表/会话详情/数据质量移除恒空观测项、调用详情改为时间戳推导性能值（OpenSpec `trim-uncollectable-observability-ui`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
+| 概览活动口径与来源新鲜度：会话总时长按窗口重叠裁剪、消息/工具按明细时间统计、来源集合同步并标记失效来源、游标推进写 `last_scan_at`（OpenSpec `fix-overview-activity-and-freshness`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-19 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 

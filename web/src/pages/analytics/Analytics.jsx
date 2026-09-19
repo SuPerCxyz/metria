@@ -14,7 +14,7 @@ import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 
 const TABS = [
@@ -93,9 +93,7 @@ export default function Analytics() {
       labels: pts.map((p) => p.bucket),
       latency: [
         { label: 'TTFT', values: pick('ttft_avg_ms'), color: COLORS.latency.p50 },
-        { label: '首字节', values: pick('first_byte_avg_ms'), color: COLORS.latency.p95 },
         { label: '生成耗时', values: pick('generation_avg_ms'), color: COLORS.latency.avg },
-        { label: 'Token 间延迟', values: pick('inter_token_latency_avg_ms'), color: PALETTE[3] },
       ],
       speed: [{ label: '输出 Token/s', values: pts.map((p) => p.output_tokens_per_second_milli_avg == null ? null : p.output_tokens_per_second_milli_avg / 1000), color: COLORS.output }],
     }
@@ -164,12 +162,8 @@ export default function Analytics() {
   }
   const performanceHasSamples = [
     performanceMetric('ttft'),
-    performanceMetric('first_byte'),
     performanceMetric('generation'),
     performanceMetric('output_speed', 'avg_tokens_per_second'),
-    performanceMetric('inter_token_latency'),
-    performance.data?.stalls?.count > 0,
-    ...['request_payload', 'response_payload', 'request_wire', 'response_wire'].map((key) => performance.data?.observed_bytes?.[key]?.count > 0),
   ].some(Boolean)
 
   const modelItems = (byModel.data?.by || [])
@@ -265,13 +259,13 @@ export default function Analytics() {
             <>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 {performanceMetric('ttft') && <PerformanceCard
-                  label="TTFT"
+                  label="首个可观察输出"
                   value={fmtDuration(performance.data.ttft.avg_ms)}
                   count={performance.data?.ttft?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.ttft?.coverage}
                   sourceLabel={performanceSourceLabel(performance.data?.ttft?.sources)}
-                  hint="优先使用原生实时首 Token；日志来源为条目时间戳近似。"
+                  hint="日志条目时间戳近似；缺失时保持不可用。"
                 />}
                 {performanceMetric('output_speed', 'avg_tokens_per_second') && <PerformanceCard
                   label="输出速度"
@@ -280,16 +274,7 @@ export default function Analytics() {
                   total={performance.data?.total_calls}
                   coverage={performance.data?.output_speed?.coverage}
                   sourceLabel={performanceSourceLabel(performance.data?.output_speed?.sources)}
-                  hint="只计算首 Token 之后的生成区间，不把等待时间算入速度。"
-                />}
-                {performanceMetric('first_byte') && <PerformanceCard
-                  label="首字节延迟"
-                  value={fmtDuration(performance.data.first_byte.avg_ms)}
-                  count={performance.data?.first_byte?.count}
-                  total={performance.data?.total_calls}
-                  coverage={performance.data?.first_byte?.coverage}
-                  sourceLabel={performanceSourceLabel(performance.data?.first_byte?.sources)}
-                  hint="请求开始到首个响应字节，仅原生 observe 可得。"
+                  hint="只计算首个输出之后的生成区间，不把等待时间算入速度。"
                 />}
                 {performanceMetric('generation') && <PerformanceCard
                   label="生成耗时"
@@ -298,32 +283,11 @@ export default function Analytics() {
                   total={performance.data?.total_calls}
                   coverage={performance.data?.generation?.coverage}
                   sourceLabel={performanceSourceLabel(performance.data?.generation?.sources)}
-                  hint="首 Token 到最后输出事件。"
-                />}
-                {performanceMetric('inter_token_latency') && <PerformanceCard
-                  label="Token 间延迟"
-                  value={fmtDuration(performance.data.inter_token_latency.avg_ms)}
-                  count={performance.data.inter_token_latency.count}
-                  total={performance.data.total_calls}
-                  coverage={performance.data.inter_token_latency.coverage}
-                  sourceLabel={performanceSourceLabel(performance.data?.inter_token_latency?.sources)}
-                  hint="相邻输出 Token 之间的观测间隔，仅原生 observe 可得。"
+                  hint="首个输出到最后输出事件。"
                 />}
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 {performance.data?.reliability?.success_rate != null && <SimpleMetric label="成功率" value={`${(performance.data.reliability.success_rate * 100).toFixed(1)}%`} />}
-                {performance.data?.stalls?.count > 0 && isAvailable(performance.data.stalls.avg_count) && <SimpleMetric label="平均停顿次数" value={Number(performance.data.stalls.avg_count).toFixed(1)} />}
-                {['request_payload', 'response_payload', 'request_wire', 'response_wire'].map((key) => {
-                  const metric = performance.data?.observed_bytes?.[key]
-                  if (metric?.count <= 0 || !isAvailable(metric.bytes)) return null
-                  const labels = {
-                    request_payload: '观测请求字节',
-                    response_payload: '观测响应字节',
-                    request_wire: '观测请求 Wire 字节',
-                    response_wire: '观测响应 Wire 字节',
-                  }
-                  return <SimpleMetric key={key} label={labels[key]} value={fmtBytes(metric.bytes)} />
-                })}
               </div>
               <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">
                 观测来源：{formatTimingSources(performance.data?.sources)}；不支持的调用保持不可用，不按 0 计入。
@@ -334,7 +298,7 @@ export default function Analytics() {
                 <div className="mt-6 space-y-6">
                   {performanceTrend.latency.some((dataset) => dataset.values.some((value) => value != null)) && <div>
                     <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">性能趋势</h3>
-                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首字节、首 Token、生成耗时和 Token 间延迟趋势" />
+                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首个可观察输出与生成耗时趋势" />
                   </div>}
                   {performanceTrend.speed[0].values.some((value) => value != null) && <div>
                     <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">输出速度趋势</h3>
@@ -344,7 +308,7 @@ export default function Analytics() {
               )}
             </>
           ) : (
-            <EmptyState title="暂无可用观测数据" desc="日志推导依赖客户端可证明事件；首字节、Token 间延迟、停顿与观测字节需原生 Agent 通过 observe 启动。" />
+            <EmptyState title="暂无可用观测数据" desc="日志推导依赖客户端可证明事件；所选范围没有可计算的首个可观察输出、生成耗时或输出速度样本。" />
           )}
 
           {(latency.data?.count ?? 0) > 0 && <>

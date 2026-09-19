@@ -11,7 +11,7 @@ import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
-import { fmtDateTime, fmtDuration, fmtTokensShort, fmtUsd, outputTokens } from '../../services/format'
+import { fmtDateTime, fmtTokensShort, fmtUsd, outputTokens } from '../../services/format'
 
 const PAGE_SIZE = 100
 
@@ -55,18 +55,13 @@ export default function Calls() {
     { key: 'input_tokens', label: '输入 Token', sortValue: (r) => r.input_tokens, render: (r) => fmtTokensShort(r.input_tokens) },
     { key: 'output_tokens', label: '输出 Token', sortValue: (r) => outputTokens(r), render: (r) => fmtTokensShort(outputTokens(r)) },
     { key: 'cost', label: '费用', sortValue: (r) => r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd, render: (r) => fmtUsd(r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
-    { key: 'ttft_ms', label: '首 Token', hideWhenEmpty: true, sortValue: (r) => r.ttft_ms, render: (r) => fmtDuration(r.ttft_ms) },
-    { key: 'first_byte_latency_ms', label: '首字节', hideWhenEmpty: true, sortValue: (r) => r.first_byte_latency_ms, render: (r) => fmtDuration(r.first_byte_latency_ms) },
-    { key: 'generation_duration_ms', label: '生成耗时', hideWhenEmpty: true, sortValue: (r) => r.generation_duration_ms, render: (r) => fmtDuration(r.generation_duration_ms) },
-    { key: 'output_tokens_per_second_milli', label: '输出速度', hideWhenEmpty: true, sortValue: (r) => r.output_tokens_per_second_milli, render: (r) => r.output_tokens_per_second_milli != null ? `${(r.output_tokens_per_second_milli / 1000).toFixed(1)} Token/s` : '—' },
-    { key: 'observability_source', label: '观测来源', hideWhenEmpty: true, render: (r) => r.observability_source || '—' },
   ]
 
   const nextCursor = query.data?.next_cursor
 
   return (
     <>
-      <PageHeader title="调用" subtitle="查看当前时间范围内的模型调用与可观测性能" />
+      <PageHeader title="调用" subtitle="查看当前时间范围内的模型调用与 Token、费用" />
       <FilterBar searchPlaceholder="搜索 Agent、模型或状态…" onSearch={setSearch} />
       <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <DataTable columns={columns} data={filtered} pageSize={20} onRowClick={(r) => navigate(`/calls/${encodeURIComponent(r.id)}`)} />

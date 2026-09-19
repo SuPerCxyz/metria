@@ -28,6 +28,8 @@ pub struct CycleStats {
     pub sources: usize,
     pub events: usize,
     pub errors: usize,
+    /// 本轮发现并正在采集的来源集合（用于向 Hub 同步来源状态）。
+    pub discovered: Vec<String>,
 }
 
 /// 可中断睡眠：返回 true 表示收到退出信号。
@@ -197,12 +199,14 @@ pub fn run_cycle(
     cursors: &HashMap<String, SourceCursor>,
 ) -> Result<CycleStats> {
     let mut totals = CycleStats::default();
+    let mut discovered = std::collections::BTreeSet::new();
     for (client_name, adapter) in scanner.iter_adapters() {
         let Some(sources) = scanner.discover_sources(client_name, adapter) else {
             continue;
         };
         for source in sources {
             let source_id = source.path_hash.as_str().to_string();
+            discovered.insert(source_id.clone());
             let (events, next_cursor) =
                 match scanner.scan_source_events(adapter, &source, cursors.get(&source_id)) {
                     Ok(v) => v,
@@ -229,12 +233,47 @@ pub fn run_cycle(
                     // 上传失败：该 Source 游标不推进，中止本轮（下轮从旧游标重扫）
                     totals.errors += 1;
                     tracing::warn!("Source {source_id} 本轮未完成（游标不推进，下轮重试）: {e}");
+                    totals.discovered = discovered.into_iter().collect();
                     return Ok(totals);
                 }
             }
         }
     }
+    totals.discovered = discovered.into_iter().collect();
     Ok(totals)
+}
+
+/// 上报当前发现的来源集合，供 Hub 标记已消失来源。
+fn upload_source_sync(
+    client: &HubClient,
+    identity: &ScanIdentity,
+    source_ids: &[String],
+) -> Result<()> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let batch_id = metria_core::model::EventId::from_content(&format!(
+        "source-sync:{}:{now_ms}",
+        identity.collector_id
+    ))
+    .as_str()
+    .to_string();
+    let batch = UploadBatch {
+        schema_version: metria_protocol::limits::SCHEMA_VERSION,
+        batch_id: batch_id.clone(),
+        node_id: identity.node_id.clone(),
+        collector_id: identity.collector_id.clone(),
+        agent_version: metria_core::VERSION.to_string(),
+        events: vec![BatchEvent {
+            kind: "source_sync".into(),
+            event_id: batch_id,
+            payload: serde_json::json!({
+                "node_id": identity.node_id,
+                "collector_id": identity.collector_id,
+                "source_ids": source_ids,
+            }),
+        }],
+    };
+    client.upload(&batch)?;
+    Ok(())
 }
 
 /// 无状态轮询主循环（阻塞直至退出信号或致命错误）。
@@ -259,6 +298,14 @@ pub fn polling_loop(
                 match run_cycle(&scanner, &cfg, &client, &identity, &cursors) {
                     Ok(stats) => {
                         backoff = poll;
+                        if stats.errors == 0 {
+                            // 每轮无错时上报当前来源集合：既是来源状态同步，也是扫描时间心跳。
+                            if let Err(e) =
+                                upload_source_sync(&client, &identity, &stats.discovered)
+                            {
+                                tracing::warn!("来源集合同步失败（下轮重试）: {e}");
+                            }
+                        }
                         if stats.sources > 0 || stats.errors > 0 {
                             tracing::debug!(
                                 "轮询完成: sources={} events={} errors={}",
@@ -613,6 +660,21 @@ mod tests {
         assert!(result.is_err());
         let recorded = requests.lock().unwrap();
         assert!(!recorded.iter().any(|r| r.contains("/collectors/cursors")));
+    }
+
+    #[test]
+    fn source_sync_uploads_current_source_set() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_scripted_hub(vec![(200, ack_body(&["sync"]))], requests.clone());
+        upload_source_sync(
+            &client(&addr),
+            &identity(),
+            &["s1".to_string(), "s2".to_string()],
+        )
+        .unwrap();
+        let recorded = requests.lock().unwrap();
+        // 请求体经 zstd 压缩，这里只校验走了批量上传接口；内容由 Hub e2e 覆盖。
+        assert!(recorded[0].contains("/events/batch"));
     }
 
     #[test]

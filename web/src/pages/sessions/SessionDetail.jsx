@@ -60,13 +60,6 @@ export default function SessionDetail() {
     { key: 'cache_read_tokens', label: '缓存 Token', render: (r) => fmtTokensShort(r.cache_read_tokens) },
     { key: 'calculated_cost_micro_usd', label: '费用', sortValue: (r) => r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd, render: (r) => fmtUsd(r.reported_cost_micro_usd ?? r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
     { key: 'duration_ms', label: '响应时间', hideWhenEmpty: true, render: (r) => fmtDuration(r.duration_ms) },
-    { key: 'ttft_ms', label: 'TTFT', hideWhenEmpty: true, render: (r) => fmtDuration(r.ttft_ms) },
-    { key: 'first_byte_latency_ms', label: '首字节', hideWhenEmpty: true, render: (r) => fmtDuration(r.first_byte_latency_ms) },
-    { key: 'generation_duration_ms', label: '生成耗时', hideWhenEmpty: true, render: (r) => fmtDuration(r.generation_duration_ms) },
-    { key: 'inter_token_latency_avg_ms', label: 'Token 间延迟', hideWhenEmpty: true, render: (r) => fmtDuration(r.inter_token_latency_avg_ms) },
-    { key: 'stall_count', label: '停顿次数', hideWhenEmpty: true, render: (r) => r.stall_count != null ? String(r.stall_count) : '—' },
-    { key: 'output_tokens_per_second_milli', label: '输出速度', hideWhenEmpty: true, render: (r) => r.output_tokens_per_second_milli != null ? `${(r.output_tokens_per_second_milli / 1000).toFixed(1)} Token/s` : '—' },
-    { key: 'observability_source', label: '观测来源', hideWhenEmpty: true, render: (r) => r.observability_source || '—' },
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
   ]
 

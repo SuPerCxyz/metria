@@ -29,7 +29,7 @@ export default function DataQuality() {
     const data = performance.data || {}
     const cards = []
     if (data.total_calls > 0) cards.push(<MetricCard key="observed-calls" label="性能调用范围" value={String(data.total_calls)} sub="当前范围模型调用" />)
-    for (const [key, label] of [['ttft', '首 Token 覆盖率'], ['first_byte', '首字节覆盖率'], ['generation', '生成耗时覆盖率'], ['output_speed', '输出速度覆盖率']]) {
+    for (const [key, label] of [['ttft', '首个可观察输出覆盖率'], ['generation', '生成耗时覆盖率'], ['output_speed', '输出速度覆盖率']]) {
       const metric = data[key]
       if (metric?.count > 0 && isAvailable(metric.coverage)) cards.push(<MetricCard key={key} label={label} value={fmtPct(metric.coverage)} sub={`${metric.count} / ${data.total_calls} 次调用`} />)
     }
@@ -42,7 +42,7 @@ export default function DataQuality() {
 
   return (
     <>
-      <PageHeader title="数据质量" subtitle="采集来源、解析状态与运行时观测覆盖率" />
+      <PageHeader title="数据质量" subtitle="采集来源、解析状态与性能覆盖率" />
 
       <div className="grid grid-cols-12 gap-6">
         {isAvailable(scan.total) && <MetricCard span="xl:col-span-3" label="来源健康" value={`${scan.healthy ?? 0} / ${scan.total}`} sub={scan.with_errors ? `${scan.with_errors} 个来源有错误` : '来源扫描状态'} />}
@@ -54,7 +54,7 @@ export default function DataQuality() {
       {quality.error && <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">部分质量数据加载失败：{quality.error.message}</p>}
       {performance.error && <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">性能覆盖率加载失败：{performance.error.message}</p>}
 
-      {!hasQualityDetails && observationCards.length === 0 && <div className="mt-4 bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700/60"><EmptyState title="暂无质量异常或观测样本" desc="当前范围没有来源错误、游标异常或原生运行时观测数据。" /></div>}
+      {!hasQualityDetails && observationCards.length === 0 && <div className="mt-4 bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700/60"><EmptyState title="暂无质量异常或性能样本" desc="当前范围没有来源错误、游标异常或可推导的性能数据。" /></div>}
 
       {usageDistribution.length > 0 && <QualitySection title="用量来源分布">
         <DataTable

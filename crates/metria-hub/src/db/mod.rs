@@ -497,6 +497,74 @@ impl HubDb {
             stmt.execute(params![collector_id, source_id, cursor_json, ts])
                 .map_err(StorageError::from)?;
         }
+        // 游标推进即代表该来源本轮扫描完成，用于数据新鲜度统计。
+        if !items.is_empty() {
+            let mut touch = c
+                .prepare(
+                    "UPDATE sources SET last_scan_at = ?1,
+                       status = CASE WHEN status = 'missing' THEN 'active' ELSE status END
+                     WHERE id = ?2 AND collector_id = ?3",
+                )
+                .map_err(StorageError::from)?;
+            for (source_id, _) in items {
+                touch
+                    .execute(params![ts, source_id, collector_id])
+                    .map_err(StorageError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 记录来源最近一次产生事件的时间（数据新鲜度）。
+    ///
+    /// 注意：当前事件 payload 的 `source_id` 是 `pseudo_id(path_hash)`，与 `sources.id`
+    /// （原始 path_hash）不一致，无法按事件直接回写；保留此方法供身份统一后使用。
+    pub fn touch_source_events(
+        &self,
+        source_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if source_ids.is_empty() {
+            return Ok(());
+        }
+        let c = self.conn();
+        let ts = now.to_rfc3339();
+        let mut stmt = c
+            .prepare("UPDATE sources SET last_event_at = ?1, updated_at = ?1 WHERE id = ?2")
+            .map_err(StorageError::from)?;
+        for id in source_ids {
+            stmt.execute(params![ts, id]).map_err(StorageError::from)?;
+        }
+        Ok(())
+    }
+
+    /// 用 Agent 上报的当前来源集合同步状态：集合内标记 active，集合外标记 missing。
+    pub fn sync_collector_sources(
+        &self,
+        collector_id: &str,
+        source_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        if collector_id.is_empty() {
+            return Ok(());
+        }
+        let c = self.conn();
+        let ts = now.to_rfc3339();
+        c.execute(
+            "UPDATE sources SET status = 'missing', updated_at = ?1 WHERE collector_id = ?2",
+            params![ts, collector_id],
+        )
+        .map_err(StorageError::from)?;
+        let mut stmt = c
+            .prepare(
+                "UPDATE sources SET status = 'active', last_scan_at = ?1, updated_at = ?1
+                 WHERE collector_id = ?2 AND id = ?3",
+            )
+            .map_err(StorageError::from)?;
+        for id in source_ids {
+            stmt.execute(params![ts, collector_id, id])
+                .map_err(StorageError::from)?;
+        }
         Ok(())
     }
 

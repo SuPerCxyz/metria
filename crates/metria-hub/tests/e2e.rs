@@ -296,8 +296,14 @@ async fn full_ingest_rollup_query_cycle() {
     assert_eq!(overview["pricing_coverage"]["total_calls"], 2);
     assert_eq!(overview["token_calls"], 2);
     assert!(overview.get("traffic_coverage").is_none());
-    assert_eq!(overview["message_count"], 4);
-    assert_eq!(overview["tool_call_count"], 1);
+    // 消息/工具按明细统计：该夹具没有明细事件，因此为 0（不再沿用会话级计数）。
+    assert_eq!(overview["message_count"], 0);
+    assert_eq!(overview["tool_call_count"], 0);
+    assert_eq!(overview["user_message_count"], 0);
+    assert_eq!(
+        overview["session_duration_ms"], 10_000,
+        "会话跨度 = 开始(01:00:00) 到最后活动(01:00:10)"
+    );
     assert!(overview["active_duration_ms"].is_null());
 
     let filter_options: Value = ureq::get(&format!("{base}/api/v1/usage/filter-options"))
@@ -1876,6 +1882,162 @@ fn catalog_sync_keeps_only_latest_snapshot_and_rules() {
         !models.contains(&"legacy-model".to_string()),
         "停用目录规则不应返回"
     );
+}
+
+/// 概览活动/消息统计按窗口内明细与重叠时长计算，而不是按会话开始时间归属。
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_activity_uses_window_and_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _state) = spawn_hub(dir.path()).await;
+
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "act-node", "node_name": "act-node",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.3.0", "protocol_version": 1
+        }))
+        .unwrap();
+
+    let node = "act-node";
+    let collector = "collector-act-node";
+    let batch = json!({
+        "schema_version": 1,
+        "batch_id": "act-batch-1",
+        "node_id": node,
+        "collector_id": collector,
+        "agent_version": "0.3.0",
+        "events": [
+            {"kind": "session", "event_id": "blake3:act-session", "payload": {
+                "id": "act-sess-id",
+                "source_session_id": "act-src-session",
+                "node_id": node,
+                "collector_id": collector,
+                "source_id": "src-act",
+                "client_id": "codex",
+                "started_at": "2026-09-18T23:00:00Z",
+                "last_activity_at": "2026-09-19T02:00:00Z",
+                "status": "active",
+                "message_count": 99,
+                "tool_call_count": 88,
+                "model_call_count": 0,
+                "created_at": "2026-09-18T23:00:00Z"
+            }},
+            {"kind": "message", "event_id": "blake3:act-message", "payload": {
+                "id": "act-msg-1", "turn_id": null, "session_id": "act-sess-id",
+                "source_message_id": null, "sequence": 1, "role": "user", "content_type": "text",
+                "content": "hi", "content_hash": "h1", "content_length": 2, "utf8_bytes": 2,
+                "created_at": "2026-09-19T01:00:00Z", "redacted": false
+            }},
+            {"kind": "tool", "event_id": "blake3:act-tool", "payload": {
+                "id": "act-tool-1", "session_id": "act-sess-id", "model_call_id": null, "turn_id": null,
+                "source_tool_id": "t1", "name": "Bash", "tool_type": "command", "status": "success",
+                "input_length": 1, "output_length": 1, "started_at": "2026-09-19T01:30:00Z",
+                "completed_at": "2026-09-19T01:30:01Z", "duration_ms": 1000, "error": false,
+                "created_at": "2026-09-19T01:30:01Z"
+            }}
+        ]
+    });
+    let upload: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(upload["accepted"].as_array().unwrap().len(), 3, "{upload}");
+
+    let token = admin_token(&base);
+    let overview: Value = ureq::get(&format!(
+        "{base}/api/v1/overview?from=2026-09-19T00:00:00Z&to=2026-09-19T03:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(overview["sessions"], 0, "窗口内没有新建会话");
+    assert_eq!(overview["message_count"], 1, "按消息时间统计");
+    assert_eq!(overview["user_message_count"], 1);
+    assert_eq!(overview["tool_call_count"], 1, "按工具时间统计");
+    assert_eq!(
+        overview["session_duration_ms"], 7_200_000,
+        "会话跨度应裁剪到窗口（23:00 开始、02:00 最后活动 → 00:00-02:00 共 2 小时）"
+    );
+}
+
+/// Agent 上报来源集合后，消失的来源标记 missing，新鲜度不再被历史来源拉低。
+#[tokio::test(flavor = "multi_thread")]
+async fn source_sync_marks_missing_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _state) = spawn_hub(dir.path()).await;
+
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "sync-node", "node_name": "sync-node",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.3.0", "protocol_version": 1
+        }))
+        .unwrap();
+
+    let node = "sync-node";
+    let collector = "collector-sync-node";
+    let source_event = |id: &str| {
+        json!({"kind": "source", "event_id": format!("blake3:src-{id}"), "payload": {
+            "id": id, "node_id": node, "collector_id": collector, "client_id": "codex",
+            "adapter_id": "codex", "adapter_version": "0.3.0",
+            "source_fingerprint": id, "source_path_hash": id, "capabilities": [], "status": "active"
+        }})
+    };
+    let upload = |events: Value, batch_id: &str| -> Value {
+        ureq::post(&format!("{base}/api/v1/events/batch"))
+            .set("Authorization", "Bearer testtok")
+            .send_json(json!({
+                "schema_version": 1, "batch_id": batch_id,
+                "node_id": node, "collector_id": collector, "agent_version": "0.3.0",
+                "events": events
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap()
+    };
+
+    let resp = upload(
+        json!([source_event("s1"), source_event("s2")]),
+        "sync-batch-1",
+    );
+    assert_eq!(resp["accepted"].as_array().unwrap().len(), 2, "{resp}");
+
+    let resp = upload(
+        json!([{"kind": "source_sync", "event_id": "blake3:sync-1", "payload": {
+            "node_id": node, "collector_id": collector, "source_ids": ["s1"]
+        }}]),
+        "sync-batch-2",
+    );
+    assert_eq!(resp["accepted"].as_array().unwrap().len(), 1, "{resp}");
+
+    let token = admin_token(&base);
+    let overview: Value = ureq::get(&format!(
+        "{base}/api/v1/overview?from=2026-09-19T00:00:00Z&to=2026-09-19T03:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    let freshness = &overview["freshness"];
+    assert_eq!(
+        freshness["source_total"], 1,
+        "消失的来源不计入覆盖率分母：{freshness}"
+    );
+    assert_eq!(freshness["source_missing"], 1);
+    assert_eq!(freshness["source_healthy"], 1);
+    assert!(
+        freshness["last_scan_at"].is_string(),
+        "同步即记录扫描时间：{freshness}"
+    );
+    assert_eq!(freshness["coverage"], 1.0);
+    assert_eq!(freshness["status"], "fresh");
 }
 
 fn tempdir(prefix: &str) -> std::path::PathBuf {

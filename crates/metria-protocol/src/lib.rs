@@ -350,6 +350,7 @@ pub fn valid_kind(kind: &str) -> bool {
         kind,
         "session"
             | "source"
+            | "source_sync"
             | "call"
             | "usage"
             | "message"
@@ -369,6 +370,7 @@ mod tests {
         assert!(valid_kind("message"));
         assert!(valid_kind("tool"));
         assert!(valid_kind("subagent"));
+        assert!(valid_kind("source_sync"));
         assert!(!valid_kind("unknown_kind"));
     }
 

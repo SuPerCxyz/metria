@@ -233,21 +233,6 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         body["duration_p95_ms"] = pct(0.95);
         body["duration_p99_ms"] = pct(0.99);
     }
-    // 会话消息中只有用户角色需要从明细表计数；总消息/工具调用沿用 rollup。
-    let (session_filter, session_fargs) = range_filter_sessions(&p);
-    body["user_message_count"] = c
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM messages m
-                 JOIN sessions s ON s.id = m.session_id
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2
-                   AND m.role = 'user' {session_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, session_fargs)),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into();
     // 活跃时长只统计明确记录了 duration_ms 的调用；没有记录时返回 null。
     let (active_duration, active_count) = c
         .query_row(
@@ -264,24 +249,16 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     } else {
         serde_json::Value::Null
     };
-    // 会话持续时长是起始到最后活动/结束的跨度，允许会话之间重叠，不能解释为去重在线时长。
-    let (session_duration, session_count) = c
-        .query_row(
-            &format!(
-                "SELECT SUM(CASE WHEN COALESCE(s.last_activity_at, s.ended_at, s.started_at) > s.started_at
-                                  THEN CAST((julianday(COALESCE(s.last_activity_at, s.ended_at, s.started_at)) - julianday(s.started_at)) * 86400000 AS INTEGER)
-                                  ELSE 0 END), COUNT(*)
-                 FROM sessions s WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, range_filter_sessions(&p).1)),
-            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .unwrap_or((None, 0));
-    body["session_duration_ms"] = if session_count > 0 {
-        session_duration.into()
-    } else {
-        serde_json::Value::Null
-    };
+    // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
+    let activity = overview_activity(&c, &p, from, to);
+    body["sessions"] = activity.sessions.into();
+    body["message_count"] = activity.messages.into();
+    body["user_message_count"] = activity.user_messages.into();
+    body["tool_call_count"] = activity.tools.into();
+    body["session_duration_ms"] = activity
+        .session_duration_ms
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
     body["freshness"] = freshness_summary(&c, &p);
     // S3.9：缓存读取节省费用 = 范围内各模型 cache_read_tokens × 匹配规则的缓存读取单价。
     // c 在此之后不再使用；先 drop 释放 Mutex 锁，load_all_rules 才能安全取锁（Mutex 不可重入）。
@@ -974,11 +951,13 @@ fn freshness_summary(
     let source = c
         .query_row(
             &format!(
-                "SELECT COUNT(*),
+                "SELECT
+                    COALESCE(SUM(CASE WHEN s.status != 'missing' THEN 1 ELSE 0 END),0),
                     COALESCE(SUM(CASE WHEN status = 'active' AND last_error IS NULL AND last_scan_at IS NOT NULL THEN 1 ELSE 0 END),0),
                     MAX(last_scan_at), MAX(last_event_at),
-                    COALESCE(SUM(CASE WHEN last_scan_at IS NULL OR last_scan_at < ?{cutoff_index} THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+                    COALESCE(SUM(CASE WHEN s.status != 'missing' AND (last_scan_at IS NULL OR last_scan_at < ?{cutoff_index}) THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN s.status = 'missing' THEN 1 ELSE 0 END),0)
                  FROM sources s WHERE 1 = 1 {source_filter}"
             ),
             params_from_iter(source_args),
@@ -990,10 +969,11 @@ fn freshness_summary(
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
                 ))
             },
         )
-        .unwrap_or((0, 0, None, None, 0, 0));
+        .unwrap_or((0, 0, None, None, 0, 0, 0));
 
     let (collector_filter, mut collector_args) = collector_scope_filter(p);
     let online_index = collector_args.len() + 1;
@@ -1035,6 +1015,7 @@ fn freshness_summary(
         "source_healthy": source.1,
         "source_stale": source.4,
         "source_errors": source.5,
+        "source_missing": source.6,
         "coverage": if source.0 > 0 { Some(source.1 as f64 / source.0 as f64) } else { None },
         "collectors_total": collectors.0,
         "collectors_online": collectors.1,
@@ -2232,7 +2213,7 @@ pub(crate) async fn call_detail(
                 observability_quality, endpoint, finish_reason, error_kind, rate_limited,
                 observed_request_payload_bytes, observed_response_payload_bytes,
                 observed_request_wire_bytes, observed_response_wire_bytes, streaming, stream_completed, retry_count,
-                status_code
+                status_code, first_response_at
              FROM model_calls WHERE id = ?1",
             [&id],
             |r| {
@@ -2282,6 +2263,7 @@ pub(crate) async fn call_detail(
                     "stream_completed": r.get::<_, Option<bool>>(42)?,
                     "retry_count": r.get::<_, i64>(43)?,
                     "status_code": r.get::<_, Option<i64>>(44)?,
+                    "first_response_at": r.get::<_, Option<String>>(45)?,
                 }))
             },
         )
@@ -3396,7 +3378,7 @@ fn edge_windows(
 fn add_overview_raw_edges(
     body: &mut serde_json::Value,
     c: &metria_storage::rusqlite::Connection,
-    p: &RangeParams,
+    _p: &RangeParams,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     h_from: DateTime<Utc>,
@@ -3404,7 +3386,6 @@ fn add_overview_raw_edges(
     call_filter: &str,
     call_fargs: &[SqlValue],
 ) {
-    let (session_filter, session_fargs) = range_filter_sessions(p);
     for (w_from, w_to) in edge_windows(from, to, h_from, h_to) {
         if let Ok(values) = c.query_row(
             &format!(
@@ -3440,24 +3421,95 @@ fn add_overview_raw_edges(
                 add_json_number(body, key, *value);
             }
         }
-        if let Ok((sessions, messages, tools)) = c.query_row(
+    }
+}
+
+/// 概览「活动与健康 / 消息与数据状态」的窗口口径统计。
+struct OverviewActivity {
+    sessions: i64,
+    messages: i64,
+    user_messages: i64,
+    tools: i64,
+    session_duration_ms: Option<i64>,
+}
+
+/// 新建会话按窗口内开始计；会话时长按与窗口重叠的跨度裁剪；
+/// 消息与工具按明细自身的发生时间统计（开启内容采集后才会有数据）。
+fn overview_activity(
+    c: &metria_storage::rusqlite::Connection,
+    p: &RangeParams,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> OverviewActivity {
+    let (session_filter, session_fargs) = range_filter_sessions(p);
+    let sessions = c
+        .query_row(
             &format!(
-                "SELECT COUNT(*), COALESCE(SUM(s.message_count),0), COALESCE(SUM(s.tool_call_count),0)
-                 FROM sessions s WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
+                "SELECT COUNT(*) FROM sessions s
+                 WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
             ),
-            params_from_iter(range_args(&w_from, &w_to, session_fargs.clone())),
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0).unwrap_or(0),
-                    r.get::<_, i64>(1).unwrap_or(0),
-                    r.get::<_, i64>(2).unwrap_or(0),
-                ))
-            },
-        ) {
-            add_json_number(body, "sessions", sessions);
-            add_json_number(body, "message_count", messages);
-            add_json_number(body, "tool_call_count", tools);
-        }
+            params_from_iter(range_args(&from, &to, session_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let messages = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages m
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE m.created_at >= ?1 AND m.created_at < ?2 {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let user_messages = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages m
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE m.created_at >= ?1 AND m.created_at < ?2
+                   AND m.role = 'user' {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let tools = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM tool_events t
+                 JOIN sessions s ON s.id = t.session_id
+                 WHERE t.started_at >= ?1 AND t.started_at < ?2 {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    // 与窗口重叠的会话跨度（裁剪到窗口边界），允许会话之间重叠。
+    let (overlap_count, overlap_ms) = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    CASE WHEN julianday(MIN(COALESCE(s.last_activity_at, s.ended_at, s.started_at), ?2))
+                              > julianday(MAX(s.started_at, ?1))
+                         THEN CAST((julianday(MIN(COALESCE(s.last_activity_at, s.ended_at, s.started_at), ?2))
+                                  - julianday(MAX(s.started_at, ?1))) * 86400000 AS INTEGER)
+                         ELSE 0 END),0)
+                 FROM sessions s
+                 WHERE s.started_at < ?2
+                   AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) > ?1 {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs)),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap_or((0, None));
+    OverviewActivity {
+        sessions,
+        messages,
+        user_messages,
+        tools,
+        session_duration_ms: if overlap_count > 0 { overlap_ms } else { None },
     }
 }
 

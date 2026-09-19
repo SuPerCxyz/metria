@@ -15,7 +15,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
@@ -202,15 +202,9 @@ export default function Overview() {
     const label = performanceSourceLabel(metric.sources)
     return label ? `${base} · ${label}` : base
   }
-  const observedBytesCoverage = (key) => {
-    const metric = performanceData.observed_bytes?.[key]
-    return metric?.count > 0
-      ? `${metric.count}/${performanceData.total_calls ?? 0} 次调用有观测 · 运行时观测`
-      : '暂无运行时观测数据'
-  }
   const performanceSources = (performanceData.sources || [])
     .map((source) => `${source.source}（${source.quality}，${source.count}）`)
-    .join('、') || '暂无实时观测样本'
+    .join('、') || '暂无样本'
   const tokenTotal = sumTokens(o)
   const previousTokenTotal = previous ? sumTokens(previous) : null
   const averageTokenCount = o.token_calls ?? 0
@@ -225,14 +219,9 @@ export default function Overview() {
     return metric?.count > 0 && isAvailable(metric[valueKey])
   }
   const performanceCards = [
-    <MetricCard key="ttft" span="xl:col-span-3" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首个可观察输出；日志推导为条目时间戳近似，精确流式时序需 metria observe" />,
-    <MetricCard key="first-byte" span="xl:col-span-3" label="首字节延迟" value={performanceMetric('first_byte') ? fmtDuration(performanceData.first_byte.avg_ms) : '—'} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节；仅 metria observe 可得" />,
-    <MetricCard key="generation" span="xl:col-span-3" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件" />,
-    <MetricCard key="speed" span="xl:col-span-3" label="输出速度" value={performanceMetric('output_speed', 'avg_tokens_per_second') ? `${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '—'} sub={performanceCoverage('output_speed')} hint="仅使用首 Token 后的生成区间计算" />,
-    <MetricCard key="itl" span="xl:col-span-3" label="Token 间延迟" value={performanceMetric('inter_token_latency') ? fmtDuration(performanceData.inter_token_latency.avg_ms) : '—'} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔；仅 metria observe 可得" />,
-    <MetricCard key="stalls" span="xl:col-span-3" label="平均停顿次数" value={performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) ? Number(performanceData.stalls.avg_count).toFixed(1) : '—'} sub={performanceData.stalls?.count > 0 ? `${performanceData.stalls.count} 次调用有停顿统计 · 运行时观测` : '暂无停顿样本'} hint="观测到的生成停顿次数；仅 metria observe 可得" />,
-    <MetricCard key="request-payload" span="xl:col-span-3" label="观测请求字节" value={fmtBytes(performanceData.observed_bytes?.request_payload?.bytes)} sub={observedBytesCoverage('request_payload')} hint="仅表示运行时观测链路看到的请求 payload 字节" />,
-    <MetricCard key="response-payload" span="xl:col-span-3" label="观测响应字节" value={fmtBytes(performanceData.observed_bytes?.response_payload?.bytes)} sub={observedBytesCoverage('response_payload')} hint="仅表示运行时观测链路看到的响应 payload 字节" />,
+    <MetricCard key="ttft" span="xl:col-span-4" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首个可观察输出；日志推导为条目时间戳近似，缺失时保持不可用" />,
+    <MetricCard key="generation" span="xl:col-span-4" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首个输出到最后输出事件，不含其后的工具执行时间" />,
+    <MetricCard key="speed" span="xl:col-span-4" label="输出速度" value={performanceMetric('output_speed', 'avg_tokens_per_second') ? `${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '—'} sub={performanceCoverage('output_speed')} hint="仅使用首个输出后的生成区间计算" />,
   ]
 
   return (
@@ -305,7 +294,7 @@ export default function Overview() {
         <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
         {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
         {performance.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">性能数据加载失败：{performance.error.message}</p>}
-        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；每张卡片按来源标注「运行时观测」或「日志推导」，日志调用缺失的字段保持不可用，不使用推算值补齐；首字节、Token 间延迟、停顿与观测字节仅 metria observe 可产生。</p>}
+        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；每张卡片按来源标注「运行时观测」或「日志推导」，日志调用缺失的字段保持不可用，不使用推算值补齐。</p>}
       </div>
 
       <div className="mt-3">
@@ -315,7 +304,7 @@ export default function Overview() {
           <MetricCard span="xl:col-span-2" label="错误率" value={errorRate != null ? fmtPct100(errorRate) : '—'} {...compare(errorRate, previousErrorRate, true)} sub={errorRate != null ? `成功 ${fmtPct100(successRate)} · 失败 ${failed} 次` : '当前范围暂无请求数据'} hint="失败请求占全部请求比例；下降表示改善" />
           <MetricCard span="xl:col-span-2" label="新建会话" value={isAvailable(o.sessions) ? String(o.sessions) : '—'} {...compare(o.sessions, previous?.sessions)} sub={isAvailable(o.sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据'} hint="当前 Agent 新建的会话数" />
           <MetricCard span="xl:col-span-2" label="活跃时长" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub="模型调用耗时合计" hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠" />
-          <MetricCard span="xl:col-span-2" label="会话总时长" value={fmtDuration(o.session_duration_ms)} {...compare(o.session_duration_ms, previous?.session_duration_ms)} sub="会话持续跨度合计" hint="从会话开始到最后活动/结束；不去重重叠会话" />
+          <MetricCard span="xl:col-span-2" label="会话总时长" value={fmtDuration(o.session_duration_ms)} {...compare(o.session_duration_ms, previous?.session_duration_ms)} sub="范围重叠的会话跨度合计" hint="与所选范围重叠的会话跨度（裁剪到范围边界）；不去重重叠会话" />
           <MetricCard span="xl:col-span-2" label="节点在线" value={isAvailable(o.collectors) ? `${o.collectors_online ?? 0} / ${o.collectors}` : '—'} sub={isAvailable(o.collectors) ? `${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目` : '当前范围暂无采集器数据'} hint="在线采集器 / 总数" />
         </div>
       </div>
@@ -323,9 +312,9 @@ export default function Overview() {
       <div className="mt-3">
         <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
         <div className="grid grid-cols-12 gap-6">
-          <MetricCard span="xl:col-span-3" label="总消息数" value={fmtTokensShort(o.message_count)} {...compare(o.message_count, previous?.message_count)} sub="用户、助手和系统消息" />
+          <MetricCard span="xl:col-span-3" label="总消息数" value={fmtTokensShort(o.message_count)} {...compare(o.message_count, previous?.message_count)} sub="按消息时间统计（需内容采集）" />
           <MetricCard span="xl:col-span-3" label="用户消息数" value={fmtTokensShort(o.user_message_count)} {...compare(o.user_message_count, previous?.user_message_count)} sub="可识别 role=user" />
-          <MetricCard span="xl:col-span-3" label="工具调用消息" value={fmtTokensShort(o.tool_call_count)} {...compare(o.tool_call_count, previous?.tool_call_count)} sub="会话工具调用计数" />
+          <MetricCard span="xl:col-span-3" label="工具调用消息" value={fmtTokensShort(o.tool_call_count)} {...compare(o.tool_call_count, previous?.tool_call_count)} sub="按工具事件时间统计" />
           <FreshnessCard freshness={o.freshness} />
         </div>
       </div>
@@ -452,6 +441,7 @@ function FreshnessCard({ freshness }) {
       <div className="mt-1 truncate text-xs text-gray-300 dark:text-gray-600" title={latest || undefined}>
         {freshness?.source_stale ? `${freshness.source_stale} 个来源延迟` : '最近扫描已完成'}
         {freshness?.source_errors ? ` · ${freshness.source_errors} 个来源错误` : ''}
+        {freshness?.source_missing ? ` · ${freshness.source_missing} 个来源已失效` : ''}
       </div>
     </div>
   )
