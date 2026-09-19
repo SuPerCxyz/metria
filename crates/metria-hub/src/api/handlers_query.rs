@@ -2918,6 +2918,15 @@ pub(crate) async fn usage_performance(
     let mut inter_token = Vec::new();
     let mut stalls = Vec::new();
     let mut sources: std::collections::HashMap<(String, String), i64> = Default::default();
+    // 每个指标单独记录来源/质量分布，供前端区分「运行时观测」与「日志推导」。
+    let mut ttft_sources: std::collections::HashMap<(String, String), i64> = Default::default();
+    let mut first_byte_sources: std::collections::HashMap<(String, String), i64> =
+        Default::default();
+    let mut generation_sources: std::collections::HashMap<(String, String), i64> =
+        Default::default();
+    let mut speed_sources: std::collections::HashMap<(String, String), i64> = Default::default();
+    let mut inter_token_sources: std::collections::HashMap<(String, String), i64> =
+        Default::default();
     let mut observed_bytes = [0i64; 4];
     let mut observed_counts = [0usize; 4];
     for row in rows.flatten() {
@@ -2962,16 +2971,28 @@ pub(crate) async fn usage_performance(
             .unwrap_or_else(|| "unknown".into());
         if let Some(byte_at) = byte_at.filter(|at| *at >= started) {
             first_byte.push((byte_at - started).num_milliseconds());
+            *first_byte_sources
+                .entry((source.clone(), quality.clone()))
+                .or_default() += 1;
         }
         if let Some(first) = first.filter(|first| *first >= started) {
             ttft.push((first - started).num_milliseconds());
             *sources
                 .entry((source.clone(), quality.clone()))
                 .or_default() += 1;
+            *ttft_sources
+                .entry((source.clone(), quality.clone()))
+                .or_default() += 1;
             if let Some(value) = row.8.filter(|value| *value > 0) {
                 generation.push(value);
+                *generation_sources
+                    .entry((source.clone(), quality.clone()))
+                    .or_default() += 1;
             } else if let Some(last) = last_output.or(completed).filter(|last| *last > first) {
                 generation.push((last - first).num_milliseconds());
+                *generation_sources
+                    .entry((source.clone(), quality.clone()))
+                    .or_default() += 1;
             }
             let generation_ms = row.8.or_else(|| {
                 last_output
@@ -2981,19 +3002,31 @@ pub(crate) async fn usage_performance(
             });
             if let Some(value) = row.7.filter(|value| *value > 0) {
                 speeds.push(value as f64 / 1000.0);
+                *speed_sources
+                    .entry((source.clone(), quality.clone()))
+                    .or_default() += 1;
             } else if let (Some(generation_ms), Some(tokens)) =
                 (generation_ms, row.6.filter(|value| *value > 0))
             {
                 if generation_ms > 0 {
                     speeds.push(tokens as f64 * 1000.0 / generation_ms as f64);
+                    *speed_sources
+                        .entry((source.clone(), quality.clone()))
+                        .or_default() += 1;
                 }
             }
         }
         if let Some(value) = row.9.filter(|value| *value >= 0) {
             inter_token.push(value);
+            *inter_token_sources
+                .entry((source.clone(), quality.clone()))
+                .or_default() += 1;
         }
         if let Some(value) = row.10.filter(|value| *value >= 0) {
             inter_token.push(value);
+            *inter_token_sources
+                .entry((source.clone(), quality.clone()))
+                .or_default() += 1;
         }
         if let Some(value) = row.11.filter(|value| *value >= 0) {
             stalls.push(value);
@@ -3048,13 +3081,18 @@ pub(crate) async fn usage_performance(
     };
     let ttft_count = ttft.len();
     let speed_count = speeds.len();
-    let mut source_rows: Vec<serde_json::Value> = sources
-        .into_iter()
-        .map(|((source, quality), count)| {
-            serde_json::json!({ "source": source, "quality": quality, "count": count })
-        })
-        .collect();
-    source_rows.sort_by_key(|row| std::cmp::Reverse(row["count"].as_i64().unwrap_or(0)));
+    let build_source_rows =
+        |map: std::collections::HashMap<(String, String), i64>| -> Vec<serde_json::Value> {
+            let mut rows: Vec<serde_json::Value> = map
+                .into_iter()
+                .map(|((source, quality), count)| {
+                    serde_json::json!({ "source": source, "quality": quality, "count": count })
+                })
+                .collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row["count"].as_i64().unwrap_or(0)));
+            rows
+        };
+    let source_rows = build_source_rows(sources);
     Json(serde_json::json!({
         "total_calls": total,
         "reliability": {
@@ -3070,6 +3108,7 @@ pub(crate) async fn usage_performance(
             "p95_ms": percentile_i64(&first_byte, 0.95),
             "p99_ms": percentile_i64(&first_byte, 0.99),
             "coverage": if total > 0 { Some(first_byte.len() as f64 / total as f64) } else { None },
+            "sources": build_source_rows(first_byte_sources),
         },
         "ttft": {
             "count": ttft_count,
@@ -3078,6 +3117,7 @@ pub(crate) async fn usage_performance(
             "p95_ms": percentile_i64(&ttft, 0.95),
             "p99_ms": percentile_i64(&ttft, 0.99),
             "coverage": if total > 0 { Some(ttft_count as f64 / total as f64) } else { None },
+            "sources": build_source_rows(ttft_sources),
         },
         "generation": {
             "count": generation.len(),
@@ -3086,6 +3126,7 @@ pub(crate) async fn usage_performance(
             "p95_ms": percentile_i64(&generation, 0.95),
             "p99_ms": percentile_i64(&generation, 0.99),
             "coverage": if total > 0 { Some(generation.len() as f64 / total as f64) } else { None },
+            "sources": build_source_rows(generation_sources),
         },
         "output_speed": {
             "count": speed_count,
@@ -3093,6 +3134,7 @@ pub(crate) async fn usage_performance(
             "p50_tokens_per_second": percentile_f64(&speeds, 0.50),
             "p95_tokens_per_second": percentile_f64(&speeds, 0.95),
             "coverage": if total > 0 { Some(speed_count as f64 / total as f64) } else { None },
+            "sources": build_source_rows(speed_sources),
         },
         "inter_token_latency": {
             "count": inter_token.len(),
@@ -3101,6 +3143,7 @@ pub(crate) async fn usage_performance(
             "p95_ms": percentile_i64(&inter_token, 0.95),
             "p99_ms": percentile_i64(&inter_token, 0.99),
             "coverage": if total > 0 { Some(inter_token.len() as f64 / total as f64) } else { None },
+            "sources": build_source_rows(inter_token_sources),
         },
         "stalls": {
             "count": stalls.len(),

@@ -1578,6 +1578,35 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
         .unwrap();
     assert!((avg_speed - 69.44).abs() < 0.1, "avg_speed={avg_speed}");
 
+    // 每指标来源分布：运行时观测与日志推导分别统计
+    let ttft_sources = performance["ttft"]["sources"].as_array().unwrap();
+    assert_eq!(ttft_sources.len(), 2, "两类来源应分别统计");
+    let count_of = |name: &str| {
+        ttft_sources
+            .iter()
+            .find(|item| item["source"] == name)
+            .and_then(|item| item["count"].as_i64())
+            .unwrap_or(0)
+    };
+    assert_eq!(count_of("runtime_http"), 1);
+    assert_eq!(count_of("test_event_timestamps"), 1);
+    assert_eq!(
+        performance["output_speed"]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "输出速度也应带来源分布"
+    );
+    assert!(
+        performance["first_byte"]["sources"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 1,
+        "首字节延迟只有运行时观测来源"
+    );
+
     let performance_series: Value = ureq::get(&format!(
         "{base}/api/v1/usage/performance/timeseries?from={from}&to={to}"
     ))
@@ -1854,4 +1883,124 @@ fn tempdir(prefix: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// 会话明细（message/tool）事件应通过协议白名单并落库，可在时间线/工具接口读取。
+#[tokio::test(flavor = "multi_thread")]
+async fn session_detail_events_are_ingested() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _state) = spawn_hub(dir.path()).await;
+
+    ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "detail-node", "node_name": "detail-node",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.3.0", "protocol_version": 1
+        }))
+        .unwrap();
+
+    let node = "detail-node";
+    let collector = "collector-detail-node";
+    let sid = "detail-session-source";
+    let batch = json!({
+        "schema_version": 1,
+        "batch_id": "detail-batch-1",
+        "node_id": node,
+        "collector_id": collector,
+        "agent_version": "0.3.0",
+        "events": [
+            {"kind": "session", "event_id": "blake3:detail-session", "payload": {
+                "id": "detail-sess-id",
+                "source_session_id": sid,
+                "node_id": node,
+                "collector_id": collector,
+                "source_id": "src-detail",
+                "client_id": "codex",
+                "started_at": "2026-09-19T01:00:00Z",
+                "status": "ended",
+                "message_count": 1,
+                "tool_call_count": 1,
+                "model_call_count": 1,
+                "created_at": "2026-09-19T01:00:00Z"
+            }},
+            {"kind": "message", "event_id": "blake3:detail-message", "payload": {
+                "id": "detail-msg-1",
+                "turn_id": null,
+                "session_id": "detail-sess-id",
+                "source_message_id": null,
+                "sequence": 1,
+                "role": "user",
+                "content_type": "text",
+                "content": "你好",
+                "content_hash": "hash-detail",
+                "content_length": 2,
+                "utf8_bytes": 6,
+                "created_at": "2026-09-19T01:00:01Z",
+                "redacted": false
+            }},
+            {"kind": "tool", "event_id": "blake3:detail-tool", "payload": {
+                "id": "detail-tool-1",
+                "session_id": "detail-sess-id",
+                "model_call_id": null,
+                "turn_id": null,
+                "source_tool_id": "call_detail",
+                "name": "Bash",
+                "tool_type": "command",
+                "status": "success",
+                "input_length": 10,
+                "output_length": 20,
+                "started_at": "2026-09-19T01:00:02Z",
+                "completed_at": "2026-09-19T01:00:03Z",
+                "duration_ms": 1000,
+                "error": false,
+                "created_at": "2026-09-19T01:00:03Z"
+            }}
+        ]
+    });
+    let upload: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(
+        upload["accepted"].as_array().unwrap().len(),
+        3,
+        "message 与 tool 应被接受：{upload}"
+    );
+    assert!(upload["failed"].as_array().unwrap().is_empty());
+
+    let token = admin_token(&base);
+    let sessions: Value = ureq::get(&format!(
+        "{base}/api/v1/sessions?from=2026-09-19T00:00:00Z&to=2026-09-19T02:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    let session_id = sessions["sessions"][0]["id"].as_str().unwrap().to_string();
+
+    let timeline: Value = ureq::get(&format!("{base}/api/v1/sessions/{session_id}/timeline"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let messages = timeline["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "时间线应包含上传的消息");
+    assert_eq!(messages[0]["role"], "user");
+
+    let tools: Value = ureq::get(&format!("{base}/api/v1/sessions/{session_id}/tools"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(
+        tools["tools"].as_array().unwrap().len(),
+        1,
+        "会话工具列表应包含上传的工具事件"
+    );
 }

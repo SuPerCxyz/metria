@@ -352,6 +352,7 @@ pub fn valid_kind(kind: &str) -> bool {
             | "source"
             | "call"
             | "usage"
+            | "message"
             | "traffic"
             | "tool"
             | "subagent"
@@ -362,6 +363,14 @@ pub fn valid_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_detail_kind_is_allowed() {
+        assert!(valid_kind("message"));
+        assert!(valid_kind("tool"));
+        assert!(valid_kind("subagent"));
+        assert!(!valid_kind("unknown_kind"));
+    }
 
     fn batch(payload: serde_json::Value) -> UploadBatch {
         UploadBatch {

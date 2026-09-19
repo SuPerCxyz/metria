@@ -16,7 +16,7 @@ import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
-import { isAvailable } from '../../services/dataAvailability'
+import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
 const TREND_TABS = [
@@ -197,15 +197,16 @@ export default function Overview() {
   const performanceData = performance.data || {}
   const performanceCoverage = (key) => {
     const metric = performanceData[key]
-    return metric?.count != null
-      ? `覆盖 ${fmtPct(metric.coverage)} · ${metric.count}/${performanceData.total_calls ?? 0} 次调用`
-      : '暂无实时观测数据'
+    if (metric?.count == null) return '暂无观测数据'
+    const base = `覆盖 ${fmtPct(metric.coverage)} · ${metric.count}/${performanceData.total_calls ?? 0} 次调用`
+    const label = performanceSourceLabel(metric.sources)
+    return label ? `${base} · ${label}` : base
   }
   const observedBytesCoverage = (key) => {
     const metric = performanceData.observed_bytes?.[key]
     return metric?.count > 0
-      ? `${metric.count}/${performanceData.total_calls ?? 0} 次调用有观测`
-      : '暂无实时观测数据'
+      ? `${metric.count}/${performanceData.total_calls ?? 0} 次调用有观测 · 运行时观测`
+      : '暂无运行时观测数据'
   }
   const performanceSources = (performanceData.sources || [])
     .map((source) => `${source.source}（${source.quality}，${source.count}）`)
@@ -224,12 +225,12 @@ export default function Overview() {
     return metric?.count > 0 && isAvailable(metric[valueKey])
   }
   const performanceCards = [
-    <MetricCard key="ttft" span="xl:col-span-3" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首 Token 延迟；普通 metria agent 未通过 observe 时不产生该样本" />,
-    <MetricCard key="first-byte" span="xl:col-span-3" label="首字节延迟" value={performanceMetric('first_byte') ? fmtDuration(performanceData.first_byte.avg_ms) : '—'} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节的观测时长" />,
-    <MetricCard key="generation" span="xl:col-span-3" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件的观测时长" />,
+    <MetricCard key="ttft" span="xl:col-span-3" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首个可观察输出；日志推导为条目时间戳近似，精确流式时序需 metria observe" />,
+    <MetricCard key="first-byte" span="xl:col-span-3" label="首字节延迟" value={performanceMetric('first_byte') ? fmtDuration(performanceData.first_byte.avg_ms) : '—'} sub={performanceCoverage('first_byte')} hint="请求开始到首个响应字节；仅 metria observe 可得" />,
+    <MetricCard key="generation" span="xl:col-span-3" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首 Token 到最后输出事件" />,
     <MetricCard key="speed" span="xl:col-span-3" label="输出速度" value={performanceMetric('output_speed', 'avg_tokens_per_second') ? `${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '—'} sub={performanceCoverage('output_speed')} hint="仅使用首 Token 后的生成区间计算" />,
-    <MetricCard key="itl" span="xl:col-span-3" label="Token 间延迟" value={performanceMetric('inter_token_latency') ? fmtDuration(performanceData.inter_token_latency.avg_ms) : '—'} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔" />,
-    <MetricCard key="stalls" span="xl:col-span-3" label="平均停顿次数" value={performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) ? Number(performanceData.stalls.avg_count).toFixed(1) : '—'} sub={performanceData.stalls?.count > 0 ? `${performanceData.stalls.count} 次调用有停顿统计` : '暂无停顿样本'} hint="观测到的生成停顿次数，不包含未观测调用" />,
+    <MetricCard key="itl" span="xl:col-span-3" label="Token 间延迟" value={performanceMetric('inter_token_latency') ? fmtDuration(performanceData.inter_token_latency.avg_ms) : '—'} sub={performanceCoverage('inter_token_latency')} hint="相邻输出 Token 之间的观测间隔；仅 metria observe 可得" />,
+    <MetricCard key="stalls" span="xl:col-span-3" label="平均停顿次数" value={performanceData.stalls?.count > 0 && isAvailable(performanceData.stalls.avg_count) ? Number(performanceData.stalls.avg_count).toFixed(1) : '—'} sub={performanceData.stalls?.count > 0 ? `${performanceData.stalls.count} 次调用有停顿统计 · 运行时观测` : '暂无停顿样本'} hint="观测到的生成停顿次数；仅 metria observe 可得" />,
     <MetricCard key="request-payload" span="xl:col-span-3" label="观测请求字节" value={fmtBytes(performanceData.observed_bytes?.request_payload?.bytes)} sub={observedBytesCoverage('request_payload')} hint="仅表示运行时观测链路看到的请求 payload 字节" />,
     <MetricCard key="response-payload" span="xl:col-span-3" label="观测响应字节" value={fmtBytes(performanceData.observed_bytes?.response_payload?.bytes)} sub={observedBytesCoverage('response_payload')} hint="仅表示运行时观测链路看到的响应 payload 字节" />,
   ]
@@ -300,11 +301,11 @@ export default function Overview() {
       </div>
 
       <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">实时性能观测</h2>
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">性能观测</h2>
         <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
         {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
         {performance.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">性能数据加载失败：{performance.error.message}</p>}
-        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；普通日志调用缺失这些字段时保持不可用，不使用推算值补齐。</p>}
+        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；每张卡片按来源标注「运行时观测」或「日志推导」，日志调用缺失的字段保持不可用，不使用推算值补齐；首字节、Token 间延迟、停顿与观测字节仅 metria observe 可产生。</p>}
       </div>
 
       <div className="mt-3">

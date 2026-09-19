@@ -27,9 +27,21 @@ fn real_codex_smoke() {
     assert!(!sources.is_empty(), "真实目录应发现 rollout 文件");
 
     let mut total_calls = 0usize;
+    let mut calls_with_first_output = 0usize;
+    let mut calls_with_duration = 0usize;
     for s in sources.iter().take(2) {
         let batch = a.scan(s, None, &ScanIdentity::test()).expect("scan 失败");
         total_calls += batch.model_calls.len();
+        calls_with_first_output += batch
+            .model_calls
+            .iter()
+            .filter(|c| c.first_response_at.is_some())
+            .count();
+        calls_with_duration += batch
+            .model_calls
+            .iter()
+            .filter(|c| c.duration_ms.is_some_and(|d| d > 0))
+            .count();
         println!(
             "{}: sessions={} calls={} usage={} tools={} warnings={}",
             s.canonical_path.display(),
@@ -39,7 +51,12 @@ fn real_codex_smoke() {
             batch.tool_events.len(),
             batch.warnings.len()
         );
+        for warning in batch.warnings.iter().take(3) {
+            println!("  warning: {warning}");
+        }
     }
     assert!(total_calls > 0, "真实 rollout 应包含模型调用（usage）");
-    println!("OK: 共 {total_calls} 次调用");
+    println!(
+        "OK: 共 {total_calls} 次调用，其中 {calls_with_first_output} 次有首输出、{calls_with_duration} 次时长>0"
+    );
 }

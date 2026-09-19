@@ -29,7 +29,7 @@ subagent_relations / next_cursor / warnings / source_errors`。类型中的旧
 | Adapter | 数据源 | 解析要点 | 游标 |
 |---|---|---|---|
 | claude-code | `projects/*/*.jsonl` + 扁平布局 | modern entry（type/user/assistant/message.usage/cache_*/tool_use/tool_result/summary/ai-title）；turn 分组；Task tool_use 的 `leafUuid` 推导子代理关系 | JSONL offset+inode |
-| codex | `sessions/<id>/*.jsonl` | session_meta / user_message / token_count(last_token_usage) / response_item(message/reasoning/custom_tool_call/output)；`previous_response_id` → stateful_reference；重复 token_count 去重；全零 usage 不产假调用；`input` 扣除 cached/cache_write、`output` 扣除 reasoning 归一到 Metria 口径 | JSONL offset |
+| codex | `sessions/<id>/*.jsonl` | session_meta / user_message / token_count(last_token_usage) / response_item(message/reasoning/custom_tool_call/output)；兼容新 rollout 的 `task_started`(turn_id) + `item_completed`(UserMessage/AgentMessage/Reasoning/工具类)；`previous_response_id` → stateful_reference；重复 token_count 去重；全零 usage 不产假调用；调用起点/首个可观察输出/末输出由可证明事件推导，缺事件保持 null；`input` 扣除 cached/cache_write、`output` 扣除 reasoning 归一到 Metria 口径 | JSONL offset |
 | opencode | 全局 `opencode.db` + `project/*/storage/**/*.db` | 只读打开（READ_ONLY+busy_timeout+query_only，不改 PRAGMA/不 migration）；message/part(text/reasoning/tool/step)；session.cost→reported；parent_id→subagent | SQLite rowid 增量 |
 
 ### 2.1 Token 口径归一化

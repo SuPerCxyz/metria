@@ -103,13 +103,46 @@ pub struct UserMessagePayload {
 }
 
 /// reasoning payload。
+///
+/// 新 rollout 的 `summary` 是 `[{type,text}]` 数组（常见为空数组），旧格式是字符串；
+/// 用 untagged 兼容两种形态，避免解析失败导致 reasoning 时序与摘要丢失。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ReasoningPayload {
     pub id: Option<String>,
-    pub summary: Option<String>,
-    pub content: Option<String>,
+    pub summary: Option<ReasoningSummary>,
+    pub content: Option<serde_json::Value>,
     pub encrypted_content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ReasoningSummary {
+    Text(String),
+    Blocks(Vec<ReasoningSummaryBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReasoningSummaryBlock {
+    pub text: Option<String>,
+}
+
+impl ReasoningSummary {
+    /// 归一化为纯文本；空数组或无文本时返回 None。
+    pub fn text(&self) -> Option<String> {
+        match self {
+            ReasoningSummary::Text(text) => (!text.is_empty()).then(|| text.clone()),
+            ReasoningSummary::Blocks(blocks) => {
+                let joined = blocks
+                    .iter()
+                    .filter_map(|block| block.text.as_deref())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!joined.is_empty()).then_some(joined)
+            }
+        }
+    }
 }
 
 /// turn_context payload（含当前模型名）。
@@ -184,6 +217,29 @@ mod tests {
         let tp: ToolCallPayload = serde_json::from_value(t.payload.unwrap()).unwrap();
         assert_eq!(tp.name.as_deref(), Some("Read"));
         assert_eq!(tp.call_id.as_deref(), Some("call1"));
+    }
+
+    #[test]
+    fn reasoning_summary_accepts_string_and_blocks() {
+        let legacy: ReasoningPayload = serde_json::from_value(
+            serde_json::json!({"type":"reasoning","id":"r1","summary":"旧格式摘要"}),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.summary.unwrap().text().as_deref(),
+            Some("旧格式摘要")
+        );
+
+        let v3: ReasoningPayload = serde_json::from_value(serde_json::json!({
+            "type":"reasoning","id":"r2","summary":[{"type":"summary_text","text":"新格式摘要"}]
+        }))
+        .unwrap();
+        assert_eq!(v3.summary.unwrap().text().as_deref(), Some("新格式摘要"));
+
+        let empty: ReasoningPayload =
+            serde_json::from_value(serde_json::json!({"type":"reasoning","id":"r3","summary":[]}))
+                .unwrap();
+        assert_eq!(empty.summary.unwrap().text(), None);
     }
 
     #[test]

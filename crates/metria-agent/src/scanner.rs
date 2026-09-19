@@ -247,11 +247,13 @@ pub struct SourceScan {
 
 /// 将 ScanBatch 归一化为待上传事件（含定价）。
 ///
-/// 精简模式：只上传 session 概要（聚合计数，无正文）、call、usage；
-/// 不采集 message/tool/subagent 等会话详细内容。
+/// 内容模式：
+/// - `none`：只上传 session 概要（聚合计数）、call、usage；
+/// - `metadata`：额外上传 message/tool/subagent 的结构与元数据，消息正文不上传；
+/// - `full`：额外上传 message/tool/subagent，并保留消息正文。
 pub fn normalize_batch(
     batch: &ScanBatch,
-    _content_mode: ContentMode,
+    content_mode: ContentMode,
     pricing: &PricingEngine,
     source_id: &str,
 ) -> Vec<PendingEvent> {
@@ -319,7 +321,44 @@ pub fn normalize_batch(
 
     // source_id 附注（用于 hub 关联；payload 内已有）
     let _ = source_id;
+
+    // 会话明细：按内容模式决定是否上传，metadata 模式剥离正文。
+    if content_mode != ContentMode::None {
+        let include_content = content_mode == ContentMode::Full;
+        for m in &batch.messages {
+            let mut payload = serde_json::to_value(m).unwrap_or_default();
+            if !include_content {
+                payload["content"] = serde_json::Value::Null;
+            }
+            out.push(detail_event("message", m.id.as_str(), payload));
+        }
+        for t in &batch.tool_events {
+            let payload = serde_json::to_value(t).unwrap_or_default();
+            out.push(detail_event("tool", t.id.as_str(), payload));
+        }
+        for s in &batch.subagent_relations {
+            let payload = serde_json::to_value(s).unwrap_or_default();
+            out.push(detail_event("subagent", s.id.as_str(), payload));
+        }
+    }
+
     out
+}
+
+/// 明细事件：`event_id` 取自记录自身 id，保证同一记录重传时保持幂等。
+fn detail_event(kind: &str, id: &str, payload: serde_json::Value) -> PendingEvent {
+    let event_id = if id.is_empty() {
+        EventId::from_content(&format!("{kind}:{}", payload))
+            .as_str()
+            .to_string()
+    } else {
+        format!("blake3:{kind}:{id}")
+    };
+    PendingEvent {
+        event_id,
+        kind: kind.into(),
+        payload,
+    }
 }
 
 fn clear_legacy_traffic_fields(payload: &mut serde_json::Value) {
@@ -336,8 +375,73 @@ fn clear_legacy_traffic_fields(payload: &mut serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_legacy_traffic_fields;
+    use super::{clear_legacy_traffic_fields, normalize_batch};
+    use metria_adapter_api::{DiscoveryContext, ScanIdentity, SourceAdapter};
+    use metria_core::config::ContentMode;
+    use metria_pricing::PricingEngine;
     use serde_json::json;
+
+    fn codex_v3_batch() -> metria_adapter_api::types::ScanBatch {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex");
+        let adapter = metria_adapter_codex::CodexAdapter;
+        let ctx = DiscoveryContext {
+            node_id: "test-node".into(),
+            collector_id: "test-collector".into(),
+            root_paths: vec![root],
+        };
+        let source = adapter
+            .discover(&ctx)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.canonical_path.ends_with("golden_v3_rollout.jsonl"))
+            .expect("应发现 golden_v3_rollout.jsonl");
+        let identity = ScanIdentity {
+            node_id: "test-node".into(),
+            collector_id: "test-collector".into(),
+        };
+        adapter.scan(&source, None, &identity).unwrap()
+    }
+
+    fn count_kind(events: &[super::PendingEvent], kind: &str) -> usize {
+        events.iter().filter(|event| event.kind == kind).count()
+    }
+
+    #[test]
+    fn content_mode_controls_detail_upload() {
+        let batch = codex_v3_batch();
+        assert!(!batch.messages.is_empty(), "夹具应含消息");
+        assert!(!batch.tool_events.is_empty(), "夹具应含工具事件");
+        let pricing = PricingEngine::new();
+
+        let none = normalize_batch(&batch, ContentMode::None, &pricing, "src");
+        assert_eq!(count_kind(&none, "message"), 0, "none 不上传消息");
+        assert_eq!(count_kind(&none, "tool"), 0, "none 不上传工具");
+
+        let metadata = normalize_batch(&batch, ContentMode::Metadata, &pricing, "src");
+        assert_eq!(count_kind(&metadata, "message"), batch.messages.len());
+        assert_eq!(count_kind(&metadata, "tool"), batch.tool_events.len());
+        for event in metadata.iter().filter(|event| event.kind == "message") {
+            assert!(event.payload["content"].is_null(), "metadata 不携带正文");
+            assert!(
+                event.payload["content_hash"].is_string(),
+                "metadata 保留内容哈希"
+            );
+        }
+
+        let full = normalize_batch(&batch, ContentMode::Full, &pricing, "src");
+        let messages: Vec<_> = full
+            .iter()
+            .filter(|event| event.kind == "message")
+            .collect();
+        assert_eq!(messages.len(), batch.messages.len());
+        assert!(
+            messages.iter().any(|event| event.payload["content"]
+                .as_str()
+                .is_some_and(|c| !c.is_empty())),
+            "full 携带正文"
+        );
+    }
 
     #[test]
     fn ordinary_agent_never_emits_estimated_traffic_fields() {

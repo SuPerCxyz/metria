@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use metria_adapter_api::testutil::{assert_golden_basics, scan_fixture};
+use metria_adapter_api::testutil::{assert_golden_basics, assert_malformed_tolerant, scan_fixture};
 use metria_adapter_api::{ScanIdentity, SourceAdapter};
 
 use metria_adapter_codex::CodexAdapter;
@@ -126,6 +126,145 @@ fn malformed_tolerated() {
     assert!(!s.batch.usage_events.is_empty(), "正常记录仍解析");
     assert_eq!(s.batch.tool_events.len(), 1);
     assert_eq!(s.batch.sessions.len(), 1);
+}
+
+#[test]
+fn golden_v3_rollout_timeline() {
+    // Codex 0.154 rollout：task_started + item_completed，没有 user_message/agent_message。
+    let adapter = CodexAdapter;
+    let s = scan_fixture(&adapter, &fixture_dir(), "golden_v3_rollout.jsonl");
+    assert_golden_basics(&s);
+    assert_eq!(s.batch.sessions.len(), 1);
+    assert_eq!(s.batch.turns.len(), 2, "turn_id 变化应开新回合");
+    assert_eq!(s.batch.model_calls.len(), 3);
+    assert_eq!(s.batch.usage_events.len(), 3);
+
+    let first = &s.batch.model_calls[0];
+    assert_eq!(
+        first.started_at,
+        ts("2026-09-18T16:00:01.300Z"),
+        "用户条目应把调用起点精化到消息时刻"
+    );
+    assert_eq!(
+        first.first_response_at,
+        Some(ts("2026-09-18T16:00:04Z")),
+        "首个可观察输出来自 AgentMessage 条目"
+    );
+    assert_eq!(first.last_output_at, Some(ts("2026-09-18T16:00:04.100Z")));
+    assert_eq!(first.completed_at, Some(ts("2026-09-18T16:00:05.500Z")));
+    assert_eq!(first.duration_ms, Some(4200));
+    assert_eq!(
+        first.timing_source.as_deref(),
+        Some("codex_event_timestamps")
+    );
+
+    let second = &s.batch.model_calls[1];
+    assert_eq!(
+        second.started_at,
+        ts("2026-09-18T16:00:05.100Z"),
+        "工具条目应是同回合下一次调用的起点"
+    );
+    assert_eq!(second.first_response_at, Some(ts("2026-09-18T16:00:07Z")));
+    assert_eq!(second.last_output_at, Some(ts("2026-09-18T16:00:07.100Z")));
+    assert_eq!(second.duration_ms, Some(2400));
+
+    let third = &s.batch.model_calls[2];
+    assert_eq!(third.started_at, ts("2026-09-18T16:01:00.300Z"));
+    assert_eq!(third.first_response_at, Some(ts("2026-09-18T16:01:03Z")));
+    assert_eq!(third.duration_ms, Some(3200));
+}
+
+#[test]
+fn malformed_v3_tolerated() {
+    let adapter = CodexAdapter;
+    let s = scan_fixture(&adapter, &fixture_dir(), "malformed_v3.jsonl");
+    assert_malformed_tolerant(&s, true);
+    assert_eq!(s.batch.sessions.len(), 1);
+    assert_eq!(
+        s.batch.model_calls.len(),
+        1,
+        "零 usage 不产生调用，坏记录与未知 item 类型被跳过"
+    );
+}
+
+#[test]
+fn v3_incremental_restores_call_start() {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-v3-incremental-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"timestamp":"2026-09-18T02:00:00Z","type":"session_meta","payload":{"session_id":"v3-incremental","timestamp":"2026-09-18T02:00:00Z","cwd":"/tmp/project","model_provider":"custom"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-18T02:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-inc","started_at":1789783201}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-18T02:00:01.100Z","type":"response_item","payload":{"type":"message","id":"um-inc","role":"user","content":[{"type":"input_text","text":"增量扫描恢复"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-18T02:00:01.200Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-inc","item":{"type":"UserMessage","id":"um-inc"}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = CodexAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let identity = ScanIdentity::test();
+
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert!(first.model_calls.is_empty());
+
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-18T02:00:03.000Z","type":"event_msg","payload":{{"type":"item_completed","turn_id":"turn-inc","item":{{"type":"Reasoning","id":"rs-inc"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-18T02:00:04.000Z","type":"event_msg","payload":{{"type":"item_completed","turn_id":"turn-inc","item":{{"type":"AgentMessage","id":"am-inc"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-18T02:00:05.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1200,"cached_input_tokens":900,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":1280}}}}}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    assert_eq!(second.model_calls.len(), 1);
+    assert_eq!(
+        second.model_calls[0].started_at,
+        ts("2026-09-18T02:00:01.200Z"),
+        "增量扫描必须按新事件边界恢复调用起点"
+    );
+    assert_eq!(
+        second.model_calls[0].first_response_at,
+        Some(ts("2026-09-18T02:00:04Z"))
+    );
+    assert_eq!(second.model_calls[0].duration_ms, Some(3800));
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

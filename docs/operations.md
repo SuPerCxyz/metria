@@ -137,7 +137,7 @@ Dashboard 默认读 rollup，不在每次请求时扫描全部历史事件。
 | `METRIA_PRICING_OPENROUTER_ENABLED` | 启用 OpenRouter 价格目录 |
 | `METRIA_PRICING_LITELLM_ENABLED` | 启用 LiteLLM 价格目录 |
 | `METRIA_PRICING_CUSTOM_URL` / `_AUTH` | 自定义 HTTP 价格目录 |
-| `METRIA_CONTENT_MODE` | `none` / `metadata` / `full` |
+| `METRIA_CONTENT_MODE` | Agent 上传明细的模式：`none` 只传 session/call/usage；`metadata` 追加消息/工具/子代理的结构与元数据（正文为 null）；`full` 追加并保留正文 |
 | `METRIA_TIMEZONE` | Web 展示与报告的环境默认时区（设置页保存值优先） |
 | `METRIA_NODE_ID` / `METRIA_NODE_NAME` | Agent 节点身份 |
 | `METRIA_HUB_URL` / `METRIA_AGENT_TOKEN_FILE` | Agent 连接配置 |

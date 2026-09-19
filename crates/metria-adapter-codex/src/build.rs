@@ -87,10 +87,14 @@ pub struct SessionBuilder {
     pub context_transport_mode: ContextTransportMode,
     pub cache_transport_behavior: CacheTransportBehavior,
     current_turn: Option<Id>,
+    /// 来源日志的回合标识（新 rollout 的 `turn_id`）；用于区分同一会话的多个回合。
+    current_source_turn_id: Option<String>,
     current_call_started_at: Option<DateTime<Utc>>,
     pending_call_started_at: Option<DateTime<Utc>>,
     first_visible_output_at: Option<DateTime<Utc>>,
     first_reasoning_output_at: Option<DateTime<Utc>>,
+    /// 当前调用内最后一个输出事件时间（可见或 reasoning）。
+    last_output_at: Option<DateTime<Utc>>,
     tool_map: HashMap<String, usize>,
     running_text: String,
     running_bytes: usize,
@@ -159,10 +163,12 @@ impl SessionBuilder {
             context_transport_mode: ContextTransportMode::FullContext,
             cache_transport_behavior: CacheTransportBehavior::FullContentSent,
             current_turn: None,
+            current_source_turn_id: None,
             current_call_started_at: None,
             pending_call_started_at: None,
             first_visible_output_at: None,
             first_reasoning_output_at: None,
+            last_output_at: None,
             tool_map: HashMap::new(),
             running_text: String::new(),
             running_bytes: 0,
@@ -249,6 +255,41 @@ impl SessionBuilder {
         self.pending_call_started_at = None;
         self.first_visible_output_at = None;
         self.first_reasoning_output_at = None;
+        self.last_output_at = None;
+    }
+
+    /// 按来源回合标识开新回合：`turn_id` 与当前不同（或尚未记录）时开新回合。
+    ///
+    /// 新 rollout 用 `task_started` 带 `turn_id` 标记回合；同回合内后续事件不应重复开回合。
+    pub fn note_source_turn(&mut self, turn_id: Option<&str>, at: DateTime<Utc>) {
+        match turn_id {
+            Some(id) => {
+                if self.current_source_turn_id.as_deref() == Some(id) {
+                    return;
+                }
+                self.current_source_turn_id = Some(id.to_string());
+                self.new_turn(at);
+            }
+            None => {
+                self.new_turn(at);
+            }
+        }
+    }
+
+    /// 当前来源回合标识（旧格式没有 `turn_id` 时为 None）。
+    pub fn source_turn_id(&self) -> Option<&str> {
+        self.current_source_turn_id.as_deref()
+    }
+
+    /// 用户消息类事件把调用起点精化到更精确的时刻；已有输出或没有进行中的调用时不动。
+    pub fn refine_call_start(&mut self, at: DateTime<Utc>) {
+        if self.current_call_started_at.is_some()
+            && self.first_visible_output_at.is_none()
+            && self.first_reasoning_output_at.is_none()
+        {
+            self.current_call_started_at = Some(at);
+            self.pending_call_started_at = None;
+        }
     }
 
     /// 增量扫描恢复游标前尚未完成调用的开始边界。
@@ -265,17 +306,23 @@ impl SessionBuilder {
         }
     }
 
-    /// 记录当前调用第一个可见 assistant 输出。
+    /// 记录当前调用第一个可见 assistant 输出，并推进末输出时间。
     pub fn note_visible_output(&mut self, at: DateTime<Utc>) {
-        if self.current_call_started_at.is_some() && self.first_visible_output_at.is_none() {
-            self.first_visible_output_at = Some(at);
+        if self.current_call_started_at.is_some() {
+            if self.first_visible_output_at.is_none() {
+                self.first_visible_output_at = Some(at);
+            }
+            self.last_output_at = Some(at);
         }
     }
 
-    /// 记录 reasoning 事件，仅在没有可见 assistant 输出时作为回退。
+    /// 记录 reasoning 事件，仅在没有可见 assistant 输出时作为首输出回退；同时推进末输出时间。
     pub fn note_reasoning_output(&mut self, at: DateTime<Utc>) {
-        if self.current_call_started_at.is_some() && self.first_reasoning_output_at.is_none() {
-            self.first_reasoning_output_at = Some(at);
+        if self.current_call_started_at.is_some() {
+            if self.first_reasoning_output_at.is_none() {
+                self.first_reasoning_output_at = Some(at);
+            }
+            self.last_output_at = Some(at);
         }
     }
 
@@ -284,6 +331,7 @@ impl SessionBuilder {
         self.current_call_started_at = self.pending_call_started_at.take();
         self.first_visible_output_at = None;
         self.first_reasoning_output_at = None;
+        self.last_output_at = None;
     }
 
     pub fn ensure_turn(&mut self, at: DateTime<Utc>) -> Id {
@@ -432,6 +480,10 @@ impl SessionBuilder {
         let duration_ms = observed_start
             .filter(|start| *start <= at)
             .map(|start| (at - start).num_milliseconds());
+        // 末输出只取调用区间内最后一个可见/reasoning 输出事件，不含其后的工具执行时间。
+        let last_output_at = self
+            .last_output_at
+            .filter(|last| observed_start.is_some_and(|start| start <= *last) && *last <= at);
 
         // 优先显式模型，否则回退到 turn_context 记录的本会话模型
         let model_raw = model
@@ -460,7 +512,7 @@ impl SessionBuilder {
             first_byte_at: None,
             first_token_at: None,
             first_response_at,
-            last_output_at: None,
+            last_output_at,
             completed_at: Some(at),
             duration_ms,
             first_byte_latency_ms: None,

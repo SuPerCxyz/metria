@@ -15,7 +15,7 @@ import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtBytes, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
-import { isAvailable } from '../../services/dataAvailability'
+import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -270,7 +270,8 @@ export default function Analytics() {
                   count={performance.data?.ttft?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.ttft?.coverage}
-                  hint="优先使用原生实时首 Token；日志来源会单独标记。"
+                  sourceLabel={performanceSourceLabel(performance.data?.ttft?.sources)}
+                  hint="优先使用原生实时首 Token；日志来源为条目时间戳近似。"
                 />}
                 {performanceMetric('output_speed', 'avg_tokens_per_second') && <PerformanceCard
                   label="输出速度"
@@ -278,6 +279,7 @@ export default function Analytics() {
                   count={performance.data?.output_speed?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.output_speed?.coverage}
+                  sourceLabel={performanceSourceLabel(performance.data?.output_speed?.sources)}
                   hint="只计算首 Token 之后的生成区间，不把等待时间算入速度。"
                 />}
                 {performanceMetric('first_byte') && <PerformanceCard
@@ -286,7 +288,8 @@ export default function Analytics() {
                   count={performance.data?.first_byte?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.first_byte?.coverage}
-                  hint="请求开始到首个响应字节。"
+                  sourceLabel={performanceSourceLabel(performance.data?.first_byte?.sources)}
+                  hint="请求开始到首个响应字节，仅原生 observe 可得。"
                 />}
                 {performanceMetric('generation') && <PerformanceCard
                   label="生成耗时"
@@ -294,6 +297,7 @@ export default function Analytics() {
                   count={performance.data?.generation?.count}
                   total={performance.data?.total_calls}
                   coverage={performance.data?.generation?.coverage}
+                  sourceLabel={performanceSourceLabel(performance.data?.generation?.sources)}
                   hint="首 Token 到最后输出事件。"
                 />}
                 {performanceMetric('inter_token_latency') && <PerformanceCard
@@ -302,7 +306,8 @@ export default function Analytics() {
                   count={performance.data.inter_token_latency.count}
                   total={performance.data.total_calls}
                   coverage={performance.data.inter_token_latency.coverage}
-                  hint="相邻输出 Token 之间的观测间隔。"
+                  sourceLabel={performanceSourceLabel(performance.data?.inter_token_latency?.sources)}
+                  hint="相邻输出 Token 之间的观测间隔，仅原生 observe 可得。"
                 />}
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -328,7 +333,7 @@ export default function Analytics() {
               ) : (
                 <div className="mt-6 space-y-6">
                   {performanceTrend.latency.some((dataset) => dataset.values.some((value) => value != null)) && <div>
-                    <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">实时性能趋势</h3>
+                    <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">性能趋势</h3>
                     <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首字节、首 Token、生成耗时和 Token 间延迟趋势" />
                   </div>}
                   {performanceTrend.speed[0].values.some((value) => value != null) && <div>
@@ -339,7 +344,7 @@ export default function Analytics() {
               )}
             </>
           ) : (
-            <EmptyState title="暂无可用观测数据" desc="普通 Agent 只读取日志；需要原生 Agent 通过 observe 启动且存在可证明的性能样本。" />
+            <EmptyState title="暂无可用观测数据" desc="日志推导依赖客户端可证明事件；首字节、Token 间延迟、停顿与观测字节需原生 Agent 通过 observe 启动。" />
           )}
 
           {(latency.data?.count ?? 0) > 0 && <>
@@ -468,7 +473,7 @@ function SimpleMetric({ label, value }) {
   )
 }
 
-function PerformanceCard({ label, value, count = 0, total = 0, coverage, hint }) {
+function PerformanceCard({ label, value, count = 0, total = 0, coverage, hint, sourceLabel }) {
   return (
     <div className="rounded-xl bg-gray-50 p-4 dark:bg-gray-700/30">
       <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
@@ -476,6 +481,9 @@ function PerformanceCard({ label, value, count = 0, total = 0, coverage, hint })
       <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
         覆盖率 {fmtPct(coverage)} · {count} / {total} 次调用
       </div>
+      {sourceLabel && (
+        <div className="mt-1 text-xs text-gray-400 dark:text-gray-500">来源：{sourceLabel}</div>
+      )}
       <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">{hint}</p>
     </div>
   )

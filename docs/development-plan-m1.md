@@ -41,6 +41,9 @@
 | 推理 Token 与缓存命中率口径修复：Codex `output_tokens` 归一化为不含推理的生成 Token、历史回填与重算，缓存命中率分母补 `cache_write`（OpenSpec `fix-reasoning-and-cache-hit-accounting`） | ✅ 已部署并核对（含 Agent 更新与迁移 019 追加回填） | 2026-09-16 |
 | 总 Token 口径与 ccswitch 对齐：总 Token 改为含缓存读写、等值于 ccswitch 用量面板的消耗总量，全站 Web/报告/Webhook 同步，分层堆叠图补「缓存写入」层（OpenSpec `include-cache-in-total-tokens`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-16 |
 | Web 数据完整性与有效容器审计：首页稳定 KPI、性能空态、调用/数据质量页、可选列表列与观测字段补齐（OpenSpec `frontend-data-coverage-audit`） | ✅ 实现与门禁完成，未部署 lstable | 2026-09-18 |
+| Codex 新 rollout 时序解析与性能来源区分：`task_started`/`item_completed` 调用起点与首/末输出、`summary` 数组兼容、Hub 每指标来源分布、首页/分析页来源标注（OpenSpec `fix-codex-rollout-timing`） | ✅ 实现与门禁完成，已部署 lstable；非破坏性时序回填窗口覆盖率 68/802 → 745/802 | 2026-09-19 |
+| 会话明细上传恢复：Agent 按 `METRIA_CONTENT_MODE` 上传 message/tool/subagent、协议白名单补 `message`、Hub 按会话键关联工具事件（OpenSpec `restore-agent-content-upload`） | ✅ 实现与门禁完成，本机 Agent 以 `full` 运行，消息已带正文落库 | 2026-09-19 |
+| 归档 `frontend-data-coverage-audit`、`fix-codex-rollout-timing`、`restore-agent-content-upload`，并合并 `add-ephemeral-llm-observability` 冲突场景保持校验全绿 | ✅ 完成 | 2026-09-19 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 

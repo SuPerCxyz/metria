@@ -1090,6 +1090,14 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
             None
         };
 
+        // tool/subagent 的 session_id 必须与 Hub 会话键一致，才能被会话详情接口检索到。
+        if matches!(ev.kind.as_str(), "tool" | "subagent") {
+            if let Some(key) = resolved.as_deref().filter(|key| !key.is_empty()) {
+                payload["session_id"] = serde_json::json!(key);
+            }
+        }
+        let v = &payload;
+
         let result: Result<bool, metria_storage::StorageError> = match ev.kind.as_str() {
             "session" => st.db.upsert_session(v),
             "source" => st.db.upsert_source(v),

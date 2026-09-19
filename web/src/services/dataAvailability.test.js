@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { averagePerCall, getVisibleColumns, hasAnyToken, isAvailable } from './dataAvailability.js'
+import { averagePerCall, getVisibleColumns, hasAnyToken, isAvailable, performanceSourceLabel } from './dataAvailability.js'
 
 test('availability keeps zero and rejects null or blank values', () => {
   assert.equal(isAvailable(0), true)
@@ -29,4 +29,27 @@ test('optional columns hide only when every loaded row is unavailable', () => {
   assert.deepEqual(getVisibleColumns(columns, [{ name: 'a', duration: null }]).map((c) => c.key), ['name'])
   assert.deepEqual(getVisibleColumns(columns, [{ name: 'a', duration: 0 }, { name: 'b', duration: null }]).map((c) => c.key), ['name', 'duration'])
   assert.deepEqual(getVisibleColumns(columns, []).map((c) => c.key), ['name', 'duration'])
+})
+
+test('performance source label separates runtime observation from log derivation', () => {
+  assert.equal(performanceSourceLabel([]), null)
+  assert.equal(performanceSourceLabel(undefined), null)
+  assert.equal(
+    performanceSourceLabel([{ source: 'runtime_http', quality: 'observed', count: 2 }]),
+    '运行时观测',
+  )
+  assert.equal(
+    performanceSourceLabel([
+      { source: 'codex_event_timestamps', quality: 'observed', count: 5 },
+      { source: 'opencode_message_timestamps', quality: 'observed', count: 3 },
+    ]),
+    '日志推导',
+  )
+  assert.equal(
+    performanceSourceLabel([
+      { source: 'runtime_http', quality: 'observed', count: 1 },
+      { source: 'codex_event_timestamps', quality: 'observed', count: 4 },
+    ]),
+    '运行时+日志',
+  )
 })

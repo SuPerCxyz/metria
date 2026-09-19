@@ -1,0 +1,13 @@
+{"timestamp":"2026-09-18T18:00:00.000Z","type":"session_meta","payload":{"session_id":"v3-malformed-0001","cwd":"/home/alice/projects/codex-v3","cli_version":"0.154.0"}}
+{"timestamp":"2026-09-18T18:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-bad","started_at":1789754401}}
+{"timestamp":"2026-09-18T18:00:01.050Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-bad","item":{"type":"UserMessage"
+{"timestamp":"2026-09-18T18:00:01.100Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-bad","item":{"type":"UserMessage","id":"um-bad"}}}
+{"timestamp":"2026-09-18T18:00:01.200Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-bad","item":{"type":"UnknownFutureItem","id":"uf1","payload":{"x":1}}}}
+{"timestamp":"2026-09-18T18:00:01.300Z","type":"response_item","payload":{"type":"message","id":"am-bad","role":"assistant","content":[{"type":"output_text","text":"容忍未知字段"},{"type":"future_block","data":1}],"unknown_field":true}}
+{"timestamp":"2026-09-18T18:00:01.400Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":258400}}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"ce-nostamp"}}}
+{"timestamp":"2026-09-18T18:00:01.500Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-bad","item":{"type":"Reasoning","id":"rs-bad"}}}
+{"timestamp":"2026-09-18T18:00:01.600Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-bad","item":{"type":"AgentMessage","id":"am-bad"}}}
+{"timestamp":"2026-09-18T18:00:01.700Z","type":"response_item","payload":{"type":"message","id":"am-bad2","role":"assistant","content":[{"type":"output_text","text":"完成。"}]}}
+{"timestamp":"2026-09-18T18:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5000,"cached_input_tokens":100,"cache_write_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":30,"total_tokens":5200},"model_context_window":258400}}}
+{"timestamp":"2026-09-18T18:00:02.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-bad","started_at":1789754401,"completed_at":1789754402}}

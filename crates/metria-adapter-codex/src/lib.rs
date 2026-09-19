@@ -334,11 +334,13 @@ fn is_timing_boundary(event: &RawEvent) -> bool {
         .and_then(|kind| kind.as_str());
     matches!(
         (event.event_type.as_str(), kind),
-        ("event_msg", Some("user_message" | "token_count"))
-            | (
-                "response_item",
-                Some("custom_tool_call_output" | "function_call_output")
-            )
+        (
+            "event_msg",
+            Some("user_message" | "token_count" | "task_started" | "item_completed")
+        ) | (
+            "response_item",
+            Some("custom_tool_call_output" | "function_call_output")
+        )
     )
 }
 
@@ -351,8 +353,20 @@ fn restore_timing_event(builder: &mut SessionBuilder, event: &RawEvent) {
         .and_then(|payload| payload.get("type"))
         .and_then(|kind| kind.as_str());
     match (event.event_type.as_str(), kind) {
-        ("event_msg", Some("user_message")) => builder.restore_call_start(at),
+        ("event_msg", Some("user_message" | "task_started")) => builder.restore_call_start(at),
         ("event_msg", Some("token_count")) => builder.note_call_completed(),
+        ("event_msg", Some("item_completed")) => {
+            match payload
+                .and_then(|payload| payload.get("item"))
+                .and_then(|item| item.get("type"))
+                .and_then(|kind| kind.as_str())
+            {
+                Some("AgentMessage") => builder.note_visible_output(at),
+                Some("Reasoning") => builder.note_reasoning_output(at),
+                Some("UserMessage") => builder.restore_call_start(at),
+                _ => builder.note_tool_result_input(at),
+            }
+        }
         ("event_msg", Some("agent_message"))
             if payload
                 .and_then(|payload| payload.get("message"))
@@ -498,12 +512,38 @@ fn process_event_msg(
     let payload = event.payload.clone().unwrap_or(serde_json::json!({}));
     let ptype = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ptype {
+        "task_started" => {
+            // 新 rollout 以 task_started 开启回合；turn_id 变化才开新回合。
+            let turn_id = payload.get("turn_id").and_then(|v| v.as_str());
+            builder.note_source_turn(turn_id, at);
+        }
         "user_message" => {
             let p: UserMessagePayload = serde_json::from_value(payload)
                 .map_err(|e| format!("user_message 解析失败: {e}"))?;
-            let turn = builder.new_turn(at);
-            if let Some(text) = p.message {
-                builder.add_message(turn, "user", "text", Some(text), at);
+            if builder.source_turn_id().is_none() {
+                // 旧格式没有 task_started：用户消息即回合起点。
+                let turn = builder.new_turn(at);
+                if let Some(text) = p.message {
+                    builder.add_message(turn, "user", "text", Some(text), at);
+                }
+            } else {
+                // 新格式回合已由 task_started 开启：用户消息只精化调用起点。
+                builder.refine_call_start(at);
+            }
+        }
+        "item_completed" => {
+            // 新 rollout 的条目完成事件；UserMessage 精化起点、输出条目记首/末输出、
+            // 其余（命令执行、文件变更、MCP 调用等）作为下一次调用的工具输入边界。
+            let item_type = payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(|kind| kind.as_str())
+                .unwrap_or("");
+            match item_type {
+                "UserMessage" => builder.refine_call_start(at),
+                "AgentMessage" => builder.note_visible_output(at),
+                "Reasoning" => builder.note_reasoning_output(at),
+                _ => builder.note_tool_result_input(at),
             }
         }
         "agent_message" => {
@@ -583,15 +623,14 @@ fn process_response_item(
             }
         }
         "reasoning" => {
+            // 先记时序，再解析正文：即使未来 payload 形态再变，首/末输出也不丢失。
+            builder.note_reasoning_output(at);
             let p: ReasoningPayload =
                 serde_json::from_value(payload).map_err(|e| format!("reasoning 解析失败: {e}"))?;
-            builder.note_reasoning_output(at);
             // 摘要可选记录（正文可能加密，不保存）
-            if let Some(s) = p.summary {
-                if !s.is_empty() {
-                    let turn = builder.ensure_turn(at);
-                    builder.add_message(turn, "assistant", "reasoning", Some(s), at);
-                }
+            if let Some(s) = p.summary.and_then(|summary| summary.text()) {
+                let turn = builder.ensure_turn(at);
+                builder.add_message(turn, "assistant", "reasoning", Some(s), at);
             }
         }
         "custom_tool_call" | "function_call" => {

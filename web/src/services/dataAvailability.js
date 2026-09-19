@@ -26,3 +26,18 @@ export function getVisibleColumns(columns, rows) {
         : row?.[column.key]))
   })
 }
+
+/// 运行时观测来源统一以 `runtime_` 前缀标识（如 runtime_http）。
+export function isRuntimeObservationSource(source) {
+  return typeof source === 'string' && source.startsWith('runtime_')
+}
+
+/// 按来源/质量分布把性能指标归类为「运行时观测」「日志推导」或两者并存；无样本返回 null。
+export function performanceSourceLabel(sources) {
+  const items = sources || []
+  if (items.length === 0) return null
+  const runtime = items.some((item) => isRuntimeObservationSource(item?.source))
+  const logged = items.some((item) => !isRuntimeObservationSource(item?.source))
+  if (runtime && logged) return '运行时+日志'
+  return runtime ? '运行时观测' : '日志推导'
+}
