@@ -9,6 +9,10 @@ use crate::db::HubDb;
 
 const ROLLUP_BATCH_SIZE: i64 = 512;
 
+/// SQL 侧分桶表达式（与 `metria_core::time::bucket_hour` / `bucket_day` 的 UTC 形式对齐）。
+const HOURLY_BUCKET: &str = "substr({ts},1,14)||'00:00+00:00'";
+const DAILY_BUCKET: &str = "substr({ts},1,10)||'T00:00:00+00:00'";
+
 /// 汇总增量类型。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RollupKind {
@@ -238,7 +242,7 @@ impl HubDb {
     /// Rollup 对账：对比 raw 事件表与 rollup 汇总的计数/字节，返回差异摘要。
     ///
     /// 逐 bucket 对比 hourly_rollups 与 sessions/model_calls/usage_events/traffic_estimates
-    /// 的聚合值。差异过大时记录告警（写入 server_meta），并可通过 [`Self::rebuild_drift`]
+    /// 的聚合值。差异过大时记录告警（写入 server_meta），并可通过 [`Self::rebuild_rollups`]
     /// 触发重建。每次扫描限制在最近 N 天，避免全库扫描。
     pub fn reconcile_rollups(&self, days: i64) -> Result<ReconcileReport, StorageError> {
         let since = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
@@ -319,214 +323,163 @@ impl HubDb {
         Ok(report)
     }
 
-    /// 对指定时间范围重建 rollup：从 raw 事件表重新聚合（先删后插）。
-    /// 幂等：仅重建最近 `days` 天，供对账漂移修复与手工重算使用。
-    pub fn rebuild_drift(&self, days: i64) -> Result<usize, StorageError> {
-        let since = Utc::now() - chrono::Duration::days(days);
-
-        // 1. 收集待重建的 raw 事件（作用域内借用 conn，离开即释放锁）
-        let (sessions, calls): (Vec<Value>, Vec<Value>) = {
-            let c = self.conn();
-            let mut sess = c
-                .prepare(
-                    "SELECT started_at, node_id, collector_id, client_id, source_id, project_id,
-                        provider_normalized, primary_model_normalized,
-                        message_count, tool_call_count, subagent_count, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                        reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                        estimated_request_bytes, estimated_response_bytes, estimated_total_bytes
-                     FROM sessions WHERE started_at >= ?1",
-                )
-                .map_err(StorageError::from)?;
-            let srows: Vec<Value> = sess
-                .query_map([since.to_rfc3339()], |r| {
-                    let ts: String = r.get(0)?;
-                    Ok(serde_json::json!({
-                        "timestamp": ts,
-                        "node_id": r.get::<_, String>(1)?,
-                        "collector_id": r.get::<_, String>(2)?,
-                        "client_id": r.get::<_, String>(3)?,
-                        "source_id": r.get::<_, String>(4)?,
-                        "project_id": r.get::<_, Option<String>>(5)?,
-                        "provider_normalized": r.get::<_, Option<String>>(6)?,
-                        "model_normalized": r.get::<_, Option<String>>(7)?,
-                        "message_count": r.get::<_, i64>(8)?,
-                        "tool_call_count": r.get::<_, i64>(9)?,
-                        "subagent_count": r.get::<_, i64>(10)?,
-                        "input_tokens": r.get::<_, Option<i64>>(11)?,
-                        "output_tokens": r.get::<_, Option<i64>>(12)?,
-                        "cache_read_tokens": r.get::<_, Option<i64>>(13)?,
-                        "cache_write_tokens": r.get::<_, Option<i64>>(14)?,
-                        "reasoning_tokens": r.get::<_, Option<i64>>(15)?,
-                        "reported_cost_micro_usd": r.get::<_, Option<i64>>(16)?,
-                        "calculated_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
-                        "estimated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
-                        "estimated_request_bytes": r.get::<_, Option<i64>>(19)?,
-                        "estimated_response_bytes": r.get::<_, Option<i64>>(20)?,
-                        "estimated_total_bytes": r.get::<_, Option<i64>>(21)?,
-                    }))
-                })
-                .map_err(StorageError::from)?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            let mut calls = c
-                .prepare(
-                    "SELECT started_at, node_id, collector_id, client_id, source_id, model_normalized
-                     FROM model_calls WHERE started_at >= ?1",
-                )
-                .map_err(StorageError::from)?;
-            let crows: Vec<Value> = calls
-                .query_map([since.to_rfc3339()], |r| {
-                    Ok(serde_json::json!({
-                        "timestamp": r.get::<_, String>(0)?,
-                        "node_id": r.get::<_, String>(1)?,
-                        "collector_id": r.get::<_, String>(2)?,
-                        "client_id": r.get::<_, String>(3)?,
-                        "source_id": r.get::<_, String>(4)?,
-                        "model_normalized": r.get::<_, Option<String>>(5)?,
-                    }))
-                })
-                .map_err(StorageError::from)?
-                .filter_map(|r| r.ok())
-                .collect();
-            (srows, crows)
-        };
-
-        // 2. 删除待重建 bucket 的 rollup 行（先删后插，幂等）
-        let c = self.conn();
-        c.execute(
-            "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1)",
-            [since.to_rfc3339()],
-        )
-        .map_err(StorageError::from)?;
-        c.execute(
-            "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1)",
-            [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
-        )
-        .map_err(StorageError::from)?;
-        drop(c);
-
-        // 3. 逐条增量重建（每次调用内部重新获取连接锁）
-        let mut rebuilt = 0usize;
-        for row in &sessions {
-            self.rollup_event("session", row)?;
-            rebuilt += 1;
-        }
-        for row in &calls {
-            self.rollup_event("call", row)?;
-            rebuilt += 1;
-        }
-        Ok(rebuilt)
-    }
-
-    /// 重建 usage 派生的费用 rollup：先删后插（幂等）。
+    /// 重建 rollup（session/call 计数 + usage 的 Token 与费用 + 流量估算字节）：先删后插，单事务批量聚合。
     ///
-    /// 重新计价后调用，使 Overview/费用页按最新价格反映费用。仅处理
-    /// usage/pricing 相关行（`pricing_source` 或 `usage_source` 非空），
-    /// 不影响 session/call/traffic 行。
-    pub fn rebuild_usage_rollups(&self, days: i64) -> Result<usize, StorageError> {
-        let since = Utc::now() - chrono::Duration::days(days);
-        self.rebuild_usage_rollups_since(since)
+    /// 同一时间只允许一个重建任务；`try_rebuild_rollups` 用于周期任务，避免与启动全量
+    /// 重建互相删写。批量 SQL 替代逐行重放，使全量重建从小时级降到秒级。
+    pub fn rebuild_rollups(&self, days: i64) -> Result<usize, StorageError> {
+        let _guard = self.rebuild_guard();
+        self.rebuild_rollups_locked(days)
     }
 
-    /// 重建全部历史 usage rollup，供跨任意历史范围的重计价使用。
-    pub fn rebuild_all_usage_rollups(&self) -> Result<usize, StorageError> {
-        self.rebuild_usage_rollups_since(DateTime::<Utc>::UNIX_EPOCH)
+    /// 尝试重建；已有重建在执行时返回 `Ok(None)`，不阻塞调用方。
+    pub fn try_rebuild_rollups(&self, days: i64) -> Result<Option<usize>, StorageError> {
+        let Some(_guard) = self.try_rebuild_guard() else {
+            return Ok(None);
+        };
+        self.rebuild_rollups_locked(days).map(Some)
     }
 
-    fn rebuild_usage_rollups_since(&self, since: DateTime<Utc>) -> Result<usize, StorageError> {
+    fn rebuild_rollups_locked(&self, days: i64) -> Result<usize, StorageError> {
         let _heap_release = crate::memory::HeapReleaseGuard;
+        let since = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         let c = self.conn();
-        c.execute(
-            "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND (pricing_source != '' OR usage_source != '')",
-            [since.to_rfc3339()],
-        )
-        .map_err(StorageError::from)?;
-        c.execute(
-            "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1) AND (pricing_source != '' OR usage_source != '')",
-            [metria_core::time::bucket_day(since, chrono_tz::Tz::UTC).to_rfc3339()],
-        )
-        .map_err(StorageError::from)?;
-        drop(c);
+        c.execute("BEGIN IMMEDIATE", [])
+            .map_err(StorageError::from)?;
+        let result = (|| -> Result<usize, StorageError> {
+            c.execute(
+                "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1)",
+                [&since],
+            )
+            .map_err(StorageError::from)?;
+            c.execute(
+                "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1)",
+                [&since],
+            )
+            .map_err(StorageError::from)?;
 
-        let mut rebuilt = 0usize;
-        let since_text = since.to_rfc3339();
-        let mut last_rowid = 0i64;
-        loop {
-            let events = {
-                let c = self.conn();
-                let mut stmt = c
-                    .prepare(
-                        "SELECT rowid, node_id, collector_id, client_id, source_id,
-                                provider_normalized, model_normalized, timestamp,
-                                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                                reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd,
-                                estimated_cost_micro_usd, usage_source, usage_granularity
-                         FROM usage_events
-                         WHERE rowid > ?1 AND timestamp >= ?2
-                         ORDER BY rowid LIMIT ?3",
+            let pk = "bucket,node_id,collector_id,client_id,source_id,project_id,provider,model,\
+                      usage_source,usage_granularity,pricing_source,traffic_estimation_source,\
+                      traffic_confidence_level";
+            let mut rebuilt = 0usize;
+            for (table, ts) in [
+                ("hourly_rollups", HOURLY_BUCKET),
+                ("daily_rollups", DAILY_BUCKET),
+            ] {
+                let session_bucket = ts.replace("{ts}", "s.started_at");
+                let call_bucket = ts.replace("{ts}", "started_at");
+                let usage_bucket = ts.replace("{ts}", "timestamp");
+                rebuilt += c
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (bucket, node_id, collector_id, client_id, source_id, \
+                             project_id, provider, model, session_count, message_count, tool_call_count, subagent_count) \
+                             SELECT {session_bucket}, s.node_id, s.collector_id, s.client_id, s.source_id, \
+                               COALESCE(s.project_id,''), COALESCE(s.provider_normalized,''), \
+                               COALESCE(s.primary_model_normalized,''), \
+                               COUNT(*), SUM(COALESCE(s.message_count,0)), SUM(COALESCE(s.tool_call_count,0)), \
+                               SUM(COALESCE(s.subagent_count,0)) \
+                             FROM sessions s WHERE s.started_at >= ?1 GROUP BY 1,2,3,4,5,6,7,8 \
+                             ON CONFLICT({pk}) DO UPDATE SET \
+                               session_count = session_count + excluded.session_count, \
+                               message_count = message_count + excluded.message_count, \
+                               tool_call_count = tool_call_count + excluded.tool_call_count, \
+                               subagent_count = subagent_count + excluded.subagent_count"
+                        ),
+                        [&since],
                     )
                     .map_err(StorageError::from)?;
-                let rows = stmt
-                    .query_map(
-                        metria_storage::rusqlite::params![
-                            last_rowid,
-                            since_text,
-                            ROLLUP_BATCH_SIZE
-                        ],
-                        |r| {
-                            Ok((
-                                r.get::<_, i64>(0)?,
-                                serde_json::json!({
-                                    "node_id": r.get::<_, String>(1)?,
-                                    "collector_id": r.get::<_, String>(2)?,
-                                    "client_id": r.get::<_, String>(3)?,
-                                    "source_id": r.get::<_, String>(4)?,
-                                    "provider_normalized": r.get::<_, Option<String>>(5)?,
-                                    "model_normalized": r.get::<_, Option<String>>(6)?,
-                                    "timestamp": r.get::<_, String>(7)?,
-                                    "usage": {
-                                        "input": r.get::<_, Option<i64>>(8)?,
-                                        "output": r.get::<_, Option<i64>>(9)?,
-                                        "cache_read": r.get::<_, Option<i64>>(10)?,
-                                        "cache_write": r.get::<_, Option<i64>>(11)?,
-                                        "reasoning": r.get::<_, Option<i64>>(12)?,
-                                    },
-                                    "cost": {
-                                        "reported_micro_usd": r.get::<_, Option<i64>>(13)?,
-                                        "calculated_micro_usd": r.get::<_, Option<i64>>(14)?,
-                                        "estimated_micro_usd": r.get::<_, Option<i64>>(15)?,
-                                    },
-                                    "quality": {
-                                        "usage_source": r.get::<_, Option<String>>(16)?,
-                                        "granularity": r.get::<_, Option<String>>(17)?,
-                                    },
-                                }),
-                            ))
-                        },
+                rebuilt += c
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (bucket, node_id, collector_id, client_id, source_id, model, model_call_count) \
+                             SELECT {call_bucket}, node_id, collector_id, client_id, source_id, \
+                               COALESCE(model_normalized,''), COUNT(*) \
+                             FROM model_calls WHERE started_at >= ?1 GROUP BY 1,2,3,4,5,6 \
+                             ON CONFLICT({pk}) DO UPDATE SET \
+                               model_call_count = model_call_count + excluded.model_call_count"
+                        ),
+                        [&since],
                     )
                     .map_err(StorageError::from)?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(StorageError::from)?
-            };
-            let Some(last) = events.last().map(|(rowid, _)| *rowid) else {
-                break;
-            };
-            last_rowid = last;
-            for (_, event) in events {
-                self.rollup_event("usage", &event)?;
-                rebuilt += 1;
+                rebuilt += c
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (bucket, node_id, collector_id, client_id, source_id, provider, model, \
+                             usage_source, usage_granularity, pricing_source, input_tokens, output_tokens, \
+                             cache_read_tokens, cache_write_tokens, reasoning_tokens, reported_cost, \
+                             calculated_cost, estimated_cost) \
+                             SELECT {usage_bucket}, node_id, collector_id, client_id, source_id, \
+                               COALESCE(provider_normalized,''), COALESCE(model_normalized,''), \
+                               COALESCE(usage_source,''), COALESCE(usage_granularity,''), \
+                               CASE WHEN reported_cost_micro_usd IS NOT NULL THEN 'reported' \
+                                    WHEN calculated_cost_micro_usd IS NOT NULL THEN 'calculated' \
+                                    WHEN estimated_cost_micro_usd IS NOT NULL THEN 'estimated' ELSE '' END, \
+                               SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0)), \
+                               SUM(COALESCE(cache_read_tokens,0)), SUM(COALESCE(cache_write_tokens,0)), \
+                               SUM(COALESCE(reasoning_tokens,0)), \
+                               SUM(COALESCE(reported_cost_micro_usd,0)), \
+                               SUM(COALESCE(calculated_cost_micro_usd,0)), \
+                               SUM(COALESCE(estimated_cost_micro_usd,0)) \
+                             FROM usage_events WHERE timestamp >= ?1 GROUP BY 1,2,3,4,5,6,7,8,9,10 \
+                             ON CONFLICT({pk}) DO UPDATE SET \
+                               input_tokens = input_tokens + excluded.input_tokens, \
+                               output_tokens = output_tokens + excluded.output_tokens, \
+                               cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
+                               cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, \
+                               reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, \
+                               reported_cost = reported_cost + excluded.reported_cost, \
+                               calculated_cost = calculated_cost + excluded.calculated_cost, \
+                               estimated_cost = estimated_cost + excluded.estimated_cost"
+                        ),
+                        [&since],
+                    )
+                    .map_err(StorageError::from)?;
+                let traffic_bucket = ts.replace("{ts}", "m.started_at");
+                rebuilt += c
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} (bucket, node_id, collector_id, client_id, source_id, provider, model, \
+                             traffic_estimation_source, traffic_confidence_level, \
+                             estimated_request_bytes, estimated_response_bytes, estimated_total_bytes, \
+                             estimated_lower_bound_bytes, estimated_upper_bound_bytes) \
+                             SELECT {traffic_bucket}, t.node_id, '', t.client_id, '', \
+                               COALESCE(t.provider,''), COALESCE(t.model,''), \
+                               COALESCE(t.estimation_source,''), \
+                               CASE WHEN t.confidence IS NULL THEN '' \
+                                    WHEN t.confidence >= 0.7 THEN 'high' \
+                                    WHEN t.confidence >= 0.4 THEN 'medium' ELSE 'low' END, \
+                               SUM(COALESCE(t.estimated_request_wire_bytes,0)), \
+                               SUM(COALESCE(t.estimated_response_wire_bytes,0)), \
+                               SUM(COALESCE(t.estimated_total_wire_bytes,0)), \
+                               SUM(COALESCE(t.lower_bound_bytes,0)), \
+                               SUM(COALESCE(t.upper_bound_bytes,0)) \
+                             FROM model_calls m JOIN traffic_estimates t ON t.id = m.traffic_estimate_id \
+                             WHERE m.started_at >= ?1 GROUP BY 1,2,3,4,5,6,7 \
+                             ON CONFLICT({pk}) DO UPDATE SET \
+                               estimated_request_bytes = estimated_request_bytes + excluded.estimated_request_bytes, \
+                               estimated_response_bytes = estimated_response_bytes + excluded.estimated_response_bytes, \
+                               estimated_total_bytes = estimated_total_bytes + excluded.estimated_total_bytes, \
+                               estimated_lower_bound_bytes = estimated_lower_bound_bytes + excluded.estimated_lower_bound_bytes, \
+                               estimated_upper_bound_bytes = estimated_upper_bound_bytes + excluded.estimated_upper_bound_bytes"
+                        ),
+                        [&since],
+                    )
+                    .map_err(StorageError::from)?;
             }
+            c.execute("COMMIT", []).map_err(StorageError::from)?;
+            Ok(rebuilt)
+        })();
+        if result.is_err() {
+            let _ = c.execute("ROLLBACK", []);
         }
-        Ok(rebuilt)
+        result
     }
-
     /// 重建流量估算 rollup：先删后插（幂等）。
     ///
     /// 从 `traffic_estimates` 重放 traffic 事件，恢复 `hourly/daily_rollups`
-    /// 的 `estimated_*_bytes` 等列。`rebuild_drift` 只重放 session/call，
-    /// 会删除 traffic 行却不恢复，导致维护重建后流量归零，故必须单独重建。
+    /// 的 `estimated_*_bytes` 等列。`rebuild_rollups` 已同时重放 session/call/usage/traffic，
+    /// 本函数保留用于仅重建流量维度的场景。
     pub fn rebuild_traffic_rollups(&self, days: i64) -> Result<usize, StorageError> {
         let since = Utc::now() - chrono::Duration::days(days);
         self.rebuild_traffic_rollups_since(since)
@@ -762,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_drift_rebuilds_rollup() {
+    fn rebuild_rollups_rebuilds_sessions_and_calls() {
         let db = test_db("rebuild");
         let now = Utc::now();
         let sess = sess_json("sess-b", &(now - chrono::Duration::hours(2)).to_rfc3339());
@@ -772,12 +725,12 @@ mod tests {
         db.rollup_event("session", &sess).unwrap();
         db.rollup_event("call", &call).unwrap();
 
-        // 人为制造漂移：删掉 rollup 行
+        // 人为制造漂移：删掉 rollup 行（维护重建会先删整范围再回填）
         {
             let c = db.conn();
             c.execute("DELETE FROM hourly_rollups", []).unwrap();
         }
-        let rebuilt = db.rebuild_drift(1).unwrap();
+        let rebuilt = db.rebuild_rollups(1).unwrap();
         assert!(rebuilt >= 2, "应重建 session+call: {rebuilt}");
         let report = db.reconcile_rollups(1).unwrap();
         assert!(report.drift_buckets == 0, "重建后应无漂移: {report:?}");
@@ -801,7 +754,7 @@ mod tests {
         db.insert_traffic(&t).unwrap();
         db.rollup_event("traffic", &t).unwrap();
 
-        // 人为制造漂移：删掉全部 rollup 行（模拟维护任务 rebuild_drift 删除 traffic 行）
+        // 人为制造漂移：删掉全部 rollup 行（维护重建会先删整范围，流量行也必须回填）
         {
             let c = db.conn();
             c.execute("DELETE FROM hourly_rollups", []).unwrap();
@@ -840,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_usage_rollups_processes_multiple_batches() {
+    fn rebuild_rollups_processes_usage_batches() {
         let db = test_db("usage-batches");
         let count = ROLLUP_BATCH_SIZE as usize + 1;
         for index in 0..count {
@@ -849,7 +802,7 @@ mod tests {
                 .unwrap());
         }
 
-        assert_eq!(db.rebuild_all_usage_rollups().unwrap(), count);
+        db.rebuild_rollups(36_500).unwrap();
         let (rows, input, output): (i64, i64, i64) = db
             .conn()
             .query_row(
@@ -944,5 +897,74 @@ mod tests {
         assert_eq!(fk, 1);
         metria_storage::wal_checkpoint(&conn).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_rebuild_rollups_skips_while_locked() {
+        let db = test_db("rebuild-lock");
+        let guard = db.rebuild_guard();
+        assert!(
+            db.try_rebuild_rollups(1).unwrap().is_none(),
+            "已有重建在执行时必须跳过，避免互相删写"
+        );
+        drop(guard);
+        assert!(
+            db.try_rebuild_rollups(1).unwrap().is_some(),
+            "重建锁释放后应可执行"
+        );
+    }
+
+    #[test]
+    fn rebuild_rollups_restores_counts_and_tokens() {
+        let db = test_db("rebuild-match");
+        let now = Utc::now();
+        let sess = sess_json("sess-m", &(now - chrono::Duration::hours(2)).to_rfc3339());
+        let call = call_json(&(now - chrono::Duration::hours(1)).to_rfc3339());
+        db.upsert_session(&sess).unwrap();
+        db.insert_call(&call, "n1:sess-m").unwrap();
+        db.insert_usage(&usage_json(0, true), "batch-node:batch-session")
+            .unwrap();
+        let call_time = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let mut traffic = traffic_json(&now.to_rfc3339());
+        traffic["model_call_id"] = serde_json::json!("traffic-call-m");
+        let mut traffic_call = call_json(&call_time);
+        traffic_call["id"] = serde_json::json!("traffic-call-m");
+        traffic_call["session_id"] = serde_json::json!("sess-m");
+        traffic_call["traffic_estimate_id"] = traffic["id"].clone();
+        traffic_call["status"] = serde_json::json!("success");
+        traffic_call["call_granularity"] = serde_json::json!("call");
+        db.insert_call(&traffic_call, "n1:sess-m").unwrap();
+        db.insert_traffic(&traffic).unwrap();
+
+        // 人为清空 rollup：重建必须同时恢复 session/call 计数、usage 的 Token 与流量字节。
+        {
+            let c = db.conn();
+            c.execute("DELETE FROM hourly_rollups", []).unwrap();
+            c.execute("DELETE FROM daily_rollups", []).unwrap();
+        }
+        db.rebuild_rollups(36_500).unwrap();
+
+        let report = db.reconcile_rollups(1).unwrap();
+        assert_eq!(report.drift_buckets, 0, "重建后不应有漂移: {report:?}");
+        let (input, output): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+                 FROM hourly_rollups WHERE usage_source != ''",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((input, output), (10, 5), "usage Token 必须随重建恢复");
+        let traffic: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(estimated_total_bytes), 0)
+                 FROM hourly_rollups WHERE traffic_estimation_source != ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(traffic, 12000, "流量估算字节必须随重建恢复");
     }
 }

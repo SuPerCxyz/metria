@@ -143,11 +143,9 @@ fn spawn_integrity_repair(db: db::HubDb) {
             let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
             if full_needed {
                 crate::catalog::reprice_from_rules(&db, false)?;
-                db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
-                db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+                db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
             } else if timings > 0 {
-                db.rebuild_drift(36_500).map_err(|e| e.to_string())?;
-                db.rebuild_all_usage_rollups().map_err(|e| e.to_string())?;
+                db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
             }
             if full_needed {
                 db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
@@ -287,14 +285,11 @@ fn spawn_maintenance(db: db::HubDb) {
                             drift = report.drift_buckets,
                             "rollup 对账发现漂移，触发重建"
                         );
-                        // 重建 session/call 计数，再重建 usage 的 token/cost。
-                        match db.rebuild_drift(1) {
-                            Ok(rebuilt) => info!("rollup 重建完成: {rebuilt} 条"),
+                        // 与启动全量重建互斥：已有重建在执行时跳过本轮，避免互相删写。
+                        match db.try_rebuild_rollups(1) {
+                            Ok(Some(rebuilt)) => info!("rollup 重建完成: {rebuilt} 条"),
+                            Ok(None) => info!("已有 rollup 重建在执行，跳过本轮"),
                             Err(e) => warn!("rollup 重建失败: {e}"),
-                        }
-                        match db.rebuild_usage_rollups(1) {
-                            Ok(rebuilt) => info!("usage rollup 重建完成: {rebuilt} 条"),
-                            Err(e) => warn!("usage rollup 重建失败: {e}"),
                         }
                     }
                 }

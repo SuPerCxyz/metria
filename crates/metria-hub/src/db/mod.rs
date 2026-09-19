@@ -20,6 +20,8 @@ pub mod traffic;
 #[derive(Debug, Clone)]
 pub struct HubDb {
     conn: Arc<Mutex<Connection>>,
+    /// 串行化 rollup 重建：同一时间只允许一个重建任务执行。
+    rebuild_lock: Arc<Mutex<()>>,
 }
 
 /// 可安全返回给 Web 的用户资料。
@@ -59,7 +61,18 @@ impl HubDb {
         let conn = metria_storage::open(&path, &metria_storage::DbOptions::default())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            rebuild_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// 阻塞获取重建锁（启动时的全量修复使用）。
+    pub fn rebuild_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.rebuild_lock.lock().expect("rebuild lock poisoned")
+    }
+
+    /// 尝试获取重建锁；已有重建在跑时返回 None（周期任务使用，避免与全量重建互相删写）。
+    pub fn try_rebuild_guard(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.rebuild_lock.try_lock().ok()
     }
 
     pub fn apply_migrations(&self) -> Result<Vec<i64>, StorageError> {
