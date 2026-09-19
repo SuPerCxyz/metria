@@ -45,7 +45,10 @@
 | 会话明细上传恢复：Agent 按 `METRIA_CONTENT_MODE` 上传 message/tool/subagent、协议白名单补 `message`、Hub 按会话键关联工具事件（OpenSpec `restore-agent-content-upload`） | ✅ 实现与门禁完成，本机 Agent 以 `full` 运行，消息已带正文落库 | 2026-09-19 |
 | 归档 `frontend-data-coverage-audit`、`fix-codex-rollout-timing`、`restore-agent-content-upload`，并合并 `add-ephemeral-llm-observability` 冲突场景保持校验全绿 | ✅ 完成 | 2026-09-19 |
 | 展示面按可采集性收敛：首页性能观测保留 3 张日志可推导卡并改三列、分析/调用列表/会话详情/数据质量移除恒空观测项、调用详情改为时间戳推导性能值（OpenSpec `trim-uncollectable-observability-ui`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
-| 概览活动口径与来源新鲜度：会话总时长按窗口重叠裁剪、消息/工具按明细时间统计、来源集合同步并标记失效来源、游标推进写 `last_scan_at`（OpenSpec `fix-overview-activity-and-freshness`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-19 |
+| 概览活动口径与来源新鲜度：会话总时长按窗口重叠裁剪、消息/工具按明细时间统计、来源集合同步并标记失效来源、游标推进写 `last_scan_at`（OpenSpec `fix-overview-activity-and-freshness`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
+| 日志不再推导生成耗时与输出速度：只接受运行时观测字段，页面移除这两项展示（OpenSpec `drop-log-derived-generation-speed`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
+| 首页区块合并：用量与成本合并为「用量与成本」六卡、会话卡改为「活跃会话」（新增 `active_sessions`）、移除数据新鲜度与来源脚注（OpenSpec `tidy-overview-sections`、`merge-usage-cost-and-active-sessions`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
+| OpenCode v2 采集与排序控件收敛：适配 `session_v2`/`session_message`（模型、tokens、上报费用、created/streamed/completed）、指纹变化重扫；全站移除排行排序控件（OpenSpec `support-opencode-v2-and-trim-sort-controls`） | 🟡 实现与门禁完成，待部署 lstable | 2026-09-19 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 

@@ -1,37 +1,14 @@
-// 排行列表：排名 + 名称 + 数值条。默认前 N 项。
+// 排行列表：排名 + 名称 + 数值条。按数值降序取前 N 项，不提供交互排序控件。
 
-import React, { useMemo, useState } from 'react'
+import React from 'react'
 import { sortRankingItems } from '../../services/ranking'
-import SortControls from '../common/SortControls'
 
 export default function RankingList({ items, valueKey, labelKey, format, secondaryKey, secondaryLabel = '费用', secondaryFormat, limit = 5, onItemClick }) {
-  const sortOptions = useMemo(() => [
-    { key: valueKey, label: '数值' },
-    ...(secondaryKey ? [{ key: secondaryKey, label: secondaryLabel }] : []),
-    { key: labelKey || 'name', label: '名称' },
-  ].filter((option, index, options) => options.findIndex((item) => item.key === option.key) === index), [labelKey, secondaryKey, secondaryLabel, valueKey])
-  const [sortKey, setSortKey] = useState(valueKey)
-  const [sortDir, setSortDir] = useState(-1)
-  const rows = sortRankingItems(items, valueKey, limit, sortKey, sortDir)
+  const rows = sortRankingItems(items, valueKey, limit)
   const max = Math.max(1, ...rows.map((r) => Number(r[valueKey] ?? 0)))
 
   return (
-    <div>
-      {sortOptions.length > 1 && (
-        <div className="mb-2 flex items-center justify-end gap-2">
-          <SortControls
-            options={sortOptions}
-            value={sortKey}
-            direction={sortDir}
-            onValueChange={(key) => {
-              setSortKey(key)
-              setSortDir(-1)
-            }}
-            onDirectionToggle={() => setSortDir((direction) => direction === -1 ? 1 : -1)}
-          />
-        </div>
-      )}
-      <div className="space-y-1">
+    <div className="space-y-1">
       {rows.length === 0 && <div className="text-sm text-gray-400 dark:text-gray-500 py-8 text-center">暂无数据</div>}
       {rows.map((item, i) => {
         const v = Number(item[valueKey] ?? 0)
@@ -62,7 +39,6 @@ export default function RankingList({ items, valueKey, labelKey, format, seconda
           </button>
         )
       })}
-      </div>
     </div>
   )
 }

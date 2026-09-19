@@ -93,9 +93,7 @@ export default function Analytics() {
       labels: pts.map((p) => p.bucket),
       latency: [
         { label: 'TTFT', values: pick('ttft_avg_ms'), color: COLORS.latency.p50 },
-        { label: '生成耗时', values: pick('generation_avg_ms'), color: COLORS.latency.avg },
       ],
-      speed: [{ label: '输出 Token/s', values: pts.map((p) => p.output_tokens_per_second_milli_avg == null ? null : p.output_tokens_per_second_milli_avg / 1000), color: COLORS.output }],
     }
   }, [performanceSeries.data])
 
@@ -162,8 +160,6 @@ export default function Analytics() {
   }
   const performanceHasSamples = [
     performanceMetric('ttft'),
-    performanceMetric('generation'),
-    performanceMetric('output_speed', 'avg_tokens_per_second'),
   ].some(Boolean)
 
   const modelItems = (byModel.data?.by || [])
@@ -265,25 +261,7 @@ export default function Analytics() {
                   total={performance.data?.total_calls}
                   coverage={performance.data?.ttft?.coverage}
                   sourceLabel={performanceSourceLabel(performance.data?.ttft?.sources)}
-                  hint="日志条目时间戳近似；缺失时保持不可用。"
-                />}
-                {performanceMetric('output_speed', 'avg_tokens_per_second') && <PerformanceCard
-                  label="输出速度"
-                  value={`${performance.data.output_speed.avg_tokens_per_second.toFixed(1)} Token/s`}
-                  count={performance.data?.output_speed?.count}
-                  total={performance.data?.total_calls}
-                  coverage={performance.data?.output_speed?.coverage}
-                  sourceLabel={performanceSourceLabel(performance.data?.output_speed?.sources)}
-                  hint="只计算首个输出之后的生成区间，不把等待时间算入速度。"
-                />}
-                {performanceMetric('generation') && <PerformanceCard
-                  label="生成耗时"
-                  value={fmtDuration(performance.data.generation.avg_ms)}
-                  count={performance.data?.generation?.count}
-                  total={performance.data?.total_calls}
-                  coverage={performance.data?.generation?.coverage}
-                  sourceLabel={performanceSourceLabel(performance.data?.generation?.sources)}
-                  hint="首个输出到最后输出事件。"
+                  hint="调用开始到首个输出条目；日志推导为条目时间戳近似。"
                 />}
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -298,17 +276,13 @@ export default function Analytics() {
                 <div className="mt-6 space-y-6">
                   {performanceTrend.latency.some((dataset) => dataset.values.some((value) => value != null)) && <div>
                     <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">性能趋势</h3>
-                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首个可观察输出与生成耗时趋势" />
-                  </div>}
-                  {performanceTrend.speed[0].values.some((value) => value != null) && <div>
-                    <h3 className="mb-3 text-sm font-semibold text-gray-500 dark:text-gray-400">输出速度趋势</h3>
-                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.speed} range={range} height={220} formatY={(value) => `${Number(value).toFixed(1)} Token/s`} ariaLabel="输出 Token 每秒趋势" />
+                    <TrendChart labels={performanceTrend.labels} datasets={performanceTrend.latency} range={range} height={260} formatY={fmtDuration} ariaLabel="首个可观察输出趋势" />
                   </div>}
                 </div>
               )}
             </>
           ) : (
-            <EmptyState title="暂无可用观测数据" desc="日志推导依赖客户端可证明事件；所选范围没有可计算的首个可观察输出、生成耗时或输出速度样本。" />
+            <EmptyState title="暂无可用观测数据" desc="所选范围没有可计算的首个可观察输出样本；生成耗时与输出速度需要运行时观测。" />
           )}
 
           {(latency.data?.count ?? 0) > 0 && <>

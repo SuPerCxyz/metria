@@ -15,7 +15,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtRelative, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
@@ -188,11 +188,13 @@ export default function Overview() {
     : null
   const pricingCoverage = o.pricing_coverage || {}
   const previousPricingCoverage = previous?.pricing_coverage || {}
-  const averageCallCost = pricingCoverage.priced_calls > 0 && totalCost != null
-    ? totalCost / pricingCoverage.priced_calls
+  const activeSessions = o.active_sessions ?? null
+  const previousActiveSessions = previous?.active_sessions ?? null
+  const averageSessionCost = pricingCoverage.priced_calls > 0 && totalCost != null && activeSessions > 0
+    ? totalCost / activeSessions
     : null
-  const previousAverageCallCost = previousPricingCoverage.priced_calls > 0 && previousCost != null
-    ? previousCost / previousPricingCoverage.priced_calls
+  const previousAverageSessionCost = previousPricingCoverage.priced_calls > 0 && previousCost != null && previousActiveSessions > 0
+    ? previousCost / previousActiveSessions
     : null
   const performanceData = performance.data || {}
   const performanceCoverage = (key) => {
@@ -202,9 +204,6 @@ export default function Overview() {
     const label = performanceSourceLabel(metric.sources)
     return label ? `${base} · ${label}` : base
   }
-  const performanceSources = (performanceData.sources || [])
-    .map((source) => `${source.source}（${source.quality}，${source.count}）`)
-    .join('、') || '暂无样本'
   const tokenTotal = sumTokens(o)
   const previousTokenTotal = previous ? sumTokens(previous) : null
   const averageTokenCount = o.token_calls ?? 0
@@ -219,9 +218,7 @@ export default function Overview() {
     return metric?.count > 0 && isAvailable(metric[valueKey])
   }
   const performanceCards = [
-    <MetricCard key="ttft" span="xl:col-span-4" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="首个可观察输出；日志推导为条目时间戳近似，缺失时保持不可用" />,
-    <MetricCard key="generation" span="xl:col-span-4" label="生成耗时" value={performanceMetric('generation') ? fmtDuration(performanceData.generation.avg_ms) : '—'} sub={performanceCoverage('generation')} hint="首个输出到最后输出事件，不含其后的工具执行时间" />,
-    <MetricCard key="speed" span="xl:col-span-4" label="输出速度" value={performanceMetric('output_speed', 'avg_tokens_per_second') ? `${performanceData.output_speed.avg_tokens_per_second.toFixed(1)} Token/s` : '—'} sub={performanceCoverage('output_speed')} hint="仅使用首个输出后的生成区间计算" />,
+    <MetricCard key="ttft" span="xl:col-span-3" label="首个可观察输出" value={performanceMetric('ttft') ? fmtDuration(performanceData.ttft.avg_ms) : '—'} sub={performanceCoverage('ttft')} hint="调用开始到首个输出条目；日志推导为条目时间戳近似，缺失时保持不可用" />,
   ]
 
   return (
@@ -229,7 +226,7 @@ export default function Overview() {
       <PageHeader title="总览" subtitle="AI 编程 Agent 用量、费用与性能概览" />
 
       <div className="mt-0">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量</h2>
+        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">用量与成本</h2>
         <div className="grid grid-cols-12 gap-6">
           <MetricCard
             span="xl:col-span-4"
@@ -256,12 +253,6 @@ export default function Overview() {
             sub={averageTokensPerCall != null ? `${averageTokenCount} 次有 Token 数据的调用` : '当前范围暂无 Token 数据'}
             hint="总 Token 除以有 Token 数据的调用数；缺失 Token 的调用不计入分母"
           />
-        </div>
-      </div>
-
-      <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">成本</h2>
-        <div className="grid grid-cols-12 gap-6">
           <MetricCard
             span="xl:col-span-4"
             label="总费用"
@@ -280,21 +271,13 @@ export default function Overview() {
           />
           <MetricCard
             span="xl:col-span-4"
-            label="平均单次调用费用"
-            value={averageCallCost != null ? fmtUsd(averageCallCost) : '—'}
-            {...compare(averageCallCost, previousAverageCallCost)}
-            sub={averageCallCost != null ? `${pricingCoverage.priced_calls} 次有费用口径调用` : '当前范围暂无可计算费用'}
-            hint="当前范围总费用除以有费用口径的调用数；未定价调用不按 0 计入"
+            label="平均每会话费用"
+            value={averageSessionCost != null ? fmtUsd(averageSessionCost) : '—'}
+            {...compare(averageSessionCost, previousAverageSessionCost)}
+            sub={averageSessionCost != null ? `${activeSessions} 个活跃会话` : '当前范围暂无可计算费用'}
+            hint="当前范围总费用除以范围内活跃或新建的会话数；无会话或未定价时保持不可用"
           />
         </div>
-      </div>
-
-      <div className="mt-3">
-        <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">性能观测</h2>
-        <div className="grid grid-cols-12 gap-6">{performanceCards}</div>
-        {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
-        {performance.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">性能数据加载失败：{performance.error.message}</p>}
-        {!performance.loading && !performance.error && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">观测来源：{performanceSources}；每张卡片按来源标注「运行时观测」或「日志推导」，日志调用缺失的字段保持不可用，不使用推算值补齐。</p>}
       </div>
 
       <div className="mt-3">
@@ -302,7 +285,7 @@ export default function Overview() {
         <div className="grid grid-cols-12 gap-6">
           <MetricCard span="xl:col-span-2" label="请求数" value={String(modelCalls)} {...compare(modelCalls, previousModelCalls)} sub="模型调用次数" hint={`涉及 ${o.models ?? 0} 个模型`} />
           <MetricCard span="xl:col-span-2" label="错误率" value={errorRate != null ? fmtPct100(errorRate) : '—'} {...compare(errorRate, previousErrorRate, true)} sub={errorRate != null ? `成功 ${fmtPct100(successRate)} · 失败 ${failed} 次` : '当前范围暂无请求数据'} hint="失败请求占全部请求比例；下降表示改善" />
-          <MetricCard span="xl:col-span-2" label="新建会话" value={isAvailable(o.sessions) ? String(o.sessions) : '—'} {...compare(o.sessions, previous?.sessions)} sub={isAvailable(o.sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据'} hint="当前 Agent 新建的会话数" />
+          <MetricCard span="xl:col-span-2" label="活跃会话" value={isAvailable(o.active_sessions) ? String(o.active_sessions) : '—'} {...compare(o.active_sessions, previous?.active_sessions)} sub={isAvailable(o.active_sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据'} hint="范围内新建或仍在活动的会话数" />
           <MetricCard span="xl:col-span-2" label="活跃时长" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub="模型调用耗时合计" hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠" />
           <MetricCard span="xl:col-span-2" label="会话总时长" value={fmtDuration(o.session_duration_ms)} {...compare(o.session_duration_ms, previous?.session_duration_ms)} sub="范围重叠的会话跨度合计" hint="与所选范围重叠的会话跨度（裁剪到范围边界）；不去重重叠会话" />
           <MetricCard span="xl:col-span-2" label="节点在线" value={isAvailable(o.collectors) ? `${o.collectors_online ?? 0} / ${o.collectors}` : '—'} sub={isAvailable(o.collectors) ? `${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目` : '当前范围暂无采集器数据'} hint="在线采集器 / 总数" />
@@ -315,8 +298,10 @@ export default function Overview() {
           <MetricCard span="xl:col-span-3" label="总消息数" value={fmtTokensShort(o.message_count)} {...compare(o.message_count, previous?.message_count)} sub="按消息时间统计（需内容采集）" />
           <MetricCard span="xl:col-span-3" label="用户消息数" value={fmtTokensShort(o.user_message_count)} {...compare(o.user_message_count, previous?.user_message_count)} sub="可识别 role=user" />
           <MetricCard span="xl:col-span-3" label="工具调用消息" value={fmtTokensShort(o.tool_call_count)} {...compare(o.tool_call_count, previous?.tool_call_count)} sub="按工具事件时间统计" />
-          <FreshnessCard freshness={o.freshness} />
+          {performanceCards}
         </div>
+        {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
+        {performance.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">性能数据加载失败：{performance.error.message}</p>}
       </div>
 
       {/* 第二行：主趋势图 */}
@@ -415,35 +400,6 @@ export default function Overview() {
       </div>}
 
     </>
-  )
-}
-
-function FreshnessCard({ freshness }) {
-  const status = freshness?.status || 'unavailable'
-  const statusText = { fresh: '正常', delayed: '有延迟', error: '有错误', unavailable: '不可用' }[status] || '不可用'
-  const statusClass = status === 'fresh'
-    ? 'text-emerald-600 bg-emerald-100 dark:text-emerald-400 dark:bg-emerald-400/10'
-    : status === 'unavailable'
-      ? 'text-gray-500 bg-gray-100 dark:text-gray-400 dark:bg-gray-700/40'
-      : 'text-amber-600 bg-amber-100 dark:text-amber-400 dark:bg-amber-400/10'
-  const latest = freshness?.last_event_at || freshness?.last_scan_at || freshness?.last_upload_at
-  const coverage = freshness?.coverage == null ? '—' : `${(Number(freshness.coverage) * 100).toFixed(1)}%`
-  return (
-    <div className="flex flex-col col-span-full sm:col-span-6 xl:col-span-3 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-medium text-gray-500 dark:text-gray-400">数据新鲜度</h3>
-        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass}`}>{statusText}</span>
-      </div>
-      <div className="text-2xl font-bold text-gray-800 dark:text-gray-100 tabular-nums tracking-tight">{fmtRelative(latest)}</div>
-      <div className="mt-1 text-xs text-gray-400 dark:text-gray-500 tabular-nums">
-        在线采集器 {freshness?.collectors_online ?? 0} / {freshness?.collectors_total ?? 0} · 来源覆盖率 {coverage}
-      </div>
-      <div className="mt-1 truncate text-xs text-gray-300 dark:text-gray-600" title={latest || undefined}>
-        {freshness?.source_stale ? `${freshness.source_stale} 个来源延迟` : '最近扫描已完成'}
-        {freshness?.source_errors ? ` · ${freshness.source_errors} 个来源错误` : ''}
-        {freshness?.source_missing ? ` · ${freshness.source_missing} 个来源已失效` : ''}
-      </div>
-    </div>
   )
 }
 

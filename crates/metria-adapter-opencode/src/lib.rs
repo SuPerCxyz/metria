@@ -7,6 +7,7 @@
 
 pub mod build;
 pub mod entry;
+pub mod v2;
 
 use std::collections::HashMap;
 use std::fs;
@@ -101,11 +102,21 @@ impl SourceAdapter for OpenCodeAdapter {
             source: std::io::Error::other(e.to_string()),
         })?;
 
-        // Schema 检查：必需表必须存在
-        ensure_schema(&conn, path)?;
-        let schema_signature = schema_signature(&conn);
+        // Schema 检查：按布局选择必需表
+        let v2_layout =
+            v2::has_table(&conn, "session_message") && v2::has_table(&conn, "session_v2");
+        if v2_layout {
+            v2::ensure_schema_v2(&conn, path)?;
+        } else {
+            ensure_schema(&conn, path)?;
+        }
+        let schema_signature = if v2_layout {
+            v2::schema_signature_v2(&conn)
+        } else {
+            schema_signature(&conn)
+        };
 
-        let (last_rowid, expected_fp) = match cursor {
+        let (mut last_rowid, expected_fp) = match cursor {
             Some(metria_core::model::SourceCursor::Sqlite(c)) => {
                 (c.last_rowid, Some(c.database_fingerprint.clone()))
             }
@@ -115,13 +126,30 @@ impl SourceAdapter for OpenCodeAdapter {
             "{}:{schema_signature}",
             source.path_hash.as_str()
         ));
+        let mut tolerance = ScanTolerance::default();
         if let Some(expected) = expected_fp {
             if expected != fingerprint {
-                // schema 或文件变化：从 0 重新扫描（游标失效但数据仍可读）
-                return Err(AdapterError::CursorInvalid(
-                    "数据库指纹变化，游标失效".into(),
-                ));
+                // schema 或文件变化（例如 OpenCode v1→v2 迁移）：从 0 重扫，避免来源被永久卡住。
+                tolerance.record("数据库指纹变化，已从起始位置重新扫描".into());
+                last_rowid = 0;
             }
+        }
+
+        if v2_layout {
+            let (mut batches, max_rowid) = v2::scan_v2(
+                &conn,
+                identity,
+                source.path_hash.as_str(),
+                last_rowid,
+                &mut tolerance,
+            )?;
+            batches.warnings = tolerance.warnings;
+            batches.next_cursor = Some(sqlite_cursor(
+                fingerprint,
+                Some(schema_signature),
+                max_rowid,
+            ));
+            return Ok(batches);
         }
 
         let ctx = BuildCtx {
@@ -131,7 +159,6 @@ impl SourceAdapter for OpenCodeAdapter {
             client_id: "opencode".into(),
         };
 
-        let mut tolerance = ScanTolerance::default();
         let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
         let mut session_cache: HashMap<String, SessionRow> = HashMap::new();
         let mut max_rowid = last_rowid;
@@ -216,54 +243,7 @@ impl SourceAdapter for OpenCodeAdapter {
             process_message(&conn, builder, &msg_id, &data, at, &mut tolerance);
         }
 
-        // 子代理关系：child.parent_source_id -> parent builder
-        let parent_by_source: HashMap<String, Id> = builders
-            .iter()
-            .map(|(sid, b)| (sid.clone(), b.session.id.clone()))
-            .collect();
-        let children: Vec<(Id, Option<String>)> = builders
-            .values()
-            .map(|b| (b.session.id.clone(), b.parent_source_id.clone()))
-            .filter(|(_, p)| p.is_some())
-            .collect();
-        for (child_id, parent_src) in children {
-            if let Some(parent_src) = parent_src {
-                if let Some(parent_id) = parent_by_source.get(&parent_src) {
-                    if let Some(parent_builder) = builders.get_mut(&parent_src) {
-                        parent_builder
-                            .subagents
-                            .push(metria_core::model::SubagentRelation {
-                                id: Id::new(),
-                                session_id: parent_id.clone(),
-                                parent_model_call_id: None,
-                                child_session_id: child_id.clone(),
-                                relation: "subagent".into(),
-                                created_at: Utc::now(),
-                            });
-                    }
-                }
-            }
-        }
-
-        let mut batches = ScanBatch::default();
-        for (_, b) in builders {
-            let (mut s, turns, messages, mut calls, usage, tools, subagents, _traffic) = b.finish();
-            s.estimated_request_bytes = None;
-            s.estimated_response_bytes = None;
-            s.estimated_total_bytes = None;
-            s.traffic_confidence = None;
-            for call in &mut calls {
-                call.traffic_estimate_id = None;
-            }
-            batches.sessions.push(s);
-            batches.turns.extend(turns);
-            batches.messages.extend(messages);
-            batches.model_calls.extend(calls);
-            batches.usage_events.extend(usage);
-            batches.tool_events.extend(tools);
-            batches.subagent_relations.extend(subagents);
-        }
-        batches.warnings = tolerance.warnings;
+        let mut batches = finalize_builders(builders, &tolerance);
         batches.next_cursor = Some(sqlite_cursor(
             fingerprint,
             Some(schema_signature),
@@ -284,20 +264,29 @@ impl SourceAdapter for OpenCodeAdapter {
             });
         }
         match metria_storage::open_readonly(path) {
-            Ok(conn) => match ensure_schema(&conn, path) {
-                Ok(()) => Ok(SourceHealth {
-                    ok: true,
-                    status: SourceStatus::Active,
-                    message: None,
-                    last_error: None,
-                }),
-                Err(e) => Ok(SourceHealth {
-                    ok: false,
-                    status: SourceStatus::Error,
-                    message: Some(e.to_string()),
-                    last_error: Some(e.to_string()),
-                }),
-            },
+            Ok(conn) => {
+                let v2_layout =
+                    v2::has_table(&conn, "session_message") && v2::has_table(&conn, "session_v2");
+                let schema = if v2_layout {
+                    v2::ensure_schema_v2(&conn, path)
+                } else {
+                    ensure_schema(&conn, path)
+                };
+                match schema {
+                    Ok(()) => Ok(SourceHealth {
+                        ok: true,
+                        status: SourceStatus::Active,
+                        message: None,
+                        last_error: None,
+                    }),
+                    Err(e) => Ok(SourceHealth {
+                        ok: false,
+                        status: SourceStatus::Error,
+                        message: Some(e.to_string()),
+                        last_error: Some(e.to_string()),
+                    }),
+                }
+            }
             Err(e) => Ok(SourceHealth {
                 ok: false,
                 status: SourceStatus::Error,
@@ -470,6 +459,7 @@ fn process_message(
                     cache.and_then(|(_, w)| w),
                     tokens.reasoning,
                     status,
+                    None,
                     if response_text.is_empty() {
                         None
                     } else {
@@ -621,6 +611,61 @@ fn schema_signature(conn: &Connection) -> String {
         }
     }
     sig
+}
+
+/// 汇总：接线子代理关系、结束构建器并收集批次。
+pub(crate) fn finalize_builders(
+    mut builders: HashMap<String, SessionBuilder>,
+    tolerance: &ScanTolerance,
+) -> ScanBatch {
+    let parent_by_source: HashMap<String, Id> = builders
+        .iter()
+        .map(|(sid, b)| (sid.clone(), b.session.id.clone()))
+        .collect();
+    let children: Vec<(Id, Option<String>)> = builders
+        .values()
+        .map(|b| (b.session.id.clone(), b.parent_source_id.clone()))
+        .filter(|(_, parent)| parent.is_some())
+        .collect();
+    for (child_id, parent_src) in children {
+        if let Some(parent_src) = parent_src {
+            if let Some(parent_id) = parent_by_source.get(&parent_src) {
+                if let Some(parent_builder) = builders.get_mut(&parent_src) {
+                    parent_builder
+                        .subagents
+                        .push(metria_core::model::SubagentRelation {
+                            id: Id::new(),
+                            session_id: parent_id.clone(),
+                            parent_model_call_id: None,
+                            child_session_id: child_id.clone(),
+                            relation: "subagent".into(),
+                            created_at: Utc::now(),
+                        });
+                }
+            }
+        }
+    }
+
+    let mut batches = ScanBatch::default();
+    for (_, b) in builders {
+        let (mut s, turns, messages, mut calls, usage, tools, subagents, _traffic) = b.finish();
+        s.estimated_request_bytes = None;
+        s.estimated_response_bytes = None;
+        s.estimated_total_bytes = None;
+        s.traffic_confidence = None;
+        for call in &mut calls {
+            call.traffic_estimate_id = None;
+        }
+        batches.sessions.push(s);
+        batches.turns.extend(turns);
+        batches.messages.extend(messages);
+        batches.model_calls.extend(calls);
+        batches.usage_events.extend(usage);
+        batches.tool_events.extend(tools);
+        batches.subagent_relations.extend(subagents);
+    }
+    batches.warnings = tolerance.warnings.clone();
+    batches
 }
 
 fn dollar_to_micro(dollars: Option<f64>) -> Option<i64> {

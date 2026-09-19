@@ -38,6 +38,23 @@ pub struct MessageData {
     pub finish: Option<String>,
     pub error: Option<serde_json::Value>,
     pub time: Option<MessageTime>,
+    /// v2 user 消息正文。
+    pub text: Option<String>,
+    /// v2 assistant 消息内嵌内容（text/reasoning/tool）。
+    pub content: Option<Vec<ContentItem>>,
+}
+
+/// v2 `session_message.data.content` 条目。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContentItem {
+    #[serde(rename = "type")]
+    pub item_type: Option<String>,
+    pub text: Option<String>,
+    /// 工具调用 id（v2 用 `id`，旧版 part 用 `callID`）。
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub state: Option<PartState>,
+    pub time: Option<PartTime>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -46,6 +63,8 @@ pub struct MessageModel {
     pub provider_id: Option<String>,
     #[serde(alias = "modelID")]
     pub model_id: Option<String>,
+    /// v2 使用 `id` 表示模型标识。
+    pub id: Option<String>,
     pub variant: Option<String>,
 }
 
@@ -67,6 +86,8 @@ pub struct CacheTokens {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MessageTime {
     pub created: Option<i64>,
+    /// v2：首个流式输出到达时间。
+    pub streamed: Option<i64>,
     pub completed: Option<i64>,
 }
 
@@ -94,6 +115,10 @@ pub struct PartState {
 pub struct PartTime {
     pub start: Option<i64>,
     pub end: Option<i64>,
+    /// v2 工具条目时间线。
+    pub created: Option<i64>,
+    pub ran: Option<i64>,
+    pub completed: Option<i64>,
 }
 
 /// 毫秒时间戳 → UTC。

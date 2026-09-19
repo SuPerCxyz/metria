@@ -379,3 +379,184 @@ fn incremental_assistant_restores_corresponding_user_turn_start() {
     assert_eq!(call.completed_at, Some(ts(3000)));
     assert_eq!(call.duration_ms, Some(2000));
 }
+
+// ===== v2（session_v2 / session_message）=====
+
+/// v2 schema：内容内嵌在 session_message.data。
+fn create_schema_v2(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE session_v2 (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+          fork_session_id TEXT, fork_boundary TEXT, slug TEXT, directory TEXT, path TEXT,
+          title TEXT, version TEXT, share_url TEXT, summary_additions INTEGER,
+          summary_deletions INTEGER, summary_files INTEGER, summary_diffs TEXT, metadata TEXT,
+          cost REAL DEFAULT 0 NOT NULL, tokens_input INTEGER DEFAULT 0,
+          tokens_output INTEGER DEFAULT 0, tokens_reasoning INTEGER DEFAULT 0,
+          tokens_cache_read INTEGER DEFAULT 0, tokens_cache_write INTEGER DEFAULT 0,
+          revert TEXT, permission TEXT, agent TEXT, model TEXT,
+          time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+          time_compacting INTEGER, time_archived INTEGER, time_suspended INTEGER,
+          resume_attempts INTEGER, time_idle INTEGER, time_viewed INTEGER, idle_outcome TEXT
+        );
+        CREATE TABLE session_message (
+          id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
+          time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+}
+
+fn insert_golden_v2(conn: &Connection) {
+    conn.execute(
+        "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, time_created, time_updated) VALUES \
+         ('v2s1','proj-hash',NULL,'v2s1','/home/alice/projects/v2','v2 会话','1.18.18',0.0025,150,60,10,500,0,'{\"id\":\"commandcode/deepseek/deepseek-v4.1-flash\",\"providerID\":\"command-code\"}',1000,6000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2u1','v2s1','user',1,1000,1000, ?1)",
+        [r#"{"time":{"created":1000},"text":"帮我看看构建"}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2a1','v2s1','assistant',2,2000,6000, ?1)",
+        [r#"{"time":{"created":2000,"streamed":2500,"completed":6000},"agent":"general","model":{"id":"commandcode/deepseek/deepseek-v4.1-flash","providerID":"command-code","variant":"max"},"tokens":{"input":150,"output":60,"reasoning":10,"cache":{"read":500,"write":0}},"cost":0.0025,"finish":"end-turn","content":[{"type":"reasoning","text":"先看仓库"},{"type":"text","text":"构建通过。"},{"type":"tool","id":"call_1","name":"shell","state":{"status":"completed","input":{"command":"npm build"},"output":"ok"},"time":{"created":3000,"ran":3100,"completed":4000}}]}"#],
+    )
+    .unwrap();
+}
+
+#[test]
+fn v2_reads_session_call_usage_and_tool() {
+    let dir = temp_dir("v2-golden");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema_v2(&conn);
+    insert_golden_v2(&conn);
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    assert_golden_basics(&summary);
+    let batch = &summary.batch;
+
+    assert_eq!(batch.sessions.len(), 1);
+    let session = &batch.sessions[0];
+    assert_eq!(session.source_session_id, "v2s1");
+    assert_eq!(session.title.as_deref(), Some("v2 会话"));
+    assert_eq!(
+        session.reported_cost_micro_usd,
+        Some(2_500),
+        "session_v2.cost 应转为 reported 微美元"
+    );
+    assert!(session.working_directory_hash.is_some());
+
+    assert_eq!(batch.model_calls.len(), 1);
+    let call = &batch.model_calls[0];
+    assert_eq!(
+        call.model_raw.as_deref(),
+        Some("commandcode/deepseek/deepseek-v4.1-flash")
+    );
+    assert_eq!(call.provider_raw.as_deref(), Some("command-code"));
+    assert_eq!(call.input_tokens, Some(150));
+    assert_eq!(call.output_tokens, Some(60));
+    assert_eq!(call.reasoning_tokens, Some(10));
+    assert_eq!(call.cache_read_tokens, Some(500));
+    assert_eq!(
+        call.reported_cost_micro_usd,
+        Some(2_500),
+        "v2 单条消息 cost 应作为 reported cost"
+    );
+    assert_eq!(call.started_at, ts(1000), "回合起点来自 user 消息");
+    assert_eq!(
+        call.first_response_at,
+        Some(ts(2500)),
+        "首个可观察输出来自 time.streamed"
+    );
+    assert_eq!(call.completed_at, Some(ts(6000)));
+
+    assert_eq!(batch.usage_events.len(), 1);
+    assert_eq!(batch.messages.len(), 3, "user + assistant text + reasoning");
+    assert_eq!(batch.tool_events.len(), 1);
+    assert_eq!(batch.tool_events[0].name, "shell");
+    assert_eq!(
+        batch.tool_events[0].source_tool_id.as_deref(),
+        Some("call_1")
+    );
+    assert!(batch.traffic_estimates.is_empty());
+}
+
+#[test]
+fn v2_cursor_is_incremental() {
+    let dir = temp_dir("v2-cursor");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema_v2(&conn);
+    insert_golden_v2(&conn);
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert_eq!(first.model_calls.len(), 1);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2u2','v2s1','user',3,7000,7000, ?1)",
+        [r#"{"time":{"created":7000},"text":"再跑一次"}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('v2a2','v2s1','assistant',4,8000,9000, ?1)",
+        [r#"{"time":{"created":8000,"streamed":8200,"completed":9000},"model":{"id":"commandcode/deepseek/deepseek-v4.1-flash","providerID":"command-code"},"tokens":{"input":10,"output":5},"finish":"end-turn","content":[{"type":"text","text":"完成"}]}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    assert_eq!(second.model_calls.len(), 1, "只应产出新增调用");
+    let call = &second.model_calls[0];
+    assert_eq!(call.started_at, ts(7000));
+    assert_eq!(call.first_response_at, Some(ts(8200)));
+    assert_eq!(call.completed_at, Some(ts(9000)));
+
+    let third = adapter
+        .scan(&source, second.next_cursor.as_ref(), &identity)
+        .unwrap();
+    assert!(third.model_calls.is_empty());
+}
+
+#[test]
+fn v2_migration_rescans_after_schema_change() {
+    // 旧库先按 v1 扫描，再出现 v2 表：指纹变化时应从 0 重扫而不是报错卡住。
+    let dir = temp_dir("v2-migration");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    insert_golden_data(&conn);
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert_eq!(first.sessions.len(), 2);
+
+    let conn = Connection::open(&db).unwrap();
+    create_schema_v2(&conn);
+    insert_golden_v2(&conn);
+    drop(conn);
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    assert_eq!(second.sessions.len(), 1, "v2 会话应被扫描到");
+    assert_eq!(second.model_calls.len(), 1);
+    assert!(
+        second.warnings.iter().any(|w| w.contains("指纹变化")),
+        "应记录指纹变化并重扫：{:?}",
+        second.warnings
+    );
+}

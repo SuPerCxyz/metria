@@ -1578,11 +1578,17 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
     assert_eq!(performance["total_calls"], 3);
     assert_eq!(performance["ttft"]["count"], 2);
     assert_eq!(performance["ttft"]["avg_ms"], 250);
-    assert_eq!(performance["output_speed"]["count"], 2);
+    // 生成耗时与输出速度只来自运行时观测字段：仅 call-1 带显式字段。
+    assert_eq!(performance["generation"]["count"], 1);
+    assert_eq!(performance["generation"]["avg_ms"], 500);
+    assert_eq!(performance["output_speed"]["count"], 1);
     let avg_speed = performance["output_speed"]["avg_tokens_per_second"]
         .as_f64()
         .unwrap();
-    assert!((avg_speed - 69.44).abs() < 0.1, "avg_speed={avg_speed}");
+    assert!(
+        (avg_speed - 83.333).abs() < 0.1,
+        "日志条目时间戳不得推导速度；avg_speed={avg_speed}"
+    );
 
     // 每指标来源分布：运行时观测与日志推导分别统计
     let ttft_sources = performance["ttft"]["sources"].as_array().unwrap();
@@ -1601,8 +1607,8 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
             .as_array()
             .unwrap()
             .len(),
-        2,
-        "输出速度也应带来源分布"
+        1,
+        "输出速度只统计运行时观测样本"
     );
     assert!(
         performance["first_byte"]["sources"]
@@ -1956,6 +1962,10 @@ async fn overview_activity_uses_window_and_detail() {
     .into_json()
     .unwrap();
     assert_eq!(overview["sessions"], 0, "窗口内没有新建会话");
+    assert_eq!(
+        overview["active_sessions"], 1,
+        "窗口内仍在活动的会话应计入活跃会话"
+    );
     assert_eq!(overview["message_count"], 1, "按消息时间统计");
     assert_eq!(overview["user_message_count"], 1);
     assert_eq!(overview["tool_call_count"], 1, "按工具时间统计");

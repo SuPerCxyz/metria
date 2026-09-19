@@ -291,6 +291,7 @@ impl SessionBuilder {
         cache_write: Option<i64>,
         reasoning: Option<i64>,
         status: &str,
+        reported_cost_micro_usd: Option<i64>,
         response_text: Option<String>,
     ) {
         let model_norm = model.map(normalize_model);
@@ -357,7 +358,7 @@ impl SessionBuilder {
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
             reasoning_tokens: reasoning,
-            reported_cost_micro_usd: None,
+            reported_cost_micro_usd,
             calculated_cost_micro_usd: None,
             estimated_cost_micro_usd: None,
             endpoint: None,
@@ -398,7 +399,10 @@ impl SessionBuilder {
                 cache_write,
                 reasoning,
             },
-            cost: Default::default(),
+            cost: metria_core::model::Cost {
+                reported_micro_usd: reported_cost_micro_usd,
+                ..Default::default()
+            },
             quality: metria_core::model::Quality {
                 usage_source: "reported".into(),
                 granularity: UsageGranularity::Message,

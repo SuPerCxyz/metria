@@ -34,13 +34,9 @@ export default function CallDetail() {
 
   const firstOutput = c.first_response_at || c.first_token_at || c.first_byte_at
   const ttft = msBetween(c.started_at, firstOutput)
-  const generation = msBetween(firstOutput, c.last_output_at) ?? msBetween(firstOutput, c.completed_at)
-  const speed = generation > 0 && c.output_tokens > 0 ? (c.output_tokens * 1000) / generation : null
 
   const performanceFields = [
     ['首个可观察输出', ttft != null ? fmtDuration(ttft) : null],
-    ['生成耗时', generation != null ? fmtDuration(generation) : null],
-    ['输出速度', speed != null ? `${speed.toFixed(1)} Token/s` : null],
     ['状态码', c.status_code != null ? String(c.status_code) : null],
   ].filter(([, value]) => value != null)
 

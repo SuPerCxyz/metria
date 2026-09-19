@@ -252,6 +252,7 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
     let activity = overview_activity(&c, &p, from, to);
     body["sessions"] = activity.sessions.into();
+    body["active_sessions"] = activity.active_sessions.into();
     body["message_count"] = activity.messages.into();
     body["user_message_count"] = activity.user_messages.into();
     body["tool_call_count"] = activity.tools.into();
@@ -2924,8 +2925,6 @@ pub(crate) async fn usage_performance(
         let byte_at = row.1.as_deref().and_then(parse);
         let token_at = row.2.as_deref().and_then(parse);
         let legacy_first = row.3.as_deref().and_then(parse);
-        let last_output = row.4.as_deref().and_then(parse);
-        let completed = row.5.as_deref().and_then(parse);
         if row.21 == "success" || row.21 == "ok" || row.21 == "completed" {
             success += 1;
         } else {
@@ -2965,23 +2964,14 @@ pub(crate) async fn usage_performance(
             *ttft_sources
                 .entry((source.clone(), quality.clone()))
                 .or_default() += 1;
-            if let Some(value) = row.8.filter(|value| *value > 0) {
+            // 生成耗时与输出速度只信任运行时观测字段；日志条目完成时间无法测量生成区间。
+            let generation_ms = row.8.filter(|value| *value > 0);
+            if let Some(value) = generation_ms {
                 generation.push(value);
                 *generation_sources
                     .entry((source.clone(), quality.clone()))
                     .or_default() += 1;
-            } else if let Some(last) = last_output.or(completed).filter(|last| *last > first) {
-                generation.push((last - first).num_milliseconds());
-                *generation_sources
-                    .entry((source.clone(), quality.clone()))
-                    .or_default() += 1;
             }
-            let generation_ms = row.8.or_else(|| {
-                last_output
-                    .or(completed)
-                    .filter(|last| *last > first)
-                    .map(|last| (last - first).num_milliseconds())
-            });
             if let Some(value) = row.7.filter(|value| *value > 0) {
                 speeds.push(value as f64 / 1000.0);
                 *speed_sources
@@ -3427,6 +3417,7 @@ fn add_overview_raw_edges(
 /// 概览「活动与健康 / 消息与数据状态」的窗口口径统计。
 struct OverviewActivity {
     sessions: i64,
+    active_sessions: i64,
     messages: i64,
     user_messages: i64,
     tools: i64,
@@ -3447,6 +3438,19 @@ fn overview_activity(
             &format!(
                 "SELECT COUNT(*) FROM sessions s
                  WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
+            ),
+            params_from_iter(range_args(&from, &to, session_fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    // 活跃会话：窗口内新建，或窗口之前开始但在窗口内仍有活动。
+    let active_sessions = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM sessions s
+                 WHERE ((s.started_at >= ?1 AND s.started_at < ?2)
+                    OR (s.started_at < ?2
+                        AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) >= ?1)) {session_filter}"
             ),
             params_from_iter(range_args(&from, &to, session_fargs.clone())),
             |r| r.get::<_, i64>(0),
@@ -3506,6 +3510,7 @@ fn overview_activity(
         .unwrap_or((0, None));
     OverviewActivity {
         sessions,
+        active_sessions,
         messages,
         user_messages,
         tools,
