@@ -50,6 +50,10 @@
 | 首页区块合并：用量与成本合并为「用量与成本」六卡、会话卡改为「活跃会话」（新增 `active_sessions`）、移除数据新鲜度与来源脚注（OpenSpec `tidy-overview-sections`、`merge-usage-cost-and-active-sessions`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
 | OpenCode v2 采集与排序控件收敛：适配 `session_v2`/`session_message`（模型、tokens、上报费用、created/streamed/completed）、指纹变化重扫；全站移除排行排序控件（OpenSpec `support-opencode-v2-and-trim-sort-controls`） | ✅ 已部署 lstable | 2026-09-19 |
 | 尾部优先补采：SQLite 来源双游标（最新区间先采、历史并行回补）+ 上传分块重试（OpenSpec `prioritize-recent-backfill`） | ✅ 已部署本机 Agent | 2026-09-19 |
+| 精确重复调用清理：删除 17,011 条完全重复调用与 11,806 条重复用量（保留行已有用量），1,644 条唯一用量改指保留行，Hub 重启重建 rollup；备份 `deploy-before-20260919-dedup.db.zst` | ✅ 已执行并校验（无精确重复残留） | 2026-09-19 |
+| 热力图悬浮提示：单元格悬浮/聚焦显示该时段 Token 与请求数（OpenSpec `heatmap-hover-metrics`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
+| 重复行清理后的 rollup 修复：停机用 SQL 一次性重建 hourly/daily（25s，明细/rollup 调用数与 Token 完全一致）；清理全量重建与 6h 对账并发互相覆盖的触发方式（已回填完整性版本，仅按 24h 对账自愈） | ✅ 已执行并校验 | 2026-09-19 |
+| rollup 重建并发彻底修复：`HubDb` 新增重建锁串行化（启动全量阻塞获取、6h 对账 `try` 获取忙时跳过）；逐行重放改为单事务批量 SQL（含 session/call/usage/traffic 四类），全量重建回到秒级 | ✅ 实现与门禁完成，已部署 lstable；上线后对账触发重建 115 行秒级完成，24h 对账 drift=0，流量 rollup 一并恢复 | 2026-09-19 |
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 
