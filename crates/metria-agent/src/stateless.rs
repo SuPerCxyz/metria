@@ -22,6 +22,9 @@ use crate::wire::HubClient;
 /// 清积压的总时长上限（迁移用；超时保留 spool 下次重试）。
 const MIGRATION_DRAIN_DEADLINE: Duration = Duration::from_secs(600);
 
+/// 单个上传分块的失败重试次数（网络抖动/超时）。
+const UPLOAD_RETRIES: usize = 3;
+
 /// 一轮采集统计。
 #[derive(Debug, Default)]
 pub struct CycleStats {
@@ -149,8 +152,22 @@ fn upload_events(
     let chunks = chunk_events(events, cfg.batch_max_events, cfg.batch_max_bytes);
     let mut uploaded = 0usize;
     for chunk in &chunks {
-        match upload_chunk(client, identity, chunk) {
-            Ok(_) => uploaded += chunk.len(),
+        // 网络抖动/超时重试，避免单个分块失败导致整源游标停滞并重复上传。
+        let mut attempt = 0usize;
+        let result = loop {
+            match upload_chunk(client, identity, chunk) {
+                Ok(_) => break Ok(()),
+                Err(AgentError::BatchTooLarge) => break Err(AgentError::BatchTooLarge),
+                Err(e) if attempt < UPLOAD_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!("上传分块失败（第 {attempt} 次重试）: {e}");
+                    std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        match result {
+            Ok(()) => uploaded += chunk.len(),
             Err(AgentError::BatchTooLarge) if chunk.len() > 1 => {
                 let mid = chunk.len() / 2;
                 uploaded += upload_events(cfg, client, identity, &chunk[..mid])?;

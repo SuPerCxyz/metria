@@ -127,28 +127,42 @@ impl SourceAdapter for OpenCodeAdapter {
             source.path_hash.as_str()
         ));
         let mut tolerance = ScanTolerance::default();
+        let mut fingerprint_changed = false;
         if let Some(expected) = expected_fp {
             if expected != fingerprint {
                 // schema 或文件变化（例如 OpenCode v1→v2 迁移）：从 0 重扫，避免来源被永久卡住。
                 tolerance.record("数据库指纹变化，已从起始位置重新扫描".into());
                 last_rowid = 0;
+                fingerprint_changed = true;
             }
         }
 
         if v2_layout {
-            let (mut batches, max_rowid) = v2::scan_v2(
+            let (v2_cursor, frontier_hint) = if fingerprint_changed {
+                (None, 0)
+            } else {
+                match cursor {
+                    Some(metria_core::model::SourceCursor::Sqlite(s)) => (
+                        v2::V2Cursor::decode(s.last_rowid, s.last_primary_key.as_deref()),
+                        s.last_rowid,
+                    ),
+                    _ => (None, 0),
+                }
+            };
+            let (mut batches, state) = v2::scan_v2(
                 &conn,
                 identity,
                 source.path_hash.as_str(),
-                last_rowid,
+                v2_cursor,
+                frontier_hint,
                 &mut tolerance,
             )?;
             batches.warnings = tolerance.warnings;
-            batches.next_cursor = Some(sqlite_cursor(
-                fingerprint,
-                Some(schema_signature),
-                max_rowid,
-            ));
+            let mut next = sqlite_cursor(fingerprint, Some(schema_signature), state.frontier);
+            if let metria_core::model::SourceCursor::Sqlite(ref mut s) = next {
+                s.last_primary_key = Some(state.encode());
+            }
+            batches.next_cursor = Some(next);
             return Ok(batches);
         }
 

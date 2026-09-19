@@ -18,6 +18,43 @@ use crate::entry::{from_millis, parse_session_model, MessageData, SessionRow};
 /// v2 单批读取行数：内容内嵌，控制单次扫描内存。
 pub(crate) const V2_BATCH_LIMIT: i64 = 2_000;
 
+/// 首次补采时优先覆盖的最新行数（保证最近数据先出现）。
+pub(crate) const V2_TAIL_BOOTSTRAP: i64 = 8_000;
+
+/// 双游标：`frontier` 为历史回补进度，`tail_marker`/`tail_floor` 覆盖最新区间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct V2Cursor {
+    pub frontier: i64,
+    pub tail_marker: i64,
+    pub tail_floor: i64,
+}
+
+impl V2Cursor {
+    /// 编码进 `SqliteCursor.last_primary_key`。
+    pub(crate) fn encode(&self) -> String {
+        format!("tail={};floor={}", self.tail_marker, self.tail_floor)
+    }
+
+    /// 从游标字段解析；缺失或损坏时返回 None（重新引导）。
+    pub(crate) fn decode(frontier: i64, primary_key: Option<&str>) -> Option<Self> {
+        let key = primary_key?;
+        let mut tail = None;
+        let mut floor = None;
+        for part in key.split(';') {
+            if let Some(value) = part.strip_prefix("tail=") {
+                tail = value.parse::<i64>().ok();
+            } else if let Some(value) = part.strip_prefix("floor=") {
+                floor = value.parse::<i64>().ok();
+            }
+        }
+        Some(Self {
+            frontier,
+            tail_marker: tail?,
+            tail_floor: floor?,
+        })
+    }
+}
+
 /// 表是否存在。
 pub(crate) fn has_table(conn: &Connection, name: &str) -> bool {
     conn.query_row(
@@ -80,14 +117,62 @@ fn is_incomplete_v2(kind: &str, d: &MessageData) -> bool {
         && cache.map(|c| c.write.unwrap_or(0)).unwrap_or(0) == 0
 }
 
-/// 扫描 v2 表；返回批次与新的最大 rowid。
+/// 扫描 v2 表：先补最新区间（tail），再按 rowid 回补历史，两者在同一批返回。
 pub(crate) fn scan_v2(
     conn: &Connection,
     identity: &ScanIdentity,
     source_path_hash: &str,
-    last_rowid: i64,
+    cursor: Option<V2Cursor>,
+    frontier_hint: i64,
     tolerance: &mut ScanTolerance,
-) -> Result<(ScanBatch, i64), AdapterError> {
+) -> Result<(ScanBatch, V2Cursor), AdapterError> {
+    scan_v2_with_limits(
+        conn,
+        identity,
+        source_path_hash,
+        cursor,
+        frontier_hint,
+        V2_TAIL_BOOTSTRAP,
+        V2_BATCH_LIMIT,
+        V2_BATCH_LIMIT,
+        tolerance,
+    )
+}
+
+/// 可配置窗口的扫描入口（测试用）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_v2_with_limits(
+    conn: &Connection,
+    identity: &ScanIdentity,
+    source_path_hash: &str,
+    cursor: Option<V2Cursor>,
+    frontier_hint: i64,
+    tail_bootstrap: i64,
+    tail_limit: i64,
+    history_limit: i64,
+    tolerance: &mut ScanTolerance,
+) -> Result<(ScanBatch, V2Cursor), AdapterError> {
+    let max_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM session_message",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let mut state = match cursor {
+        Some(state) => state,
+        None => {
+            // 首次补采：尾部窗口先覆盖最近 tail_bootstrap 行（不早于已有历史进度），
+            // 历史从 frontier_hint 向上追。
+            let frontier = frontier_hint.max(0);
+            let floor = max_rowid.saturating_sub(tail_bootstrap).max(frontier);
+            V2Cursor {
+                frontier,
+                tail_marker: floor,
+                tail_floor: floor,
+            }
+        }
+    };
     let ctx = BuildCtx {
         node_id: identity.node_id.clone(),
         collector_id: pseudo_id(&identity.collector_id),
@@ -96,17 +181,57 @@ pub(crate) fn scan_v2(
     };
     let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
     let mut session_cache: HashMap<String, SessionRow> = HashMap::new();
-    let mut max_rowid = last_rowid;
 
+    state.tail_marker = scan_window(
+        conn,
+        &ctx,
+        state.tail_marker,
+        None,
+        tail_limit,
+        &mut builders,
+        &mut session_cache,
+        tolerance,
+    )?;
+    if state.frontier < state.tail_floor {
+        state.frontier = scan_window(
+            conn,
+            &ctx,
+            state.frontier,
+            Some(state.tail_floor),
+            history_limit,
+            &mut builders,
+            &mut session_cache,
+            tolerance,
+        )?;
+    }
+
+    let batches = crate::finalize_builders(builders, tolerance);
+    Ok((batches, state))
+}
+
+/// 扫描一个 rowid 窗口：`from < rowid <= min(cap, ...)`，返回新的标记。
+#[allow(clippy::too_many_arguments)]
+fn scan_window(
+    conn: &Connection,
+    ctx: &BuildCtx,
+    from_rowid: i64,
+    cap_rowid: Option<i64>,
+    limit: i64,
+    builders: &mut HashMap<String, SessionBuilder>,
+    session_cache: &mut HashMap<String, SessionRow>,
+    tolerance: &mut ScanTolerance,
+) -> Result<i64, AdapterError> {
+    let mut marker = from_rowid;
+    let cap = cap_rowid.unwrap_or(i64::MAX);
     let mut stmt = conn
         .prepare(
             "SELECT rowid, id, session_id, type, time_created, data FROM session_message \
-             WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+             WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3",
         )
         .map_err(|e| AdapterError::Other(format!("session_message 查询失败: {e}")))?;
     let rows = stmt
         .query_map(
-            metria_storage::rusqlite::params![last_rowid, V2_BATCH_LIMIT],
+            metria_storage::rusqlite::params![from_rowid, cap, limit],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -134,13 +259,13 @@ pub(crate) fn scan_v2(
         if is_incomplete_v2(&kind, &data) {
             let recent = Utc::now().signed_duration_since(at) < chrono::Duration::minutes(60);
             if recent {
-                max_rowid = rowid - 1;
+                marker = rowid - 1;
                 break;
             }
             continue;
         }
-        if rowid > max_rowid {
-            max_rowid = rowid;
+        if rowid > marker {
+            marker = rowid;
         }
 
         let builder = builders.entry(session_id.clone()).or_insert_with(|| {
@@ -155,7 +280,7 @@ pub(crate) fn scan_v2(
                 row.project_id.clone(),
                 model,
                 provider,
-                crate::v2::dollar_to_micro(row.cost),
+                dollar_to_micro(row.cost),
                 row.parent_id.clone(),
             );
             b
@@ -171,9 +296,7 @@ pub(crate) fn scan_v2(
 
         process_v2_message(builder, &msg_id, &kind, &data, at, tolerance);
     }
-
-    let batches = crate::finalize_builders(builders, tolerance);
-    Ok((batches, max_rowid))
+    Ok(marker)
 }
 
 fn process_v2_message(
@@ -411,4 +534,102 @@ pub(crate) fn dollar_to_micro(dollars: Option<f64>) -> Option<i64> {
     dollars
         .filter(|d| *d > 0.0)
         .map(|d| (d * 1_000_000.0).round() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metria_storage::rusqlite::Connection;
+
+    fn setup(conn: &Connection, rows: i64) {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_v2 (
+              id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT,
+              title TEXT, cost REAL DEFAULT 0 NOT NULL, tokens_input INTEGER DEFAULT 0,
+              tokens_output INTEGER DEFAULT 0, tokens_reasoning INTEGER DEFAULT 0,
+              tokens_cache_read INTEGER DEFAULT 0, tokens_cache_write INTEGER DEFAULT 0,
+              model TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE session_message (
+              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
+              time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, directory, title, time_created, time_updated) VALUES ('s','p','/tmp/x','t',0,0)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=rows {
+            let ts = 1_700_000_000_000i64 + i;
+            conn.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?1,'s','user',?2,?3,?3,?4)",
+                metria_storage::rusqlite::params![
+                    format!("u{i}"),
+                    i,
+                    ts,
+                    format!(r#"{{"time":{{"created":{ts}}},"text":"m{i}"}}"#)
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn test_identity() -> ScanIdentity {
+        ScanIdentity {
+            node_id: "n".into(),
+            collector_id: "c".into(),
+        }
+    }
+
+    #[test]
+    fn dual_cursor_covers_tail_first_then_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn, 20);
+        let mut tolerance = ScanTolerance::default();
+        let mut cursor: Option<V2Cursor> = None;
+        let mut total_messages = 0usize;
+        let mut first_batch_newest = false;
+
+        for round in 0..12 {
+            let (batch, next) = scan_v2_with_limits(
+                &conn,
+                &test_identity(),
+                "hash",
+                cursor.clone(),
+                0,
+                5,
+                3,
+                4,
+                &mut tolerance,
+            )
+            .unwrap();
+            if round == 0 {
+                let contents: Vec<String> = batch
+                    .messages
+                    .iter()
+                    .filter_map(|m| m.content.clone())
+                    .collect();
+                // 首轮必须覆盖最新写入的行（m20 附近），证明尾部优先。
+                first_batch_newest = contents
+                    .iter()
+                    .any(|c| c == "m20" || c == "m19" || c == "m18");
+            }
+            total_messages += batch.messages.len();
+            cursor = Some(next);
+            let state = cursor.as_ref().unwrap();
+            if state.frontier >= state.tail_floor && state.tail_marker >= 20 {
+                break;
+            }
+        }
+
+        assert!(first_batch_newest, "首轮应优先覆盖最新消息");
+        assert_eq!(
+            total_messages, 20,
+            "所有消息应恰好处理一次（无重复/无遗漏）"
+        );
+    }
 }
