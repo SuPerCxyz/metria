@@ -517,8 +517,14 @@ fn incremental_context_lookback_beyond_initial_window() {
     .unwrap();
     drop(file);
 
+    // 去掉快照，强制走有界回溯路径（该用例专门覆盖 1MiB 窗口外回溯恢复）
+    let mut lookback_cursor = first.next_cursor.clone().unwrap();
+    match &mut lookback_cursor {
+        metria_core::model::SourceCursor::Jsonl(c) => c.adapter_state = None,
+        _ => unreachable!(),
+    }
     let second = adapter
-        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .scan(&source, Some(&lookback_cursor), &identity)
         .unwrap();
     assert_eq!(
         second.model_calls.len(),
@@ -546,6 +552,7 @@ fn incremental_context_lookback_beyond_initial_window() {
 #[test]
 fn title_skips_system_injection_uses_first_real_user_message() {
     // 会话开头常注入 AGENTS.md/系统指令，不应作为标题；
+    // 之后的第一条真实用户消息应作为标题。
     // 之后的第一条真实用户消息应作为标题。
     let dir = std::env::temp_dir().join(format!(
         "codex-title-{}-{}",
@@ -591,6 +598,200 @@ fn title_skips_system_injection_uses_first_real_user_message() {
         Some("网页右上角的刷新按钮点击后时间没有更新"),
         "AGENTS.md 注入应被跳过，真实用户消息作为标题"
     );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 构造临时 rollout 目录与来源的公共步骤。
+fn temp_rollout(
+    tag: &str,
+    content: &str,
+) -> (PathBuf, metria_adapter_api::DiscoveredSource, CodexAdapter) {
+    let dir = std::env::temp_dir().join(format!(
+        "codex-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout.jsonl");
+    std::fs::write(&path, content).unwrap();
+    let adapter = CodexAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    (dir, source, adapter)
+}
+
+fn jsonl_cursor_of(cursor: &metria_core::model::SourceCursor) -> &metria_core::model::JsonlCursor {
+    match cursor {
+        metria_core::model::SourceCursor::Jsonl(c) => c,
+        _ => panic!("expected jsonl cursor"),
+    }
+}
+
+/// 游标快照恢复与回溯恢复必须产出完全一致的增量结果（含模型与调用计时）。
+#[test]
+fn snapshot_restore_matches_lookback() {
+    let base = concat!(
+        r#"{"timestamp":"2026-09-20T01:00:00Z","type":"session_meta","payload":{"session_id":"snap-eq","timestamp":"2026-09-20T01:00:00Z","cwd":"/tmp/project","model_provider":"custom"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T01:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T01:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T01:00:03Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"Reasoning","id":"rs-1"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T01:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"output_tokens":100,"reasoning_output_tokens":10,"total_tokens":1110}}}}"#,
+        "\n"
+    );
+    let (dir, source, adapter) = temp_rollout("snapshot-eq", base);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert_eq!(first.model_calls.len(), 1);
+    assert!(
+        jsonl_cursor_of(first.next_cursor.as_ref().unwrap())
+            .adapter_state
+            .is_some(),
+        "扫描后游标应携带解析上下文快照"
+    );
+
+    // 追加新回合：task_started + Reasoning + token_count
+    let path = dir.join("rollout.jsonl");
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-20T01:01:00Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-2"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-20T01:01:01Z","type":"event_msg","payload":{{"type":"item_completed","turn_id":"turn-2","item":{{"type":"Reasoning","id":"rs-2"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-09-20T01:01:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":200,"reasoning_output_tokens":20,"total_tokens":2220}}}}}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    // 路径 A：游标经 JSON 序列化（模拟 Hub 往返）后使用快照恢复
+    let cursor_json = serde_json::to_string(first.next_cursor.as_ref().unwrap()).unwrap();
+    let roundtrip: metria_core::model::SourceCursor = serde_json::from_str(&cursor_json).unwrap();
+    let with_snapshot = adapter.scan(&source, Some(&roundtrip), &identity).unwrap();
+
+    // 路径 B：去掉快照，强制走有界回溯恢复
+    let mut no_state = roundtrip.clone();
+    match &mut no_state {
+        metria_core::model::SourceCursor::Jsonl(c) => c.adapter_state = None,
+        _ => unreachable!(),
+    }
+    let with_lookback = adapter.scan(&source, Some(&no_state), &identity).unwrap();
+
+    assert_eq!(with_snapshot.model_calls.len(), 1);
+    assert_eq!(with_lookback.model_calls.len(), 1);
+    let a = &with_snapshot.model_calls[0];
+    let b = &with_lookback.model_calls[0];
+    assert_eq!(a.started_at, b.started_at, "调用起点必须一致");
+    assert_eq!(a.first_response_at, b.first_response_at);
+    assert_eq!(a.completed_at, b.completed_at);
+    assert_eq!(a.duration_ms, b.duration_ms);
+    assert_eq!(a.model_raw, b.model_raw, "快照必须恢复 turn_context 模型");
+    assert_eq!(a.model_raw.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(a.input_tokens, b.input_tokens);
+    assert_eq!(a.output_tokens, b.output_tokens);
+    assert_eq!(a.session_id, b.session_id);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 未变化的 rollout 不应被重新读取：文件不可读时扫描仍成功且返回空批次。
+#[cfg(unix)]
+#[test]
+fn unchanged_rollout_is_not_reread() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = concat!(
+        r#"{"timestamp":"2026-09-20T02:00:00Z","type":"session_meta","payload":{"session_id":"unchanged","timestamp":"2026-09-20T02:00:00Z","cwd":"/tmp/project","model_provider":"custom"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T02:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+        "\n"
+    );
+    let (dir, source, adapter) = temp_rollout("unchanged", base);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert_eq!(first.model_calls.len(), 1);
+    let cursor = first.next_cursor.unwrap();
+    let before = jsonl_cursor_of(&cursor).clone();
+
+    // 去掉读权限：若仍打开文件解析会失败；快速跳过路径则不受影响。
+    let path = dir.join("rollout.jsonl");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let second = adapter.scan(&source, Some(&cursor), &identity).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        second.model_calls.is_empty() && second.usage_events.is_empty(),
+        "未变化文件不应产生事件"
+    );
+    let after = jsonl_cursor_of(second.next_cursor.as_ref().unwrap());
+    assert_eq!(after.byte_offset, before.byte_offset);
+    assert_eq!(after.adapter_state, before.adapter_state);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 轮转/截断（inode 变化）时必须从头重扫，不能停在旧偏移丢数据。
+#[test]
+fn rotated_rollout_resets_to_start() {
+    let base = concat!(
+        r#"{"timestamp":"2026-09-20T03:00:00Z","type":"session_meta","payload":{"session_id":"rotated-old","timestamp":"2026-09-20T03:00:00Z","cwd":"/tmp/project","model_provider":"custom"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T03:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}"#,
+        "\n"
+    );
+    let (dir, source, adapter) = temp_rollout("rotated", base);
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    assert_eq!(first.sessions[0].source_session_id, "rotated-old");
+
+    // 以重命名替换文件（新 inode）模拟轮转，内容为另一个会话
+    let path = dir.join("rollout.jsonl");
+    let replacement = dir.join("rollout.new.jsonl");
+    std::fs::write(
+        &replacement,
+        concat!(
+            r#"{"timestamp":"2026-09-20T03:30:00Z","type":"session_meta","payload":{"session_id":"rotated-new","timestamp":"2026-09-20T03:30:00Z","cwd":"/tmp/project","model_provider":"custom"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-20T03:30:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330}}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+
+    let second = adapter
+        .scan(&source, first.next_cursor.as_ref(), &identity)
+        .unwrap();
+    assert!(
+        second
+            .sessions
+            .iter()
+            .any(|s| s.source_session_id == "rotated-new"),
+        "inode 变化后必须从头重扫并采到新会话"
+    );
+    assert_eq!(second.model_calls.len(), 1);
 
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -314,3 +314,150 @@ fn incremental_assistant_restores_real_user_start() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// 快照恢复与回溯恢复必须为增量 assistant 调用给出一致的回合起点。
+#[test]
+fn snapshot_restore_matches_lookback() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!(
+        "metria-claude-snapshot-eq-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("snapshot.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","sessionId":"snap","timestamp":"2026-09-02T00:00:01Z","message":{"id":"u1","role":"user","content":"go"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = ClaudeCodeAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    match first.next_cursor.as_ref().unwrap() {
+        metria_core::model::SourceCursor::Jsonl(c) => {
+            assert!(c.adapter_state.is_some(), "游标应携带解析上下文快照")
+        }
+        _ => panic!("expected jsonl cursor"),
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"assistant","sessionId":"snap","timestamp":"2026-09-02T00:00:08Z","message":{{"id":"a1","role":"assistant","model":"claude-test","usage":{{"input_tokens":10,"output_tokens":2}},"content":[{{"type":"text","text":"done"}}]}}}}"#
+    )
+    .unwrap();
+    drop(file);
+
+    // 路径 A：Hub JSON 往返后使用快照
+    let cursor_json = serde_json::to_string(first.next_cursor.as_ref().unwrap()).unwrap();
+    let roundtrip: metria_core::model::SourceCursor = serde_json::from_str(&cursor_json).unwrap();
+    let with_snapshot = adapter.scan(&source, Some(&roundtrip), &identity).unwrap();
+
+    // 路径 B：去掉快照强制回溯
+    let mut no_state = roundtrip.clone();
+    match &mut no_state {
+        metria_core::model::SourceCursor::Jsonl(c) => c.adapter_state = None,
+        _ => unreachable!(),
+    }
+    let with_lookback = adapter.scan(&source, Some(&no_state), &identity).unwrap();
+
+    assert_eq!(with_snapshot.model_calls.len(), 1);
+    assert_eq!(with_lookback.model_calls.len(), 1);
+    assert_eq!(
+        with_snapshot.model_calls[0].started_at,
+        with_lookback.model_calls[0].started_at
+    );
+    assert_eq!(
+        with_snapshot.model_calls[0].started_at,
+        ts("2026-09-02T00:00:01Z")
+    );
+    assert_eq!(with_snapshot.messages.len(), with_lookback.messages.len());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 未变化的 JSONL 不应被重新读取：文件不可读时扫描仍成功且为空批次。
+#[cfg(unix)]
+#[test]
+fn unchanged_file_is_not_reread() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "metria-claude-unchanged-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("unchanged.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","sessionId":"unchanged","timestamp":"2026-09-03T00:00:01Z","message":{"id":"u1","role":"user","content":"go"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let adapter = ClaudeCodeAdapter;
+    let context = metria_adapter_api::DiscoveryContext {
+        node_id: "test-node".into(),
+        collector_id: "test-collector".into(),
+        root_paths: vec![dir.clone()],
+    };
+    let source = adapter
+        .discover(&context)
+        .unwrap()
+        .into_iter()
+        .find(|source| source.canonical_path == path)
+        .unwrap();
+    let identity = ScanIdentity::test();
+    let first = adapter.scan(&source, None, &identity).unwrap();
+    let cursor = first.next_cursor.unwrap();
+    let before = match &cursor {
+        metria_core::model::SourceCursor::Jsonl(c) => c.clone(),
+        _ => panic!("expected jsonl cursor"),
+    };
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let second = adapter.scan(&source, Some(&cursor), &identity).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        second.messages.is_empty() && second.model_calls.is_empty(),
+        "未变化文件不应产生事件"
+    );
+    let after = match second.next_cursor.as_ref().unwrap() {
+        metria_core::model::SourceCursor::Jsonl(c) => c,
+        _ => panic!("expected jsonl cursor"),
+    };
+    assert_eq!(after.byte_offset, before.byte_offset);
+    assert_eq!(after.adapter_state, before.adapter_state);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

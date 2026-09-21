@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod error;
+pub mod memory;
 pub mod observer;
 mod observer_metrics;
 mod observer_proxy;

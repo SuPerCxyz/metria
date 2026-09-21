@@ -10,6 +10,78 @@ use metria_core::model::{
 };
 use metria_core::normalize::normalize_model;
 use metria_traffic::{estimate, EstimateInput};
+use serde::{Deserialize, Serialize};
+
+/// 未完成调用的计时边界快照（`restore_timing_event` 影响的全部字段）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TimingSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_call_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_call_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_visible_output_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_reasoning_output_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<DateTime<Utc>>,
+}
+
+/// 增量解析上下文快照：覆盖有界回溯恢复的全部状态，随 JSONL 游标持久化。
+///
+/// 恢复结果必须与回溯路径一致；缺失或文件身份变化时回退回溯。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub source_session_id: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory_hash: Option<metria_core::model::ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_normalized: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model_normalized: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model_normalized: Option<String>,
+    #[serde(default = "default_context_transport_mode")]
+    pub context_transport_mode: ContextTransportMode,
+    #[serde(default = "default_cache_transport_behavior")]
+    pub cache_transport_behavior: CacheTransportBehavior,
+    #[serde(default)]
+    pub timing: TimingSnapshot,
+}
+
+fn default_context_transport_mode() -> ContextTransportMode {
+    ContextTransportMode::FullContext
+}
+
+fn default_cache_transport_behavior() -> CacheTransportBehavior {
+    CacheTransportBehavior::FullContentSent
+}
+
+impl Default for SessionSnapshot {
+    fn default() -> Self {
+        Self {
+            source_session_id: String::new(),
+            started_at: Utc::now(),
+            working_directory_hash: None,
+            provider_raw: None,
+            provider_normalized: None,
+            primary_model_raw: None,
+            primary_model_normalized: None,
+            current_model_raw: None,
+            current_model_normalized: None,
+            context_transport_mode: default_context_transport_mode(),
+            cache_transport_behavior: default_cache_transport_behavior(),
+            timing: TimingSnapshot::default(),
+        }
+    }
+}
 
 /// 用于 token_count 去重的 usage 键。
 type UsageKey = (
@@ -219,6 +291,49 @@ impl SessionBuilder {
         }
         self.current_model_raw = Some(m.to_string());
         self.current_model_normalized = Some(normalized);
+    }
+
+    /// 导出增量解析上下文快照（随游标持久化，供下一轮/重启直接恢复）。
+    pub fn session_snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            source_session_id: self.session.source_session_id.clone(),
+            started_at: self.session.started_at,
+            working_directory_hash: self.session.working_directory_hash.clone(),
+            provider_raw: self.session.provider_raw.clone(),
+            provider_normalized: self.session.provider_normalized.clone(),
+            primary_model_raw: self.session.primary_model_raw.clone(),
+            primary_model_normalized: self.session.primary_model_normalized.clone(),
+            current_model_raw: self.current_model_raw.clone(),
+            current_model_normalized: self.current_model_normalized.clone(),
+            context_transport_mode: self.context_transport_mode,
+            cache_transport_behavior: self.cache_transport_behavior,
+            timing: TimingSnapshot {
+                pending_call_started_at: self.pending_call_started_at,
+                current_call_started_at: self.current_call_started_at,
+                first_visible_output_at: self.first_visible_output_at,
+                first_reasoning_output_at: self.first_reasoning_output_at,
+                last_output_at: self.last_output_at,
+            },
+        }
+    }
+
+    /// 从快照恢复增量解析上下文；结果必须与有界回溯重放一致。
+    pub fn apply_session_snapshot(&mut self, snapshot: &SessionSnapshot) {
+        self.session.started_at = snapshot.started_at;
+        self.session.working_directory_hash = snapshot.working_directory_hash.clone();
+        self.session.provider_raw = snapshot.provider_raw.clone();
+        self.session.provider_normalized = snapshot.provider_normalized.clone();
+        self.session.primary_model_raw = snapshot.primary_model_raw.clone();
+        self.session.primary_model_normalized = snapshot.primary_model_normalized.clone();
+        self.current_model_raw = snapshot.current_model_raw.clone();
+        self.current_model_normalized = snapshot.current_model_normalized.clone();
+        self.context_transport_mode = snapshot.context_transport_mode;
+        self.cache_transport_behavior = snapshot.cache_transport_behavior;
+        self.pending_call_started_at = snapshot.timing.pending_call_started_at;
+        self.current_call_started_at = snapshot.timing.current_call_started_at;
+        self.first_visible_output_at = snapshot.timing.first_visible_output_at;
+        self.first_reasoning_output_at = snapshot.timing.first_reasoning_output_at;
+        self.last_output_at = snapshot.timing.last_output_at;
     }
 
     /// 新用户消息 → 开新回合。
@@ -814,12 +929,14 @@ pub fn entry_time(ts: &str) -> Option<DateTime<Utc>> {
 }
 
 /// 构建 JSONL 游标。
+/// 构建 JSONL 游标（`adapter_state` 为适配器私有的解析上下文快照）。
 pub fn jsonl_cursor(
     path_hash: metria_core::model::ContentHash,
     inode: i64,
     size: i64,
     mtime: i64,
     offset: i64,
+    adapter_state: Option<serde_json::Value>,
 ) -> metria_core::model::SourceCursor {
     use metria_core::model::JsonlCursor;
     metria_core::model::SourceCursor::Jsonl(JsonlCursor {
@@ -831,6 +948,7 @@ pub fn jsonl_cursor(
         byte_offset: offset,
         last_event_hash: None,
         last_scan_at: Some(Utc::now()),
+        adapter_state,
     })
 }
 

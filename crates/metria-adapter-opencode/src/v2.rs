@@ -15,11 +15,17 @@ use metria_storage::rusqlite::{Connection, OptionalExtension};
 use crate::build::{BuildCtx, SessionBuilder};
 use crate::entry::{from_millis, parse_session_model, MessageData, SessionRow};
 
-/// v2 单批读取行数：内容内嵌，控制单次扫描内存。
+/// v2 单窗读取行数上限：内容内嵌，控制单窗内存。
 pub(crate) const V2_BATCH_LIMIT: i64 = 2_000;
 
 /// 首次补采时优先覆盖的最新行数（保证最近数据先出现）。
 pub(crate) const V2_TAIL_BOOTSTRAP: i64 = 8_000;
+
+/// 单窗行数据字节预算：窗口按字节提前结束，避免单窗内存随行数增长。
+pub(crate) const V2_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
+/// 单轮扫描（尾部 + 历史）总字节预算：跨轮续扫，避免单轮内存峰值。
+pub(crate) const V2_SCAN_BYTES: usize = 16 * 1024 * 1024;
 
 /// 双游标：`frontier` 为历史回补进度，`tail_marker`/`tail_floor` 覆盖最新区间。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +141,8 @@ pub(crate) fn scan_v2(
         V2_TAIL_BOOTSTRAP,
         V2_BATCH_LIMIT,
         V2_BATCH_LIMIT,
+        V2_WINDOW_BYTES,
+        V2_SCAN_BYTES,
         tolerance,
     )
 }
@@ -150,6 +158,8 @@ pub(crate) fn scan_v2_with_limits(
     tail_bootstrap: i64,
     tail_limit: i64,
     history_limit: i64,
+    window_bytes: usize,
+    scan_bytes: usize,
     tolerance: &mut ScanTolerance,
 ) -> Result<(ScanBatch, V2Cursor), AdapterError> {
     let max_rowid: i64 = conn
@@ -182,6 +192,8 @@ pub(crate) fn scan_v2_with_limits(
     let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
     let mut session_cache: HashMap<String, SessionRow> = HashMap::new();
 
+    // 单轮总字节预算：尾部先消费，剩余额度再给历史窗口；不足时留待下一轮。
+    let mut consumed = 0usize;
     state.tail_marker = scan_window(
         conn,
         &ctx,
@@ -190,9 +202,12 @@ pub(crate) fn scan_v2_with_limits(
         tail_limit,
         &mut builders,
         &mut session_cache,
+        window_bytes,
+        scan_bytes,
+        &mut consumed,
         tolerance,
     )?;
-    if state.frontier < state.tail_floor {
+    if state.frontier < state.tail_floor && consumed < scan_bytes {
         state.frontier = scan_window(
             conn,
             &ctx,
@@ -201,6 +216,9 @@ pub(crate) fn scan_v2_with_limits(
             history_limit,
             &mut builders,
             &mut session_cache,
+            window_bytes,
+            scan_bytes,
+            &mut consumed,
             tolerance,
         )?;
     }
@@ -210,6 +228,9 @@ pub(crate) fn scan_v2_with_limits(
 }
 
 /// 扫描一个 rowid 窗口：`from < rowid <= min(cap, ...)`，返回新的标记。
+///
+/// `consumed` 为单轮累计行数据字节（跨窗口共享）；`window_bytes` 限制单窗、
+/// `scan_bytes` 限制单轮总量，达到预算时在当前行之前停止，标记停在上一完整行。
 #[allow(clippy::too_many_arguments)]
 fn scan_window(
     conn: &Connection,
@@ -219,9 +240,13 @@ fn scan_window(
     limit: i64,
     builders: &mut HashMap<String, SessionBuilder>,
     session_cache: &mut HashMap<String, SessionRow>,
+    window_bytes: usize,
+    scan_bytes: usize,
+    consumed: &mut usize,
     tolerance: &mut ScanTolerance,
 ) -> Result<i64, AdapterError> {
     let mut marker = from_rowid;
+    let mut window_consumed = 0usize;
     let cap = cap_rowid.unwrap_or(i64::MAX);
     let mut stmt = conn
         .prepare(
@@ -248,6 +273,14 @@ fn scan_window(
     for row in rows {
         let (rowid, msg_id, session_id, kind, ts_ms, data_json) =
             row.map_err(|e| AdapterError::Other(format!("session_message 行解析失败: {e}")))?;
+        // 字节预算：达到后在本行之前停止，已处理的完整行全部生效，下一轮从此继续。
+        let over_window = window_consumed > 0 && window_consumed >= window_bytes;
+        let over_scan = *consumed > 0 && *consumed >= scan_bytes;
+        if over_window || over_scan {
+            break;
+        }
+        window_consumed += data_json.len();
+        *consumed += data_json.len();
         let data: MessageData = match serde_json::from_str(&data_json) {
             Ok(d) => d,
             Err(e) => {
@@ -604,6 +637,8 @@ mod tests {
                 5,
                 3,
                 4,
+                V2_WINDOW_BYTES,
+                V2_SCAN_BYTES,
                 &mut tolerance,
             )
             .unwrap();
@@ -631,5 +666,71 @@ mod tests {
             total_messages, 20,
             "所有消息应恰好处理一次（无重复/无遗漏）"
         );
+    }
+
+    #[test]
+    fn byte_budget_splits_scan_and_never_regresses() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn, 30);
+        let mut tolerance = ScanTolerance::default();
+        let mut cursor: Option<V2Cursor> = None;
+        let mut last_progress = (-1i64, -1i64);
+        let mut rounds = 0usize;
+        let mut total_messages = 0usize;
+
+        for _ in 0..40 {
+            let (batch, next) = scan_v2_with_limits(
+                &conn,
+                &test_identity(),
+                "hash",
+                cursor.clone(),
+                0,
+                6,
+                10,
+                10,
+                150, // 单窗字节预算：小到每轮只能处理几行
+                300, // 单轮总预算
+                &mut tolerance,
+            )
+            .unwrap();
+            total_messages += batch.messages.len();
+            assert!(
+                (next.frontier, next.tail_marker) >= last_progress,
+                "预算分窗不得回退进度: {:?} -> {:?}",
+                last_progress,
+                (next.frontier, next.tail_marker)
+            );
+            last_progress = (next.frontier, next.tail_marker);
+            let done = next.frontier >= next.tail_floor && next.tail_marker >= 30;
+            cursor = Some(next);
+            rounds += 1;
+            if done {
+                break;
+            }
+        }
+
+        assert!(rounds > 1, "小预算应触发多轮续扫");
+        // 预算分轮后必须恰好消费全部 30 行（不重复不遗漏）
+        assert_eq!(total_messages, 30, "所有消息应恰好处理一次");
+        // 最终必须消费完所有 30 行：再用一次空扫描确认进度已追上
+        let (batch, next) = scan_v2_with_limits(
+            &conn,
+            &test_identity(),
+            "hash",
+            cursor.clone(),
+            0,
+            6,
+            10,
+            10,
+            150,
+            300,
+            &mut tolerance,
+        )
+        .unwrap();
+        assert!(
+            batch.messages.is_empty(),
+            "预算分轮后应恰好消费全部行，不重复不遗漏"
+        );
+        assert_eq!(next.tail_marker, 30);
     }
 }

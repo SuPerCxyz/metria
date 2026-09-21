@@ -19,11 +19,14 @@ use metria_core::model::{
     CacheTransportBehavior, ContextTransportMode, Id, ReconstructionQuality, SourceStatus,
 };
 
-use build::{entry_time, jsonl_cursor, BuildCtx, SessionBuilder};
+use build::{entry_time, jsonl_cursor, BuildCtx, ClaudeSessionSnapshot, SessionBuilder};
 use entry::{is_assistant, is_real_user_prompt, RawContent, RawEntry};
 
 /// 单行上限（工具结果可能很大）。
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 单来源单轮读取字节预算：积压大文件跨轮续扫，避免一次读入过多内存。
+const SCAN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// 从增量游标前恢复最近真实用户消息时的初始回看窗口。
 const TIMING_LOOKBACK_BYTES: u64 = 1024 * 1024;
@@ -86,10 +89,6 @@ impl SourceAdapter for ClaudeCodeAdapter {
         identity: &metria_adapter_api::ScanIdentity,
     ) -> Result<ScanBatch, AdapterError> {
         let path = &source.canonical_path;
-        let offset = match cursor {
-            Some(metria_core::model::SourceCursor::Jsonl(c)) => c.byte_offset,
-            _ => 0,
-        };
         let meta = fs::metadata(path)?;
         let inode = meta_file_inode(&meta);
         let size = meta.len() as i64;
@@ -100,6 +99,34 @@ impl SourceAdapter for ClaudeCodeAdapter {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        let cursor_jsonl = match cursor {
+            Some(metria_core::model::SourceCursor::Jsonl(c)) => Some(c),
+            _ => None,
+        };
+
+        // 未变化：不打开文件、不解析，仅回推游标（含新 last_scan_at）维持来源新鲜度。
+        if let Some(c) = cursor_jsonl {
+            if c.inode == inode && c.size == size && c.byte_offset >= size {
+                return Ok(ScanBatch {
+                    next_cursor: Some(jsonl_cursor(
+                        source.path_hash.clone(),
+                        inode,
+                        size,
+                        mtime,
+                        c.byte_offset,
+                        c.adapter_state.clone(),
+                    )),
+                    ..ScanBatch::default()
+                });
+            }
+        }
+
+        // 轮转/截断（inode 变化或文件变短）时从头重扫，否则从游标继续。
+        let offset = match cursor_jsonl {
+            Some(c) if c.inode == inode && size >= c.byte_offset => c.byte_offset.max(0) as u64,
+            _ => 0,
+        };
+
         let ctx = BuildCtx {
             node_id: identity.node_id.clone(),
             collector_id: pseudo_id(&identity.collector_id),
@@ -109,15 +136,31 @@ impl SourceAdapter for ClaudeCodeAdapter {
 
         let mut tolerance = ScanTolerance::default();
         let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
-        let mut last_user_at: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         let mut entry_warnings: Vec<String> = Vec::new();
 
-        restore_last_real_user_times(path, offset as u64, &mut last_user_at, &mut entry_warnings)?;
+        // 解析上下文：优先使用游标快照（跨轮/重启零回溯读），缺失或身份不符时回退有界回溯。
+        let snapshot = match cursor_jsonl {
+            Some(c) if offset > 0 && c.inode == inode && c.byte_offset as u64 == offset => {
+                c.adapter_state.as_ref().and_then(|value| {
+                    serde_json::from_value::<ClaudeSessionSnapshot>(value.clone()).ok()
+                })
+            }
+            _ => None,
+        };
+        let mut last_user_at: HashMap<String, chrono::DateTime<chrono::Utc>> = match &snapshot {
+            Some(snap) => snap.last_user_at.clone(),
+            None => {
+                let mut map = HashMap::new();
+                restore_last_real_user_times(path, offset, &mut map, &mut entry_warnings)?;
+                map
+            }
+        };
 
         let new_offset = scan_jsonl_file(
             path,
-            offset as u64,
+            offset,
             MAX_LINE_BYTES,
+            SCAN_MAX_BYTES,
             |value| {
                 let entry: RawEntry = match serde_json::from_value(value.clone()) {
                     Ok(e) => e,
@@ -134,6 +177,12 @@ impl SourceAdapter for ClaudeCodeAdapter {
             &mut tolerance,
         )?;
         tolerance.warnings.extend(entry_warnings);
+
+        // 捕获本轮结束时的解析上下文，随游标持久化供下一轮/重启直接恢复。
+        let adapter_state = serde_json::to_value(ClaudeSessionSnapshot {
+            last_user_at: last_user_at.clone(),
+        })
+        .ok();
 
         // 汇总所有构建器
         let mut batches = ScanBatch::default();
@@ -161,6 +210,7 @@ impl SourceAdapter for ClaudeCodeAdapter {
             size,
             mtime,
             new_offset as i64,
+            adapter_state,
         ));
 
         Ok(batches)

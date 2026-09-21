@@ -18,7 +18,7 @@ use metria_core::model::{
     CacheTransportBehavior, ContextTransportMode, ReconstructionQuality, SourceStatus,
 };
 
-use build::{entry_time, jsonl_cursor, BuildCtx, SessionBuilder};
+use build::{entry_time, jsonl_cursor, BuildCtx, SessionBuilder, SessionSnapshot};
 use entry::{
     model_name_from, MessagePayload, RawEvent, ReasoningPayload, SessionMeta, TokenCount,
     ToolCallOutputPayload, ToolCallPayload, TurnContextPayload, UserMessagePayload,
@@ -29,6 +29,9 @@ const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 从游标前恢复模型上下文时的初始回看窗口。
 const CONTEXT_LOOKBACK_BYTES: u64 = 1024 * 1024;
+
+/// 单来源单轮读取字节预算：积压大文件跨轮续扫，避免一次读入过多内存。
+const SCAN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Codex Adapter。
 #[derive(Debug, Default, Clone)]
@@ -88,10 +91,6 @@ impl SourceAdapter for CodexAdapter {
         identity: &metria_adapter_api::ScanIdentity,
     ) -> Result<ScanBatch, AdapterError> {
         let path = &source.canonical_path;
-        let offset = match cursor {
-            Some(metria_core::model::SourceCursor::Jsonl(c)) => c.byte_offset,
-            _ => 0,
-        };
         let meta = fs::metadata(path)?;
         let inode = meta_file_inode(&meta);
         let size = meta.len() as i64;
@@ -101,6 +100,34 @@ impl SourceAdapter for CodexAdapter {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+
+        let cursor_jsonl = match cursor {
+            Some(metria_core::model::SourceCursor::Jsonl(c)) => Some(c),
+            _ => None,
+        };
+
+        // 未变化：不打开文件、不解析，仅回推游标（含新 last_scan_at）维持来源新鲜度。
+        if let Some(c) = cursor_jsonl {
+            if c.inode == inode && c.size == size && c.byte_offset >= size {
+                return Ok(ScanBatch {
+                    next_cursor: Some(jsonl_cursor(
+                        source.path_hash.clone(),
+                        inode,
+                        size,
+                        mtime,
+                        c.byte_offset,
+                        c.adapter_state.clone(),
+                    )),
+                    ..ScanBatch::default()
+                });
+            }
+        }
+
+        // 轮转/截断（inode 变化或文件变短）时从头重扫，否则从游标继续。
+        let offset = match cursor_jsonl {
+            Some(c) if c.inode == inode && size >= c.byte_offset => c.byte_offset.max(0) as u64,
+            _ => 0,
+        };
 
         let ctx = BuildCtx {
             node_id: identity.node_id.clone(),
@@ -113,12 +140,29 @@ impl SourceAdapter for CodexAdapter {
         let mut state = ScanState::new();
         let mut entry_warnings: Vec<String> = Vec::new();
 
-        bootstrap_incremental_context(path, offset as u64, &mut state, &ctx, &mut entry_warnings)?;
+        // 解析上下文：优先使用游标快照（跨轮/重启零回溯读），缺失或身份不符时回退有界回溯。
+        let snapshot = match cursor_jsonl {
+            Some(c) if offset > 0 && c.inode == inode && c.byte_offset as u64 == offset => c
+                .adapter_state
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<SessionSnapshot>(value.clone()).ok()),
+            _ => None,
+        };
+        match &snapshot {
+            Some(snap) => {
+                let builder = state.builder(&ctx, &snap.source_session_id, snap.started_at);
+                builder.apply_session_snapshot(snap);
+            }
+            None => {
+                bootstrap_incremental_context(path, offset, &mut state, &ctx, &mut entry_warnings)?
+            }
+        }
 
         let new_offset = scan_jsonl_file(
             path,
-            offset as u64,
+            offset,
             MAX_LINE_BYTES,
+            SCAN_MAX_BYTES,
             |value| {
                 let event: RawEvent = match serde_json::from_value(value.clone()) {
                     Ok(e) => e,
@@ -135,6 +179,13 @@ impl SourceAdapter for CodexAdapter {
             &mut tolerance,
         )?;
         tolerance.warnings.extend(entry_warnings);
+
+        // 捕获本轮结束时的解析上下文，随游标持久化供下一轮/重启直接恢复。
+        let adapter_state = state
+            .current
+            .as_ref()
+            .and_then(|sid| state.builders.get(sid))
+            .and_then(|builder| serde_json::to_value(builder.session_snapshot()).ok());
 
         let mut batches = ScanBatch::default();
         for (_, b) in state.builders {
@@ -161,6 +212,7 @@ impl SourceAdapter for CodexAdapter {
             size,
             mtime,
             new_offset as i64,
+            adapter_state,
         ));
 
         Ok(batches)

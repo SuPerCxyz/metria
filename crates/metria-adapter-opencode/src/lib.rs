@@ -27,8 +27,11 @@ use metria_storage::rusqlite::{Connection, OptionalExtension};
 use build::{sqlite_cursor, BuildCtx, SessionBuilder};
 use entry::{from_millis, parse_session_model, MessageData, PartData, SessionRow};
 
-/// 单批次读取行数上限（防止单次扫描过大）。
-const BATCH_LIMIT: i64 = 100_000;
+/// legacy（v1）单窗读取行数上限；实际由字节预算提前结束。
+const BATCH_LIMIT: i64 = 2_000;
+
+/// legacy（v1）单轮读取字节预算：达到后在本行之前停止，下一轮继续。
+const SCAN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// OpenCode Adapter。
 #[derive(Debug, Default, Clone)]
@@ -176,6 +179,7 @@ impl SourceAdapter for OpenCodeAdapter {
         let mut builders: HashMap<String, SessionBuilder> = HashMap::new();
         let mut session_cache: HashMap<String, SessionRow> = HashMap::new();
         let mut max_rowid = last_rowid;
+        let mut consumed = 0usize;
 
         let mut stmt = conn
             .prepare(
@@ -201,6 +205,11 @@ impl SourceAdapter for OpenCodeAdapter {
         for row in rows {
             let (rowid, msg_id, session_id, ts_ms, data_json) =
                 row.map_err(|e| AdapterError::Other(format!("message 行解析失败: {e}")))?;
+            // 单轮字节预算：达到后在本行之前停止，游标停在上一完整行，下一轮继续。
+            if consumed >= SCAN_MAX_BYTES {
+                break;
+            }
+            consumed += data_json.len();
             let data: MessageData = match serde_json::from_str(&data_json) {
                 Ok(d) => d,
                 Err(e) => {

@@ -50,6 +50,9 @@ pub struct JsonlCursor {
     pub byte_offset: i64,
     pub last_event_hash: Option<ContentHash>,
     pub last_scan_at: Option<DateTime<Utc>>,
+    /// 适配器私有的最小解析上下文快照（Hub 不解释其内容），用于跨轮/重启恢复增量解析。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_state: Option<serde_json::Value>,
 }
 
 /// SQLite 数据源游标。
@@ -111,11 +114,25 @@ mod tests {
             byte_offset: 500,
             last_event_hash: None,
             last_scan_at: None,
+            adapter_state: Some(serde_json::json!({ "model": "gpt-5" })),
         });
         let json = serde_json::to_string(&j).unwrap();
         assert!(json.contains("\"kind\":\"jsonl\""));
         let back: SourceCursor = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SourceCursor::Jsonl(_)));
+        assert_eq!(back, j);
+    }
+
+    #[test]
+    fn cursor_without_adapter_state_stays_compatible() {
+        // 旧游标 JSON（无 adapter_state 字段）必须能反序列化
+        let json = r#"{"kind":"jsonl","canonical_path_hash":"blake3:x","file_identity":"inode:1",
+            "inode":1,"size":10,"mtime":5,"byte_offset":10,"last_event_hash":null,"last_scan_at":null}"#;
+        let back: SourceCursor = serde_json::from_str(json).unwrap();
+        match back {
+            SourceCursor::Jsonl(c) => assert!(c.adapter_state.is_none()),
+            _ => panic!("expected jsonl cursor"),
+        }
     }
 
     #[test]

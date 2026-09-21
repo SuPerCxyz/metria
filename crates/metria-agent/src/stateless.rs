@@ -76,26 +76,40 @@ fn build_batch(identity: &ScanIdentity, batch_id: &str, events: &[PendingEvent])
     }
 }
 
-/// 按事件数 + 未压缩字节预算切块；单个超预算事件独立成块（由 413 拆批兜底）。
+/// 估算事件序列化大小（计数 writer，不分配完整字符串）。
+fn payload_size(event: &PendingEvent) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, &event.payload);
+    counter.0 + event.kind.len()
+}
+
+/// 按事件数 + 未压缩字节预算切块（移动事件，避免整批克隆）；单个超预算事件独立成块（由 413 拆批兜底）。
 fn chunk_events(
-    events: &[PendingEvent],
+    events: Vec<PendingEvent>,
     max_events: usize,
     max_bytes: usize,
 ) -> Vec<Vec<PendingEvent>> {
     let mut out = Vec::new();
     let mut cur: Vec<PendingEvent> = Vec::new();
     let mut bytes = 0usize;
-    for e in events {
-        let size = serde_json::to_string(&e.payload)
-            .map(|s| s.len())
-            .unwrap_or(0)
-            + e.kind.len();
+    for event in events {
+        let size = payload_size(&event);
         if !cur.is_empty() && (cur.len() >= max_events || bytes + size > max_bytes) {
             out.push(std::mem::take(&mut cur));
             bytes = 0;
         }
         bytes += size;
-        cur.push(e.clone());
+        cur.push(event);
     }
     if !cur.is_empty() {
         out.push(cur);
@@ -139,9 +153,8 @@ fn upload_chunk(
     Ok(fatal.len())
 }
 
-/// 上传事件列表（自动切块；413 时二分拆批重试）。返回已处理事件数。
-fn upload_events(
-    cfg: &AgentConfig,
+/// 上传单个分块（网络抖动重试；413 时二分拆批）。返回已处理事件数。
+fn upload_slice(
     client: &HubClient,
     identity: &ScanIdentity,
     events: &[PendingEvent],
@@ -149,65 +162,86 @@ fn upload_events(
     if events.is_empty() {
         return Ok(0);
     }
+    let mut attempt = 0usize;
+    let result = loop {
+        match upload_chunk(client, identity, events) {
+            Ok(_) => break Ok(events.len()),
+            Err(AgentError::BatchTooLarge) => break Err(AgentError::BatchTooLarge),
+            Err(e) if attempt < UPLOAD_RETRIES => {
+                attempt += 1;
+                tracing::warn!("上传分块失败（第 {attempt} 次重试）: {e}");
+                std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    match result {
+        Ok(uploaded) => Ok(uploaded),
+        Err(AgentError::BatchTooLarge) if events.len() > 1 => {
+            let mid = events.len() / 2;
+            let mut uploaded = upload_slice(client, identity, &events[..mid])?;
+            uploaded += upload_slice(client, identity, &events[mid..])?;
+            Ok(uploaded)
+        }
+        Err(AgentError::BatchTooLarge) => {
+            tracing::error!(
+                "单条事件超限被永久拒绝（跳过，游标将推进）：{}",
+                events[0].event_id
+            );
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 上传事件列表（自动切块）。返回已处理事件数。
+fn upload_events(
+    cfg: &AgentConfig,
+    client: &HubClient,
+    identity: &ScanIdentity,
+    events: Vec<PendingEvent>,
+) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
     let chunks = chunk_events(events, cfg.batch_max_events, cfg.batch_max_bytes);
     let mut uploaded = 0usize;
     for chunk in &chunks {
-        // 网络抖动/超时重试，避免单个分块失败导致整源游标停滞并重复上传。
-        let mut attempt = 0usize;
-        let result = loop {
-            match upload_chunk(client, identity, chunk) {
-                Ok(_) => break Ok(()),
-                Err(AgentError::BatchTooLarge) => break Err(AgentError::BatchTooLarge),
-                Err(e) if attempt < UPLOAD_RETRIES => {
-                    attempt += 1;
-                    tracing::warn!("上传分块失败（第 {attempt} 次重试）: {e}");
-                    std::thread::sleep(std::time::Duration::from_secs(attempt as u64));
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        match result {
-            Ok(()) => uploaded += chunk.len(),
-            Err(AgentError::BatchTooLarge) if chunk.len() > 1 => {
-                let mid = chunk.len() / 2;
-                uploaded += upload_events(cfg, client, identity, &chunk[..mid])?;
-                uploaded += upload_events(cfg, client, identity, &chunk[mid..])?;
-            }
-            Err(AgentError::BatchTooLarge) => {
-                tracing::error!(
-                    "单条事件超限被永久拒绝（跳过，游标将推进）：{}",
-                    chunk[0].event_id
-                );
-                uploaded += 1;
-            }
-            Err(e) => return Err(e),
-        }
+        uploaded += upload_slice(client, identity, chunk)?;
     }
     Ok(uploaded)
 }
 
-/// 单 Source 流水线：上传 → 全部确认后推进游标（顺序硬约束）。
-fn upload_and_advance(
+/// 上传单 Source 事件并生成待推进游标；事件未全部确认时返回 Err（游标不推进）。
+fn upload_and_collect(
     cfg: &AgentConfig,
     client: &HubClient,
     identity: &ScanIdentity,
     source_id: &str,
-    events: &[PendingEvent],
+    events: Vec<PendingEvent>,
     next_cursor: Option<&SourceCursor>,
-) -> Result<usize> {
+) -> Result<(usize, Option<CursorEntry>)> {
     let uploaded = upload_events(cfg, client, identity, events)?;
-    if let Some(c) = next_cursor {
-        let entry = CursorEntry {
+    let entry = match next_cursor {
+        Some(c) => Some(CursorEntry {
             source_id: source_id.to_string(),
             cursor_json: serde_json::to_string(c).map_err(|e| AgentError::Serde(e.to_string()))?,
             updated_at: None,
-        };
-        client.push_cursors(std::slice::from_ref(&entry))?;
-    }
-    Ok(uploaded)
+        }),
+        None => None,
+    };
+    Ok((uploaded, entry))
 }
 
-/// 一轮采集：拉游标 → 逐 Source「扫描→上传→推游标」。
+/// 按协议上限分块批量推进游标（仅传入已确认来源的游标，顺序约束不变）。
+fn push_cursor_entries(client: &HubClient, entries: Vec<CursorEntry>) -> Result<()> {
+    for chunk in entries.chunks(metria_protocol::limits::MAX_CURSORS_PER_SYNC) {
+        client.push_cursors(chunk)?;
+    }
+    Ok(())
+}
+
+/// 一轮采集：拉游标 → 逐 Source「扫描→上传→收集游标」→ 批量推进已确认游标。
 pub fn run_cycle(
     scanner: &Scanner,
     cfg: &AgentConfig,
@@ -217,6 +251,7 @@ pub fn run_cycle(
 ) -> Result<CycleStats> {
     let mut totals = CycleStats::default();
     let mut discovered = std::collections::BTreeSet::new();
+    let mut pending: Vec<CursorEntry> = Vec::new();
     for (client_name, adapter) in scanner.iter_adapters() {
         let Some(sources) = scanner.discover_sources(client_name, adapter) else {
             continue;
@@ -237,23 +272,45 @@ pub fn run_cycle(
             if events.is_empty() && next_cursor.is_none() {
                 continue;
             }
-            match upload_and_advance(
+            match upload_and_collect(
                 cfg,
                 client,
                 identity,
                 &source_id,
-                &events,
+                events,
                 next_cursor.as_ref(),
             ) {
-                Ok(n) => totals.events += n,
+                Ok((n, entry)) => {
+                    totals.events += n;
+                    if let Some(entry) = entry {
+                        pending.push(entry);
+                    }
+                }
                 Err(e) => {
-                    // 上传失败：该 Source 游标不推进，中止本轮（下轮从旧游标重扫）
+                    // 上传失败：该 Source 游标不推进，中止本轮（下轮从旧游标重扫）；
+                    // 已确认来源的游标仍先批量推进，与逐源推送语义一致。
                     totals.errors += 1;
                     tracing::warn!("Source {source_id} 本轮未完成（游标不推进，下轮重试）: {e}");
+                    if !pending.is_empty() {
+                        if let Err(push_err) =
+                            push_cursor_entries(client, std::mem::take(&mut pending))
+                        {
+                            tracing::warn!("游标批量推进失败（下轮重扫补偿）: {push_err}");
+                        }
+                    }
                     totals.discovered = discovered.into_iter().collect();
                     return Ok(totals);
                 }
             }
+        }
+    }
+    if !pending.is_empty() {
+        if let Err(e) = push_cursor_entries(client, pending) {
+            // 事件已确认但游标未推进：下轮从旧游标重扫，Hub 按 event_id 幂等去重
+            totals.errors += 1;
+            tracing::warn!("游标批量推进失败（下轮重扫补偿）: {e}");
+            totals.discovered = discovered.into_iter().collect();
+            return Ok(totals);
         }
     }
     totals.discovered = discovered.into_iter().collect();
@@ -336,6 +393,8 @@ pub fn polling_loop(
                         tracing::warn!("本轮采集未完成（游标不推进）: {e}");
                     }
                 }
+                // 归还本轮解析/上传释放的堆页，控制常驻进程堆高水位
+                crate::memory::trim_heap();
                 if sleep_interruptible(&stop, poll) {
                     break;
                 }
@@ -533,6 +592,7 @@ mod tests {
             byte_offset: offset,
             last_event_hash: None,
             last_scan_at: None,
+            adapter_state: None,
         })
     }
 
@@ -646,16 +706,18 @@ mod tests {
             requests.clone(),
         );
         let cfg = test_cfg(&std::env::temp_dir());
-        let uploaded = upload_and_advance(
+        let hub = client(&addr);
+        let (uploaded, entry) = upload_and_collect(
             &cfg,
-            &client(&addr),
+            &hub,
             &identity(),
             "s1",
-            &[ev("e1")],
+            vec![ev("e1")],
             Some(&jsonl_cursor(10)),
         )
         .unwrap();
         assert_eq!(uploaded, 1);
+        push_cursor_entries(&hub, vec![entry.expect("确认后应有游标")]).unwrap();
         let recorded = requests.lock().unwrap();
         assert!(recorded[0].contains("/events/batch"));
         assert!(recorded[1].contains("/collectors/cursors"));
@@ -666,12 +728,12 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let addr = spawn_scripted_hub(vec![(500, "{}".into())], requests.clone());
         let cfg = test_cfg(&std::env::temp_dir());
-        let result = upload_and_advance(
+        let result = upload_and_collect(
             &cfg,
             &client(&addr),
             &identity(),
             "s1",
-            &[ev("e1")],
+            vec![ev("e1")],
             Some(&jsonl_cursor(10)),
         );
         assert!(result.is_err());
@@ -711,16 +773,18 @@ mod tests {
             requests.clone(),
         );
         let cfg = test_cfg(&std::env::temp_dir());
-        let uploaded = upload_and_advance(
+        let hub = client(&addr);
+        let (uploaded, entry) = upload_and_collect(
             &cfg,
-            &client(&addr),
+            &hub,
             &identity(),
             "s1",
-            &[ev("e1")],
+            vec![ev("e1")],
             Some(&jsonl_cursor(10)),
         )
         .unwrap();
         assert_eq!(uploaded, 1);
+        push_cursor_entries(&hub, vec![entry.expect("永久拒绝后仍应推进游标")]).unwrap();
         assert!(requests.lock().unwrap()[1].contains("/collectors/cursors"));
     }
 
@@ -738,12 +802,12 @@ mod tests {
         .to_string();
         let addr = spawn_scripted_hub(vec![(200, failed)], requests.clone());
         let cfg = test_cfg(&std::env::temp_dir());
-        let result = upload_and_advance(
+        let result = upload_and_collect(
             &cfg,
             &client(&addr),
             &identity(),
             "s1",
-            &[ev("e1")],
+            vec![ev("e1")],
             Some(&jsonl_cursor(10)),
         );
         assert!(result.is_err());
@@ -769,29 +833,53 @@ mod tests {
         );
         let cfg = test_cfg(&std::env::temp_dir());
         let events = vec![ev("e1"), ev("e2"), ev("e3")];
-        let uploaded = upload_and_advance(
+        let hub = client(&addr);
+        let (uploaded, entry) = upload_and_collect(
             &cfg,
-            &client(&addr),
+            &hub,
             &identity(),
             "s1",
-            &events,
+            events,
             Some(&jsonl_cursor(10)),
         )
         .unwrap();
         assert_eq!(uploaded, 3);
+        push_cursor_entries(&hub, vec![entry.expect("确认后应有游标")]).unwrap();
         let recorded = requests.lock().unwrap();
         assert_eq!(recorded.len(), 4);
         assert!(recorded[3].contains("/collectors/cursors"));
     }
 
     #[test]
+    fn push_cursor_entries_chunks_by_protocol_limit() {
+        // 300 条游标 → 按协议上限 256 分 2 次请求
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_scripted_hub(
+            vec![
+                (200, r#"{"ok":true}"#.into()),
+                (200, r#"{"ok":true}"#.into()),
+            ],
+            requests.clone(),
+        );
+        let entries: Vec<CursorEntry> = (0..300)
+            .map(|i| CursorEntry {
+                source_id: format!("s{i}"),
+                cursor_json: "{}".into(),
+                updated_at: None,
+            })
+            .collect();
+        push_cursor_entries(&client(&addr), entries).unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
     fn chunk_events_respects_limits() {
         let events: Vec<PendingEvent> = (0..5).map(|i| ev(&format!("e{i}"))).collect();
-        let chunks = chunk_events(&events, 2, 1_000_000);
+        let chunks = chunk_events(events.clone(), 2, 1_000_000);
         assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 5);
         assert!(chunks.iter().all(|c| c.len() <= 2));
         // 超小字节预算：逐事件成块
-        let chunks = chunk_events(&events, 256, 10);
+        let chunks = chunk_events(events, 256, 10);
         assert_eq!(chunks.len(), 5);
     }
 

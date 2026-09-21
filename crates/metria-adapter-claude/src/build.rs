@@ -9,8 +9,18 @@ use metria_core::model::{
 };
 use metria_core::normalize::normalize_model;
 use metria_traffic::{estimate, EstimateInput};
+use serde::{Deserialize, Serialize};
 
 use crate::entry::RawEntry;
+
+/// Claude 增量解析上下文快照（随 JSONL 游标持久化）。
+///
+/// 记录各会话最近一次真实用户消息时间，避免每轮从游标前回溯读取来恢复回合起点。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaudeSessionSnapshot {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_user_at: HashMap<String, DateTime<Utc>>,
+}
 
 /// 会话构建上下文（来源相关固定信息）。
 #[derive(Debug, Clone)]
@@ -583,13 +593,14 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// 构建 JSONL 游标。
+/// 构建 JSONL 游标（`adapter_state` 为适配器私有的解析上下文快照）。
 pub fn jsonl_cursor(
     path_hash: metria_core::model::ContentHash,
     inode: i64,
     size: i64,
     mtime: i64,
     offset: i64,
+    adapter_state: Option<serde_json::Value>,
 ) -> SourceCursor {
     use metria_core::model::JsonlCursor;
     SourceCursor::Jsonl(JsonlCursor {
@@ -601,5 +612,6 @@ pub fn jsonl_cursor(
         byte_offset: offset,
         last_event_hash: None,
         last_scan_at: Some(Utc::now()),
+        adapter_state,
     })
 }
