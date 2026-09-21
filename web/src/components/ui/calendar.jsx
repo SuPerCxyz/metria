@@ -2,8 +2,12 @@
 
 import * as React from "react"
 import { DayPicker } from "react-day-picker"
+import { zhCN } from "react-day-picker/locale"
 
 import { cn } from "../../lib/utils"
+
+// 周一起始的星期表头（与热力图、周报口径一致）
+const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
 
 function Calendar({
   className,
@@ -14,6 +18,12 @@ function Calendar({
   return (
     <DayPicker
       showOutsideDays={showOutsideDays}
+      weekStartsOn={1}
+      locale={zhCN}
+      formatters={{
+        formatWeekdayName: (date) => WEEKDAY_LABELS[date.getDay()],
+        formatCaption: (date) => `${date.getFullYear()}年${date.getMonth() + 1}月`,
+      }}
       className={cn("pt-0 pb-1 text-gray-600 dark:text-gray-100 relative", className)}
       classNames={{
         months: "flex flex-col sm:flex-row space-y-4 sm:space-y-0",
