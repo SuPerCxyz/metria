@@ -148,6 +148,7 @@ fn gen_session(
 
     let mut total_input = 0i64;
     let mut total_output = 0i64;
+    let mut last_event_at: Option<DateTime<Utc>> = None;
     for i in 0..calls {
         let ts = started + chrono::Duration::seconds((i * 7 + 1) as i64);
         let input = rng.range(500, 40_000) as i64;
@@ -220,6 +221,12 @@ fn gen_session(
         if db.insert_usage(&usage, &session_key).unwrap_or(false) {
             let _ = db.rollup_event("usage", &usage);
         }
+        last_event_at = Some(ts);
+    }
+
+    // 与真实 ingest 一致：回写来源最近数据时间（demo 直接走 db，不经过 process_batch）
+    if let Some(ts) = last_event_at {
+        let _ = db.touch_source_events(&[(format!("{source_id}-{node}"), ts.to_rfc3339())]);
     }
 
     let _ = total_input;

@@ -2201,3 +2201,125 @@ async fn session_detail_events_are_ingested() {
         "会话工具列表应包含上传的工具事件"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn data_quality_reports_source_freshness_and_usage_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, state) = spawn_hub(dir.path()).await;
+    // 注册 node/collector：sources 有外键，source 事件需先有 collector 行
+    let reg: Value = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "n-dq", "node_name": "n-dq",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.1.0", "protocol_version": 1
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let collector = reg["collector_id"].as_str().unwrap().to_string();
+    // 事件 source_id 是 pseudo_id(path_hash)，与 sources.id（原始 path_hash）不同：
+    // ingest 必须用同批次 source 事件把它们关联起来回写 last_event_at。
+    let pseudo = metria_core::privacy::hash_path("dq-src")
+        .as_str()
+        .to_string();
+    let batch = json!({
+        "schema_version": 1, "batch_id": "dq-1", "node_id": "n-dq", "collector_id": collector,
+        "agent_version": "0.1.0",
+        "events": [
+            {"kind": "source", "event_id": "blake3:dq-src", "payload": {
+                "id": "dq-src", "node_id": "n-dq", "collector_id": collector,
+                "client_id": "codex", "adapter_id": "codex", "adapter_version": "0.3.0",
+                "source_fingerprint": "fp", "source_path_hash": "dq-src",
+                "capabilities": [], "status": "active"
+            }},
+            {"kind": "session", "event_id": "blake3:dq-session", "payload": {
+                "id": "dq-session", "source_session_id": "dq-session",
+                "node_id": "n-dq", "collector_id": collector, "client_id": "codex",
+                "source_id": pseudo, "started_at": "2026-08-07T01:00:00Z",
+                "last_activity_at": "2026-08-07T01:00:05Z", "status": "active",
+                "message_count": 0, "tool_call_count": 0, "model_call_count": 1
+            }},
+            {"kind": "call", "event_id": "blake3:dq-call", "payload": {
+                "id": "dq-call", "node_id": "n-dq", "collector_id": collector,
+                "client_id": "codex", "source_id": pseudo, "session_id": "dq-session",
+                "model_raw": "gpt-5", "model_normalized": "gpt-5",
+                "provider_raw": "openai", "provider_normalized": "openai",
+                "started_at": "2026-08-07T01:00:10Z", "completed_at": "2026-08-07T01:00:15Z",
+                "status": "success", "call_granularity": "call"
+            }},
+            {"kind": "usage", "event_id": "blake3:dq-usage", "payload": {
+                "event_id": "blake3:dq-usage", "schema_version": 1,
+                "node_id": "n-dq", "collector_id": collector, "source_id": pseudo,
+                "client_id": "codex", "adapter_id": "codex", "adapter_version": "0.3.0",
+                "session_id": "dq-session", "model_call_id": "dq-call",
+                "timestamp": "2026-08-07T01:00:20Z",
+                "model_raw": "gpt-5", "model_normalized": "gpt-5",
+                "usage": {"input": 1000, "output": 100, "cache_read": 50, "cache_write": 10, "reasoning": 5},
+                "cost": {"reported_micro_usd": null, "calculated_micro_usd": 1234,
+                         "estimated_micro_usd": null, "pricing_rule_id": null, "pricing_snapshot_id": null},
+                "quality": {"usage_source": "reported", "granularity": "call", "confidence": 1.0}
+            }}
+        ]
+    });
+    let resp: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch.clone())
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(
+        resp["accepted"].as_array().unwrap().len(),
+        4,
+        "全部事件应接受: {resp}"
+    );
+
+    // sources.last_event_at 取批次内该来源最新事件时间（usage 01:00:20Z）
+    let last_event: Option<String> = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT last_event_at FROM sources WHERE id = 'dq-src'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        last_event.as_deref(),
+        Some("2026-08-07T01:00:20+00:00"),
+        "ingest 应把 pseudo source_id 关联回 sources.id 并回写最新事件时间"
+    );
+
+    let token = admin_token(&base);
+    let quality: Value = ureq::get(&format!(
+        "{base}/api/v1/data-quality?from=2026-08-07T00:00:00Z&to=2026-08-08T00:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    let cursor = quality["cursor_status"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source_id"] == "dq-src")
+        .expect("cursor_status 应包含该来源");
+    assert_eq!(cursor["last_event_at"], "2026-08-07T01:00:20+00:00");
+
+    // 用量来源分布只统计 Usage 行：不含空来源，且带完整 Token 构成
+    let dist = quality["usage_distribution"].as_array().unwrap();
+    assert!(
+        dist.iter().all(|row| row["usage_source"] != ""),
+        "不应再返回空 usage_source 行: {dist:?}"
+    );
+    let reported = dist
+        .iter()
+        .find(|row| row["usage_source"] == "reported")
+        .expect("应有 reported 行");
+    assert_eq!(reported["tokens"], 1000);
+    assert_eq!(reported["output_tokens"], 100);
+    assert_eq!(reported["cache_read_tokens"], 50);
+    assert_eq!(reported["cache_write_tokens"], 10);
+    assert_eq!(reported["reasoning_tokens"], 5);
+}

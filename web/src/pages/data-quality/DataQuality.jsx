@@ -9,7 +9,7 @@ import { EmptyState, ErrorState, LoadingSkeleton } from '../../components/feedba
 import { api, q, rangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
-import { fmtDateTime, fmtPct, fmtRelative } from '../../services/format'
+import { fmtDateTime, fmtPct, fmtRelative, fmtTokensShort, outputTokens } from '../../services/format'
 import { isAvailable } from '../../services/dataAvailability'
 
 export default function DataQuality() {
@@ -56,24 +56,27 @@ export default function DataQuality() {
 
       {!hasQualityDetails && observationCards.length === 0 && <div className="mt-4 bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700/60"><EmptyState title="暂无质量异常或性能样本" desc="当前范围没有来源错误、游标异常或可推导的性能数据。" /></div>}
 
-      {usageDistribution.length > 0 && <QualitySection title="用量来源分布">
+      {usageDistribution.length > 0 && <QualitySection title="用量来源分布" hint="仅统计用量事件（按 usage_source 标注）的 Token；调用数见总览与性能卡。">
         <DataTable
           columns={[
             { key: 'usage_source', label: '用量来源' },
-            { key: 'calls', label: '调用数', sortValue: (r) => r.calls },
-            { key: 'tokens', label: '输入 Token', sortValue: (r) => r.tokens },
+            { key: 'tokens', label: '输入 Token', sortValue: (r) => r.tokens, render: (r) => <span title={String(r.tokens ?? 0)}>{fmtTokensShort(r.tokens ?? 0)}</span> },
+            { key: 'output', label: '输出 Token', sortValue: (r) => outputTokens(r), render: (r) => <span title={String(outputTokens(r))}>{fmtTokensShort(outputTokens(r))}</span> },
+            { key: 'cache_read_tokens', label: '缓存读取', sortValue: (r) => r.cache_read_tokens, render: (r) => <span title={String(r.cache_read_tokens ?? 0)}>{fmtTokensShort(r.cache_read_tokens ?? 0)}</span> },
+            { key: 'cache_write_tokens', label: '缓存写入', sortValue: (r) => r.cache_write_tokens, render: (r) => <span title={String(r.cache_write_tokens ?? 0)}>{fmtTokensShort(r.cache_write_tokens ?? 0)}</span> },
           ]}
           data={usageDistribution}
         />
       </QualitySection>}
 
-      {cursorStatus.length > 0 && <QualitySection title="来源游标状态">
+      {cursorStatus.length > 0 && <QualitySection title="来源游标状态" hint="「活跃」表示最近扫描成功，不代表有新数据；是否有近期数据请看「最近数据」。">
         <DataTable
           columns={[
             { key: 'source_id', label: 'Source', render: (r) => <span title={r.source_id} className="block max-w-[18rem] truncate">{r.source_id}</span> },
             { key: 'client_id', label: 'Agent' },
             { key: 'adapter_id', label: 'Adapter' },
             { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
+            { key: 'last_event_at', label: '最近数据', sortValue: (r) => r.last_event_at, render: (r) => (r.last_event_at ? fmtDateTime(r.last_event_at) : '—') },
             { key: 'last_scan_at', label: '最后扫描', sortValue: (r) => r.last_scan_at, render: (r) => fmtDateTime(r.last_scan_at) },
             { key: 'last_error', label: '最近错误', hideWhenEmpty: true, render: (r) => r.last_error || '—' },
           ]}
@@ -123,10 +126,11 @@ export default function DataQuality() {
   )
 }
 
-function QualitySection({ title, children }) {
+function QualitySection({ title, hint, children }) {
   return (
     <section className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
       <h2 className="mb-3 px-2 text-lg font-bold text-gray-800 dark:text-gray-100">{title}</h2>
+      {hint && <p className="-mt-2 mb-3 px-2 text-xs text-gray-400 dark:text-gray-500">{hint}</p>}
       {children}
     </section>
   )

@@ -2658,19 +2658,38 @@ pub(crate) async fn data_quality(
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
 
+    // 用量来源分布：仅统计 Usage 行（Call/Session 行不带 Token 与 usage_source），
+    // 按来源汇总 Token 构成，避免与调用计数混在一张表里产生镜像行。
     let mut usage_dist = Vec::new();
     if let Ok(mut stmt) = c.prepare(
-        "SELECT usage_source, COALESCE(SUM(input_tokens),0), COALESCE(SUM(model_call_count),0) FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) GROUP BY usage_source",
+        "SELECT usage_source,
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                COALESCE(SUM(reasoning_tokens),0)
+         FROM hourly_rollups
+         WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2)
+           AND usage_source != ''
+         GROUP BY usage_source
+         ORDER BY 2 DESC, 1",
     ) {
-        if let Ok(rows) = stmt.query_map(
-            params![from.to_rfc3339(), to.to_rfc3339()],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
-        ) {
+        if let Ok(rows) = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        }) {
             for row in rows.flatten() {
                 usage_dist.push(serde_json::json!({
                     "usage_source": row.0,
                     "tokens": row.1,
-                    "calls": row.2,
+                    "output_tokens": row.2,
+                    "cache_read_tokens": row.3,
+                    "cache_write_tokens": row.4,
+                    "reasoning_tokens": row.5,
                 }));
             }
         }
@@ -2751,11 +2770,13 @@ pub(crate) async fn data_quality(
         out
     };
 
-    // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康）
+    // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康 + 最近数据新鲜度）
     let cursor_status: Vec<serde_json::Value> = {
         let st = c.prepare(
-            "SELECT id, client_id, adapter_id, status, last_scan_at, last_error
-             FROM sources ORDER BY last_scan_at DESC LIMIT 100",
+            "SELECT id, client_id, adapter_id, status, last_scan_at, last_error, last_event_at
+             FROM sources
+             ORDER BY COALESCE(last_event_at,'') DESC, last_scan_at DESC
+             LIMIT 100",
         );
         let mut out = Vec::new();
         if let Ok(mut st) = st {
@@ -2767,6 +2788,7 @@ pub(crate) async fn data_quality(
                     "status": r.get::<_, String>(3)?,
                     "last_scan_at": r.get::<_, Option<String>>(4)?,
                     "last_error": r.get::<_, Option<String>>(5)?,
+                    "last_event_at": r.get::<_, Option<String>>(6)?,
                 }))
             }) {
                 out = rows.filter_map(|x| x.ok()).collect();

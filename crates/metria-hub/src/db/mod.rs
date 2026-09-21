@@ -530,22 +530,25 @@ impl HubDb {
 
     /// 记录来源最近一次产生事件的时间（数据新鲜度）。
     ///
-    /// 注意：当前事件 payload 的 `source_id` 是 `pseudo_id(path_hash)`，与 `sources.id`
-    /// （原始 path_hash）不一致，无法按事件直接回写；保留此方法供身份统一后使用。
-    pub fn touch_source_events(
-        &self,
-        source_ids: &[String],
-        now: DateTime<Utc>,
-    ) -> Result<(), StorageError> {
-        if source_ids.is_empty() {
+    /// 参数为 `(source_id, 事件时间 RFC3339)`：source_id 使用 `sources.id`（原始
+    /// path_hash）；调用方在 ingest 批次内用 source 事件把 pseudo source_id 映射回它。
+    /// 只前进不后退（按 julianday 比较）。
+    pub fn touch_source_events(&self, items: &[(String, String)]) -> Result<(), StorageError> {
+        if items.is_empty() {
             return Ok(());
         }
         let c = self.conn();
-        let ts = now.to_rfc3339();
         let mut stmt = c
-            .prepare("UPDATE sources SET last_event_at = ?1, updated_at = ?1 WHERE id = ?2")
+            .prepare(
+                "UPDATE sources SET last_event_at =
+                     CASE WHEN last_event_at IS NULL
+                               OR julianday(last_event_at) < julianday(?1)
+                          THEN ?1 ELSE last_event_at END,
+                     updated_at = ?1
+                 WHERE id = ?2",
+            )
             .map_err(StorageError::from)?;
-        for id in source_ids {
+        for (id, ts) in items {
             stmt.execute(params![ts, id]).map_err(StorageError::from)?;
         }
         Ok(())

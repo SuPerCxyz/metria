@@ -1055,6 +1055,19 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
     let session_map = st.db.session_key_map(&serde_json::json!({
         "sessions": batch.events.iter().filter(|e| e.kind == "session").map(|e| e.payload.clone()).collect::<Vec<_>>()
     }));
+    // 事件里的 source_id 是 pseudo_id(path_hash)，与 sources.id（原始 path_hash）不同；
+    // 用同批次的 source 事件建立映射，供回写 sources.last_event_at（数据新鲜度）。
+    let source_map: HashMap<String, String> = batch
+        .events
+        .iter()
+        .filter(|e| e.kind == "source")
+        .filter_map(|e| {
+            let raw = e.payload.get("id").and_then(|x| x.as_str())?;
+            let pseudo = metria_core::privacy::hash_path(raw).as_str().to_string();
+            Some((pseudo, raw.to_string()))
+        })
+        .collect();
+    let mut source_event_times: HashMap<String, DateTime<Utc>> = HashMap::new();
 
     for ev in &batch.events {
         if matches!(ev.kind.as_str(), "traffic" | "traffic_sample") {
@@ -1142,6 +1155,19 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                     accepted.push(ev.event_id.clone());
                     let _ = st.db.rollup_event(&ev.kind, v);
                     publish_ingest(st, &ev.kind);
+                    // 仅在事件首次落库时推进来源新鲜度，避免重传回写
+                    if let Some(raw_id) = v
+                        .get("source_id")
+                        .and_then(|x| x.as_str())
+                        .and_then(|pseudo| source_map.get(pseudo))
+                    {
+                        if let Some(ts) = event_timestamp(&ev.kind, v) {
+                            let entry = source_event_times.entry(raw_id.clone()).or_insert(ts);
+                            if ts > *entry {
+                                *entry = ts;
+                            }
+                        }
+                    }
                 } else {
                     duplicate.push(ev.event_id.clone());
                 }
@@ -1153,6 +1179,16 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                     retryable: false,
                 });
             }
+        }
+    }
+
+    if !source_event_times.is_empty() {
+        let items: Vec<(String, String)> = source_event_times
+            .into_iter()
+            .map(|(id, ts)| (id, ts.to_rfc3339()))
+            .collect();
+        if let Err(e) = st.db.touch_source_events(&items) {
+            tracing::warn!(%e, "回写来源 last_event_at 失败");
         }
     }
 
@@ -1172,6 +1208,28 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
         failed,
         message: None,
     }
+}
+
+/// 事件自身的时间戳（用于 sources.last_event_at 新鲜度回写）。
+///
+/// 各类型取语义上的代表时间；缺失或不可解析返回 None（不硬造）。
+fn event_timestamp(kind: &str, v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let s = match kind {
+        "session" => v
+            .get("last_activity_at")
+            .or_else(|| v.get("started_at"))
+            .and_then(|x| x.as_str()),
+        "call" => v
+            .get("completed_at")
+            .or_else(|| v.get("started_at"))
+            .and_then(|x| x.as_str()),
+        "usage" => v.get("timestamp").and_then(|x| x.as_str()),
+        "message" | "tool" | "subagent" => v.get("created_at").and_then(|x| x.as_str()),
+        _ => None,
+    }?;
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 async fn ingest_batch(State(st): State<AppState>, req: axum::extract::Request) -> Response {
