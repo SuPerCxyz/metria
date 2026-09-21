@@ -670,6 +670,33 @@ mod tests {
                 .any(|r| r.child_session_id.as_str() == "child"),
             "同批次的父子会话应产生子代理关系"
         );
+
+        // 重复扫描（模拟每轮轮询）：关系 id 必须稳定，Hub 才能幂等去重
+        let (batch2, _) = scan_v2_with_limits(
+            &conn,
+            &test_identity(),
+            "hash",
+            None,
+            0,
+            100,
+            100,
+            100,
+            V2_WINDOW_BYTES,
+            V2_SCAN_BYTES,
+            &mut tolerance,
+        )
+        .unwrap();
+        let ids1: Vec<String> = batch
+            .subagent_relations
+            .iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
+        let ids2: Vec<String> = batch2
+            .subagent_relations
+            .iter()
+            .map(|r| r.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids1, ids2, "重复扫描的关系 id 必须稳定（幂等去重前提）");
     }
 
     #[test]

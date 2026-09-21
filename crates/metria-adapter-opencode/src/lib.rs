@@ -654,10 +654,20 @@ pub(crate) fn finalize_builders(
         if let Some(parent_src) = parent_src {
             if let Some(parent_id) = parent_by_source.get(&parent_src) {
                 if let Some(parent_builder) = builders.get_mut(&parent_src) {
+                    // 关系 id 确定性派生：重复扫描由 Hub 幂等去重，避免关系表膨胀
+                    let rel_id = Id::parse(
+                        metria_core::model::EventId::from_content(&format!(
+                            "subagent:{}:{}",
+                            parent_id.as_str(),
+                            child_id.as_str()
+                        ))
+                        .as_str(),
+                    )
+                    .unwrap_or_else(|_| Id::new());
                     parent_builder
                         .subagents
                         .push(metria_core::model::SubagentRelation {
-                            id: Id::new(),
+                            id: rel_id,
                             session_id: parent_id.clone(),
                             parent_model_call_id: None,
                             child_session_id: child_id.clone(),

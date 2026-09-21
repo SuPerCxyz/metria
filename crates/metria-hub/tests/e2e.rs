@@ -2463,4 +2463,20 @@ async fn subagent_sessions_are_excluded_and_visible_in_parent_detail() {
 
     // 回填幂等：父级已写入时不重复回填
     assert_eq!(state.db.backfill_subagent_parents().unwrap(), 0);
+
+    // 历史重复关系清理：手工插入同父子会话的第二条关系后应被去重
+    state
+        .db
+        .insert_subagent(&json!({
+            "id": "sa-rel-dup", "session_id": parent_key, "child_session_id": "sa-child",
+            "relation": "subagent", "created_at": "2026-08-08T01:00:07Z"
+        }))
+        .unwrap();
+    assert_eq!(state.db.dedupe_subagent_relations().unwrap(), 1);
+    let subs = get(&format!("/api/v1/sessions/{parent_key}/subagents"));
+    assert_eq!(
+        subs["relations"].as_array().unwrap().len(),
+        1,
+        "去重后关系列表不应包含重复子会话"
+    );
 }

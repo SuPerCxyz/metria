@@ -2579,9 +2579,11 @@ pub(crate) async fn session_subagents(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     let c = st.db.conn();
+    // 同一子会话只保留最早一条关系（历史 Agent 曾按扫描轮次重复写入）
     let mut stmt = q!(c.prepare(
-        "SELECT id, child_session_id, relation, created_at
-         FROM subagent_relations WHERE session_id = ?1 ORDER BY created_at",
+        "SELECT MIN(id) AS id, child_session_id, MIN(relation) AS relation, MIN(created_at) AS created_at
+         FROM subagent_relations WHERE session_id = ?1
+         GROUP BY child_session_id ORDER BY MIN(created_at)",
     ));
     let rows = q!(stmt.query_map([&id], |r| {
         Ok(serde_json::json!({

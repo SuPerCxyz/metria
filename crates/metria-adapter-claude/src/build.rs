@@ -550,8 +550,18 @@ impl SessionBuilder {
         for leaf in &self.pending_subagent_leaves {
             if let Ok(child_id) = Id::parse(leaf) {
                 self.session.subagent_count += 1;
+                // 关系 id 确定性派生：重复扫描由 Hub 幂等去重，避免关系表膨胀
+                let rel_id = Id::parse(
+                    metria_core::model::EventId::from_content(&format!(
+                        "subagent:{}:{}",
+                        self.session.id.as_str(),
+                        child_id.as_str()
+                    ))
+                    .as_str(),
+                )
+                .unwrap_or_else(|_| Id::new());
                 self.subagents.push(SubagentRelation {
-                    id: Id::new(),
+                    id: rel_id,
                     session_id: self.session.id.clone(),
                     parent_model_call_id: None,
                     child_session_id: child_id,

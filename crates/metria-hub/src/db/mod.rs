@@ -1662,6 +1662,24 @@ impl HubDb {
         Ok(n)
     }
 
+    /// 删除重复的子代理关系（同一父会话 + 同一子会话只保留最早一行）。
+    ///
+    /// 历史 Agent 每次扫描都会新建随机 id 的关系行；本方法幂等清理重复。
+    pub fn dedupe_subagent_relations(&self) -> Result<usize, StorageError> {
+        let c = self.conn();
+        let n = c
+            .execute(
+                "DELETE FROM subagent_relations
+                 WHERE rowid NOT IN (
+                     SELECT MIN(rowid) FROM subagent_relations
+                     GROUP BY session_id, child_session_id
+                 )",
+                [],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n)
+    }
+
     /// 批次内映射：ULID 会话 id → 规范键。
     pub fn session_key_map(&self, v: &Value) -> HashMap<String, String> {
         let mut m = HashMap::new();

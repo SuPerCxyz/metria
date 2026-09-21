@@ -135,8 +135,9 @@ fn spawn_integrity_repair(db: db::HubDb) {
         const KEY: &str = "observability_integrity_version";
         const TIMING_KEY: &str = "observability_timing_repair_version";
         // v1：子 Agent 会话父级回填 + 会话汇总口径收敛（会话数只含主会话）。
+        // v2：清理历史重复子代理关系（确定性关系 id 上线前的重复行）。
         const SUBAGENT_KEY: &str = "subagent_parent_repair_version";
-        const SUBAGENT_VERSION: &str = "1";
+        const SUBAGENT_VERSION: &str = "2";
         // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
         const VERSION: &str = "4";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
@@ -150,6 +151,10 @@ fn spawn_integrity_repair(db: db::HubDb) {
             let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
             // 回填必须在重建之前：重建按主会话口径重放会话计数
             if subagent_needed {
+                let deduped = db.dedupe_subagent_relations().map_err(|e| e.to_string())?;
+                if deduped > 0 {
+                    info!(deduped, "重复子代理关系已清理");
+                }
                 let backfilled = db.backfill_subagent_parents().map_err(|e| e.to_string())?;
                 info!(backfilled, "子 Agent 会话父级回填完成");
             }
