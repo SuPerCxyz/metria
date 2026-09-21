@@ -31,10 +31,14 @@ export default function SessionDetail() {
   const query = useQuery(`session-detail-${id}`, () => api(`/sessions/${encodeURIComponent(id)}`))
   const calls = useQuery(`session-calls-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/calls`))
   const timeline = useQuery(`session-timeline-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/timeline`))
+  const subagents = useQuery(`session-subagents-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/subagents`))
   const nodeNames = useNodeNames()
 
   const callList = calls.data?.calls || []
   const messageList = timeline.data?.messages || []
+  const subagentRelations = subagents.data?.relations || []
+  const subagentChildren = subagents.data?.children || []
+  const subagentTotals = subagents.data?.totals || null
 
   const trendData = useMemo(() => {
     const pts = callList
@@ -63,6 +67,18 @@ export default function SessionDetail() {
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
   ]
 
+  const childColumns = [
+    { key: 'title', label: '标题', render: (r) => <span className="block min-w-[8rem] max-w-[16rem] truncate" title={r.title || r.source_session_id}>{r.title || r.source_session_id}</span> },
+    { key: 'model', label: '模型', render: (r) => r.model || '—' },
+    { key: 'model_call_count', label: '调用数', sortValue: (r) => r.model_call_count, render: (r) => Number(r.model_call_count ?? 0).toLocaleString() },
+    { key: 'input_tokens', label: '输入 Token', render: (r) => fmtTokensShort(r.input_tokens) },
+    { key: 'output', label: '输出（含推理）', sortValue: (r) => outputTokens(r), render: (r) => fmtTokensShort(outputTokens(r)) },
+    { key: 'cache_read_tokens', label: '缓存读取', render: (r) => fmtTokensShort(r.cache_read_tokens) },
+    { key: 'cost', label: '费用', sortValue: (r) => r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd, render: (r) => fmtUsd(r.calculated_cost_micro_usd ?? r.estimated_cost_micro_usd) },
+    { key: 'last_activity_at', label: '最近活动', sortValue: (r) => r.last_activity_at || r.started_at, render: (r) => fmtDateTime(r.last_activity_at || r.started_at) },
+    { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
+  ]
+
   const errors = (callList || []).filter((c) => c.status && !['success', 'ok', 'completed'].includes(String(c.status).toLowerCase()))
 
   if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
@@ -74,8 +90,21 @@ export default function SessionDetail() {
       <PageHeader
         back={<Link to="/sessions" className="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">← 返回会话</Link>}
         title="会话详情"
-        subtitle={<span>{s.client_id} · {nodeNames[s.node_id] || s.node_id} · <StatusBadge status={s.status} /></span>}
+        subtitle={
+          <span className="inline-flex flex-wrap items-center gap-2">
+            {s.parent_session_id && (
+              <span className="inline-flex items-center rounded-full bg-violet-600 px-2 py-0.5 text-xs font-medium text-white">子 Agent 会话</span>
+            )}
+            {s.client_id} · {nodeNames[s.node_id] || s.node_id} · <StatusBadge status={s.status} />
+          </span>
+        }
       />
+
+      {s.parent_session_id && (
+        <p className="mb-3 text-sm">
+          <Link to={`/sessions/${encodeURIComponent(s.parent_session_id)}`} className="text-indigo-600 hover:underline dark:text-indigo-400">← 返回主会话</Link>
+        </p>
+      )}
 
       <DetailSummary
         items={[
@@ -126,6 +155,27 @@ export default function SessionDetail() {
       </div>
 
       <ConversationTimeline query={timeline} messages={messageList} />
+
+      {subagentRelations.length > 0 && (
+        <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">子 Agent 使用情况</h2>
+            {subagentTotals?.children > 0 && (
+              <span className="text-sm tabular-nums text-gray-500 dark:text-gray-400">
+                {subagentTotals.children} 个子会话 · {Number(subagentTotals.model_calls ?? 0).toLocaleString()} 次调用 · {fmtTokensShort(sumTokens(subagentTotals))} Token
+                {subagentTotals.cost_micro_usd != null ? ` · ${fmtUsd(subagentTotals.cost_micro_usd)}` : ' · 费用不可用'}
+              </span>
+            )}
+          </div>
+          {subagentTotals?.children > 0 ? (
+            <DataTable columns={childColumns} data={subagentChildren} pageSize={8} onRowClick={(r) => navigate(`/sessions/${encodeURIComponent(r.id)}`)} />
+          ) : (
+            <p className="text-sm text-gray-500 dark:text-gray-400">
+              关联的 {subagentRelations.length} 个子 Agent 未单独采集（用量已并入本会话）。
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 p-2">模型调用列表</h2>

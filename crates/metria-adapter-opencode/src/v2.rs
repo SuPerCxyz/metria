@@ -619,6 +619,60 @@ mod tests {
     }
 
     #[test]
+    fn child_session_records_parent_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn, 2);
+        // 子会话（parent_id 指向 's'）及其消息
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, title, time_created, time_updated) VALUES ('child','p','s','/tmp/x','child',0,0)",
+            [],
+        )
+        .unwrap();
+        let ts = 1_700_000_000_500i64;
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('c1','child','user',1,?1,?1,?2)",
+            metria_storage::rusqlite::params![
+                ts,
+                format!(r#"{{"time":{{"created":{ts}}},"text":"child"}}"#)
+            ],
+        )
+        .unwrap();
+
+        let mut tolerance = ScanTolerance::default();
+        let (batch, _) = scan_v2_with_limits(
+            &conn,
+            &test_identity(),
+            "hash",
+            None,
+            0,
+            100,
+            100,
+            100,
+            V2_WINDOW_BYTES,
+            V2_SCAN_BYTES,
+            &mut tolerance,
+        )
+        .unwrap();
+        let child = batch
+            .sessions
+            .iter()
+            .find(|s| s.source_session_id == "child")
+            .expect("应扫描到子会话");
+        assert_eq!(
+            child.parent_session_id.as_ref().map(|id| id.as_str()),
+            Some("s"),
+            "子会话必须记录父会话 id"
+        );
+        assert!(
+            batch
+                .subagent_relations
+                .iter()
+                .any(|r| r.child_session_id.as_str() == "child"),
+            "同批次的父子会话应产生子代理关系"
+        );
+    }
+
+    #[test]
     fn dual_cursor_covers_tail_first_then_history() {
         let conn = Connection::open_in_memory().unwrap();
         setup(&conn, 20);

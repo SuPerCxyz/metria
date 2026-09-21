@@ -2323,3 +2323,144 @@ async fn data_quality_reports_source_freshness_and_usage_sources() {
     assert_eq!(reported["cache_write_tokens"], 10);
     assert_eq!(reported["reasoning_tokens"], 5);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subagent_sessions_are_excluded_and_visible_in_parent_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, state) = spawn_hub(dir.path()).await;
+    let reg: Value = ureq::post(&format!("{base}/api/v1/collectors/register"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(json!({
+            "schema_version": 1, "node_id": "n-sa", "node_name": "n-sa",
+            "node_platform": "linux", "node_architecture": "x86_64",
+            "agent_version": "0.1.0", "protocol_version": 1
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let collector = reg["collector_id"].as_str().unwrap().to_string();
+    let pseudo = metria_core::privacy::hash_path("sa-src")
+        .as_str()
+        .to_string();
+    let call = |id: &str, session: &str, input: i64| {
+        json!({"kind": "call", "event_id": format!("blake3:call-{id}"), "payload": {
+            "id": id, "node_id": "n-sa", "collector_id": collector, "client_id": "opencode",
+            "source_id": pseudo, "session_id": session,
+            "model_raw": "gpt-5", "model_normalized": "gpt-5",
+            "started_at": "2026-08-08T01:00:10Z", "status": "success",
+            "call_granularity": "call", "input_tokens": input, "output_tokens": 10
+        }})
+    };
+    let usage = |id: &str, session: &str, input: i64| {
+        json!({"kind": "usage", "event_id": format!("blake3:usage-{id}"), "payload": {
+            "event_id": format!("blake3:usage-{id}"), "schema_version": 1,
+            "node_id": "n-sa", "collector_id": collector, "source_id": pseudo,
+            "client_id": "opencode", "adapter_id": "opencode", "adapter_version": "0.3.0",
+            "session_id": session, "model_call_id": id,
+            "timestamp": "2026-08-08T01:00:10Z",
+            "model_raw": "gpt-5", "model_normalized": "gpt-5",
+            "usage": {"input": input, "output": 10},
+            "cost": {"calculated_micro_usd": 100},
+            "quality": {"usage_source": "reported", "granularity": "call", "confidence": 1.0}
+        }})
+    };
+    let batch = json!({
+        "schema_version": 1, "batch_id": "sa-1", "node_id": "n-sa", "collector_id": collector,
+        "agent_version": "0.1.0",
+        "events": [
+            {"kind": "source", "event_id": "blake3:sa-src", "payload": {
+                "id": "sa-src", "node_id": "n-sa", "collector_id": collector,
+                "client_id": "opencode", "adapter_id": "opencode", "adapter_version": "0.3.0",
+                "source_fingerprint": "fp", "source_path_hash": "sa-src",
+                "capabilities": [], "status": "active"
+            }},
+            {"kind": "session", "event_id": "blake3:sa-parent", "payload": {
+                "id": "sa-parent", "source_session_id": "sa-parent", "node_id": "n-sa",
+                "collector_id": collector, "client_id": "opencode", "source_id": pseudo,
+                "started_at": "2026-08-08T01:00:00Z", "last_activity_at": "2026-08-08T01:00:20Z",
+                "status": "ended", "message_count": 0, "tool_call_count": 0,
+                "model_call_count": 1, "subagent_count": 1
+            }},
+            {"kind": "session", "event_id": "blake3:sa-child", "payload": {
+                "id": "sa-child", "source_session_id": "sa-child", "node_id": "n-sa",
+                "collector_id": collector, "client_id": "opencode", "source_id": pseudo,
+                "parent_session_id": "sa-parent",
+                "started_at": "2026-08-08T01:00:05Z", "last_activity_at": "2026-08-08T01:00:15Z",
+                "status": "ended", "message_count": 0, "tool_call_count": 0,
+                "model_call_count": 1
+            }},
+            call("sa-call-parent", "sa-parent", 100),
+            usage("sa-call-parent", "sa-parent", 100),
+            call("sa-call-child", "sa-child", 500),
+            usage("sa-call-child", "sa-child", 500),
+            {"kind": "subagent", "event_id": "blake3:sa-rel", "payload": {
+                "id": "sa-rel", "session_id": "sa-parent", "child_session_id": "sa-child",
+                "relation": "subagent", "created_at": "2026-08-08T01:00:06Z"
+            }}
+        ]
+    });
+    let resp: Value = ureq::post(&format!("{base}/api/v1/events/batch"))
+        .set("Authorization", "Bearer testtok")
+        .send_json(batch)
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(
+        resp["accepted"].as_array().unwrap().len(),
+        8,
+        "全部事件应接受: {resp}"
+    );
+
+    let token = admin_token(&base);
+    let get = |path: &str| -> Value {
+        ureq::get(&format!("{base}{path}"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap()
+    };
+
+    // 概览会话数只含主会话；Token 仍包含子会话用量
+    let overview = get("/api/v1/overview?from=2026-08-08T00:00:00Z&to=2026-08-09T00:00:00Z");
+    assert_eq!(overview["sessions"], 1, "会话数应只含主会话");
+    assert_eq!(overview["input_tokens"], 600, "子会话 Token 不应丢失");
+
+    // 列表默认不含子会话；显式包含时返回 2 条
+    let list = get("/api/v1/sessions?from=2026-08-08T00:00:00Z&to=2026-08-09T00:00:00Z");
+    assert_eq!(
+        list["sessions"].as_array().unwrap().len(),
+        1,
+        "默认只列主会话"
+    );
+    let list_all = get(
+        "/api/v1/sessions?from=2026-08-08T00:00:00Z&to=2026-08-09T00:00:00Z&include_subagents=true",
+    );
+    assert_eq!(
+        list_all["sessions"].as_array().unwrap().len(),
+        2,
+        "include_subagents=true 应返回全部会话"
+    );
+
+    // 子会话详情：父级已解析为规范键
+    let parent_key = "n-sa:sa-parent";
+    let child_key = "n-sa:sa-child";
+    let child = get(&format!("/api/v1/sessions/{child_key}"));
+    assert_eq!(child["session"]["parent_session_id"], parent_key);
+    let parent = get(&format!("/api/v1/sessions/{parent_key}"));
+    assert!(parent["session"]["parent_session_id"].is_null());
+
+    // 主会话详情：子 Agent 明细与合计
+    let subs = get(&format!("/api/v1/sessions/{parent_key}/subagents"));
+    let children = subs["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "应返回子会话摘要");
+    assert_eq!(children[0]["id"], child_key);
+    assert_eq!(children[0]["input_tokens"], 500);
+    assert_eq!(subs["totals"]["children"], 1);
+    assert_eq!(subs["totals"]["input_tokens"], 500);
+    assert_eq!(subs["totals"]["model_calls"], 1);
+    assert_eq!(subs["totals"]["cost_micro_usd"], 100);
+
+    // 回填幂等：父级已写入时不重复回填
+    assert_eq!(state.db.backfill_subagent_parents().unwrap(), 0);
+}

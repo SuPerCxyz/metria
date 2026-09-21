@@ -150,6 +150,10 @@ impl SessionBuilder {
             self.session.reported_cost_micro_usd = reported_cost_micro_usd;
         }
         if self.parent_source_id.is_none() {
+            // 子 Agent 会话：记录父会话（原始 source id，Hub 侧解析为规范键）
+            if let Some(parent) = parent_source_id.as_deref().and_then(|s| Id::parse(s).ok()) {
+                self.session.parent_session_id = Some(parent);
+            }
             self.parent_source_id = parent_source_id;
         }
     }

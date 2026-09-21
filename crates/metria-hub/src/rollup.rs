@@ -379,7 +379,7 @@ impl HubDb {
                                COALESCE(s.primary_model_normalized,''), \
                                COUNT(*), SUM(COALESCE(s.message_count,0)), SUM(COALESCE(s.tool_call_count,0)), \
                                SUM(COALESCE(s.subagent_count,0)) \
-                             FROM sessions s WHERE s.started_at >= ?1 GROUP BY 1,2,3,4,5,6,7,8 \
+                             FROM sessions s WHERE s.started_at >= ?1 AND s.parent_session_id IS NULL GROUP BY 1,2,3,4,5,6,7,8 \
                              ON CONFLICT({pk}) DO UPDATE SET \
                                session_count = session_count + excluded.session_count, \
                                message_count = message_count + excluded.message_count, \

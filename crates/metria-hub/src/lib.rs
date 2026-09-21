@@ -75,7 +75,6 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
     // 价格目录种子 + 后台同步
     seed_catalogs(&db);
-    spawn_integrity_repair(db.clone());
     spawn_catalog_sync(db.clone());
 
     // 后台维护：周期 rollup 对账 + WAL checkpoint
@@ -90,6 +89,9 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
             Err(e) => warn!("Demo 数据生成失败: {e}"),
         }
     }
+
+    // 历史修复放在数据就绪之后启动，避免与 Demo 播种并发导致汇总重复计数
+    spawn_integrity_repair(db.clone());
 
     let collector_token = std::env::var("METRIA_COLLECTOR_TOKEN").ok();
     let state = AppState {
@@ -132,19 +134,29 @@ fn spawn_integrity_repair(db: db::HubDb) {
         let _heap_release = crate::memory::HeapReleaseGuard;
         const KEY: &str = "observability_integrity_version";
         const TIMING_KEY: &str = "observability_timing_repair_version";
+        // v1：子 Agent 会话父级回填 + 会话汇总口径收敛（会话数只含主会话）。
+        const SUBAGENT_KEY: &str = "subagent_parent_repair_version";
+        const SUBAGENT_VERSION: &str = "1";
         // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
         const VERSION: &str = "4";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
         let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
-        if !full_needed && !timing_needed {
+        let subagent_needed =
+            db.setting_get(SUBAGENT_KEY).ok().flatten().as_deref() != Some(SUBAGENT_VERSION);
+        if !full_needed && !timing_needed && !subagent_needed {
             return;
         }
         let result = (|| -> Result<usize, String> {
             let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
+            // 回填必须在重建之前：重建按主会话口径重放会话计数
+            if subagent_needed {
+                let backfilled = db.backfill_subagent_parents().map_err(|e| e.to_string())?;
+                info!(backfilled, "子 Agent 会话父级回填完成");
+            }
             if full_needed {
                 crate::catalog::reprice_from_rules(&db, false)?;
                 db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
-            } else if timings > 0 {
+            } else if timings > 0 || subagent_needed {
                 db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
             }
             if full_needed {
@@ -152,6 +164,10 @@ fn spawn_integrity_repair(db: db::HubDb) {
             }
             if timing_needed {
                 db.setting_set(TIMING_KEY, VERSION)
+                    .map_err(|e| e.to_string())?;
+            }
+            if subagent_needed {
+                db.setting_set(SUBAGENT_KEY, SUBAGENT_VERSION)
                     .map_err(|e| e.to_string())?;
             }
             Ok(timings)

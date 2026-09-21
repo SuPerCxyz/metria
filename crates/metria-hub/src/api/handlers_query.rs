@@ -1240,7 +1240,7 @@ pub(crate) async fn node_detail(
         "SELECT COALESCE(project_id,'(none)'), COUNT(*),
                 COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
                 COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-         FROM sessions WHERE node_id = ?1 GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
+         FROM sessions WHERE node_id = ?1 AND parent_session_id IS NULL GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
     ) {
         if let Ok(rows) = stmt.query_map([&id], |r| {
             let cost = r.get::<_, i64>(2)?;
@@ -1388,7 +1388,7 @@ pub(crate) async fn node_sessions(
             Some((ts, sid)) => (
                 format!(
                     "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
+                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL
                        AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
                      ORDER BY {tcol} DESC, id DESC LIMIT ?6",
                 ),
@@ -1413,7 +1413,7 @@ pub(crate) async fn node_sessions(
         (
             format!(
                 "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                 FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
+                 FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL ORDER BY {tcol} DESC, id DESC LIMIT ?4",
             ),
             vec![
                 SqlValue::Text(id),
@@ -1586,7 +1586,7 @@ pub(crate) async fn client_detail(
         let mut st = q!(c.prepare(
             "SELECT id, source_session_id, node_id, title, primary_model_normalized, started_at,
                     model_call_count, input_tokens, output_tokens
-             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
              ORDER BY started_at DESC LIMIT 20",
         ));
         let r = q!(
@@ -1640,7 +1640,7 @@ pub(crate) async fn client_detail(
                     COALESCE(SUM(input_tokens),0),
                     COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
                     COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
              GROUP BY project_id ORDER BY 3 DESC LIMIT 10",
         ));
         let r = q!(
@@ -1994,7 +1994,7 @@ pub(crate) async fn model_detail(
                 "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at,
                         model_call_count, input_tokens, output_tokens, cache_read_tokens,
                         reasoning_tokens
-                 FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3
+                 FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
                  ORDER BY started_at DESC LIMIT 20",
             ));
             let r = q!(
@@ -2294,6 +2294,12 @@ pub(crate) async fn list_sessions(
     let range_overlap = format!(
         "((s.{tcol} >= ?1 AND s.{tcol} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
     );
+    // 默认只返回主 Agent 会话；显式 include_subagents=true 时返回全部。
+    let subagent_filter = if p.include_subagents == Some(true) {
+        ""
+    } else {
+        " AND s.parent_session_id IS NULL"
+    };
     let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
         match crate::api::decode_cursor(cur) {
             Some((ts, id)) => {
@@ -2314,7 +2320,7 @@ pub(crate) async fn list_sessions(
                         CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                              THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
                         reasoning_tokens
-                     FROM sessions s WHERE {range_overlap} {session_filter}
+                     FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
                        AND (s.{tcol} < ?{cursor_index} OR (s.{tcol} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
                      ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}",
                     next_cursor_index = cursor_index + 1,
@@ -2337,7 +2343,7 @@ pub(crate) async fn list_sessions(
                     CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                          THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
                     reasoning_tokens
-                 FROM sessions s WHERE {range_overlap} {session_filter}
+                 FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
                  ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}"
             ),
             args,
@@ -2417,7 +2423,11 @@ pub(crate) async fn session_detail(
                 started_at, ended_at, last_activity_at, status,
                 message_count, tool_call_count, subagent_count, model_call_count,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd
+                reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                COALESCE((SELECT p.id FROM sessions p
+                          WHERE p.id = sessions.parent_session_id
+                             OR p.source_session_id = sessions.parent_session_id),
+                         sessions.parent_session_id)
              FROM sessions WHERE id = ?1",
             [&id],
             |r| {
@@ -2446,6 +2456,7 @@ pub(crate) async fn session_detail(
                     "reported_cost_micro_usd": r.get::<_, Option<i64>>(21)?,
                     "calculated_cost_micro_usd": r.get::<_, Option<i64>>(22)?,
                     "estimated_cost_micro_usd": r.get::<_, Option<i64>>(23)?,
+                    "parent_session_id": r.get::<_, Option<String>>(24)?,
                     "startup_command": serde_json::Value::Null,
                 }))
             },
@@ -2591,13 +2602,19 @@ pub(crate) async fn session_subagents(
                 .map(String::from)
         })
         .collect();
-    let children: Vec<serde_json::Value> = if child_ids.is_empty() {
-        Vec::new()
+    let (children, totals): (Vec<serde_json::Value>, serde_json::Value) = if child_ids.is_empty() {
+        (Vec::new(), serde_json::Value::Null)
     } else {
         let placeholders = child_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, source_session_id, title, primary_model_normalized, message_count, model_call_count, input_tokens, output_tokens
-             FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})"
+            "SELECT id, source_session_id, title, primary_model_normalized, message_count, tool_call_count, model_call_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                    started_at, last_activity_at, status,
+                    CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
+                         THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms
+             FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})
+             ORDER BY started_at, id"
         );
         let mut params: Vec<&str> = Vec::new();
         for id in &child_ids {
@@ -2615,16 +2632,74 @@ pub(crate) async fn session_subagents(
                     "title": r.get::<_, Option<String>>(2)?,
                     "model": r.get::<_, Option<String>>(3)?,
                     "message_count": r.get::<_, i64>(4)?,
-                    "model_call_count": r.get::<_, i64>(5)?,
-                    "input_tokens": r.get::<_, Option<i64>>(6)?,
-                    "output_tokens": r.get::<_, Option<i64>>(7)?,
+                    "tool_call_count": r.get::<_, i64>(5)?,
+                    "model_call_count": r.get::<_, i64>(6)?,
+                    "input_tokens": r.get::<_, Option<i64>>(7)?,
+                    "output_tokens": r.get::<_, Option<i64>>(8)?,
+                    "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
+                    "cache_write_tokens": r.get::<_, Option<i64>>(10)?,
+                    "reasoning_tokens": r.get::<_, Option<i64>>(11)?,
+                    "reported_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
+                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+                    "estimated_cost_micro_usd": r.get::<_, Option<i64>>(14)?,
+                    "started_at": r.get::<_, String>(15)?,
+                    "last_activity_at": r.get::<_, Option<String>>(16)?,
+                    "status": r.get::<_, String>(17)?,
+                    "duration_ms": r.get::<_, Option<i64>>(18)?,
                 }))
             })
         );
-        rows.filter_map(|r| r.ok()).collect()
+        let children: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        // 合计：Token 直接求和；费用沿用列表口径（calculated 优先、回退 estimated），
+        // 任一子会话有可用费用才给出合计，否则为不可用。
+        let sum_opt = |key: &str| -> i64 {
+            children
+                .iter()
+                .map(|c| c.get(key).and_then(|v| v.as_i64()).unwrap_or(0))
+                .sum()
+        };
+        let mut cost_total = 0i64;
+        let mut cost_available = false;
+        let mut reported_total = 0i64;
+        let mut calculated_total = 0i64;
+        let mut estimated_total = 0i64;
+        for child in &children {
+            let reported = child
+                .get("reported_cost_micro_usd")
+                .and_then(|v| v.as_i64());
+            let calculated = child
+                .get("calculated_cost_micro_usd")
+                .and_then(|v| v.as_i64());
+            let estimated = child
+                .get("estimated_cost_micro_usd")
+                .and_then(|v| v.as_i64());
+            reported_total += reported.unwrap_or(0);
+            calculated_total += calculated.unwrap_or(0);
+            estimated_total += estimated.unwrap_or(0);
+            if let Some(cost) = calculated.or(estimated) {
+                cost_total += cost;
+                cost_available = true;
+            }
+        }
+        let totals = serde_json::json!({
+            "children": children.len(),
+            "model_calls": sum_opt("model_call_count"),
+            "messages": sum_opt("message_count"),
+            "input_tokens": sum_opt("input_tokens"),
+            "output_tokens": sum_opt("output_tokens"),
+            "cache_read_tokens": sum_opt("cache_read_tokens"),
+            "cache_write_tokens": sum_opt("cache_write_tokens"),
+            "reasoning_tokens": sum_opt("reasoning_tokens"),
+            "cost_micro_usd": if cost_available { serde_json::json!(cost_total) } else { serde_json::Value::Null },
+            "reported_cost_micro_usd": if reported_total > 0 { serde_json::json!(reported_total) } else { serde_json::Value::Null },
+            "calculated_cost_micro_usd": if calculated_total > 0 { serde_json::json!(calculated_total) } else { serde_json::Value::Null },
+            "estimated_cost_micro_usd": if estimated_total > 0 { serde_json::json!(estimated_total) } else { serde_json::Value::Null },
+        });
+        (children, totals)
     };
 
-    Json(serde_json::json!({ "relations": rels, "children": children })).into_response()
+    Json(serde_json::json!({ "relations": rels, "children": children, "totals": totals }))
+        .into_response()
 }
 
 pub(crate) async fn session_timeline(
@@ -3466,7 +3541,8 @@ fn overview_activity(
         .query_row(
             &format!(
                 "SELECT COUNT(*) FROM sessions s
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}"
+                 WHERE s.started_at >= ?1 AND s.started_at < ?2 {session_filter}
+                   AND s.parent_session_id IS NULL"
             ),
             params_from_iter(range_args(&from, &to, session_fargs.clone())),
             |r| r.get::<_, i64>(0),
@@ -3479,7 +3555,8 @@ fn overview_activity(
                 "SELECT COUNT(*) FROM sessions s
                  WHERE ((s.started_at >= ?1 AND s.started_at < ?2)
                     OR (s.started_at < ?2
-                        AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) >= ?1)) {session_filter}"
+                        AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) >= ?1)) {session_filter}
+                   AND s.parent_session_id IS NULL"
             ),
             params_from_iter(range_args(&from, &to, session_fargs.clone())),
             |r| r.get::<_, i64>(0),
@@ -3531,7 +3608,8 @@ fn overview_activity(
                          ELSE 0 END),0)
                  FROM sessions s
                  WHERE s.started_at < ?2
-                   AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) > ?1 {session_filter}"
+                   AND COALESCE(s.last_activity_at, s.ended_at, s.started_at) > ?1 {session_filter}
+                   AND s.parent_session_id IS NULL"
             ),
             params_from_iter(range_args(&from, &to, session_fargs)),
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),

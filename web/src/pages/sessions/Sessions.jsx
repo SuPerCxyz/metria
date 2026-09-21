@@ -18,7 +18,8 @@ export default function Sessions() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const { nodeId, clientId, model } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model })
+  const [includeSubagents, setIncludeSubagents] = useState(false)
+  const params = usageRangeParams(range, { nodeId, clientId, model, includeSubagents })
   const [search, setSearch] = useState('')
   const nodeNames = useNodeNames()
 
@@ -57,8 +58,22 @@ const columns = [
 
   return (
     <>
-      <PageHeader title="会话" subtitle="查看所有 Agent 会话的 Token、费用与调用性能" />
-      <FilterBar searchPlaceholder="搜索标题或 Agent…" onSearch={setSearch} />
+      <PageHeader title="会话" subtitle="查看所有 Agent 会话的 Token、费用与调用性能；默认只统计主 Agent 会话" />
+      <FilterBar
+        searchPlaceholder="搜索标题或 Agent…"
+        onSearch={setSearch}
+        primary={
+          <label className="flex select-none items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+            <input
+              type="checkbox"
+              checked={includeSubagents}
+              onChange={(e) => setIncludeSubagents(e.target.checked)}
+              className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            包含子 Agent
+          </label>
+        }
+      />
       <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
         <DataTable
           columns={columns}

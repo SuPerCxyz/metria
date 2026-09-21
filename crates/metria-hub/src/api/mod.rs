@@ -419,6 +419,8 @@ pub struct RangeParams {
     pub allocation_mode: Option<String>,
     /// 汇总维度：node/client/model/provider/project（breakdown 用）。
     pub dim: Option<String>,
+    /// 会话列表是否包含子 Agent 会话（默认 false，只返回主会话）。
+    pub include_subagents: Option<bool>,
     /// SSE 通过 EventSource 连接，无法携带 Authorization 头，允许用 query 传会话 token。
     pub token: Option<String>,
 }
@@ -1082,6 +1084,22 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                 tracing::warn!(%error, event_id = %ev.event_id, "usage 即时计价失败，保留未定价状态");
             }
         }
+        // 子 Agent 会话：把父会话原始 id 尽量解析为主会话规范键（批次映射 → 库内查找）
+        if ev.kind == "session" {
+            if let Some(parent) = payload
+                .get("parent_session_id")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                let resolved = session_map
+                    .get(&parent)
+                    .cloned()
+                    .or_else(|| st.db.resolve_session_key_by_id(&parent))
+                    .unwrap_or(parent);
+                payload["parent_session_id"] = serde_json::json!(resolved);
+            }
+        }
         let v = &payload;
         let node = v
             .get("node_id")
@@ -1153,7 +1171,12 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
             Ok(is_new) => {
                 if is_new {
                     accepted.push(ev.event_id.clone());
-                    let _ = st.db.rollup_event(&ev.kind, v);
+                    // 子 Agent 会话不计入会话汇总（session_count 等），其 call/usage 照常计入
+                    let is_subagent_session = ev.kind == "session"
+                        && v.get("parent_session_id").is_some_and(|x| !x.is_null());
+                    if !is_subagent_session {
+                        let _ = st.db.rollup_event(&ev.kind, v);
+                    }
                     publish_ingest(st, &ev.kind);
                     // 仅在事件首次落库时推进来源新鲜度，避免重传回写
                     if let Some(raw_id) = v

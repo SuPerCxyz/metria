@@ -78,5 +78,6 @@ export function usageRangeParams(range, filters = {}) {
     node_id: filters.nodeId || undefined,
     client_id: filters.clientId || undefined,
     model: filters.model || undefined,
+    include_subagents: filters.includeSubagents ? true : undefined,
   }
 }

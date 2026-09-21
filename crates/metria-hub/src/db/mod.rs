@@ -1636,6 +1636,32 @@ impl HubDb {
         .ok()
     }
 
+    /// 从 subagent_relations 回填历史子会话的 `parent_session_id`（幂等：只填空值）。
+    ///
+    /// 关系表的 `session_id` 已是父会话规范键；child_session_id 为原始子会话 id，
+    /// 与 `sessions.source_session_id`/`id` 匹配。返回回填行数。
+    pub fn backfill_subagent_parents(&self) -> Result<usize, StorageError> {
+        let c = self.conn();
+        let n = c
+            .execute(
+                "UPDATE sessions SET parent_session_id = (
+                     SELECT r.session_id FROM subagent_relations r
+                     WHERE r.child_session_id = sessions.source_session_id
+                        OR r.child_session_id = sessions.id
+                     LIMIT 1
+                 )
+                 WHERE parent_session_id IS NULL
+                   AND EXISTS (
+                     SELECT 1 FROM subagent_relations r
+                     WHERE r.child_session_id = sessions.source_session_id
+                        OR r.child_session_id = sessions.id
+                   )",
+                [],
+            )
+            .map_err(StorageError::from)?;
+        Ok(n)
+    }
+
     /// 批次内映射：ULID 会话 id → 规范键。
     pub fn session_key_map(&self, v: &Value) -> HashMap<String, String> {
         let mut m = HashMap::new();
