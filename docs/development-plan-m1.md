@@ -54,6 +54,29 @@
 | 热力图悬浮提示：单元格悬浮/聚焦显示该时段 Token 与请求数（OpenSpec `heatmap-hover-metrics`） | ✅ 实现与门禁完成，已部署 lstable | 2026-09-19 |
 | 重复行清理后的 rollup 修复：停机用 SQL 一次性重建 hourly/daily（25s，明细/rollup 调用数与 Token 完全一致）；清理全量重建与 6h 对账并发互相覆盖的触发方式（已回填完整性版本，仅按 24h 对账自愈） | ✅ 已执行并校验 | 2026-09-19 |
 | rollup 重建并发彻底修复：`HubDb` 新增重建锁串行化（启动全量阻塞获取、6h 对账 `try` 获取忙时跳过）；逐行重放改为单事务批量 SQL（含 session/call/usage/traffic 四类），全量重建回到秒级 | ✅ 实现与门禁完成，已部署 lstable；上线后对账触发重建 115 行秒级完成，24h 对账 drift=0，流量 rollup 一并恢复 | 2026-09-19 |
+| 筛选与热力图提示修复：顶栏全局筛选移除项目、Agent/模型候选只随所选时间范围收敛且节点全列；热力图悬浮提示移出横向滚动容器并按实际宽度夹取，不再被裁剪 | ✅ 已部署 lstable（Hub API 实测 + 浏览器 UI 验收全部通过） | 2026-09-21 |
+| Agent 轮询扫描 I/O 与内存优化：未变化来源零读取、解析上下文快照随游标持久化、单轮字节预算分窗续扫、游标批量推进（≤256/批）、每轮 malloc_trim（OpenSpec `optimize-agent-poll-io`） | ✅ 已部署本机 Agent 与 lstable Hub；实测每轮读取 ~0.2MB（原 ~150MB）、磁盘实读归零、RSS 16MB | 2026-09-21 |
+
+### Agent 轮询扫描 I/O 与内存优化记录（2026-09-21）
+
+- 根因：无状态轮询 Agent 每轮对**全部**来源做解析上下文回溯读（Codex/Claude 每文件最多 2×1MiB，
+  窗口未命中时扩大到整段已消费区间），与文件是否有新字节无关；旧 Agent 实测 `rchar` 3.28TB、
+  磁盘实读 538GB、systemd cgroup Memory 463MB（其中 file/page cache 355MB，峰值 1.1GB）、
+  `VmData` 47MB，并有 22MB 匿名页被换出。
+- 实现：`JsonlCursor.adapter_state` 保存最小解析上下文快照（Codex 会话元数据/最近 `turn_context`/
+  未完成调用计时；Claude `last_user_at`），随「确认后推进游标」持久化，跨轮与重启零回溯，
+  快照缺失时回退有界回溯且结果与快照路径一致；JSONL 未变化来源（inode+size 一致）零读取，
+  inode 变化或截断从头重扫；JSONL 单来源单轮 16MiB、OpenCode v2 单窗 8MiB/单轮 16MiB 字节预算
+  跨轮续扫（v1 legacy 同规则）；游标按协议上限 256 条/请求批量推进（失败源不推进）；
+  每轮结束 `malloc_trim`；上传分块改为移动语义避免整批克隆。
+- 验证：适配器单测覆盖「快照 vs 回溯等价、未变化零事件、轮转复位、预算分窗不重不漏、
+  游标批量分块」；真实客户端数据（260 Codex rollout + 12 Claude 会话 + 9.3GB OpenCode DB）
+  经独立 Hub 全量补采后稳态每轮读取 0–0.4MB、重启后首轮无回溯、事件无重复（Hub 幂等）；
+  游标 JSON 最大 2.3KB（协议上限 64KiB）。
+- 部署与实测：本机 `/usr/local/bin/metria` 更新（旧版备份 `metria.bak-20260921`），
+  lstable hub 更新 `dev-latest`（部署前备份 `deploy-before-20260921-agent-io.db.zst`）。
+  生产实测：每 95s `rchar` 221KiB（旧版约 2.25MB/s）、磁盘实读 0、`VmRSS` 16.0MB、
+  `VmData` 15.3MB；lstable 游标与来源 `last_scan_at` 正常刷新。
 
 ### 推理 Token 与缓存命中率口径修复记录（2026-09-16）
 
