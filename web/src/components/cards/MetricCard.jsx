@@ -15,9 +15,9 @@ export default function MetricCard({ label, value, delta, deltaTone, sub, hint, 
           <span
             className={`inline-flex shrink-0 items-center text-xs font-medium px-2 py-0.5 rounded-full ${
               deltaTone === 'up'
-                ? 'text-white bg-emerald-600'
+                ? 'text-white bg-emerald-500'
                 : deltaTone === 'down'
-                ? 'text-white bg-red-600'
+                ? 'text-white bg-red-500'
                 : 'text-white bg-gray-500'
             }`}
           >

@@ -4,9 +4,9 @@ import React from 'react'
 import { statusTone } from '../../services/format'
 
 const toneClass = {
-  success: 'bg-emerald-600 text-white',
-  danger: 'bg-red-600 text-white',
-  warning: 'bg-amber-600 text-white',
+  success: 'bg-emerald-500 text-white',
+  danger: 'bg-red-500 text-white',
+  warning: 'bg-amber-500 text-white',
   muted: 'bg-gray-500 text-white',
 }
 
@@ -32,9 +32,9 @@ export default function StatusBadge({ status, dot = true }) {
 // 数据质量标记：精确值 / 估算值 / 部分缺失
 export function DataQualityBadge({ kind }) {
   const map = {
-    exact: { label: '精确值', cls: 'bg-emerald-600 text-white' },
-    estimated: { label: '估算值', cls: 'bg-sky-600 text-white' },
-    partial: { label: '部分缺失', cls: 'bg-amber-600 text-white' },
+    exact: { label: '精确值', cls: 'bg-emerald-500 text-white' },
+    estimated: { label: '估算值', cls: 'bg-sky-500 text-white' },
+    partial: { label: '部分缺失', cls: 'bg-amber-500 text-white' },
     missing: { label: '价格未配置', cls: 'bg-gray-500 text-white' },
   }
   const m = map[kind] || map.missing

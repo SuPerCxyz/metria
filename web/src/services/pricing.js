@@ -76,8 +76,8 @@ export const RULE_SOURCE_FILTERS = [
 ]
 
 const RULE_KIND_META = {
-  link: { label: '价格关联', className: 'bg-violet-600 text-white' },
-  user: { label: '用户价格', className: 'bg-emerald-600 text-white' },
+  link: { label: '价格关联', className: 'bg-violet-500 text-white' },
+  user: { label: '用户价格', className: 'bg-emerald-500 text-white' },
   openrouter: { label: 'OpenRouter', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
   litellm: { label: 'LiteLLM', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
   custom: { label: '自定义目录', className: 'bg-gray-100 text-gray-600 dark:bg-gray-700/40 dark:text-gray-300' },
