@@ -18,8 +18,8 @@ const PAGE_SIZE = 100
 export default function Calls() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const rangeKey = q(params)
   const [search, setSearch] = useState('')
   const [cursor, setCursor] = useState(null)

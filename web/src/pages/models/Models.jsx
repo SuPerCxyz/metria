@@ -15,8 +15,8 @@ import { fmtTokensShort, fmtUsd, fmtPct100, fmtDuration, sumTokens, sumCosts } f
 export default function Models() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const [search, setSearch] = useState('')
 
   const query = useQuery(`models${q(params)}`, () => api(`/models${q(params)}`))

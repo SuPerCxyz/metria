@@ -306,12 +306,14 @@ async fn full_ingest_rollup_query_cycle() {
     );
     assert!(overview["active_duration_ms"].is_null());
 
-    let filter_options: Value = ureq::get(&format!("{base}/api/v1/usage/filter-options"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-        .unwrap()
-        .into_json()
-        .unwrap();
+    let filter_options: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/filter-options?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
     assert!(filter_options["agents"]
         .as_array()
         .unwrap()
@@ -322,11 +324,34 @@ async fn full_ingest_rollup_query_cycle() {
         .unwrap()
         .iter()
         .any(|v| v["id"] == "claude-sonnet-4.5"));
-    assert!(filter_options["projects"]
+    assert!(filter_options["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|v| v["id"] == "demo-project"));
+        .any(|v| v["id"] == "e2e-node"));
+
+    // 时间范围外：Agent 与模型候选为空，节点仍全部列出（节点不按范围收窄）。
+    let out_of_range_options: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/filter-options?from=2026-08-10T00:00:00Z&to=2026-08-11T00:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert!(out_of_range_options["agents"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(out_of_range_options["models"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(out_of_range_options["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["id"] == "e2e-node"));
 
     let project_overview: Value = ureq::get(&format!(
         "{base}/api/v1/overview?from={from}&to={to}&project_id=demo-project"

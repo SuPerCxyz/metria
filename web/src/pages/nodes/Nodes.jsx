@@ -26,8 +26,8 @@ export default function Nodes() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const { notify } = useToast()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const [search, setSearch] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [created, setCreated] = useState(null) // { node_id, name, token, hub_url, docker_command, native_command }

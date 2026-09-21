@@ -19,10 +19,10 @@ import { fmtChange, changeTone, fmtPct, fmtUsd } from '../../services/format'
 export default function Costs() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const previousRange = useMemo(() => previousTimeRange(range), [range])
-  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model, projectId })
+  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
 
   const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
   const previousOverview = useQuery(`cost-overview-previous${q(previousParams)}`, () => api(`/overview${q(previousParams)}`), { enabled: Boolean(previousRange) })

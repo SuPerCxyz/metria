@@ -17,8 +17,8 @@ import { fmtDateTime, fmtDuration, fmtSessionTitle, fmtTokensShort, fmtUsd, sumT
 export default function Sessions() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const [search, setSearch] = useState('')
   const nodeNames = useNodeNames()
 

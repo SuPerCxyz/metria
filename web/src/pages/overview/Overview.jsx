@@ -39,8 +39,8 @@ const DAILY_MIN_SPAN_MS = 7 * 24 * 60 * 60 * 1000
 export default function Overview() {
   const { range, setRange } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const [trendTab, setTrendTab] = useState('tokens')
   const [dim, setDim] = useState('all')
   const [dailyMetric, setDailyMetric] = useState('tokens')
@@ -56,7 +56,7 @@ export default function Overview() {
   const overviewParams = { ...params, ...excludedParams }
   const seriesParams = { ...params, dim: dim === 'all' ? undefined : dim }
   const previousRange = useMemo(() => previousTimeRange(range), [range])
-  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model, projectId })
+  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
 
   const overview = useQuery(`overview${q(overviewParams)}`, () => api(`/overview${q(overviewParams)}`))
   const performance = useQuery(`overview-performance${q(overviewParams)}`, () => api(`/usage/performance${q(overviewParams)}`))
@@ -69,10 +69,10 @@ export default function Overview() {
   const byDim = useQuery(`breakdown-cost${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`breakdown-client${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
   const dailyRange = useMemo(() => withMinimumSpan(range, DAILY_MIN_SPAN_MS), [range])
-  const dailyParams = usageRangeParams(dailyRange, { nodeId, clientId, model, projectId })
+  const dailyParams = usageRangeParams(dailyRange, { nodeId, clientId, model })
   const daily = useQuery(`daily${q(dailyParams)}`, () => api(`/usage/daily${q(dailyParams)}`))
   const heatmapRange = useMemo(() => currentWeekRange(range.timezone, new Date()), [range.timezone, range.to])
-  const heatmapParams = usageRangeParams(heatmapRange, { nodeId, clientId, model, projectId })
+  const heatmapParams = usageRangeParams(heatmapRange, { nodeId, clientId, model })
   const heatmap = useQuery(`heatmap${q(heatmapParams)}`, () => api(`/usage/heatmap${q(heatmapParams)}`))
 
   const toggleHiddenDimension = useCallback((dimension) => {

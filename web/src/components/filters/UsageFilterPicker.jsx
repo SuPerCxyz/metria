@@ -1,9 +1,11 @@
-// 全局用量筛选：Agent、模型、项目、节点。状态由 NodeFilterProvider 跨页面保持。
+// 全局用量筛选：Agent、模型、节点。状态由 NodeFilterProvider 跨页面保持。
+// Agent 与模型候选只包含当前时间范围内有数据的项，节点始终列出全部已登记节点。
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useQuery } from '../../hooks/useQuery'
-import { api } from '../../services/api'
+import { useTimeRange } from '../../hooks/useTimeRange'
+import { api, q, rangeParams } from '../../services/api'
 
 const EMPTY = []
 
@@ -50,15 +52,17 @@ export default function UsageFilterPicker({ className = '' }) {
     }
   }, [open])
   const {
-    nodeId, clientId, model, projectId,
-    setNodeId, setClientId, setModel, setProjectId, clearFilters,
+    nodeId, clientId, model,
+    setNodeId, setClientId, setModel, clearFilters,
   } = useNodeFilter()
-  const options = useQuery('usage-filter-options', () => api('/usage/filter-options'))
+  const { range } = useTimeRange()
+  // 候选项跟随全局时间范围刷新：Agent/模型只列范围内有数据的，节点全列。
+  const filterRange = q(rangeParams(range))
+  const options = useQuery(`usage-filter-options${filterRange}`, () => api(`/usage/filter-options${filterRange}`))
   const nodes = useMemo(() => withSelected(options.data?.nodes || EMPTY, nodeId), [options.data, nodeId])
   const agents = useMemo(() => withSelected(options.data?.agents || EMPTY, clientId), [options.data, clientId])
   const models = useMemo(() => withSelected(options.data?.models || EMPTY, model), [options.data, model])
-  const projects = useMemo(() => withSelected(options.data?.projects || EMPTY, projectId), [options.data, projectId])
-  const active = [nodeId, clientId, model, projectId].filter(Boolean).length
+  const active = [nodeId, clientId, model].filter(Boolean).length
 
   return (
     <div ref={boxRef} className={`relative shrink-0 ${className}`}>
@@ -84,7 +88,6 @@ export default function UsageFilterPicker({ className = '' }) {
             <SelectField label="节点" value={nodeId} onChange={setNodeId} options={nodes} disabled={options.loading && nodes.length === 0} />
             <SelectField label="Agent" value={clientId} onChange={setClientId} options={agents} disabled={options.loading && agents.length === 0} />
             <SelectField label="模型" value={model} onChange={setModel} options={models} disabled={options.loading && models.length === 0} />
-            <SelectField label="项目" value={projectId} onChange={setProjectId} options={projects} disabled={options.loading && projects.length === 0} />
           </div>
           {options.error && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">筛选选项加载失败，可稍后刷新。</p>}
         </div>

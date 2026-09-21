@@ -29,8 +29,8 @@ const TABS = [
 export default function Analytics() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
-  const { nodeId, clientId, model, projectId } = useNodeFilter()
-  const params = usageRangeParams(range, { nodeId, clientId, model, projectId })
+  const { nodeId, clientId, model } = useNodeFilter()
+  const params = usageRangeParams(range, { nodeId, clientId, model })
   const [tab, setTab] = useState('tokens')
   const trendTab = 'tokens'
   const [hiddenByDimension, setHiddenByDimension] = useState({ client: [], model: [] })
@@ -48,7 +48,7 @@ export default function Analytics() {
     : params
   const detailSeriesParams = { ...params, dim: detailDimension }
   const previousRange = useMemo(() => previousTimeRange(range), [range])
-  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model, projectId })
+  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
   const previousScopedParams = { ...previousParams, ...excludedParams }
 
   const overview = useQuery(`overview${q(scopedParams)}`, () => api(`/overview${q(scopedParams)}`))

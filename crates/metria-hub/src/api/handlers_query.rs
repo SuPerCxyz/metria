@@ -319,9 +319,15 @@ pub(crate) async fn usage_timeseries(
     }
 }
 
-/// 全局筛选器选项。选项来自已登记的节点/客户端以及已观测的模型/项目，
-/// 不受当前筛选值影响，避免用户选择后选项把自己隐藏掉。
-pub(crate) async fn usage_filter_options(State(st): State<AppState>) -> Response {
+/// 全局筛选器选项：节点始终返回全部已登记节点；Agent 与模型只返回所选时间范围内
+/// 有数据的项（`model_calls.started_at` 或 `usage_events.timestamp`），避免提供当前
+/// 范围必然为空的候选项。选项不受当前筛选值影响，避免用户选择后选项把自己隐藏掉。
+pub(crate) async fn usage_filter_options(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    let (from, to) = parse_range(&p);
+    let bounds = [from.to_rfc3339(), to.to_rfc3339()];
     let c = st.db.conn();
     let mut node_stmt = q!(c.prepare("SELECT id, name FROM nodes ORDER BY name, id"));
     let node_rows = q!(node_stmt.query_map([], |r| {
@@ -333,13 +339,19 @@ pub(crate) async fn usage_filter_options(State(st): State<AppState>) -> Response
     let nodes: Vec<serde_json::Value> = node_rows.filter_map(Result::ok).collect();
 
     let mut agent_stmt = q!(c.prepare(
-        "SELECT id, label FROM (
-             SELECT id, display_name AS label FROM clients
-             UNION
-             SELECT client_id AS id, client_id AS label FROM model_calls
-         ) ORDER BY label, id",
+        "SELECT id, MAX(label) AS label FROM (
+             SELECT mc.client_id AS id, COALESCE(cl.display_name, mc.client_id) AS label
+             FROM model_calls mc LEFT JOIN clients cl ON cl.id = mc.client_id
+             WHERE mc.started_at >= ?1 AND mc.started_at < ?2
+               AND mc.client_id IS NOT NULL AND mc.client_id != ''
+             UNION ALL
+             SELECT ue.client_id AS id, COALESCE(cl.display_name, ue.client_id) AS label
+             FROM usage_events ue LEFT JOIN clients cl ON cl.id = ue.client_id
+             WHERE ue.timestamp >= ?1 AND ue.timestamp < ?2
+               AND ue.client_id IS NOT NULL AND ue.client_id != ''
+         ) GROUP BY id ORDER BY label, id",
     ));
-    let agent_rows = q!(agent_stmt.query_map([], |r| {
+    let agent_rows = q!(agent_stmt.query_map(params_from_iter(bounds.clone()), |r| {
         Ok(serde_json::json!({
             "id": r.get::<_, String>(0)?,
             "label": r.get::<_, String>(1)?,
@@ -348,28 +360,23 @@ pub(crate) async fn usage_filter_options(State(st): State<AppState>) -> Response
     let agents: Vec<serde_json::Value> = agent_rows.filter_map(Result::ok).collect();
 
     let mut model_stmt = q!(c.prepare(
-        "SELECT DISTINCT model_normalized FROM model_calls
-         WHERE model_normalized IS NOT NULL AND model_normalized != ''
-         ORDER BY model_normalized",
+        "SELECT model_normalized FROM (
+             SELECT model_normalized FROM model_calls
+             WHERE started_at >= ?1 AND started_at < ?2
+               AND model_normalized IS NOT NULL AND model_normalized != ''
+             UNION
+             SELECT model_normalized FROM usage_events
+             WHERE timestamp >= ?1 AND timestamp < ?2
+               AND model_normalized IS NOT NULL AND model_normalized != ''
+         ) ORDER BY model_normalized",
     ));
-    let model_rows = q!(model_stmt.query_map([], |r| {
+    let model_rows = q!(model_stmt.query_map(params_from_iter(bounds), |r| {
         let value = r.get::<_, String>(0)?;
         Ok(serde_json::json!({ "id": value, "label": value }))
     }));
     let models: Vec<serde_json::Value> = model_rows.filter_map(Result::ok).collect();
 
-    let mut project_stmt = q!(c.prepare(
-        "SELECT DISTINCT project_id FROM model_calls
-         WHERE project_id IS NOT NULL AND project_id != ''
-         ORDER BY project_id",
-    ));
-    let project_rows = q!(project_stmt.query_map([], |r| {
-        let value = r.get::<_, String>(0)?;
-        Ok(serde_json::json!({ "id": value, "label": value }))
-    }));
-    let projects: Vec<serde_json::Value> = project_rows.filter_map(Result::ok).collect();
-
-    Json(serde_json::json!({ "nodes": nodes, "agents": agents, "models": models, "projects": projects })).into_response()
+    Json(serde_json::json!({ "nodes": nodes, "agents": agents, "models": models })).into_response()
 }
 
 /// 按用户时区聚合最近可观测的模型调用，返回固定 7×24 网格。

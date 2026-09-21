@@ -1,6 +1,6 @@
 // 星期 × 小时活跃热力图，单元格点击由调用方负责下钻；悬浮显示该时段 Token 与请求数。
 
-import React, { useMemo, useRef, useState } from 'react'
+import React, { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Segmented from '../ui/Segmented'
 import { fmtDateTime, fmtDuration, fmtTokensShort, fmtUsd } from '../../services/format'
 
@@ -33,24 +33,41 @@ const hourRange = (hour) => `${String(hour).padStart(2, '0')}:00–${String(hour
 export default function ActivityHeatmap({ cells = [], metric, onMetricChange, onCellClick, selectedCell = null, loading = false, error = null }) {
   const byIndex = useMemo(() => new Map(cells.map((cell) => [cell.weekday * 24 + cell.hour, cell])), [cells])
   const max = useMemo(() => Math.max(...cells.map((cell) => valueOf(cell, metric) || 0), 0), [cells, metric])
-  const wrapRef = useRef(null)
+  const rootRef = useRef(null)
+  const tooltipRef = useRef(null)
   const [hover, setHover] = useState(null)
 
+  // 提示挂在组件根节点下、位于横向滚动容器之外，避免向上超出被 overflow 裁剪。
   const showTooltip = (event, cell, weekday) => {
-    const wrap = wrapRef.current
-    if (!wrap) return
+    const root = rootRef.current
+    if (!root) return
     const rect = event.currentTarget.getBoundingClientRect()
-    const wrapRect = wrap.getBoundingClientRect()
+    const rootRect = root.getBoundingClientRect()
     setHover({
       cell,
       weekday,
-      left: rect.left - wrapRect.left + rect.width / 2,
-      top: rect.top - wrapRect.top,
+      left: rect.left - rootRect.left + rect.width / 2,
+      top: rect.top - rootRect.top,
     })
   }
 
+  // 按提示实际宽度夹取水平位置，避免靠近 0/23 点时越出组件被页面横向裁剪。
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    const tip = tooltipRef.current
+    if (!root || !tip || !hover) return
+    const half = tip.offsetWidth / 2
+    const min = half + 4
+    const max = Math.max(min, root.clientWidth - half - 4)
+    const clamped = Math.min(Math.max(hover.left, min), max)
+    if (Math.abs(clamped - hover.left) > 0.5) {
+      setHover((current) => (current ? { ...current, left: clamped } : current))
+    }
+  }, [hover])
+
   const tooltip = hover && (
     <div
+      ref={tooltipRef}
       className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-gray-700 dark:bg-gray-800"
       style={{ left: hover.left, top: hover.top - 6 }}
       role="tooltip"
@@ -72,7 +89,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
   )
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col" ref={rootRef}>
       <div className="mb-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">小时活跃热力图</h2>
@@ -80,7 +97,7 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
         </div>
         <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">固定显示本周；悬浮查看该时段 Token 与请求数，点击有数据的单元格查看详情</p>
       </div>
-      {loading && cells.length === 0 ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-amber-600 dark:text-amber-400">热力图加载失败，请刷新重试。</div> : <div className="relative flex-1 overflow-x-auto pb-1" ref={wrapRef} onMouseLeave={() => setHover(null)}>
+      {loading && cells.length === 0 ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-gray-400 dark:text-gray-500">加载中…</div> : error ? <div className="flex flex-1 items-center justify-center py-12 text-center text-sm text-amber-600 dark:text-amber-400">热力图加载失败，请刷新重试。</div> : <div className="relative flex-1 overflow-x-auto pb-1" onMouseLeave={() => setHover(null)}>
         <div className="grid h-full w-full grid-rows-[auto_repeat(7,1fr)] grid-cols-[2.5rem_repeat(24,minmax(0.75rem,1fr))] gap-1 text-[10px] text-gray-400 dark:text-gray-500">
           <span aria-hidden="true" />
           {Array.from({ length: 24 }, (_, hour) => <span key={hour} className="text-center tabular-nums">{hour}</span>)}
@@ -111,8 +128,8 @@ export default function ActivityHeatmap({ cells = [], metric, onMetricChange, on
             </React.Fragment>
           ))}
         </div>
-        {tooltip}
       </div>}
+      {!error && !(loading && cells.length === 0) && tooltip}
     </div>
   )
 }
