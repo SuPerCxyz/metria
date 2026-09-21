@@ -83,7 +83,7 @@ export default function DataTable({ columns, data, pageSize = 12, onRowClick, em
                       className="inline-flex items-center gap-1 rounded-sm hover:text-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 dark:hover:text-gray-200"
                     >
                       {col.label}
-                      {sortKey === col.key && (sortDir === 1 ? <span aria-hidden="true" className="text-xs leading-none">▲</span> : <span aria-hidden="true" className="text-xs leading-none">▼</span>)}
+                      <span aria-hidden="true" className="text-[10px] leading-none text-gray-400 dark:text-gray-500">▲▼</span>
                     </button>
                   ) : <span>{col.label}</span>}
                 </th>

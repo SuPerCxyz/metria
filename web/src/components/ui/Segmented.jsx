@@ -18,10 +18,10 @@ export default function Segmented({ items, value, onChange, className }) {
             onClick={() => onChange(key)}
             aria-pressed={active}
             className={cn(
-              'px-3 py-1.5 text-sm font-medium rounded-md transition-colors',
+              'px-3 py-1 text-sm font-medium rounded-md transition-colors',
               active
-                ? 'bg-indigo-600 dark:bg-indigo-500 text-white shadow-sm'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                ? 'bg-indigo-700 dark:bg-indigo-600 text-white shadow-sm'
+                : 'text-gray-600 dark:text-gray-300 hover:text-gray-800 dark:hover:text-gray-100'
             )}
           >
             {label}

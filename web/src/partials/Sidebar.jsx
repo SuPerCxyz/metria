@@ -164,10 +164,10 @@ function Sidebar({ sidebarOpen, setSidebarOpen }) {
                         onClick={closeSidebar}
                         title={expanded ? undefined : item.label}
                         className={cn(
-                          'flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-medium transition-colors',
+                          'flex items-center gap-3 px-3 py-2 rounded-lg text-base font-medium transition-colors',
                           active
-                            ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400'
-                            : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-800 dark:hover:text-gray-100'
+                            ? 'bg-indigo-600 text-white dark:bg-indigo-500 dark:text-white'
+                            : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-gray-100'
                         )}
                       >
                         {item.icon}
