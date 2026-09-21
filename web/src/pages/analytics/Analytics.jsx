@@ -253,7 +253,8 @@ export default function Analytics() {
             <ErrorState error={performance.error} onRetry={performance.refresh} />
           ) : performanceHasSamples ? (
             <>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+              {/* 自适应列数：有几张可采集卡片就占满几列，避免大屏出现整块空白 */}
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-[repeat(auto-fit,minmax(18rem,1fr))]">
                 {performanceMetric('ttft') && <PerformanceCard
                   label="首个可观察输出"
                   value={fmtDuration(performance.data.ttft.avg_ms)}
@@ -263,8 +264,6 @@ export default function Analytics() {
                   sourceLabel={performanceSourceLabel(performance.data?.ttft?.sources)}
                   hint="调用开始到首个输出条目；日志推导为条目时间戳近似。"
                 />}
-              </div>
-              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 {performance.data?.reliability?.success_rate != null && <SimpleMetric label="成功率" value={`${(performance.data.reliability.success_rate * 100).toFixed(1)}%`} />}
               </div>
               <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">
