@@ -57,7 +57,9 @@
 | 筛选与热力图提示修复：顶栏全局筛选移除项目、Agent/模型候选只随所选时间范围收敛且节点全列；热力图悬浮提示移出横向滚动容器并按实际宽度夹取，不再被裁剪 | ✅ 已部署 lstable（Hub API 实测 + 浏览器 UI 验收全部通过） | 2026-09-21 |
 | Agent 轮询扫描 I/O 与内存优化：未变化来源零读取、解析上下文快照随游标持久化、单轮字节预算分窗续扫、游标批量推进（≤256/批）、每轮 malloc_trim（OpenSpec `optimize-agent-poll-io`） | ✅ 已部署本机 Agent 与 lstable Hub；实测每轮读取 ~0.2MB（原 ~150MB）、磁盘实读归零、RSS 16MB | 2026-09-21 |
 | 日历周一起步与中文化：顶栏时间范围日历改为周一开头（表头 周一…周日）、标题/导航中文化 | ✅ 本地实现与 UI 验收通过（表头周一至周日、中文标题/导航、交互无回归），待部署 lstable | 2026-09-21 |
-| 数据质量口径修复与来源新鲜度：用量来源分布只统计用量行并展示 Token 构成；ingest 按 pseudo→原始来源映射回写 `sources.last_event_at`，来源列表新增「最近数据」并按其倒序（OpenSpec `track-source-event-freshness`） | ✅ 实现与本地验证完成（e2e + API + UI 验收），待部署 lstable | 2026-09-21 |
+| 数据质量口径修复与来源新鲜度：用量来源分布只统计用量行并展示 Token 构成；ingest 按 pseudo→原始来源映射回写 `sources.last_event_at`，来源列表新增「最近数据」并按其倒序（OpenSpec `track-source-event-freshness`） | ✅ 已部署 lstable（e2e + API + UI 验收通过） | 2026-09-21 |
+| 导航与标签视觉收紧：左侧导航选中项改深靛蓝底白字并降低高度；页内 tab 选中项加深、高度收紧；状态/质量/涨跌/价格来源等圆角标签统一实底深色 + 白字（含深色模式） | ✅ 实现与 UI 验收通过（前后计算样式对比），待部署 lstable | 2026-09-21 |
+| 子 Agent 会话支持：OpenCode 子会话写入父级、Hub 会话汇总只计主会话（含幂等历史回填 + rollup 重建）、会话列表默认过滤并支持「包含子 Agent」、主会话详情展示子 Agent 合计与明细（OpenSpec `support-subagent-sessions`） | 🟡 实现与门禁完成，UI 验收中 | 2026-09-21 |
 
 ### Agent 轮询扫描 I/O 与内存优化记录（2026-09-21）
 
