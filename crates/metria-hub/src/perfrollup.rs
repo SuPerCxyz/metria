@@ -625,10 +625,7 @@ pub fn load_range(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Option<
         .ok()?;
     let mut out = Vec::new();
     for row in rows.flatten() {
-        match PerfHour::from_payload(&row.1) {
-            Some(value) => out.push(value),
-            None => return None,
-        }
+        out.push(PerfHour::from_payload(&row.1)?);
     }
     Some(out)
 }
