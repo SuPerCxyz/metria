@@ -100,8 +100,12 @@ impl HubDb {
         };
 
         let getn = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
-        // model_call_count 仅由 call 事件累计，避免与 session 携带值重复计数
+        // model_call_count 仅由 call 事件累计，避免与 session 携带值重复计数。
+        // 子 Agent 会话不计入会话汇总（与 rebuild 的 `parent_session_id IS NULL` 同口径），
+        // 否则增量路径与重建结果互相矛盾，对账会把一致的数据误判为漂移。
+        let child_session = kind == RollupKind::Session && !g("parent_session_id").is_empty();
         let (session_count, message_count, tool_count, subagent_count, call_count) = match kind {
+            RollupKind::Session if child_session => (0, 0, 0, 0, 0),
             RollupKind::Session => (
                 1,
                 getn("message_count"),
@@ -279,8 +283,12 @@ impl HubDb {
             let actual = self
                 .conn()
                 .query_row(
+                    // 会话计数与 rebuild 同为根会话口径：子 Agent 会话不计入 session_count，
+                    // 否则只要窗口内有子会话，对账就会永久误报漂移并触发无效重建。
                     "SELECT
-                        (SELECT COUNT(*) FROM sessions WHERE started_at >= ?1 AND started_at < ?2),
+                        (SELECT COUNT(*) FROM sessions
+                         WHERE started_at >= ?1 AND started_at < ?2
+                           AND parent_session_id IS NULL),
                         (SELECT COUNT(*) FROM model_calls WHERE started_at >= ?1 AND started_at < ?2),
                         (SELECT COALESCE(SUM(input_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2),
                         (SELECT COALESCE(SUM(output_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2),
@@ -343,17 +351,27 @@ impl HubDb {
     fn rebuild_rollups_locked(&self, days: i64) -> Result<usize, StorageError> {
         let _heap_release = crate::memory::HeapReleaseGuard;
         let since = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        // 归档水位下界：已归档区间的明细已删除，若允许重建先删这些 rollup 再从明细回填，
+        // 只会写成 0/空，静默毁掉「聚合数据完整保留」的承诺。
+        // 必须在取得连接锁**之前**读取——Mutex 不可重入，持锁再取锁会永久死锁。
+        let floor = crate::archive::watermark(self)
+            .map(|w| format!(" AND bucket >= '{w}'"))
+            .unwrap_or_default();
         let c = self.conn();
         c.execute("BEGIN IMMEDIATE", [])
             .map_err(StorageError::from)?;
         let result = (|| -> Result<usize, StorageError> {
             c.execute(
-                "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1)",
+                &format!(
+                    "DELETE FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1){floor}"
+                ),
                 [&since],
             )
             .map_err(StorageError::from)?;
             c.execute(
-                "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1)",
+                &format!(
+                    "DELETE FROM daily_rollups WHERE julianday(bucket) >= julianday(?1){floor}"
+                ),
                 [&since],
             )
             .map_err(StorageError::from)?;
@@ -712,6 +730,48 @@ mod tests {
         let report = db.reconcile_rollups(1).unwrap();
         assert!(report.drift_buckets == 0, "干净数据不应有漂移: {report:?}");
         assert!(report.buckets >= 1, "应有 bucket 被对账");
+    }
+
+    #[test]
+    fn reconcile_ignores_subagent_sessions() {
+        let db = test_db("reconcile-subagent");
+        let now = Utc::now();
+        let root = sess_json(
+            "sess-root",
+            &(now - chrono::Duration::hours(3)).to_rfc3339(),
+        );
+        let mut child = sess_json(
+            "sess-child",
+            &(now - chrono::Duration::hours(2)).to_rfc3339(),
+        );
+        child["parent_session_id"] = serde_json::json!("n1:sess-root");
+
+        db.upsert_session(&root).unwrap();
+        db.upsert_session(&child).unwrap();
+        db.rollup_event("session", &root).unwrap();
+        db.rollup_event("session", &child).unwrap();
+
+        // 增量路径与对账同为根会话口径：子会话不制造漂移，也就不会触发无效重建
+        let report = db.reconcile_rollups(1).unwrap();
+        assert_eq!(
+            report.drift_buckets, 0,
+            "存在子会话时对账不应误报漂移: {report:?}"
+        );
+
+        // 重建路径必须给出与增量路径相同的结果
+        db.rebuild_rollups(1).unwrap();
+        let report = db.reconcile_rollups(1).unwrap();
+        assert_eq!(report.drift_buckets, 0, "重建后仍应无漂移: {report:?}");
+
+        let sessions: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM hourly_rollups",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions, 1, "rollup 会话数应只含根会话，实际 {sessions}");
     }
 
     #[test]

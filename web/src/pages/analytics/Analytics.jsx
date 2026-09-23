@@ -10,12 +10,15 @@ import Segmented from '../../components/ui/Segmented'
 import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
 import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
+import { useVisibleQuery } from '../../hooks/useVisibleQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
 import { previousTimeRange } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
+import { quantileApprox } from '../../services/quantileApprox'
+import { ARCHIVED_UNAVAILABLE_LABEL, isActivityArchived } from '../../services/archiveRange'
 
 const TABS = [
   { key: 'tokens', label: 'Token' },
@@ -68,9 +71,21 @@ export default function Analytics() {
   )
   const latency = useQuery(`latency${q(scopedParams)}`, () => api(`/usage/latency${q(scopedParams)}`))
   const latencySeries = useQuery(`latency-ts${q(scopedParams)}`, () => api(`/usage/latency/timeseries${q(scopedParams)}`))
-  const performance = useQuery(`performance${q(scopedParams)}`, () => api(`/usage/performance${q(scopedParams)}`))
-  const performanceSeries = useQuery(`performance-ts${q(scopedParams)}`, () => api(`/usage/performance/timeseries${q(scopedParams)}`))
+  // 性能查询成本高：所在区域（性能分析）可见后才发起；时间序列跟随同一区域激活
+  const performance = useVisibleQuery(`performance${q(scopedParams)}`, () => api(`/usage/performance${q(scopedParams)}`))
+  const performanceSeries = useQuery(
+    `performance-ts${q(scopedParams)}`,
+    () => api(`/usage/performance/timeseries${q(scopedParams)}`),
+    { enabled: performance.ready }
+  )
   const nodeNames = useNodeNames()
+
+  // 分位数近似按**数据源**分别判定（字段缺失/旧后端按精确处理）：
+  //  - 延迟卡片 P50/P95/P99 的数据来自 /usage/latency（直方图合并 → 近似）；
+  //  - 延迟趋势来自 /usage/latency/timeseries（明细精确计算 → 不标注）。
+  // 联合判定会把精确的趋势图也标成近似，属于过度标注。
+  const quantileCardApprox = quantileApprox(latency.data, performance.data)
+  const quantileTrendApprox = quantileApprox(latencySeries.data)
 
   const latencyTrend = useMemo(() => {
     const pts = latencySeries.data?.series || []
@@ -162,6 +177,10 @@ export default function Analytics() {
     performanceMetric('ttft'),
   ].some(Boolean)
 
+  // 归档区间且带筛选时 sessions 由后端置 null（activity_archived_before 非 null）：
+  // 诚实标注为不可计算，绝不显示 —/0/无数据；水位为 null 时渲染路径不变。
+  const sessionsArchived = isActivityArchived(o.activity_archived_before, o.sessions)
+
   const modelItems = (byModel.data?.by || [])
     .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
     .map((m) => ({ id: m.dimension, name: m.dimension, value: sumTokens(m), cost: m.cost_micro_usd }))
@@ -205,7 +224,7 @@ export default function Analytics() {
             <MetricCard label="请求总数" value={fmtTokensShort(o.model_calls)} {...compare(o.model_calls, previous?.model_calls)} />
             <MetricCard label="成功请求" value={fmtTokensShort((o.model_calls ?? 0) - (o.failed_calls ?? 0))} {...compare((o.model_calls ?? 0) - (o.failed_calls ?? 0), previous ? (previous.model_calls ?? 0) - (previous.failed_calls ?? 0) : null)} sub={`失败 ${o.failed_calls ?? 0} 次`} />
             <MetricCard label="失败请求" value={fmtTokensShort(o.failed_calls ?? 0)} {...compare(o.failed_calls, previous?.failed_calls)} sub="状态非成功" />
-            <MetricCard label="平均请求频率" value={o.sessions > 0 ? ((o.model_calls ?? 0) / o.sessions).toFixed(1) : '—'} {...compare(o.sessions > 0 ? (o.model_calls ?? 0) / o.sessions : null, previous?.sessions > 0 ? (previous.model_calls ?? 0) / previous.sessions : null)} sub="每会话请求数" />
+            <MetricCard label="平均请求频率" value={sessionsArchived ? ARCHIVED_UNAVAILABLE_LABEL : (o.sessions > 0 ? ((o.model_calls ?? 0) / o.sessions).toFixed(1) : '—')} {...(sessionsArchived ? { delta: null, deltaTone: 'neutral' } : compare(o.sessions > 0 ? (o.model_calls ?? 0) / o.sessions : null, previous?.sessions > 0 ? (previous.model_calls ?? 0) / previous.sessions : null))} sub="每会话请求数" />
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">请求趋势</h2>
@@ -247,7 +266,7 @@ export default function Analytics() {
       )}
 
       {tab === 'latency' && (
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6" ref={performance.ref}>
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">性能分析</h2>
           {performance.loading ? <LoadingSkeleton rows={2} /> : performance.error ? (
             <ErrorState error={performance.error} onRetry={performance.refresh} />
@@ -291,13 +310,16 @@ export default function Analytics() {
           ) : (
             <>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                <LatencyCard label="P50" ms={latency.data.p50_ms} />
-                <LatencyCard label="P95" ms={latency.data.p95_ms} />
-                <LatencyCard label="P99" ms={latency.data.p99_ms} />
+                <LatencyCard label="P50" ms={latency.data.p50_ms} approx={quantileCardApprox} />
+                <LatencyCard label="P95" ms={latency.data.p95_ms} approx={quantileCardApprox} />
+                <LatencyCard label="P99" ms={latency.data.p99_ms} approx={quantileCardApprox} />
                 <LatencyCard label="平均" ms={latency.data.avg_ms} />
               </div>
               <div className="mt-4">
-                <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 mb-3">延迟趋势</h3>
+                <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 mb-3">
+                  延迟趋势
+                  {quantileTrendApprox && <QuantileApproxHint>P50/P95 近似</QuantileApproxHint>}
+                </h3>
                 {latencySeries.loading ? (
                   <LoadingSkeleton rows={3} />
                 ) : latencySeries.error ? (
@@ -361,7 +383,7 @@ function DetailAnalysis({
     <>
       <div className="grid grid-cols-12 gap-6">
         {sumTokens(overview) > 0 && <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} {...detailDelta(sumTokens(overview), previousOverview ? sumTokens(previousOverview) : null)} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />}
-        {(overview.model_calls ?? 0) > 0 && <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} {...detailDelta(overview.model_calls, previousOverview?.model_calls)} sub={`会话 ${fmtTokensShort(overview.sessions)}`} />}
+        {(overview.model_calls ?? 0) > 0 && <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} {...detailDelta(overview.model_calls, previousOverview?.model_calls)} sub={isActivityArchived(overview.activity_archived_before, overview.sessions) ? `会话 ${ARCHIVED_UNAVAILABLE_LABEL}` : `会话 ${fmtTokensShort(overview.sessions)}`} />}
         {isAvailable(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd) && <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} {...detailDelta(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd, previousOverview?.calculated_cost_micro_usd ?? previousOverview?.estimated_cost_micro_usd)} sub="当前范围" />}
         {latency?.avg_ms != null && <MetricCard label="平均日志时长" value={fmtDuration(latency.avg_ms)} sub="有记录的请求" />}
       </div>
@@ -392,12 +414,27 @@ function DetailAnalysis({
   )
 }
 
-function LatencyCard({ label, ms }) {
+function LatencyCard({ label, ms, approx = false }) {
   return (
     <div className="bg-gray-50 dark:bg-gray-700/30 rounded-xl p-4">
-      <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
+      <div className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-500">
+        <span>{label}</span>
+        {approx && <QuantileApproxHint />}
+      </div>
       <div className="mt-1 text-xl font-bold text-gray-800 dark:text-gray-100 tabular-nums">{ms != null ? fmtDuration(ms) : '—'}</div>
     </div>
+  )
+}
+
+// 分位数近似角标：仅用于 P50/P95/P99；样本数与平均值不加。
+function QuantileApproxHint({ children = '近似' }) {
+  return (
+    <span
+      title="分位数由小时级直方图合并估算，为近似值；样本数与平均值仍为精确值"
+      className="shrink-0 rounded border border-amber-300 px-1 text-[10px] leading-4 text-amber-600 dark:border-amber-700 dark:text-amber-400"
+    >
+      {children}
+    </span>
   )
 }
 

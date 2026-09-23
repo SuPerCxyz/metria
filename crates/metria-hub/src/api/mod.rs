@@ -189,6 +189,10 @@ pub fn app_router(state: AppState) -> Router {
             "/api/v1/settings/report",
             get(report_settings_get).put(report_settings_put),
         )
+        .route(
+            "/api/v1/settings/archive",
+            get(archive_settings_get).put(archive_settings_put),
+        )
         .route("/api/v1/settings/report/test", post(report_settings_test))
         .route("/api/v1/settings/report/history", get(report_history))
         .with_state(state.clone())
@@ -283,6 +287,21 @@ fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// 仅管理员可用的鉴权：归档会开启不可逆删除，不能与普通登录等权。
+///
+/// 未登录返回 `None`（401 语义），已登录但角色不是 admin 也返回 `None`，
+/// 由调用方按是否已登录区分 401/403。
+fn admin_user(st: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
+    let user = auth_user(st, headers)?;
+    let c = st.db.conn();
+    let role: Option<String> = c
+        .query_row("SELECT role FROM users WHERE username = ?1", [&user], |r| {
+            r.get(0)
+        })
+        .ok();
+    (role.as_deref() == Some("admin")).then_some(user)
 }
 
 fn auth_user(st: &AppState, headers: &axum::http::HeaderMap) -> Option<String> {
@@ -890,16 +909,52 @@ async fn system_info(State(st): State<AppState>, headers: axum::http::HeaderMap)
         Some(_) => "oidc+password",
         None => "password",
     };
+    // 运维表保留（上传批次/计价匹配清理），与明细归档是两套策略，分开回传。
+    let table_policy = st.db.retention_policy().unwrap_or_default();
+    let setting_i64 = |key: &str| -> Option<i64> {
+        st.db
+            .setting_get(key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    };
+    let last_cleanup_at = st
+        .db
+        .setting_get(crate::db::KEY_LAST_CLEANUP_AT)
+        .ok()
+        .flatten();
+    // 归档策略：默认关闭时仍如实显示「全量保留」，启用后展示真实保留天数与水位。
+    let archive_policy = crate::archive::policy(&st.db);
+    let archive_status = crate::archive::status(&st.db);
+    let archive_label = archive_status
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("全量保留（未启用自动清理）")
+        .to_string();
     Json(serde_json::json!({
         "content_mode": content_mode,
         "content_mode_label": content_mode_label,
         "timezone": crate::report::effective_timezone_name(&st.db, &st.cfg),
         "auth_mode": auth_mode,
         "retention": {
-            "automatic_cleanup": false,
-            "retention_days": null,
-            "label": "全量保留（未启用自动清理）"
-        }
+            "automatic_cleanup": archive_policy.enabled,
+            "retention_days": archive_policy.enabled.then_some(archive_policy.retention_days),
+            "label": archive_label
+        },
+        "table_retention": {
+            "upload_batch_retention_hours": table_policy.upload_batch_retention_hours,
+            "pricing_match_history_days": table_policy.pricing_match_history_days,
+            "pricing_keep_latest_per_usage": true,
+            "last_cleanup_at": last_cleanup_at,
+            "last_cleanup_deleted": setting_i64(crate::db::KEY_LAST_CLEANUP_DELETED),
+            "total_cleanup_deleted": setting_i64(crate::db::KEY_TOTAL_CLEANUP_DELETED),
+            "label": format!(
+                "上传批次保留 {} 小时；计价匹配每个用量行保留最新一条",
+                table_policy.upload_batch_retention_hours
+            )
+        },
+        // 明细归档：开关、保留天数、水位、最早可查明细与上次执行统计
+        "archive": archive_status
     }))
     .into_response()
 }

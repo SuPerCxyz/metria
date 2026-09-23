@@ -2,6 +2,7 @@
 //!
 //! 作为 `api` 模块的子模块，通过 `crate::api::*` 复用类型与工具函数。
 
+use crate::perfrollup::{ceil_hour, floor_hour};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -23,6 +24,25 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter(&p);
     let (call_filter, call_fargs) = range_filter_usage(&p);
+    // 时长相关统计统一来自同一份聚合：完整小时读小时级预聚合、带维度筛选或预聚合
+    // 缺桶时回退明细。必须在取得连接锁之前计算——内部会自行取锁，Mutex 不可重入。
+    let perf_agg: Option<crate::perfrollup::PerfHour> =
+        crate::perfrollup::fast_aggregate(&st.db, from, to, &call_filter).or_else(|| {
+            crate::perfrollup::scan_calls(&st.db, from, to, &call_filter, &call_fargs).ok()
+        });
+    // 归档水位决定活动类字段能否从明细算出。必须在取得连接锁之前读取
+    // （std::sync::Mutex 不可重入，持锁再取锁会把请求永久卡死）。
+    let archived_before = crate::archive::watermark(&st.db);
+    let activity_archived = archived_before
+        .as_deref()
+        .and_then(|w| DateTime::parse_from_rfc3339(w).ok())
+        .map(|watermark| from < watermark)
+        .unwrap_or(false);
+    let activity_archived_before: Option<String> = if activity_archived {
+        archived_before
+    } else {
+        None
+    };
     let c = st.db.conn();
     // rollup 按 UTC 整点分桶：完整小时读 rollup，两端不完整小时用原始明细补齐，
     // 否则范围起点非整点时会把当前小时整桶丢弃（表现为卡片为 0）。
@@ -83,7 +103,11 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         .into();
     // S3.3：AgentTool(Client)/Model/Project 计数（范围过滤）
     let range_clause = "started_at >= ?1 AND started_at < ?2";
-    body["agent_tools"] = c
+    body["agent_tools"] = match &perf_agg {
+            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+            Some(agg) => serde_json::json!(agg.distinct_clients.len()),
+            None => c
         .query_row(
             &format!(
                 "SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause} {call_filter}"
@@ -92,8 +116,13 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
-        .into();
-    body["models"] = c
+        .into()
+        };
+    body["models"] = match &perf_agg {
+            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+            Some(agg) => serde_json::json!(agg.distinct_models.len()),
+            None => c
         .query_row(
             &format!(
                 "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != '' {call_filter}"
@@ -102,18 +131,24 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
-        .into();
-    body["projects"] = c
-        .query_row(
-            &format!(
+        .into()
+        };
+    body["projects"] = match &perf_agg {
+        // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+        // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+        Some(agg) => serde_json::json!(agg.distinct_projects.len()),
+        None => c
+            .query_row(
+                &format!(
                 "SELECT COUNT(DISTINCT project_id) FROM model_calls
                  WHERE {range_clause} AND project_id IS NOT NULL AND project_id != '' {call_filter}"
             ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into();
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into(),
+    };
     // S3.3：Collector 在线状态列表（最近心跳 ≤ 5 分钟视为在线）
     let online_window = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
     body["collectors_online"] = c
@@ -125,7 +160,11 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         .unwrap_or(0)
         .into();
     // S3.9：范围内失败调用数（status 非成功）。数据源缺失时返回 0，前端诚实标注。
-    body["failed_calls"] = c
+    body["failed_calls"] = match &perf_agg {
+            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+            Some(agg) => serde_json::json!(agg.errors),
+            None => c
         .query_row(
             &format!(
                 "SELECT COUNT(*) FROM model_calls WHERE {range_clause} AND status != 'success' AND status != 'ok' AND status != 'completed' {call_filter}"
@@ -134,21 +173,47 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
-        .into();
-    let (total_cost_calls, priced_calls) = c
-        .query_row(
-            &format!(
-                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0)
-                 FROM model_calls WHERE {range_clause}
-                   AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .unwrap_or((0, 0));
-    let unpriced_models: Vec<serde_json::Value> = {
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = c.prepare(&format!(
+        .into()
+        };
+    // 计价分母与已计价条数由 perf_agg 给出（原先这里要对 17.5 万行做一次全表扫描，
+    // 实测 74ms）；取不到聚合时保留原 SQL 降级，不把缺失填成 0。
+    let (total_cost_calls, priced_calls) = match &perf_agg {
+        Some(agg) => (agg.token_pair_call_count as i64, agg.priced_call_count as i64),
+        None => c
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0)
+                     FROM model_calls WHERE {range_clause}
+                       AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
+                ),
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0)),
+    };
+    // 未计价模型分组同样来自 perf_agg 的逐小时分组（原 SQL 每次刷新都要全表
+    // 扫描 + GROUP BY，实测 85ms）；分组键保留原始 Option，渲染时才 COALESCE，
+    // 与 SQL 的 GROUP BY + COALESCE 语义完全一致。
+    let unpriced_models: Vec<serde_json::Value> = match &perf_agg {
+        Some(agg) => {
+            let mut rows: Vec<serde_json::Value> = agg
+                .unpriced_by_model
+                .iter()
+                .map(|(model, provider, calls)| {
+                    serde_json::json!({
+                        "model": model.clone().unwrap_or_else(|| "(unknown)".to_string()),
+                        "provider": provider.clone().unwrap_or_else(|| "(unknown)".to_string()),
+                        "calls": calls,
+                    })
+                })
+                .collect();
+            rows.sort_by(|a, b| b["calls"].as_i64().cmp(&a["calls"].as_i64()));
+            rows.truncate(8);
+            rows
+        }
+        None => {
+            let mut out = Vec::new();
+            if let Ok(mut stmt) = c.prepare(&format!(
             "SELECT COALESCE(model_normalized,'(unknown)'), COALESCE(provider_normalized,'(unknown)'), COUNT(*)
              FROM model_calls WHERE {range_clause}
                AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
@@ -169,7 +234,8 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
                 out = rows.filter_map(Result::ok).collect();
             }
         }
-        out
+            out
+        }
     };
     body["pricing_coverage"] = serde_json::json!({
         "priced_calls": priced_calls,
@@ -177,87 +243,66 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
         "ratio": if total_cost_calls > 0 { Some(priced_calls as f64 / total_cost_calls as f64) } else { None },
         "unpriced_models": unpriced_models,
     });
-    body["token_calls"] = c
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM model_calls WHERE {range_clause}
+    body["token_calls"] = match &perf_agg {
+        // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+        // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+        Some(agg) => serde_json::json!(agg.token_call_count),
+        None => c
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM model_calls WHERE {range_clause}
                  AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL
                       OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
                       OR reasoning_tokens IS NOT NULL) {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into();
-    // S3.9：范围内平均调用延迟（duration_ms 均值的毫秒数）。数据缺失时返回 null，前端诚实标注。
-    body["avg_duration_ms"] = c
-        .query_row(
-            &format!(
-                "SELECT AVG(duration_ms) FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, Option<f64>>(0),
-        )
-        .unwrap_or(None)
-        .map(|v| v.round() as i64)
-        .map(|v| serde_json::json!(v))
-        .unwrap_or(serde_json::Value::Null);
-    // S3.9：范围内调用时长分位数（duration_ms 的 p50/p95/p99，毫秒）。数据缺失时返回 null。
-    {
-        let mut durations: Vec<i64> = Vec::new();
-        if let Ok(mut stmt) = c.prepare(&format!(
-            "SELECT duration_ms FROM model_calls WHERE {range_clause} AND duration_ms IS NOT NULL {call_filter}"
-        )) {
-            if let Ok(mut rows) = stmt.query(params_from_iter(range_args(
-                &from,
-                &to,
-                call_fargs.clone(),
-            ))) {
-                while let Ok(Some(row)) = rows.next() {
-                    if let Ok(v) = row.get::<_, i64>(0) {
-                        durations.push(v);
-                    }
-                }
-            }
-        }
-        durations.sort_unstable();
-        let pct = |p: f64| -> serde_json::Value {
-            if durations.is_empty() {
-                return serde_json::Value::Null;
-            }
-            let idx = ((durations.len() as f64 - 1.0) * p).round() as usize;
-            serde_json::json!(durations[idx.min(durations.len() - 1)])
+                ),
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into(),
+    };
+    // S3.9：平均调用延迟与 duration 分位数（来自上面的 perf_agg）。
+    // 平均值用 sum/count 精确计算，等价于原来的 AVG(duration_ms) 后取整；
+    // 分位数由对数分箱直方图合并得出，响应标注 quantile_approx。
+    if let Some(agg) = &perf_agg {
+        body["avg_duration_ms"] = if agg.duration.count > 0 {
+            serde_json::json!((agg.duration.sum as f64 / agg.duration.count as f64).round() as i64)
+        } else {
+            serde_json::Value::Null
         };
-        body["duration_p50_ms"] = pct(0.50);
-        body["duration_p95_ms"] = pct(0.95);
-        body["duration_p99_ms"] = pct(0.99);
+        body["duration_p50_ms"] = serde_json::json!(agg.duration.quantile(0.50));
+        body["duration_p95_ms"] = serde_json::json!(agg.duration.quantile(0.95));
+        body["duration_p99_ms"] = serde_json::json!(agg.duration.quantile(0.99));
+        body["quantile_approx"] = serde_json::json!(true);
+    } else {
+        // 取不到聚合（明细回退也失败）时仍要写键，前端应读到诚实的 null 而不是 undefined。
+        body["avg_duration_ms"] = serde_json::Value::Null;
+        body["duration_p50_ms"] = serde_json::Value::Null;
+        body["duration_p95_ms"] = serde_json::Value::Null;
+        body["duration_p99_ms"] = serde_json::Value::Null;
+        body["quantile_approx"] = serde_json::Value::Null;
     }
     // 活跃时长只统计明确记录了 duration_ms 的调用；没有记录时返回 null。
-    let (active_duration, active_count) = c
-        .query_row(
-            &format!(
-                "SELECT SUM(duration_ms), COUNT(duration_ms)
-                 FROM model_calls WHERE {range_clause} {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .unwrap_or((None, 0));
-    body["active_duration_ms"] = if active_count > 0 {
-        active_duration.into()
-    } else {
-        serde_json::Value::Null
+    body["active_duration_ms"] = match perf_agg.as_ref() {
+        Some(agg) if agg.duration.count > 0 => serde_json::json!(agg.duration.sum),
+        _ => serde_json::Value::Null,
     };
     // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
-    let activity = overview_activity(&c, &p, from, to);
-    body["sessions"] = activity.sessions.into();
-    body["active_sessions"] = activity.active_sessions.into();
-    body["message_count"] = activity.messages.into();
-    body["user_message_count"] = activity.user_messages.into();
-    body["tool_call_count"] = activity.tools.into();
-    body["session_duration_ms"] = activity
-        .session_duration_ms
+    let activity = overview_activity(&c, &p, from, to, activity_archived);
+    // Option 直接落 JSON：归档区间为 null（诚实标注「已归档，不可计算」），
+    // 否则是真实数值；绝不把不可算写成 0。
+    let opt_json = |v: Option<i64>| {
+        v.map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    body["sessions"] = opt_json(activity.sessions);
+    body["active_sessions"] = opt_json(activity.active_sessions);
+    body["message_count"] = opt_json(activity.messages);
+    body["user_message_count"] = opt_json(activity.user_messages);
+    body["tool_call_count"] = opt_json(activity.tools);
+    body["session_duration_ms"] = opt_json(activity.session_duration_ms);
+    // 前端据此把上面这些 null 显示为「已归档，不可计算」而不是「无数据」
+    body["activity_archived_before"] = activity_archived_before
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
     body["freshness"] = freshness_summary(&c, &p);
@@ -390,71 +435,79 @@ pub(crate) async fn usage_heatmap(
     }
 }
 
+/// 热力图与日趋势共用的按小时数据源：完整小时读预聚合，头部/当前小时回退明细。
+///
+/// 以下情况整体回退到按小时分组的明细，宁可慢也不改口径：
+///   * 带维度筛选（预聚合不带维度）；
+///   * 预聚合缺行或 payload 版本过期；
+///   * 时区偏移不是整小时（如 Asia/Kolkata +5:30），此时一个 UTC 整点桶会横跨
+///     两个本地小时/日期，按桶映射会把数据算到错误的格子里。
+fn hourly_heatmap_source(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    filter: &str,
+    fargs: &[SqlValue],
+    timezone: &Tz,
+) -> Result<Vec<(String, crate::perfrollup::HeatmapAgg)>, String> {
+    if let Some(list) = crate::perfrollup::fast_hours(db, from, to, filter) {
+        let aligned = list.iter().all(|(bucket, _)| {
+            DateTime::parse_from_rfc3339(&crate::perfrollup::hour_bucket(*bucket))
+                .map(|ts| ts.with_timezone(timezone).minute() == 0)
+                .unwrap_or(false)
+        });
+        if aligned {
+            return Ok(list
+                .into_iter()
+                .map(|(bucket, agg)| (crate::perfrollup::hour_bucket(bucket), agg.heatmap))
+                .collect());
+        }
+    }
+    let grouped = crate::perfrollup::scan_heatmap_grouped(db, from, to, filter, fargs)
+        .map_err(|e| e.to_string())?;
+    Ok(grouped.into_iter().collect())
+}
+
 fn query_usage_heatmap(db: &HubDb, p: &RangeParams) -> Result<serde_json::Value, String> {
     let (from, to) = parse_range(p);
     let timezone = requested_timezone(p);
     let (filter, fargs) = range_filter_usage(p);
-    let c = db.conn();
-    let mut stmt = c
-        .prepare(&format!(
-            "SELECT m.started_at,
-                    COALESCE((SELECT SUM(u.input_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.input_tokens),
-                    COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
-                    COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
-                    COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
-                    COALESCE((SELECT SUM(u.cache_write_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_write_tokens),
-                    COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    m.duration_ms
-             FROM model_calls m
-             WHERE m.started_at >= ?1 AND m.started_at < ?2 {filter}"
-        ))
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<i64>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-                r.get::<_, Option<i64>>(9)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
+
+    let grouped = hourly_heatmap_source(db, from, to, &filter, &fargs, &timezone)?;
 
     let mut cells = (0..168)
         .map(|_| ActivityCell::default())
         .collect::<Vec<_>>();
-    for row in rows.flatten() {
-        let Ok(started) =
-            DateTime::parse_from_rfc3339(&row.0).map(|value| value.with_timezone(&Utc))
-        else {
+    for (bucket, agg) in grouped {
+        let Ok(started) = DateTime::parse_from_rfc3339(&bucket) else {
             continue;
         };
+        let started = started.with_timezone(&Utc);
         let local = started.with_timezone(&timezone);
         let index = local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize;
         let cell = &mut cells[index];
-        cell.input_tokens += row.1.unwrap_or(0);
-        cell.output_tokens += row.2.unwrap_or(0);
-        cell.cache_read_tokens += row.3.unwrap_or(0);
-        cell.reasoning_tokens += row.4.unwrap_or(0);
-        cell.cache_write_tokens += row.5.unwrap_or(0);
-        cell.cost_micro_usd += row.6.unwrap_or(0) + row.7.unwrap_or(0) + row.8.unwrap_or(0);
-        cell.model_calls += 1;
-        if let Some(duration) = row.9 {
-            cell.duration_ms = Some(cell.duration_ms.unwrap_or(0) + duration);
+        cell.input_tokens += agg.input_tokens;
+        cell.output_tokens += agg.output_tokens;
+        cell.cache_read_tokens += agg.cache_read_tokens;
+        cell.cache_write_tokens += agg.cache_write_tokens;
+        cell.reasoning_tokens += agg.reasoning_tokens;
+        cell.cost_micro_usd += agg.reported_cost + agg.calculated_cost + agg.estimated_cost;
+        cell.model_calls += agg.model_calls as i64;
+        if agg.duration_count > 0 {
+            cell.duration_ms = Some(cell.duration_ms.unwrap_or(0) + agg.duration_ms);
         }
-        if cell
+        if let Some(latest) = agg
             .latest_started_at
-            .is_none_or(|current| started > current)
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|ts| ts.with_timezone(&Utc))
         {
-            cell.latest_started_at = Some(started);
+            if cell
+                .latest_started_at
+                .is_none_or(|current| latest > current)
+            {
+                cell.latest_started_at = Some(latest);
+            }
         }
     }
 
@@ -508,57 +561,26 @@ fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Valu
     let (from, to) = parse_range(p);
     let timezone = requested_timezone(p);
     let (filter, fargs) = range_filter_usage(p);
-    let c = db.conn();
-    let mut stmt = c
-        .prepare(&format!(
-            "SELECT m.started_at,
-                    COALESCE((SELECT SUM(u.input_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.input_tokens),
-                    COALESCE((SELECT SUM(u.output_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.output_tokens),
-                    COALESCE((SELECT SUM(u.cache_read_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_read_tokens),
-                    COALESCE((SELECT SUM(u.reasoning_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.reasoning_tokens),
-                    COALESCE((SELECT SUM(u.cache_write_tokens) FROM usage_events u WHERE u.model_call_id = m.id), m.cache_write_tokens),
-                    COALESCE(m.reported_cost_micro_usd, (SELECT SUM(u.reported_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    COALESCE(m.calculated_cost_micro_usd, (SELECT SUM(u.calculated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    COALESCE(m.estimated_cost_micro_usd, (SELECT SUM(u.estimated_cost_micro_usd) FROM usage_events u WHERE u.model_call_id = m.id)),
-                    m.duration_ms
-             FROM model_calls m
-             WHERE m.started_at >= ?1 AND m.started_at < ?2 {filter}"
-        ))
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<i64>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-                r.get::<_, Option<i64>>(9)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
+    // 与热力图共用按小时数据源：完整小时读预聚合（原先这里每行要跑 5 个相关子查询，
+    // 30 天范围实测 1.16s），两端不整点片段与当前小时回退明细；时区偏移非整小时
+    // 或带维度筛选时整体回退明细，保证本地日期归属正确。
+    let hourly = hourly_heatmap_source(db, from, to, &filter, &fargs, &timezone)?;
     let mut by_day: std::collections::BTreeMap<String, DailyActivity> = Default::default();
-    for row in rows.flatten() {
-        let Ok(started) =
-            DateTime::parse_from_rfc3339(&row.0).map(|value| value.with_timezone(&Utc))
-        else {
+    for (bucket, agg) in hourly {
+        let Ok(started) = DateTime::parse_from_rfc3339(&bucket) else {
             continue;
         };
         let day = started.with_timezone(&timezone).date_naive().to_string();
         let entry = by_day.entry(day).or_default();
-        entry.input_tokens += row.1.unwrap_or(0);
-        entry.output_tokens += row.2.unwrap_or(0);
-        entry.cache_read_tokens += row.3.unwrap_or(0);
-        entry.reasoning_tokens += row.4.unwrap_or(0);
-        entry.cache_write_tokens += row.5.unwrap_or(0);
-        entry.cost_micro_usd += row.6.unwrap_or(0) + row.7.unwrap_or(0) + row.8.unwrap_or(0);
-        entry.model_calls += 1;
-        if let Some(duration) = row.9 {
-            entry.duration_ms = Some(entry.duration_ms.unwrap_or(0) + duration);
+        entry.input_tokens += agg.input_tokens;
+        entry.output_tokens += agg.output_tokens;
+        entry.cache_read_tokens += agg.cache_read_tokens;
+        entry.reasoning_tokens += agg.reasoning_tokens;
+        entry.cache_write_tokens += agg.cache_write_tokens;
+        entry.cost_micro_usd += agg.reported_cost + agg.calculated_cost + agg.estimated_cost;
+        entry.model_calls += agg.model_calls as i64;
+        if agg.duration_count > 0 {
+            entry.duration_ms = Some(entry.duration_ms.unwrap_or(0) + agg.duration_ms);
         }
     }
 
@@ -759,7 +781,7 @@ pub(crate) fn query_usage_timeseries(
         let (source, cte) = if bucket_secs >= 86400 {
             ("daily_rollups", String::new())
         } else {
-            ("rollup_src", rollup_source_cte(1, 2))
+            ("rollup_src", rollup_source_cte(1, 2, from, to))
         };
         let bucket_col = if bucket_secs >= 86400 {
             "substr(bucket,1,10)"
@@ -1121,7 +1143,7 @@ pub(crate) async fn usage_breakdown(
         Some("project") => " AND project_id IS NOT NULL AND project_id != ''",
         _ => " AND node_id IS NOT NULL AND node_id != ''",
     };
-    let cte = rollup_source_cte(1, 2);
+    let cte = rollup_source_cte(1, 2, from, to);
     let mut stmt = q!(c.prepare(&format!(
         "{cte}SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
@@ -1284,7 +1306,7 @@ pub(crate) async fn node_detail(
     };
 
     // S3.4：按 Client 分布（范围过滤，含 usage 汇总）
-    let cte = rollup_source_cte(2, 3);
+    let cte = rollup_source_cte(2, 3, from, to);
     let mut clients = Vec::new();
     if let Ok(mut stmt) = c.prepare(&format!(
         "{cte}SELECT s.client_id, COUNT(DISTINCT s.id) as src_count,
@@ -1380,6 +1402,9 @@ pub(crate) async fn node_sessions(
     Query(p): Query<RangeParams>,
 ) -> Response {
     let (from, to) = parse_range(&p);
+    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+    let archived_before = crate::archive::watermark(&st.db);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(50).min(500);
     let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -1445,7 +1470,12 @@ pub(crate) async fn node_sessions(
         let ts = v.get("started_at")?.as_str()?;
         Some(crate::api::encode_cursor(ts, id))
     });
-    Json(serde_json::json!({ "sessions": sessions, "next_cursor": next_cursor })).into_response()
+    Json(serde_json::json!({
+        "sessions": sessions,
+        "next_cursor": next_cursor,
+        "archived_before": archived_before,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn node_calls(
@@ -1454,6 +1484,9 @@ pub(crate) async fn node_calls(
     Query(p): Query<RangeParams>,
 ) -> Response {
     let (from, to) = parse_range(&p);
+    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+    let archived_before = crate::archive::watermark(&st.db);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(50).min(500);
     let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -1519,7 +1552,13 @@ pub(crate) async fn node_calls(
         let ts = v.get("started_at")?.as_str()?;
         Some(crate::api::encode_cursor(ts, id))
     });
-    Json(serde_json::json!({ "calls": calls, "next_cursor": next_cursor })).into_response()
+    // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而非「无数据」。
+    Json(serde_json::json!({
+        "calls": calls,
+        "next_cursor": next_cursor,
+        "archived_before": archived_before,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn list_clients(
@@ -1529,7 +1568,7 @@ pub(crate) async fn list_clients(
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter(&p);
     let c = st.db.conn();
-    let cte = rollup_source_cte(1, 2);
+    let cte = rollup_source_cte(1, 2, from, to);
     let mut stmt = q!(c.prepare(&format!(
         "{cte}SELECT client_id,
             COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
@@ -1559,7 +1598,7 @@ pub(crate) async fn client_detail(
 ) -> Response {
     let (from, to) = parse_range(&p);
     let c = st.db.conn();
-    let cte = rollup_source_cte(2, 3);
+    let cte = rollup_source_cte(2, 3, from, to);
     let mut stmt = q!(c.prepare(&format!(
         "{cte}SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0), COUNT(CASE WHEN pricing_source != '' THEN 1 END)
@@ -1821,7 +1860,7 @@ pub(crate) async fn list_models(
     let mut models: Vec<serde_json::Value> = {
         // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
         let c = st.db.conn();
-        let cte = rollup_source_cte(1, 2);
+        let cte = rollup_source_cte(1, 2, from, to);
         let mut stmt = q!(c.prepare(&format!(
             "{cte}SELECT model, MAX(provider),
                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
@@ -1942,7 +1981,7 @@ pub(crate) async fn model_detail(
     // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
     let (raws, summary, recent_sessions, recent_calls, series) = {
         let c = st.db.conn();
-        let cte = rollup_source_cte(2, 3);
+        let cte = rollup_source_cte(2, 3, from, to);
         // raw 名称 + provider 分布
         let mut stmt = q!(c.prepare(
             "SELECT model_raw, provider_raw, COUNT(*) as cnt FROM model_calls WHERE model_normalized = ?1 GROUP BY model_raw, provider_raw ORDER BY cnt DESC",
@@ -2112,6 +2151,9 @@ pub(crate) async fn list_calls(
     Query(p): Query<RangeParams>,
 ) -> Response {
     let (from, to) = parse_range(&p);
+    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+    let archived_before = crate::archive::watermark(&st.db);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(100).min(1000);
     let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -2199,7 +2241,13 @@ pub(crate) async fn list_calls(
         let ts = v.get("started_at")?.as_str()?;
         Some(crate::api::encode_cursor(ts, id))
     });
-    Json(serde_json::json!({ "calls": calls, "next_cursor": next_cursor })).into_response()
+    // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而不是「暂无数据」。
+    Json(serde_json::json!({
+        "calls": calls,
+        "next_cursor": next_cursor,
+        "archived_before": archived_before,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn call_detail(
@@ -2285,6 +2333,9 @@ pub(crate) async fn list_sessions(
     Query(p): Query<RangeParams>,
 ) -> Response {
     let (from, to) = parse_range(&p);
+    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+    let archived_before = crate::archive::watermark(&st.db);
     let c = st.db.conn();
     let limit = p.limit.unwrap_or(100).min(1000);
     let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -2409,7 +2460,12 @@ pub(crate) async fn list_sessions(
         let ts = v.get("started_at")?.as_str()?;
         Some(crate::api::encode_cursor(ts, id))
     });
-    Json(serde_json::json!({ "sessions": sessions, "next_cursor": next_cursor })).into_response()
+    Json(serde_json::json!({
+        "sessions": sessions,
+        "next_cursor": next_cursor,
+        "archived_before": archived_before,
+    }))
+    .into_response()
 }
 
 pub(crate) async fn session_detail(
@@ -2919,33 +2975,25 @@ pub(crate) async fn usage_latency(
 ) -> Response {
     let (from, to) = parse_range(&p);
     let (mc_filter, mc_fargs) = range_filter_usage(&p);
-    let c = st.db.conn();
-    let mut durations: Vec<i64> = Vec::new();
-    let mut stmt = q!(c.prepare(&format!(
-        "SELECT duration_ms FROM model_calls WHERE duration_ms IS NOT NULL AND started_at >= ?1 AND started_at < ?2 {mc_filter}"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, mc_fargs)), |r| r
-            .get::<_, i64>(0))
-    );
-    for row in rows.flatten() {
-        durations.push(row);
-    }
-    durations.sort_unstable();
-    let n = durations.len();
-    let percentile = |q: f64| -> Option<i64> {
-        if n == 0 {
-            return None;
+    // 快速路径读小时级预聚合；带维度筛选或预聚合缺桶时回退明细。
+    // 两条路径共用 perfrollup 的累加逻辑，样本数、平均值精确，分位数为直方图近似。
+    let duration = match crate::perfrollup::fast_aggregate(&st.db, from, to, &mc_filter) {
+        Some(agg) => agg.duration,
+        None => {
+            let agg = q!(crate::perfrollup::scan_calls(
+                &st.db, from, to, &mc_filter, &mc_fargs
+            ));
+            agg.duration
         }
-        let idx = ((n as f64) * q).ceil() as usize;
-        Some(durations[idx.saturating_sub(1).min(n - 1)])
     };
     Json(serde_json::json!({
-        "count": n,
-        "p50_ms": percentile(0.50),
-        "p95_ms": percentile(0.95),
-        "p99_ms": percentile(0.99),
-        "avg_ms": if n > 0 { Some(durations.iter().sum::<i64>() / n as i64) } else { None },
+        "count": duration.count,
+        "p50_ms": duration.quantile(0.50),
+        "p95_ms": duration.quantile(0.95),
+        "p99_ms": duration.quantile(0.99),
+        "avg_ms": duration.avg(),
+        // 分位数由对数分箱直方图合并得出；count 与 avg_ms 为精确统计
+        "quantile_approx": true,
     }))
     .into_response()
 }
@@ -2957,286 +3005,103 @@ pub(crate) async fn usage_performance(
 ) -> Response {
     let (from, to) = parse_range(&p);
     let (filter, fargs) = range_filter_usage(&p);
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(&format!(
-        "SELECT started_at, first_byte_at, first_token_at, first_response_at, last_output_at,
-                completed_at, output_tokens, output_tokens_per_second_milli, generation_duration_ms,
-                inter_token_latency_avg_ms, inter_token_latency_p95_ms, stall_count, stall_duration_ms,
-                observability_source, observability_quality, timing_source, timing_quality,
-                observed_request_payload_bytes, observed_response_payload_bytes,
-                observed_request_wire_bytes, observed_response_wire_bytes, status, status_code, rate_limited
-         FROM model_calls WHERE started_at >= ?1 AND started_at < ?2 {filter}"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<i64>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-                r.get::<_, Option<i64>>(9)?,
-                r.get::<_, Option<i64>>(10)?,
-                r.get::<_, Option<i64>>(11)?,
-                r.get::<_, Option<i64>>(12)?,
-                r.get::<_, Option<String>>(13)?,
-                r.get::<_, Option<String>>(14)?,
-                r.get::<_, Option<String>>(15)?,
-                r.get::<_, Option<String>>(16)?,
-                r.get::<_, Option<i64>>(17)?,
-                r.get::<_, Option<i64>>(18)?,
-                r.get::<_, Option<i64>>(19)?,
-                r.get::<_, Option<i64>>(20)?,
-                r.get::<_, String>(21)?,
-                r.get::<_, Option<i64>>(22)?,
-                r.get::<_, Option<bool>>(23)?,
-            ))
-        })
-    );
-    let mut total = 0usize;
-    let mut success = 0usize;
-    let mut errors = 0usize;
-    let mut ttft = Vec::new();
-    let mut first_byte = Vec::new();
-    let mut generation = Vec::new();
-    let mut speeds = Vec::new();
-    let mut inter_token = Vec::new();
-    let mut stalls = Vec::new();
-    let mut sources: std::collections::HashMap<(String, String), i64> = Default::default();
-    // 每个指标单独记录来源/质量分布，供前端区分「运行时观测」与「日志推导」。
-    let mut ttft_sources: std::collections::HashMap<(String, String), i64> = Default::default();
-    let mut first_byte_sources: std::collections::HashMap<(String, String), i64> =
-        Default::default();
-    let mut generation_sources: std::collections::HashMap<(String, String), i64> =
-        Default::default();
-    let mut speed_sources: std::collections::HashMap<(String, String), i64> = Default::default();
-    let mut inter_token_sources: std::collections::HashMap<(String, String), i64> =
-        Default::default();
-    let mut observed_bytes = [0i64; 4];
-    let mut observed_counts = [0usize; 4];
-    for row in rows.flatten() {
-        total += 1;
-        let parse = |value: &str| {
-            DateTime::parse_from_rfc3339(value)
-                .ok()
-                .map(|ts| ts.with_timezone(&Utc))
-        };
-        let Some(started) = parse(&row.0) else {
-            continue;
-        };
-        let byte_at = row.1.as_deref().and_then(parse);
-        let token_at = row.2.as_deref().and_then(parse);
-        let legacy_first = row.3.as_deref().and_then(parse);
-        if row.21 == "success" || row.21 == "ok" || row.21 == "completed" {
-            success += 1;
-        } else {
-            errors += 1;
-        }
-        if let Some(value) = row.22.filter(|value| *value >= 400) {
-            let _ = value;
-        }
-        for (index, value) in [row.17, row.18, row.19, row.20].into_iter().enumerate() {
-            if let Some(value) = value.filter(|value| *value >= 0) {
-                observed_bytes[index] += value;
-                observed_counts[index] += 1;
-            }
-        }
-        let first = token_at.or(legacy_first);
-        let source = row
-            .13
-            .clone()
-            .or(row.15.clone())
-            .unwrap_or_else(|| "unknown".into());
-        let quality = row
-            .14
-            .clone()
-            .or(row.16.clone())
-            .unwrap_or_else(|| "unknown".into());
-        if let Some(byte_at) = byte_at.filter(|at| *at >= started) {
-            first_byte.push((byte_at - started).num_milliseconds());
-            *first_byte_sources
-                .entry((source.clone(), quality.clone()))
-                .or_default() += 1;
-        }
-        if let Some(first) = first.filter(|first| *first >= started) {
-            ttft.push((first - started).num_milliseconds());
-            *sources
-                .entry((source.clone(), quality.clone()))
-                .or_default() += 1;
-            *ttft_sources
-                .entry((source.clone(), quality.clone()))
-                .or_default() += 1;
-            // 生成耗时与输出速度只信任运行时观测字段；日志条目完成时间无法测量生成区间。
-            let generation_ms = row.8.filter(|value| *value > 0);
-            if let Some(value) = generation_ms {
-                generation.push(value);
-                *generation_sources
-                    .entry((source.clone(), quality.clone()))
-                    .or_default() += 1;
-            }
-            if let Some(value) = row.7.filter(|value| *value > 0) {
-                speeds.push(value as f64 / 1000.0);
-                *speed_sources
-                    .entry((source.clone(), quality.clone()))
-                    .or_default() += 1;
-            } else if let (Some(generation_ms), Some(tokens)) =
-                (generation_ms, row.6.filter(|value| *value > 0))
-            {
-                if generation_ms > 0 {
-                    speeds.push(tokens as f64 * 1000.0 / generation_ms as f64);
-                    *speed_sources
-                        .entry((source.clone(), quality.clone()))
-                        .or_default() += 1;
-                }
-            }
-        }
-        if let Some(value) = row.9.filter(|value| *value >= 0) {
-            inter_token.push(value);
-            *inter_token_sources
-                .entry((source.clone(), quality.clone()))
-                .or_default() += 1;
-        }
-        if let Some(value) = row.10.filter(|value| *value >= 0) {
-            inter_token.push(value);
-            *inter_token_sources
-                .entry((source.clone(), quality.clone()))
-                .or_default() += 1;
-        }
-        if let Some(value) = row.11.filter(|value| *value >= 0) {
-            stalls.push(value);
-        }
-        if row.23 == Some(true) {
-            *sources
-                .entry(("rate_limited".into(), "observed".into()))
-                .or_default() += 1;
-        }
-    }
-    let percentile_i64 = |values: &[i64], p: f64| -> Option<i64> {
-        if values.is_empty() {
-            None
-        } else {
-            Some(
-                values[((values.len() as f64 * p).ceil() as usize)
-                    .saturating_sub(1)
-                    .min(values.len() - 1)],
-            )
+    // 快速路径读小时级预聚合（完整小时）；带维度筛选或预聚合缺桶时回退明细。
+    // 两条路径共用 perfrollup 的逐行累加逻辑，保证口径一致。
+    let acc = match crate::perfrollup::fast_aggregate(&st.db, from, to, &filter) {
+        Some(agg) => agg,
+        None => q!(crate::perfrollup::scan_calls(
+            &st.db, from, to, &filter, &fargs
+        )),
+    };
+    Json(performance_json(&acc)).into_response()
+}
+
+/// 把聚合结果渲染成 `/usage/performance` 响应。
+///
+/// `count` / `avg_*` / `coverage` / 可靠性来自精确累加；P50/P95/P99 由对数分箱直方图
+/// 合并得出，响应以 `quantile_approx` 标注，界面据此显示「近似」而不是当成精确值。
+fn performance_json(acc: &crate::perfrollup::PerfHour) -> serde_json::Value {
+    let total = acc.call_count;
+    let coverage = |count: u64| (total > 0).then(|| count as f64 / total as f64);
+    let observed = |index: usize| -> (serde_json::Value, u64) {
+        match acc.observed_bytes.get(index) {
+            Some((bytes, count)) if *count > 0 => (serde_json::json!(bytes), *count),
+            _ => (serde_json::Value::Null, 0),
         }
     };
-    let percentile_f64 = |values: &[f64], p: f64| -> Option<f64> {
-        if values.is_empty() {
-            None
-        } else {
-            Some(
-                values[((values.len() as f64 * p).ceil() as usize)
-                    .saturating_sub(1)
-                    .min(values.len() - 1)],
-            )
-        }
-    };
-    first_byte.sort_unstable();
-    ttft.sort_unstable();
-    generation.sort_unstable();
-    speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    inter_token.sort_unstable();
-    stalls.sort_unstable();
-    let avg_i64 = |values: &[i64]| {
-        if values.is_empty() {
-            None
-        } else {
-            Some(values.iter().sum::<i64>() / values.len() as i64)
-        }
-    };
-    let avg_f64 = |values: &[f64]| {
-        if values.is_empty() {
-            None
-        } else {
-            Some(values.iter().sum::<f64>() / values.len() as f64)
-        }
-    };
-    let ttft_count = ttft.len();
-    let speed_count = speeds.len();
-    let build_source_rows =
-        |map: std::collections::HashMap<(String, String), i64>| -> Vec<serde_json::Value> {
-            let mut rows: Vec<serde_json::Value> = map
-                .into_iter()
-                .map(|((source, quality), count)| {
-                    serde_json::json!({ "source": source, "quality": quality, "count": count })
-                })
-                .collect();
-            rows.sort_by_key(|row| std::cmp::Reverse(row["count"].as_i64().unwrap_or(0)));
-            rows
-        };
-    let source_rows = build_source_rows(sources);
-    Json(serde_json::json!({
+    let (req_payload, req_payload_count) = observed(0);
+    let (resp_payload, resp_payload_count) = observed(1);
+    let (req_wire, req_wire_count) = observed(2);
+    let (resp_wire, resp_wire_count) = observed(3);
+    let rows = |map: &crate::perfrollup::SourceCounts| map.clone().into_sorted_rows();
+
+    serde_json::json!({
         "total_calls": total,
         "reliability": {
-            "success_count": success,
-            "error_count": errors,
-            "success_rate": if total > 0 { Some(success as f64 / total as f64) } else { None },
-            "error_rate": if total > 0 { Some(errors as f64 / total as f64) } else { None },
+            "success_count": acc.success,
+            "error_count": acc.errors,
+            "success_rate": (total > 0).then(|| acc.success as f64 / total as f64),
+            "error_rate": (total > 0).then(|| acc.errors as f64 / total as f64),
         },
         "first_byte": {
-            "count": first_byte.len(),
-            "avg_ms": avg_i64(&first_byte),
-            "p50_ms": percentile_i64(&first_byte, 0.50),
-            "p95_ms": percentile_i64(&first_byte, 0.95),
-            "p99_ms": percentile_i64(&first_byte, 0.99),
-            "coverage": if total > 0 { Some(first_byte.len() as f64 / total as f64) } else { None },
-            "sources": build_source_rows(first_byte_sources),
+            "count": acc.first_byte.count,
+            "avg_ms": acc.first_byte.avg(),
+            "p50_ms": acc.first_byte.quantile(0.50),
+            "p95_ms": acc.first_byte.quantile(0.95),
+            "p99_ms": acc.first_byte.quantile(0.99),
+            "coverage": coverage(acc.first_byte.count),
+            "sources": rows(&acc.first_byte_sources),
         },
         "ttft": {
-            "count": ttft_count,
-            "avg_ms": avg_i64(&ttft),
-            "p50_ms": percentile_i64(&ttft, 0.50),
-            "p95_ms": percentile_i64(&ttft, 0.95),
-            "p99_ms": percentile_i64(&ttft, 0.99),
-            "coverage": if total > 0 { Some(ttft_count as f64 / total as f64) } else { None },
-            "sources": build_source_rows(ttft_sources),
+            "count": acc.ttft.count,
+            "avg_ms": acc.ttft.avg(),
+            "p50_ms": acc.ttft.quantile(0.50),
+            "p95_ms": acc.ttft.quantile(0.95),
+            "p99_ms": acc.ttft.quantile(0.99),
+            "coverage": coverage(acc.ttft.count),
+            "sources": rows(&acc.ttft_sources),
         },
         "generation": {
-            "count": generation.len(),
-            "avg_ms": avg_i64(&generation),
-            "p50_ms": percentile_i64(&generation, 0.50),
-            "p95_ms": percentile_i64(&generation, 0.95),
-            "p99_ms": percentile_i64(&generation, 0.99),
-            "coverage": if total > 0 { Some(generation.len() as f64 / total as f64) } else { None },
-            "sources": build_source_rows(generation_sources),
+            "count": acc.generation.count,
+            "avg_ms": acc.generation.avg(),
+            "p50_ms": acc.generation.quantile(0.50),
+            "p95_ms": acc.generation.quantile(0.95),
+            "p99_ms": acc.generation.quantile(0.99),
+            "coverage": coverage(acc.generation.count),
+            "sources": rows(&acc.generation_sources),
         },
         "output_speed": {
-            "count": speed_count,
-            "avg_tokens_per_second": avg_f64(&speeds),
-            "p50_tokens_per_second": percentile_f64(&speeds, 0.50),
-            "p95_tokens_per_second": percentile_f64(&speeds, 0.95),
-            "coverage": if total > 0 { Some(speed_count as f64 / total as f64) } else { None },
-            "sources": build_source_rows(speed_sources),
+            "count": acc.speed.count,
+            "avg_tokens_per_second": acc.speed.avg(),
+            "p50_tokens_per_second": acc.speed.quantile(0.50),
+            "p95_tokens_per_second": acc.speed.quantile(0.95),
+            "coverage": coverage(acc.speed.count),
+            "sources": rows(&acc.speed_sources),
         },
         "inter_token_latency": {
-            "count": inter_token.len(),
-            "avg_ms": avg_i64(&inter_token),
-            "p50_ms": percentile_i64(&inter_token, 0.50),
-            "p95_ms": percentile_i64(&inter_token, 0.95),
-            "p99_ms": percentile_i64(&inter_token, 0.99),
-            "coverage": if total > 0 { Some(inter_token.len() as f64 / total as f64) } else { None },
-            "sources": build_source_rows(inter_token_sources),
+            "count": acc.inter_token.count,
+            "avg_ms": acc.inter_token.avg(),
+            "p50_ms": acc.inter_token.quantile(0.50),
+            "p95_ms": acc.inter_token.quantile(0.95),
+            "p99_ms": acc.inter_token.quantile(0.99),
+            "coverage": coverage(acc.inter_token.count),
+            "sources": rows(&acc.inter_token_sources),
         },
         "stalls": {
-            "count": stalls.len(),
-            "avg_count": avg_i64(&stalls),
-            "p95_count": percentile_i64(&stalls, 0.95),
+            "count": acc.stalls.count,
+            "avg_count": acc.stalls.avg(),
+            "p95_count": acc.stalls.quantile(0.95),
         },
         "observed_bytes": {
-            "request_payload": { "bytes": observed_counts[0].gt(&0).then_some(observed_bytes[0]), "count": observed_counts[0] },
-            "response_payload": { "bytes": observed_counts[1].gt(&0).then_some(observed_bytes[1]), "count": observed_counts[1] },
-            "request_wire": { "bytes": observed_counts[2].gt(&0).then_some(observed_bytes[2]), "count": observed_counts[2] },
-            "response_wire": { "bytes": observed_counts[3].gt(&0).then_some(observed_bytes[3]), "count": observed_counts[3] },
+            "request_payload": { "bytes": req_payload, "count": req_payload_count },
+            "response_payload": { "bytes": resp_payload, "count": resp_payload_count },
+            "request_wire": { "bytes": req_wire, "count": req_wire_count },
+            "response_wire": { "bytes": resp_wire, "count": resp_wire_count },
         },
-        "sources": source_rows,
-    }))
-    .into_response()
+        "sources": rows(&acc.sources),
+        // 分位数为直方图近似值；样本数、平均值与覆盖率为精确统计
+        "quantile_approx": true,
+    })
 }
 
 /// 按时间桶返回运行时性能指标；空桶使用 null，避免把没有观测误报为 0。
@@ -3395,7 +3260,8 @@ pub(crate) async fn usage_latency_timeseries(
         })
         .collect();
     let filled = fill_latency_timeseries(points, from, to, bucket_secs);
-    Json(serde_json::json!({ "series": filled })).into_response()
+    // 该接口仍在明细上按桶精确计算分位数，明确标注为非近似，避免前端误标「近似」。
+    Json(serde_json::json!({ "series": filled, "quantile_approx": false })).into_response()
 }
 
 /// 把延迟序列补齐为范围内完整 bucket 序列；缺失桶统计字段为 null。
@@ -3522,11 +3388,12 @@ fn add_overview_raw_edges(
 
 /// 概览「活动与健康 / 消息与数据状态」的窗口口径统计。
 struct OverviewActivity {
-    sessions: i64,
-    active_sessions: i64,
-    messages: i64,
-    user_messages: i64,
-    tools: i64,
+    /// `None` 表示所需明细已被归档、该指标不可算——诚实返回空值而不是偏小的假数字。
+    sessions: Option<i64>,
+    active_sessions: Option<i64>,
+    messages: Option<i64>,
+    user_messages: Option<i64>,
+    tools: Option<i64>,
     session_duration_ms: Option<i64>,
 }
 
@@ -3537,9 +3404,55 @@ fn overview_activity(
     p: &RangeParams,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
+    archived: bool,
 ) -> OverviewActivity {
     let (session_filter, session_fargs) = range_filter_sessions(p);
-    let sessions = c
+
+    // 请求范围早于归档水位：这些指标全部依赖已删除的明细行。
+    // - 会话数在「整点对齐 + 无会话筛选」时可由聚合表精确给出（聚合完整保留，
+    //   与归档前完全一致，正是默认时间范围的形态）；
+    // - 其余指标（消息按 created_at、工具按 started_at、活跃会话与会话时长按会话跨度）
+    //   没有对应的聚合口径，一律返回 None → 响应里是 null，配合
+    //   activity_archived_before 由界面标注「已归档，不可计算」，
+    //   绝不返回偏小的数值或 0。
+    if archived {
+        let sessions = if session_filter.trim().is_empty()
+            && from.timestamp() % 3600 == 0
+            && to.timestamp() % 3600 == 0
+        {
+            c.query_row(
+                "SELECT COALESCE(SUM(session_count), 0) FROM hourly_rollups
+                 WHERE bucket >= ?1 AND bucket < ?2",
+                [from.to_rfc3339(), to.to_rfc3339()],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+        return OverviewActivity {
+            sessions,
+            active_sessions: None,
+            messages: None,
+            user_messages: None,
+            tools: None,
+            session_duration_ms: None,
+        };
+    }
+    // 没有会话筛选时 JOIN 是多余的：messages/tool_events 按时间列即可命中索引
+    // （实测带 JOIN 的三次计数合计 47ms，去掉后只剩索引扫描）。
+    let has_session_scope = !session_filter.trim().is_empty();
+    let messages_join = if has_session_scope {
+        "\n                 JOIN sessions s ON s.id = m.session_id"
+    } else {
+        ""
+    };
+    let tools_join = if has_session_scope {
+        "\n                 JOIN sessions s ON s.id = t.session_id"
+    } else {
+        ""
+    };
+    let sessions_raw = c
         .query_row(
             &format!(
                 "SELECT COUNT(*) FROM sessions s
@@ -3550,8 +3463,9 @@ fn overview_activity(
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0);
+    let sessions_value = Some(sessions_raw);
     // 活跃会话：窗口内新建，或窗口之前开始但在窗口内仍有活动。
-    let active_sessions = c
+    let active_sessions_raw = c
         .query_row(
             &format!(
                 "SELECT COUNT(*) FROM sessions s
@@ -3564,22 +3478,22 @@ fn overview_activity(
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    let messages = c
+    let active_sessions_value = Some(active_sessions_raw);
+    let messages_raw = c
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM messages m
-                 JOIN sessions s ON s.id = m.session_id
+                "SELECT COUNT(*) FROM messages m{messages_join}
                  WHERE m.created_at >= ?1 AND m.created_at < ?2 {session_filter}"
             ),
             params_from_iter(range_args(&from, &to, session_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    let user_messages = c
+    let messages_value = Some(messages_raw);
+    let user_messages_raw = c
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM messages m
-                 JOIN sessions s ON s.id = m.session_id
+                "SELECT COUNT(*) FROM messages m{messages_join}
                  WHERE m.created_at >= ?1 AND m.created_at < ?2
                    AND m.role = 'user' {session_filter}"
             ),
@@ -3587,17 +3501,18 @@ fn overview_activity(
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    let tools = c
+    let user_messages_value = Some(user_messages_raw);
+    let tools_raw = c
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM tool_events t
-                 JOIN sessions s ON s.id = t.session_id
+                "SELECT COUNT(*) FROM tool_events t{tools_join}
                  WHERE t.started_at >= ?1 AND t.started_at < ?2 {session_filter}"
             ),
             params_from_iter(range_args(&from, &to, session_fargs.clone())),
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0);
+    let tools_value = Some(tools_raw);
     // 与窗口重叠的会话跨度（裁剪到窗口边界），允许会话之间重叠。
     let (overlap_count, overlap_ms) = c
         .query_row(
@@ -3618,11 +3533,11 @@ fn overview_activity(
         )
         .unwrap_or((0, None));
     OverviewActivity {
-        sessions,
-        active_sessions,
-        messages,
-        user_messages,
-        tools,
+        sessions: sessions_value,
+        active_sessions: active_sessions_value,
+        messages: messages_value,
+        user_messages: user_messages_value,
+        tools: tools_value,
         session_duration_ms: if overlap_count > 0 { overlap_ms } else { None },
     }
 }
@@ -3644,7 +3559,13 @@ fn add_json_number(body: &mut serde_json::Value, key: &str, delta: i64) {
 /// `from_ph`/`to_ph` 指定 from/to 绑定的参数序号（只使用这两个参数）。
 /// 明细侧无法提供的字段（usage_source/pricing_source、
 /// session/message/tool/turn/subagent 计数）以空串或 0 补齐。
-fn rollup_source_cte(from_ph: u8, to_ph: u8) -> String {
+fn rollup_source_cte(from_ph: u8, to_ph: u8, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+    // 边缘判定原先对**每一行**执行 CAST(strftime(started_at))（解析整个时间戳），
+    // 30 天范围 17.5 万行上是 breakdown/timeseries 各 ~70ms 的主要来源。
+    // 改用 13 位小时前缀 `YYYY-MM-DDTHH` 比较：与 `Z` / `+00:00` 尾缀无关，
+    // 也不需要解析时间戳，语义仍是「整点小时落在 [ceil(from), floor(to)) 内的走 rollup」。
+    let full_from = ceil_hour(from).format("%Y-%m-%dT%H").to_string();
+    let full_to = floor_hour(to).format("%Y-%m-%dT%H").to_string();
     format!(
         r#"WITH rollup_src AS (
             SELECT bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
@@ -3653,8 +3574,8 @@ fn rollup_source_cte(from_ph: u8, to_ph: u8) -> String {
                    reported_cost, calculated_cost, estimated_cost,
                    session_count, model_call_count, turn_count, message_count, tool_call_count, subagent_count
             FROM hourly_rollups
-            WHERE CAST(strftime('%s', bucket) AS INTEGER) >= CAST(strftime('%s', ?{from_ph}) AS INTEGER)
-              AND CAST(strftime('%s', bucket) AS INTEGER) + 3600 <= CAST(strftime('%s', ?{to_ph}) AS INTEGER)
+            WHERE substr(bucket, 1, 13) >= '{full_from}'
+              AND substr(bucket, 1, 13) < '{full_to}'
             UNION ALL
             SELECT strftime('%Y-%m-%dT%H:00:00+00:00', started_at), node_id, collector_id, client_id, source_id,
                    COALESCE(project_id,''), COALESCE(provider_normalized,''), COALESCE(model_normalized,''),
@@ -3664,10 +3585,8 @@ fn rollup_source_cte(from_ph: u8, to_ph: u8) -> String {
                    0, 1, 0, 0, 0, 0
             FROM model_calls
             WHERE started_at >= ?{from_ph} AND started_at < ?{to_ph}
-              AND NOT (
-                    ((CAST(strftime('%s', started_at) AS INTEGER) / 3600) * 3600) >= CAST(strftime('%s', ?{from_ph}) AS INTEGER)
-                AND ((CAST(strftime('%s', started_at) AS INTEGER) / 3600) * 3600) + 3600 <= CAST(strftime('%s', ?{to_ph}) AS INTEGER)
-              )
+              AND NOT (substr(started_at, 1, 13) >= '{full_from}'
+                   AND substr(started_at, 1, 13) < '{full_to}')
         ) "#
     )
 }

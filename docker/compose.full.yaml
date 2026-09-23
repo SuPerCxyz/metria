@@ -33,7 +33,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      # 首次升级需跑迁移 + VACUUM + 预聚合（生产副本实测约 38s），
+      # 5s 会让健康检查在升级窗口内误报 unhealthy。
+      start_period: 90s
 
   metria-demo:
     image: ghcr.io/supercxyz/metria:latest
@@ -54,7 +56,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      # 首次升级需跑迁移 + VACUUM + 预聚合（生产副本实测约 38s），
+      # 5s 会让健康检查在升级窗口内误报 unhealthy。
+      start_period: 90s
 
   metria-agent:
     image: ghcr.io/supercxyz/metria:latest

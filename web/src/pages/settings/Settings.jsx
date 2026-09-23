@@ -11,7 +11,7 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { useToast } from '../../components/feedback/Toast'
 import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
-import { fmtDateTime, fmtUsd } from '../../services/format'
+import { fmtBytes, fmtDateTime, fmtUsd } from '../../services/format'
 import { EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, PRICE_FIELDS, RULE_SOURCE_FILTERS, filterPricingRules, pricingRuleKind, pricingRuleKindMeta, serializeRuleDraft } from '../../services/pricing'
 import ReportSettings from './ReportSettings'
 
@@ -790,13 +790,15 @@ function FieldLabel({ children }) {
   return <span className="mb-1 block text-xs font-medium text-gray-500 dark:text-gray-400">{children}</span>
 }
 
-function TextField({ value, onChange, placeholder, maxLength, type = 'text', readOnly = false }) {
+function TextField({ value, onChange, placeholder, maxLength, type = 'text', readOnly = false, min, step }) {
   return (
     <input
       type={type}
       value={value}
       readOnly={readOnly}
       maxLength={maxLength}
+      min={min}
+      step={step}
       onChange={onChange}
       placeholder={placeholder}
       className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200"
@@ -893,19 +895,135 @@ function AccountSettings({ loading, error, profile, authMode, profileDraft, setP
 }
 
 function RetentionSettings({ loading, error, info }) {
+  const { notify } = useToast()
+  const [archive, setArchive] = useState(null)
+  const [archiveLoading, setArchiveLoading] = useState(true)
+  const [archiveError, setArchiveError] = useState('')
+  const [enabled, setEnabled] = useState(false)
+  const [days, setDays] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const loadArchive = () => {
+    setArchiveLoading(true)
+    api('/settings/archive')
+      .then((data) => {
+        setArchive(data)
+        setArchiveError('')
+      })
+      .catch((e) => setArchiveError(e.message))
+      .finally(() => setArchiveLoading(false))
+  }
+
+  // hooks 必须先于任何早退渲染执行
+  useEffect(() => {
+    loadArchive()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 表单草稿与服务端策略保持同步（首次加载、保存成功后回填服务端结果）
+  useEffect(() => {
+    if (!archive?.policy) return
+    setEnabled(Boolean(archive.policy.enabled))
+    setDays(String(archive.policy.retention_days ?? ''))
+  }, [archive])
+
+  // 保存前校验：保留天数必须是不小于 1 的整数，非法时禁用保存
+  const daysNumber = Number(String(days).trim())
+  const daysValid = Number.isInteger(daysNumber) && daysNumber >= 1
+
+  const saveArchive = async (event) => {
+    event.preventDefault()
+    if (saving || !daysValid) return
+    setSaving(true)
+    try {
+      const result = await api('/settings/archive', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled, retention_days: daysNumber }),
+      })
+      setArchive({ policy: result.policy, status: result.status })
+      notify(result.policy?.enabled
+        ? '归档策略已保存；执行前会先自动备份，不会立即删除数据'
+        : '归档策略已保存；自动归档已关闭，现有明细保持不变')
+    } catch (e) {
+      if (e.status === 403) notify('仅管理员可修改归档策略', 'error')
+      else if (e.status === 400) notify('保存失败：保留天数必须是不小于 1 的整数', 'error')
+      else notify(`保存失败：${e.message}`, 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   if (loading) return <LoadingSkeleton rows={3} />
   if (!info) return <ErrorState error={error || '系统策略加载失败'} />
+  const status = archive?.status || null
   return (
     <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
       <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-2">数据保留策略</h2>
-      <p className="text-sm text-gray-500 dark:text-gray-400 mb-5">当前页面展示 Hub 的实际运行策略。自动清理尚未启用，历史数据不会因页面操作被删除。</p>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <StatusItem label="内容保存模式" value={info.content_mode_label || info.content_mode} />
-        <StatusItem label="自动清理" value={info.retention?.label || '未启用'} />
-        <StatusItem label="展示时区" value={info.timezone || '—'} />
+      <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+        明细归档按保留期删除超期的调用、会话、消息等明细；总览、趋势与报告使用的聚合数据完整保留，数值不变。默认关闭。
+      </p>
+
+      {/* 归档前须知：开启前必须始终可见的三点说明 */}
+      <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-500/5 dark:text-amber-300">
+        <p className="mb-1 font-semibold">归档前须知</p>
+        <ul className="list-disc space-y-1 pl-4">
+          <li>删除明细前会先自动备份，备份失败则中止本次归档。</li>
+          <li>总览、趋势、报告基于聚合数据，不受归档影响，数值保持不变。</li>
+          <li>明细删除不可逆：被删除的调用、会话、消息等无法恢复查看。</li>
+        </ul>
       </div>
-      {info.auth_mode && info.auth_mode !== 'password' && (
-        <div className="mt-3">
+
+      {archiveLoading ? (
+        <div className="mt-5"><LoadingSkeleton rows={5} /></div>
+      ) : archiveError ? (
+        <div className="mt-5"><ErrorState error={archiveError} onRetry={loadArchive} /></div>
+      ) : (
+        <>
+          <form onSubmit={saveArchive} className="mt-5">
+            <div className="flex flex-wrap items-end gap-4">
+              <label className="flex select-none items-center gap-2 pb-2 text-sm text-gray-600 dark:text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) => setEnabled(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                启用自动归档
+              </label>
+              <label className="block w-44">
+                <FieldLabel>保留天数</FieldLabel>
+                <TextField type="number" value={days} onChange={(e) => setDays(e.target.value)} min={1} step={1} />
+                {!daysValid && (
+                  <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400">保留天数必须是不小于 1 的整数</span>
+                )}
+              </label>
+              <div className="ml-auto pb-2">
+                <button type="submit" disabled={saving || !daysValid} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white hover:bg-indigo-700 disabled:opacity-50">
+                  {saving ? '保存中…' : '保存归档策略'}
+                </button>
+              </div>
+            </div>
+            <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">保存不会立即删除数据：系统先备份，再在后台分批执行归档。</p>
+          </form>
+
+          <h3 className="mt-6 text-sm font-semibold text-gray-500 dark:text-gray-400">归档状态</h3>
+          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <StatusItem label="当前状态" value={status?.label || info.retention?.label || '未启用'} />
+            <StatusItem label={status?.enabled ? '保留天数' : '保留天数（启用后生效）'} value={status?.retention_days ?? '—'} />
+            <StatusItem label="最早可查明细" value={fmtDateTime(status?.earliest_detail)} />
+            <StatusItem label="已归档水位" value={status?.watermark ? fmtDateTime(status.watermark) : '未发生归档'} />
+            <StatusItem label="累计删除行数" value={Number(status?.total_deleted ?? 0).toLocaleString()} />
+            <StatusItem label="已释放空间" value={fmtBytes(status?.freed_bytes)} />
+            <StatusItem label="最近一次归档" value={status?.last_run_at ? fmtDateTime(status.last_run_at) : '尚未执行'} />
+            <StatusItem label="备份文件" value={status?.backup_path || '—'} />
+          </div>
+        </>
+      )}
+
+      <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <StatusItem label="内容保存模式" value={info.content_mode_label || info.content_mode} />
+        <StatusItem label="展示时区" value={info.timezone || '—'} />
+        {info.auth_mode && info.auth_mode !== 'password' && (
           <StatusItem
             label="登录方式"
             value={
@@ -913,8 +1031,8 @@ function RetentionSettings({ loading, error, info }) {
               info.auth_mode
             }
           />
-        </div>
-      )}
+        )}
+      </div>
       <p className="mt-5 text-xs text-gray-400 dark:text-gray-500">详细保留、备份与恢复说明见项目运维文档 <code className="rounded bg-gray-100 px-1.5 py-0.5 dark:bg-gray-700">docs/operations.md</code>。</p>
     </div>
   )
@@ -924,7 +1042,7 @@ function StatusItem({ label, value }) {
   return (
     <div className="rounded-xl bg-gray-50 p-4 dark:bg-gray-700/30">
       <div className="text-xs text-gray-400 dark:text-gray-500">{label}</div>
-      <div className="mt-1 text-sm font-semibold text-gray-700 dark:text-gray-200">{value}</div>
+      <div className="mt-1 text-sm font-semibold text-gray-700 dark:text-gray-200 break-all">{value}</div>
     </div>
   )
 }

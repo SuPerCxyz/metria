@@ -9,14 +9,16 @@ import DailyUsageChart from '../../components/charts/DailyUsageChart'
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap'
 import RankingList from '../../components/cards/RankingList'
 import Segmented from '../../components/ui/Segmented'
-import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedback/Feedback'
+import { ErrorState, LoadingSkeleton, EmptyState, ArchiveNotice } from '../../components/feedback/Feedback'
 import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
+import { useVisibleQuery } from '../../hooks/useVisibleQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
 import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
+import { ARCHIVED_UNAVAILABLE_LABEL, isActivityArchived } from '../../services/archiveRange'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
 
 const TREND_TABS = [
@@ -32,6 +34,9 @@ const DIMS = [
 ]
 
 const EMPTY_HIDDEN = []
+
+// 归档区间的活动指标提示（activity_archived_before 非 null 时展示）
+const ARCHIVE_NOTICE = '所选时间早于归档水位，部分活动指标不可计算'
 
 // 日趋势最小窗口 7 天：全局范围不足时补到最近 7 天，更长范围按所选显示。
 const DAILY_MIN_SPAN_MS = 7 * 24 * 60 * 60 * 1000
@@ -59,7 +64,8 @@ export default function Overview() {
   const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
 
   const overview = useQuery(`overview${q(overviewParams)}`, () => api(`/overview${q(overviewParams)}`))
-  const performance = useQuery(`overview-performance${q(overviewParams)}`, () => api(`/usage/performance${q(overviewParams)}`))
+  // 性能查询成本高：所在区域（消息与数据状态）可见后才发起，顶栏手动刷新仍会强制发起
+  const performance = useVisibleQuery(`overview-performance${q(overviewParams)}`, () => api(`/usage/performance${q(overviewParams)}`))
   const previousOverview = useQuery(
     `overview-previous${q({ ...previousParams, ...excludedParams })}`,
     () => api(`/overview${q({ ...previousParams, ...excludedParams })}`),
@@ -73,7 +79,8 @@ export default function Overview() {
   const daily = useQuery(`daily${q(dailyParams)}`, () => api(`/usage/daily${q(dailyParams)}`))
   const heatmapRange = useMemo(() => currentWeekRange(range.timezone, new Date()), [range.timezone, range.to])
   const heatmapParams = usageRangeParams(heatmapRange, { nodeId, clientId, model })
-  const heatmap = useQuery(`heatmap${q(heatmapParams)}`, () => api(`/usage/heatmap${q(heatmapParams)}`))
+  // 热力图查询成本高：所在卡片可见后才发起，顶栏手动刷新仍会强制发起
+  const heatmap = useVisibleQuery(`heatmap${q(heatmapParams)}`, () => api(`/usage/heatmap${q(heatmapParams)}`))
 
   const toggleHiddenDimension = useCallback((dimension) => {
     if (dim === 'all') return
@@ -157,6 +164,16 @@ export default function Overview() {
     delta: previous ? fmtChange(current, previousValue) : null,
     deltaTone: previous ? changeTone(current, previousValue, inverse) : 'neutral',
   })
+
+  // 活动类字段的归档展示：水位非 null 且后端置 null → 诚实标注「已归档，不可计算」；
+  // 水位为 null（旧后端）时下列判定恒为 false，渲染路径与改动前完全一致。
+  const archivedMetric = (value) => isActivityArchived(o.activity_archived_before, value)
+  const activityValue = (value, render) => (archivedMetric(value) ? ARCHIVED_UNAVAILABLE_LABEL : render())
+  // 值不可计算时环比也失去意义：隐藏涨跌徽标，避免出现 -100% 之类的假涨跌
+  const activityDelta = (value, previousValue) => (archivedMetric(value)
+    ? { delta: null, deltaTone: 'neutral' }
+    : compare(value, previousValue))
+  const activityArchived = o.activity_archived_before != null
 
   const costItems = (byDim.data?.by || [])
     .filter((m) => m.dimension && m.dimension !== '' && m.dimension !== '(unknown)')
@@ -272,9 +289,17 @@ export default function Overview() {
           <MetricCard
             span="xl:col-span-4"
             label="平均每会话费用"
-            value={averageSessionCost != null ? fmtUsd(averageSessionCost) : '—'}
-            {...compare(averageSessionCost, previousAverageSessionCost)}
-            sub={averageSessionCost != null ? `${activeSessions} 个活跃会话` : '当前范围暂无可计算费用'}
+            value={averageSessionCost != null
+              ? fmtUsd(averageSessionCost)
+              : archivedMetric(o.active_sessions)
+                ? ARCHIVED_UNAVAILABLE_LABEL
+                : '—'}
+            {...(archivedMetric(o.active_sessions) ? { delta: null } : compare(averageSessionCost, previousAverageSessionCost))}
+            sub={averageSessionCost != null
+              ? `${activeSessions} 个活跃会话`
+              : archivedMetric(o.active_sessions)
+                ? '所选时间早于归档水位'
+                : '当前范围暂无可计算费用'}
             hint="当前范围总费用除以范围内活跃或新建的会话数；无会话或未定价时保持不可用"
           />
         </div>
@@ -282,22 +307,28 @@ export default function Overview() {
 
       <div className="mt-3">
         <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">活动与健康</h2>
+        {activityArchived && (
+          <div className="mb-3"><ArchiveNotice text={ARCHIVE_NOTICE} /></div>
+        )}
         <div className="grid grid-cols-12 gap-6">
           <MetricCard span="xl:col-span-2" label="请求数" value={String(modelCalls)} {...compare(modelCalls, previousModelCalls)} sub="模型调用次数" hint={`涉及 ${o.models ?? 0} 个模型`} />
           <MetricCard span="xl:col-span-2" label="错误率" value={errorRate != null ? fmtPct100(errorRate) : '—'} {...compare(errorRate, previousErrorRate, true)} sub={errorRate != null ? `成功 ${fmtPct100(successRate)} · 失败 ${failed} 次` : '当前范围暂无请求数据'} hint="失败请求占全部请求比例；下降表示改善" />
-          <MetricCard span="xl:col-span-2" label="活跃会话" value={isAvailable(o.active_sessions) ? String(o.active_sessions) : '—'} {...compare(o.active_sessions, previous?.active_sessions)} sub={isAvailable(o.active_sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据'} hint="范围内新建或仍在活动的会话数" />
+          <MetricCard span="xl:col-span-2" label="活跃会话" value={activityValue(o.active_sessions, () => (isAvailable(o.active_sessions) ? String(o.active_sessions) : '—'))} {...activityDelta(o.active_sessions, previous?.active_sessions)} sub={archivedMetric(o.active_sessions) ? '所选时间早于归档水位' : (isAvailable(o.active_sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据')} hint="范围内新建或仍在活动的会话数" />
           <MetricCard span="xl:col-span-2" label="活跃时长" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub="模型调用耗时合计" hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠" />
-          <MetricCard span="xl:col-span-2" label="会话总时长" value={fmtDuration(o.session_duration_ms)} {...compare(o.session_duration_ms, previous?.session_duration_ms)} sub="范围重叠的会话跨度合计" hint="与所选范围重叠的会话跨度（裁剪到范围边界）；不去重重叠会话" />
+          <MetricCard span="xl:col-span-2" label="会话总时长" value={activityValue(o.session_duration_ms, () => fmtDuration(o.session_duration_ms))} {...activityDelta(o.session_duration_ms, previous?.session_duration_ms)} sub="范围重叠的会话跨度合计" hint="与所选范围重叠的会话跨度（裁剪到范围边界）；不去重重叠会话" />
           <MetricCard span="xl:col-span-2" label="节点在线" value={isAvailable(o.collectors) ? `${o.collectors_online ?? 0} / ${o.collectors}` : '—'} sub={isAvailable(o.collectors) ? `${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目` : '当前范围暂无采集器数据'} hint="在线采集器 / 总数" />
         </div>
       </div>
 
-      <div className="mt-3">
+      <div className="mt-3" ref={performance.ref}>
         <h2 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-2">消息与数据状态</h2>
+        {activityArchived && (
+          <div className="mb-3"><ArchiveNotice text={ARCHIVE_NOTICE} /></div>
+        )}
         <div className="grid grid-cols-12 gap-6">
-          <MetricCard span="xl:col-span-3" label="总消息数" value={fmtTokensShort(o.message_count)} {...compare(o.message_count, previous?.message_count)} sub="按消息时间统计（需内容采集）" />
-          <MetricCard span="xl:col-span-3" label="用户消息数" value={fmtTokensShort(o.user_message_count)} {...compare(o.user_message_count, previous?.user_message_count)} sub="可识别 role=user" />
-          <MetricCard span="xl:col-span-3" label="工具调用消息" value={fmtTokensShort(o.tool_call_count)} {...compare(o.tool_call_count, previous?.tool_call_count)} sub="按工具事件时间统计" />
+          <MetricCard span="xl:col-span-3" label="总消息数" value={activityValue(o.message_count, () => fmtTokensShort(o.message_count))} {...activityDelta(o.message_count, previous?.message_count)} sub="按消息时间统计（需内容采集）" />
+          <MetricCard span="xl:col-span-3" label="用户消息数" value={activityValue(o.user_message_count, () => fmtTokensShort(o.user_message_count))} {...activityDelta(o.user_message_count, previous?.user_message_count)} sub="可识别 role=user" />
+          <MetricCard span="xl:col-span-3" label="工具调用消息" value={activityValue(o.tool_call_count, () => fmtTokensShort(o.tool_call_count))} {...activityDelta(o.tool_call_count, previous?.tool_call_count)} sub="按工具事件时间统计" />
           {performanceCards}
         </div>
         {performance.loading && <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">性能数据加载中…</p>}
@@ -343,7 +374,7 @@ export default function Overview() {
             error={daily.error}
           />
         </div>
-        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
+        <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5" ref={heatmap.ref}>
           <ActivityHeatmap
             cells={heatmap.data?.cells}
             metric={heatmapMetric}

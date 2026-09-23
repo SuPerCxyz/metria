@@ -6,8 +6,9 @@ import PageHeader from '../../components/common/PageHeader'
 import DataTable from '../../components/tables/DataTable'
 import StatusBadge from '../../components/common/StatusBadge'
 import FilterBar from '../../components/filters/FilterBar'
-import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
+import { ArchiveNotice, ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, usageRangeParams } from '../../services/api'
+import { archiveEmptyText, archiveRangeState } from '../../services/archiveRange'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
@@ -34,6 +35,10 @@ export default function Sessions() {
       (x.client_id || '').toLowerCase().includes(s)
     )
   }, [query.data, search])
+
+  // 归档水位：范围起点早于水位时必须标注明细已归档，不能渲染成普通「暂无数据」
+  const archive = archiveRangeState(query.data?.archived_before, range.from, range.to)
+  const sessionCount = (query.data?.sessions || []).length
 
   if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={8} />
@@ -75,10 +80,14 @@ const columns = [
         }
       />
       <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
+        {archive.level !== 'none' && (
+          <div className="mb-3"><ArchiveNotice state={archive} /></div>
+        )}
         <DataTable
           columns={columns}
           data={filtered}
           pageSize={12}
+          emptyText={sessionCount === 0 ? archiveEmptyText(archive) : undefined}
           onRowClick={(r) => navigate(`/sessions/${encodeURIComponent(r.id)}`)}
         />
       </div>

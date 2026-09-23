@@ -8,7 +8,77 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::net::IpAddr;
 
-use crate::api::{json_err, AppState};
+use crate::api::{admin_user, auth_user, json_err, AppState};
+
+// ============ 数据归档 ============
+
+fn archive_policy_json(policy: &crate::archive::ArchivePolicy) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": policy.enabled,
+        "retention_days": policy.retention_days,
+    })
+}
+
+/// PUT /api/v1/settings/archive 的请求体。
+#[derive(Debug, Deserialize)]
+pub struct ArchiveSettingsUpdate {
+    pub enabled: bool,
+    pub retention_days: i64,
+}
+
+/// GET /api/v1/settings/archive：归档策略与状态（登录即可读）。
+pub(crate) async fn archive_settings_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if auth_user(&st, &headers).is_none() {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
+    }
+    Json(serde_json::json!({
+        "policy": archive_policy_json(&crate::archive::policy(&st.db)),
+        "status": crate::archive::status(&st.db),
+    }))
+    .into_response()
+}
+
+/// PUT /api/v1/settings/archive：保存归档策略（仅管理员）。
+///
+/// 保存本身不删数据：真正删除在归档任务里执行，且必须先成功备份。
+/// 保存成功后立即异步跑一次，不必等下一个维护周期。
+pub(crate) async fn archive_settings_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ArchiveSettingsUpdate>,
+) -> Response {
+    if auth_user(&st, &headers).is_none() {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized", "未登录");
+    }
+    if admin_user(&st, &headers).is_none() {
+        return json_err(StatusCode::FORBIDDEN, "forbidden", "仅管理员可修改归档策略");
+    }
+    let policy = match crate::archive::set_policy(&st.db, req.enabled, req.retention_days) {
+        Ok(policy) => policy,
+        Err(e) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_archive_policy",
+                &e.to_string(),
+            )
+        }
+    };
+    let db = st.db.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::archive::run(&db) {
+            tracing::warn!("归档任务失败: {e}");
+        }
+    });
+    Json(serde_json::json!({
+        "ok": true,
+        "policy": archive_policy_json(&policy),
+        "status": crate::archive::status(&st.db),
+    }))
+    .into_response()
+}
 
 // ============ Pricing ============
 
@@ -302,7 +372,7 @@ pub(crate) async fn pricing_reprice(
             Json(serde_json::json!({
                 "ok": true,
                 "repriced": n,
-                "note": "重新计价生成新版本并保留历史 pricing_matches",
+                "note": "重新计价生成新版本，随后按保留策略只保留每个用量行的最新计价记录",
             }))
             .into_response()
         }

@@ -6,8 +6,9 @@ import PageHeader from '../../components/common/PageHeader'
 import DataTable from '../../components/tables/DataTable'
 import FilterBar from '../../components/filters/FilterBar'
 import StatusBadge from '../../components/common/StatusBadge'
-import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
+import { ArchiveNotice, ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { api, q, usageRangeParams } from '../../services/api'
+import { archiveEmptyText, archiveRangeState } from '../../services/archiveRange'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
@@ -58,13 +59,18 @@ export default function Calls() {
   ]
 
   const nextCursor = query.data?.next_cursor
+  // 归档水位：范围起点早于水位时必须标注明细已归档，不能渲染成普通「暂无数据」
+  const archive = archiveRangeState(query.data?.archived_before, range.from, range.to)
 
   return (
     <>
       <PageHeader title="调用" subtitle="查看当前时间范围内的模型调用与 Token、费用" />
       <FilterBar searchPlaceholder="搜索 Agent、模型或状态…" onSearch={setSearch} />
       <div className="bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
-        <DataTable columns={columns} data={filtered} pageSize={20} onRowClick={(r) => navigate(`/calls/${encodeURIComponent(r.id)}`)} />
+        {archive.level !== 'none' && (
+          <div className="mb-3"><ArchiveNotice state={archive} /></div>
+        )}
+        <DataTable columns={columns} data={filtered} pageSize={20} emptyText={calls.length === 0 ? archiveEmptyText(archive) : undefined} onRowClick={(r) => navigate(`/calls/${encodeURIComponent(r.id)}`)} />
         {query.error && <p className="mt-3 text-sm text-amber-600 dark:text-amber-400">下一页加载失败：{query.error.message}</p>}
         {nextCursor && !search && (
           <div className="mt-4 flex justify-center">

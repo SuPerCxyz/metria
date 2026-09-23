@@ -219,7 +219,7 @@ impl HubDb {
         out
     }
 
-    /// 使用给定规则集对历史 usage 重新计价（保留旧 pricing_matches）。
+    /// 使用给定规则集对历史 usage 重新计价（每个用量行保留最新一条 pricing_matches）。
     ///
     /// `only_unpriced = true` 时仅处理尚无费用的事件（后台周期增量），
     /// 否则全量重算。完成后把费用传播到关联的 model_calls，保持列表/详情一致。

@@ -1,6 +1,7 @@
-// 反馈组件：空状态 / 错误状态 / 加载骨架 / 数据质量提示。
+// 反馈组件：空状态 / 错误状态 / 加载骨架 / 数据质量提示 / 归档水位提示。
 
 import React from 'react'
+import { fmtDateTime } from '../../services/format'
 
 export function EmptyState({ title = '暂无数据', desc, icon }) {
   return (
@@ -60,4 +61,17 @@ export function DataQualityNote({ text, kind = 'estimated' }) {
       {text}
     </div>
   )
+}
+
+// 归档水位提示：列表页传 state（services/archiveRange.js 的 archiveRangeState 产出）自动拼文案；
+// 其他场景（如 /overview 的 activity_archived_before）可只传 text 自定义提示，由调用方把关出现时机。
+// state 与 text 均不构成命中时不渲染。
+export function ArchiveNotice({ state, text }) {
+  const hit = state ? state.level !== 'none' : Boolean(text)
+  if (!hit) return null
+  const stamp = state ? fmtDateTime(state.watermark) : ''
+  const message = text || (state.level === 'full'
+    ? `所选时间早于归档水位（${stamp}），该时段明细已归档，不可查看`
+    : `所选时间早于归档水位（${stamp}），水位之前的明细已归档、不可查看；水位之后的明细正常展示`)
+  return <DataQualityNote kind="partial" text={message} />
 }

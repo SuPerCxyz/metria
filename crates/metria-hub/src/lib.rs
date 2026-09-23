@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 pub mod api;
+pub mod archive;
 pub mod assets;
 pub mod catalog;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod demo;
 pub mod export;
 pub mod http;
 pub mod memory;
+pub mod perfrollup;
 pub mod pull;
 pub mod report;
 pub mod rollup;
@@ -22,7 +24,7 @@ use metria_core::logging::init_logging;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::AppState;
 pub use config::HubConfig;
@@ -68,6 +70,18 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     let applied = db.apply_migrations()?;
     if !applied.is_empty() {
         info!(applied = ?applied, "数据库迁移完成");
+    }
+    // 历史库首次切换 auto_vacuum 并回收迁移删出的空闲页：VACUUM 不能放进迁移事务，
+    // 只能在此单独执行；失败只降级为空间暂不回收，不阻断启动。
+    match db.compact_if_needed() {
+        Ok(Some(freed_pages)) => info!(freed_pages, "已切换 auto_vacuum 并回收空闲页"),
+        Ok(None) => {}
+        Err(e) => warn!("数据库空间回收跳过: {e}"),
+    }
+    // 小时级性能预聚合：启动时建好，首屏请求才不会落到「缺桶」回退路径。
+    match crate::perfrollup::rebuild_history(&db) {
+        Ok(buckets) => info!(buckets, "性能预聚合构建完成"),
+        Err(e) => warn!("性能预聚合构建失败，查询将回退明细: {e}"),
     }
 
     // 内置 admin（env 注入）与内置价格目录
@@ -297,6 +311,17 @@ fn spawn_maintenance(db: db::HubDb) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
             tick.tick().await;
+            // 运维表保留期清理：有界批次，失败只告警不中断服务
+            match db.prune_operational_tables() {
+                Ok(report) if report.deleted() > 0 => info!(
+                    upload_batches = report.upload_batches_deleted,
+                    pricing_matches = report.pricing_matches_deleted,
+                    finished = report.finished,
+                    "运维表保留期清理完成"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("运维表保留期清理失败: {e}"),
+            }
             // rollup 对账（最近 24h）
             match db.reconcile_rollups(1) {
                 Ok(report) => {
@@ -315,6 +340,24 @@ fn spawn_maintenance(db: db::HubDb) {
                     }
                 }
                 Err(e) => warn!("rollup 对账失败: {e}"),
+            }
+            // 明细归档：默认关闭；启用后执行「备份 → 分批删除 → 记水位」。
+            // 用 spawn_blocking 承载，避免备份与删除占住异步执行器。
+            if crate::archive::policy(&db).enabled {
+                let worker = db.clone();
+                match tokio::task::spawn_blocking(move || crate::archive::run(&worker)).await {
+                    Ok(Ok(report)) if !report.skipped => {
+                        info!(deleted = report.deleted, watermark = ?report.watermark, "明细归档完成")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => warn!("明细归档失败: {e}"),
+                    Err(e) => warn!("明细归档任务未完成: {e}"),
+                }
+            }
+            // 小时级性能预聚合：吸收补采、回填与重新计价对历史小时的改动
+            match crate::perfrollup::rebuild_history(&db) {
+                Ok(buckets) => debug!(buckets, "性能预聚合已刷新"),
+                Err(e) => warn!("性能预聚合刷新失败，查询将回退明细: {e}"),
             }
             // WAL checkpoint + 空间回收
             if let Err(e) = db.wal_checkpoint() {

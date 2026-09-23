@@ -48,6 +48,62 @@ pub struct ReportSendRow {
 
 const REPORT_HISTORY_LIMIT: i64 = 30;
 
+/// 运维表保留策略（键值驱动，默认值由 `migrations/021_table_retention.sql` 写入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// 上传批次保留小时数：该表只写不读，保留过久只会堆行。
+    pub upload_batch_retention_hours: i64,
+    /// 被后续重计价覆盖的计价匹配历史保留天数；0 表示每个用量行只留最新一条。
+    pub pricing_match_history_days: i64,
+}
+
+impl RetentionPolicy {
+    pub const DEFAULT_UPLOAD_BATCH_HOURS: i64 = 24;
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            upload_batch_retention_hours: Self::DEFAULT_UPLOAD_BATCH_HOURS,
+            pricing_match_history_days: 0,
+        }
+    }
+}
+
+/// 一次运维表清理的结果。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    pub upload_batches_deleted: i64,
+    pub pricing_matches_deleted: i64,
+    /// 是否已清理到没有可删行；false 表示触及单轮批次上限，下轮继续。
+    pub finished: bool,
+}
+
+impl PruneReport {
+    pub fn deleted(&self) -> i64 {
+        self.upload_batches_deleted + self.pricing_matches_deleted
+    }
+}
+
+/// 键名常量，供维护任务与系统信息接口共用。
+pub const KEY_UPLOAD_BATCH_RETENTION_HOURS: &str = "upload_batch_retention_hours";
+pub const KEY_PRICING_MATCH_HISTORY_DAYS: &str = "pricing_match_history_days";
+pub const KEY_LAST_CLEANUP_AT: &str = "table_last_cleanup_at";
+pub const KEY_LAST_CLEANUP_DELETED: &str = "table_last_cleanup_deleted";
+pub const KEY_TOTAL_CLEANUP_DELETED: &str = "table_total_cleanup_deleted";
+
+/// 单批删除行数：保证单个事务有界，不长时间持锁。
+const PRUNE_BATCH: i64 = 50_000;
+/// 单轮维护最多批次数（200 万行），超出留给下一轮。
+const PRUNE_MAX_ROUNDS: usize = 40;
+/// 空闲页占比超过该百分比且空闲页数超过下限时启动 VACUUM（迁移删行后首启即命中）。
+///
+/// 只看占比会让刚建好的小库（例如迁移 `015` 建表后 DROP 留下 1 个空闲页、总页数个位数）
+/// 误判为需要回收，因此同时要求绝对页数达到 [`VACUUM_MIN_FREE_PAGES`]。
+const VACUUM_FREE_PAGE_PERCENT: i64 = 20;
+/// 触发 VACUUM 所需的最小空闲页数（256KiB，按 4KiB 页计）。
+const VACUUM_MIN_FREE_PAGES: i64 = 64;
+
 impl HubDb {
     pub fn open(cfg: &HubConfig) -> Result<Self, StorageError> {
         let path = cfg
@@ -99,11 +155,151 @@ impl HubDb {
     }
 
     /// 执行 incremental_vacuum，回收空闲页（§9）。阈值由 caller 决定。
+    ///
+    /// 仅当库处于 `auto_vacuum=INCREMENTAL` 时有效；历史库由 [`Self::compact_if_needed`]
+    /// 在首次升级时切换，否则该调用是空操作。
     pub fn incremental_vacuum(&self) -> Result<(), StorageError> {
         let c = self.conn();
         c.execute_batch("PRAGMA incremental_vacuum")
             .map_err(StorageError::from)?;
         Ok(())
+    }
+
+    /// 读取运维表保留策略；键缺失或非法时回落到默认值。
+    pub fn retention_policy(&self) -> Result<RetentionPolicy, StorageError> {
+        let read = |key: &str, default: i64| -> Result<i64, StorageError> {
+            match self.setting_get(key)? {
+                Some(v) => match v.trim().parse::<i64>() {
+                    Ok(n) if n >= 0 => Ok(n),
+                    _ => Ok(default),
+                },
+                None => Ok(default),
+            }
+        };
+        Ok(RetentionPolicy {
+            upload_batch_retention_hours: read(
+                KEY_UPLOAD_BATCH_RETENTION_HOURS,
+                RetentionPolicy::DEFAULT_UPLOAD_BATCH_HOURS,
+            )?,
+            pricing_match_history_days: read(KEY_PRICING_MATCH_HISTORY_DAYS, 0)?,
+        })
+    }
+
+    /// 有界增量清理运维表，返回本次删除行数与是否已清理干净。
+    ///
+    /// 上传批次按保留小时数删除（该表全仓库无读路径）；计价匹配按覆盖关系删除，
+    /// 永远保留每个 `usage_event` 的最新一条，保证 `calculated_cost` 仍可追溯。
+    /// 每批固定 LIMIT，单轮最多 [`PRUNE_MAX_ROUNDS`] 批，避免长事务与持续写入追不上。
+    pub fn prune_operational_tables(&self) -> Result<PruneReport, StorageError> {
+        let policy = self.retention_policy()?;
+        let upload_cutoff = (Utc::now()
+            - chrono::Duration::hours(policy.upload_batch_retention_hours))
+        .to_rfc3339();
+        let pricing_cutoff = (policy.pricing_match_history_days > 0).then(|| {
+            (Utc::now() - chrono::Duration::days(policy.pricing_match_history_days)).to_rfc3339()
+        });
+        // 关联列 usage_event_id 走 idx_pricing_matches_usage，不产生无索引相关子查询。
+        let pricing_sql = match &pricing_cutoff {
+            Some(_) => {
+                "DELETE FROM pricing_matches WHERE id IN (
+                 SELECT m.id FROM pricing_matches m
+                 WHERE m.calculated_at < ?1
+                   AND EXISTS (SELECT 1 FROM pricing_matches p
+                               WHERE p.usage_event_id = m.usage_event_id
+                                 AND (p.calculated_at > m.calculated_at
+                                   OR (p.calculated_at = m.calculated_at AND p.id > m.id)))
+                 LIMIT ?2)"
+            }
+            None => {
+                "DELETE FROM pricing_matches WHERE id IN (
+                 SELECT m.id FROM pricing_matches m
+                 WHERE EXISTS (SELECT 1 FROM pricing_matches p
+                               WHERE p.usage_event_id = m.usage_event_id
+                                 AND (p.calculated_at > m.calculated_at
+                                   OR (p.calculated_at = m.calculated_at AND p.id > m.id)))
+                 LIMIT ?1)"
+            }
+        };
+
+        let mut report = PruneReport::default();
+        for _ in 0..PRUNE_MAX_ROUNDS {
+            let (up, pm) = {
+                let c = self.conn();
+                let up = c.execute(
+                    "DELETE FROM upload_batches WHERE rowid IN (
+                       SELECT rowid FROM upload_batches WHERE received_at < ?1 LIMIT ?2)",
+                    params![upload_cutoff, PRUNE_BATCH],
+                )? as i64;
+                let pm = match &pricing_cutoff {
+                    Some(cut) => c.execute(pricing_sql, params![cut, PRUNE_BATCH])? as i64,
+                    None => c.execute(pricing_sql, params![PRUNE_BATCH])? as i64,
+                };
+                (up, pm)
+            };
+            report.upload_batches_deleted += up;
+            report.pricing_matches_deleted += pm;
+            if up == 0 && pm == 0 {
+                report.finished = true;
+                break;
+            }
+        }
+
+        self.record_prune(report)?;
+        Ok(report)
+    }
+
+    /// 记录一次清理结果（本次行数 + 累计行数 + 时间），供系统信息接口回传。
+    ///
+    /// 一行都没删时不写：否则「最近清理时间」会退化成「最近一次任务运行时间」，
+    /// `last_cleanup_deleted` 恒为 0，界面读到的就是误导性信息。
+    fn record_prune(&self, report: PruneReport) -> Result<(), StorageError> {
+        if report.deleted() == 0 {
+            return Ok(());
+        }
+        let total = self
+            .setting_get(KEY_TOTAL_CLEANUP_DELETED)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .saturating_add(report.deleted());
+        let now = Utc::now().to_rfc3339();
+        self.settings_set_many(&[
+            (KEY_LAST_CLEANUP_AT, now),
+            (KEY_LAST_CLEANUP_DELETED, report.deleted().to_string()),
+            (KEY_TOTAL_CLEANUP_DELETED, total.to_string()),
+        ])
+    }
+
+    /// 首次升级把历史库切换为 `auto_vacuum=INCREMENTAL` 并回收空闲页。
+    ///
+    /// `PRAGMA auto_vacuum` 对已建表的库必须靠 `VACUUM` 才生效，否则既有
+    /// `incremental_vacuum` 维护调用是空操作、DELETE 也不会缩文件。副本实测 2.4GB 库
+    /// 约 10.7s、2362MiB → 1238MiB；新库在建库时已设置，后续启动空闲页占比低直接跳过。
+    /// 返回 `Some(回收页数)` 表示执行了 VACUUM，`None` 表示无需处理。
+    pub fn compact_if_needed(&self) -> Result<Option<i64>, StorageError> {
+        let (auto_vacuum, pages, free) = {
+            let c = self.conn();
+            let read = |sql: &str| -> Result<i64, StorageError> {
+                c.query_row(sql, [], |r| r.get(0))
+                    .map_err(StorageError::from)
+            };
+            (
+                read("PRAGMA auto_vacuum")?,
+                read("PRAGMA page_count")?,
+                read("PRAGMA freelist_count")?,
+            )
+        };
+        if pages > 0
+            && auto_vacuum == 2
+            && (free < VACUUM_MIN_FREE_PAGES || free * 100 / pages < VACUUM_FREE_PAGE_PERCENT)
+        {
+            return Ok(None);
+        }
+        let c = self.conn();
+        // 对已建表的库该 PRAGMA 本身不生效，靠紧随其后的 VACUUM 重写库头。
+        c.execute_batch("PRAGMA auto_vacuum=INCREMENTAL")
+            .map_err(StorageError::from)?;
+        c.execute_batch("VACUUM").map_err(StorageError::from)?;
+        Ok(Some(free))
     }
 
     pub fn schema_version(&self) -> Result<i64, StorageError> {

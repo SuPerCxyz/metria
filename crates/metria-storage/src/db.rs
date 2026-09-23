@@ -69,7 +69,14 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
 
 /// 对连接应用约定 PRAGMA（只影响本连接与本次会话）。
 pub fn configure(conn: &Connection, opts: &DbOptions) -> Result<()> {
+    // busy_timeout 必须第一个设置：归档分批删除期间，后续 PRAGMA 与查询都可能遇到
+    // 写锁，没有忙等会直接 SQLITE_BUSY（健康检查最容易命中）。
     conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))
+        .map_err(|e| StorageError::Open(e.to_string()))?;
+    // 必须先于 journal_mode：WAL 会写库头，之后再设 auto_vacuum 对已建页的库不生效
+    // （实测建表后仍为 0），导致周期 incremental_vacuum 变成空操作。
+    // 历史库无法靠此生效，由 HubDb::compact_if_needed 用一次 VACUUM 切换。
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
         .map_err(|e| StorageError::Open(e.to_string()))?;
     if opts.wal {
         conn.pragma_update(None, "journal_mode", "WAL")
