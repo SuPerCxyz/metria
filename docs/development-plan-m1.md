@@ -60,7 +60,7 @@
 | 数据质量口径修复与来源新鲜度：用量来源分布只统计用量行并展示 Token 构成；ingest 按 pseudo→原始来源映射回写 `sources.last_event_at`，来源列表新增「最近数据」并按其倒序（OpenSpec `track-source-event-freshness`） | ✅ 已部署 lstable（e2e + API + UI 验收通过） | 2026-09-21 |
 | 导航与标签视觉收紧：左侧导航选中项改深靛蓝底白字并降低高度；页内 tab 选中项加深、高度收紧；状态/质量/涨跌/价格来源等圆角标签统一实底深色 + 白字（含深色模式）；列表排序指示默认显示 ▲▼ 且点击不变样式 | ✅ 已部署 lstable（UI 验收通过） | 2026-09-21 |
 | 子 Agent 会话支持：OpenCode 子会话写入父级、Hub 会话汇总只计主会话（含幂等历史回填 + rollup 重建）、会话列表默认过滤并支持「包含子 Agent」、主会话详情展示子 Agent 合计与明细；关系 id 确定性去重（生产清理 231 条重复）（OpenSpec `support-subagent-sessions`） | ✅ 已部署 lstable 与本机 Agent；opencode 会话数 478→339（144 子会话） | 2026-09-21 |
-| Hub 资源占用治理与数据归档：运维表保留期清理（上传批次 24h、计价匹配每用量行留最新一条）+ 启动期 auto_vacuum/VACUUM；rollup 对账与重建统一为根会话口径；小时级性能预聚合把一次刷新 CPU 从 5.86s 降到 0.35s、库从 2362MiB 降到 1235MiB；明细归档（默认关闭、先备份、分批删、三张聚合表保留、`archived_before` 诚实标记）（OpenSpec `reduce-hub-query-cost-and-archive`） | ✅ 已部署 lstable（首启 78.1s、库 2362→1255MiB、首轮对账 0 漂移告警、归档未启用、部署后采集正常入库）；方案 A 已按用户裁决落地（聚合支撑的汇总归档前后一致，活动类诚实返回 null）；**待复测：页缓存 1063MiB 未达 ≤450MiB（VACUUM 后全量页缓存，可回收，rss 14MiB）** | 2026-09-23 |
+| Hub 资源占用治理与数据归档：运维表保留期清理（上传批次 24h、计价匹配每用量行留最新一条）+ 启动期 auto_vacuum/VACUUM；rollup 对账与重建统一为根会话口径；小时级性能预聚合把一次刷新 CPU 从 5.86s 降到 0.35s、库从 2362MiB 降到 1235MiB；明细归档（默认关闭、先备份、分批删、三张聚合表保留、`archived_before` 诚实标记）（OpenSpec `reduce-hub-query-cost-and-archive`） | ✅ 已部署 lstable（首启 78.1s、库 2362→1255MiB、首轮对账 0 漂移告警、归档未启用、部署后采集正常入库）；方案 A 已按用户裁决落地（聚合支撑的汇总归档前后一致，活动类诚实返回 null）；**24h 复测已闭环：页缓存 94.43MiB 达标（VACUUM 后峰值1063MiB已随回收回落91%）、6 小时对账连续 5 轮零漂移告警（原每轮18–19条）、OpenSpec change 已按 §13 同步并归档** | 2026-09-23 |
 
 ### Agent 轮询扫描 I/O 与内存优化记录（2026-09-21）
 
