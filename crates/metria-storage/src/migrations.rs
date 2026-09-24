@@ -437,4 +437,188 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+
+    /// 024：opencode 存量时长改用 first_response_at 重算；claude-code 的 turn 跨度
+    /// 时长诚实置空；codex 正常行一个字段都不动；>24h 走兜底降级。
+    #[test]
+    fn migration_024_repairs_duration_origin() {
+        let path = temp_path("dur024");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut conn = open(&path, &DbOptions::default()).unwrap();
+        let up_to_23 = migrate_embedded(&mut conn, Some(23)).unwrap();
+        assert_eq!(up_to_23.last().copied(), Some(23), "应先应用到 023");
+
+        let insert = "INSERT INTO model_calls (
+                id, node_id, collector_id, client_id, source_id, session_id, started_at,
+                first_response_at, completed_at, duration_ms, timing_source, timing_quality,
+                status, call_granularity, output_tokens, created_at, updated_at
+            ) VALUES (?1, 'n', 'c', ?2, 's', 'sess', ?3, ?4, ?5, ?6, ?7, ?8,
+                      'success', 'message', 700, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')";
+        type Row = (
+            &'static str,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<i64>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let rows: [Row; 6] = [
+            // g1 可重算：started 是 4 小时前的 turn 起点（错值），fr 才是请求起点
+            (
+                "g1",
+                "opencode",
+                "2026-08-31T20:00:00Z",
+                Some("2026-09-01T00:00:00Z"),
+                Some("2026-09-01T00:10:00Z"),
+                Some(14_400_000),
+                Some("opencode_message_timestamps"),
+                Some("observed"),
+            ),
+            // g2 opencode 缺 fr：无法重算 -> 诚实置空
+            (
+                "g2",
+                "opencode",
+                "2026-09-01T01:00:00Z",
+                None,
+                Some("2026-09-01T01:05:00Z"),
+                Some(300_000),
+                Some("opencode_message_timestamps"),
+                Some("observed"),
+            ),
+            // c1 claude-code：turn 跨度口径不可用 -> 置空并统一 source 词汇
+            (
+                "c1",
+                "claude-code",
+                "2026-09-01T02:00:00Z",
+                None,
+                Some("2026-09-01T02:05:00Z"),
+                Some(3_000_000),
+                Some("claude_message_timestamps"),
+                Some("bounded"),
+            ),
+            // x1 codex 正常行：起点本就正确，必须完全不变
+            (
+                "x1",
+                "codex",
+                "2026-09-01T03:00:00Z",
+                Some("2026-09-01T03:00:30Z"),
+                Some("2026-09-01T03:04:00Z"),
+                Some(60_000),
+                Some("codex_turn_to_token_count"),
+                Some("observed"),
+            ),
+            // x2 codex >24h：兜底降级
+            (
+                "x2",
+                "codex",
+                "2026-09-01T04:00:00Z",
+                None,
+                Some("2026-09-01T05:00:00Z"),
+                Some(90_000_000),
+                Some("codex_turn_to_token_count"),
+                Some("observed"),
+            ),
+            // g3 opencode：fr→completed 跨度 7h（>6h 残差，回填污染/挂死流）→ 置空
+            (
+                "g3",
+                "opencode",
+                "2026-09-01T05:00:00Z",
+                Some("2026-09-01T06:00:00Z"),
+                Some("2026-09-01T13:00:00Z"),
+                Some(28_800_000),
+                Some("opencode_message_timestamps"),
+                Some("observed"),
+            ),
+        ];
+        for (id, client, started, first, completed, duration, source, quality) in rows {
+            conn.execute(
+                insert,
+                rusqlite::params![id, client, started, first, completed, duration, source, quality],
+            )
+            .unwrap();
+        }
+
+        let applied = migrate_embedded(&mut conn, Some(24)).unwrap();
+        assert_eq!(applied, vec![24]);
+
+        let read = |id: &str| -> (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) {
+            conn.query_row(
+                "SELECT started_at, first_response_at, duration_ms, timing_source, timing_quality
+                 FROM model_calls WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+
+        // g1：started 改为 fr，时长重算为 10 分钟
+        let (started, first, duration, _source, quality) = read("g1");
+        assert_eq!(
+            started, "2026-09-01T00:00:00Z",
+            "started 应改为请求起点代理"
+        );
+        assert_eq!(first, Some("2026-09-01T00:00:00Z".to_string()), "fr 应保留");
+        assert_eq!(duration, Some(600_000), "时长应重算为 completed - fr");
+        assert_eq!(quality.as_deref(), Some("observed"));
+
+        // g2：无法重算必须置空，started 不动
+        let (started, _, duration, _, quality) = read("g2");
+        assert_eq!(started, "2026-09-01T01:00:00Z");
+        assert_eq!(duration, None, "无法重算必须置空，禁止保留 turn 跨度");
+        assert_eq!(quality.as_deref(), Some("unavailable"));
+
+        // c1：turn 跨度置空 + source 统一为 legacy_unavailable
+        let (started, _, duration, source, quality) = read("c1");
+        assert_eq!(
+            started, "2026-09-01T02:00:00Z",
+            "claude started_at 不在本次范围"
+        );
+        assert_eq!(duration, None);
+        assert_eq!(source.as_deref(), Some("legacy_unavailable"));
+        assert_eq!(quality.as_deref(), Some("unavailable"));
+
+        // x1：codex 正常行完全不变（含 Token）
+        let (started, first, duration, source, quality) = read("x1");
+        assert_eq!(started, "2026-09-01T03:00:00Z");
+        assert_eq!(first, Some("2026-09-01T03:00:30Z".to_string()));
+        assert_eq!(duration, Some(60_000), "codex 正常行时长不得被改写");
+        assert_eq!(source.as_deref(), Some("codex_turn_to_token_count"));
+        assert_eq!(quality.as_deref(), Some("observed"));
+        let tokens: i64 = conn
+            .query_row(
+                "SELECT output_tokens FROM model_calls WHERE id = 'x1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 700, "Token 不受时长修复影响");
+
+        // x2：>24h 兜底置空，source 保持原值
+        let (started, _, duration, source, quality) = read("x2");
+        assert_eq!(started, "2026-09-01T04:00:00Z");
+        assert_eq!(duration, None, ">24h 必须降级");
+        assert_eq!(source.as_deref(), Some("codex_turn_to_token_count"));
+        assert_eq!(quality.as_deref(), Some("unavailable"));
+
+        // g3：重算后仍 >6h 的 opencode 行 → 置空，started 采用 fr（只影响计数分桶）
+        let (started, _, duration, _, quality) = read("g3");
+        assert_eq!(started, "2026-09-01T06:00:00Z");
+        assert_eq!(
+            duration, None,
+            ">6h 残差必须降级，修复后全库 duration>6h 应为 0"
+        );
+        assert_eq!(quality.as_deref(), Some("unavailable"));
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

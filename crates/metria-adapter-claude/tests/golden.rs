@@ -64,9 +64,10 @@ fn golden_full_parses_session_events() {
     assert_eq!(s.batch.tool_events.len(), 2);
     assert_eq!(s.batch.messages.len(), 7);
 
-    // Claude 只能证明真实 user 到最终 assistant 记录的有界耗时；tool_result 不是新 turn 起点。
+    // Claude Code JSONL 只有每行 timestamp、没有请求发起时间 → 拿不到 per-message 起点：
+    // 时长诚实置空（不回退成 turn 跨度）；tool_result 不是新 turn 起点。
     let durations: Vec<Option<i64>> = s.batch.model_calls.iter().map(|c| c.duration_ms).collect();
-    assert_eq!(durations, vec![Some(4000), Some(9000), Some(11000)]);
+    assert_eq!(durations, vec![None, None, None]);
     for c in &s.batch.model_calls {
         assert_eq!(c.started_at, ts("2026-08-05T01:00:01Z"));
         assert_eq!(c.first_response_at, None);
@@ -77,7 +78,7 @@ fn golden_full_parses_session_events() {
             c.timing_source.as_deref(),
             Some("claude_message_timestamps")
         );
-        assert_eq!(c.timing_quality.as_deref(), Some("bounded"));
+        assert_eq!(c.timing_quality.as_deref(), Some("unavailable"));
         assert_eq!(c.status, "success");
         assert_eq!(c.status_code, Some(200));
     }
@@ -309,7 +310,9 @@ fn incremental_assistant_restores_real_user_start() {
     let call = &second.model_calls[0];
     assert_eq!(call.started_at, ts("2026-09-01T00:00:01Z"));
     assert_eq!(call.completed_at, Some(ts("2026-09-01T00:00:04Z")));
-    assert_eq!(call.duration_ms, Some(3000));
+    // 无请求发起时间 → 时长不可得，诚实置空并标注不可用（回合起点仍可得，故 started_at 保留）。
+    assert_eq!(call.duration_ms, None);
+    assert_eq!(call.timing_quality.as_deref(), Some("unavailable"));
     assert_eq!(call.first_response_at, None);
 
     let _ = std::fs::remove_dir_all(dir);

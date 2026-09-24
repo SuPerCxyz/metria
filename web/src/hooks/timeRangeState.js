@@ -88,7 +88,29 @@ export function currentWeekRange(timezone = Intl.DateTimeFormat().resolvedOption
   }
 }
 
-// 生成当前范围之前的等长周期，用于总览 KPI 对比。
+// 是否为本地午夜（「今天/昨天」等自然日类范围的起点）。
+function isLocalMidnight(date) {
+  return date.getHours() === 0
+    && date.getMinutes() === 0
+    && date.getSeconds() === 0
+    && date.getMilliseconds() === 0
+}
+
+// 日历日平移：用 setDate(getDate() + days) 而非回退固定毫秒，跨 DST 也保持时钟位置一致。
+function shiftCalendarDays(date, days) {
+  const next = new Date(date.getTime())
+  next.setDate(next.getDate() + days)
+  return next
+}
+
+// 部分日范围跨度上限：起点为本地午夜且跨度 < 24h 才算「今天」类日历型部分日范围。
+const PARTIAL_DAY_SPAN_MS = 24 * 60 * 60 * 1000
+
+// 生成当前范围之前的对比周期，用于总览 KPI 环比。
+// 命中「昨日同时段」需同时满足：起点为本地午夜 + 跨度 < 24h（部分日范围，如「今天」），
+// 此时 from/to 各回退 1 个日历日，时钟位置与当前窗口一致；
+// 其余范围（「本周」周一 00:00、多日午夜起点、非午夜起点）保持紧邻等长前窗 [from - span, from)。
+// 跨度恰为 24h 时两分支结果一致（紧邻前窗 ≡ 减一天）。空/非法范围返回 null。
 export function previousTimeRange(range) {
   const from = new Date(range?.from || '')
   const to = new Date(range?.to || '')
@@ -96,9 +118,10 @@ export function previousTimeRange(range) {
   const toMs = to.getTime()
   if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) return null
   const span = toMs - fromMs
+  const sameClockPreviousDay = isLocalMidnight(from) && span < PARTIAL_DAY_SPAN_MS
   return {
-    from: new Date(fromMs - span).toISOString(),
-    to: new Date(fromMs).toISOString(),
+    from: (sameClockPreviousDay ? shiftCalendarDays(from, -1) : new Date(fromMs - span)).toISOString(),
+    to: (sameClockPreviousDay ? shiftCalendarDays(to, -1) : new Date(fromMs)).toISOString(),
     ...(range.timezone ? { timezone: range.timezone } : {}),
   }
 }

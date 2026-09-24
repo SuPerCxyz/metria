@@ -2,7 +2,7 @@
 
 import React from 'react'
 
-export default function MetricCard({ label, value, delta, deltaTone, sub, hint, span }) {
+export default function MetricCard({ label, value, delta, deltaTone, deltaTitle, sub, hint, span }) {
   const spanClass = span || 'xl:col-span-3'
   return (
     <div
@@ -13,6 +13,7 @@ export default function MetricCard({ label, value, delta, deltaTone, sub, hint, 
         <h3 className="min-w-0 truncate text-sm font-medium text-gray-500 dark:text-gray-400">{label}</h3>
         {delta !== undefined && delta !== null && (
           <span
+            title={deltaTitle}
             className={`inline-flex shrink-0 items-center text-xs font-medium px-2 py-0.5 rounded-full ${
               deltaTone === 'up'
                 ? 'text-white bg-emerald-500'

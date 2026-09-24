@@ -245,7 +245,10 @@ impl SessionBuilder {
         };
         let reliable_start = turn_started_at.filter(|start| *start <= completed_at);
         let started_at = reliable_start.unwrap_or(completed_at);
-        let duration_ms = reliable_start.map(|start| (completed_at - start).num_milliseconds());
+        // Claude Code JSONL 每行只有单个 `timestamp`，客户端不记录请求发起时刻，
+        // 拿不到 per-message 起点：时长不可得就诚实置空，不回退成 turn 跨度
+        //（turn 起点是上一条 user prompt，跨度不等于单次调用耗时）。
+        let duration_ms: Option<i64> = None;
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(source_call_id),
@@ -276,7 +279,8 @@ impl SessionBuilder {
             stall_count: None,
             stall_duration_ms: None,
             timing_source: Some("claude_message_timestamps".into()),
-            timing_quality: Some("bounded".into()),
+            // 时长不可得（无请求发起时间）→ 不可用，不伪装成 bounded/observed。
+            timing_quality: Some("unavailable".into()),
             observability_source: None,
             observability_quality: None,
             status: status.to_string(),

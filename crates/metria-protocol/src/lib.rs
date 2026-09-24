@@ -302,6 +302,22 @@ fn validate_call_payload(payload: &serde_json::Value) -> Result<(), String> {
         previous = Some(parsed);
     }
 
+    // first_response_at 不放进上面的单调数组：它可能落在任意两个阶段之间。单独校验它
+    // 必须可解析、且不得晚于完成时刻——这是既有盲区（该字段从未被校验过）。
+    // 安全性：claude 恒为 None，opencode 的 valid_first 已保证 <= completed_at，
+    // codex 生产当前 0 条越界，因此不会误拒任何历史批次。
+    if let Some(raw) = payload.get("first_response_at").and_then(|v| v.as_str()) {
+        let first = chrono::DateTime::parse_from_rfc3339(raw)
+            .map_err(|_| "call.first_response_at 必须是 RFC3339 时间".to_string())?;
+        if let Some(done_raw) = payload.get("completed_at").and_then(|v| v.as_str()) {
+            let done = chrono::DateTime::parse_from_rfc3339(done_raw)
+                .map_err(|_| "call.completed_at 必须是 RFC3339 时间".to_string())?;
+            if first > done {
+                return Err("call.first_response_at 不得晚于 completed_at".to_string());
+            }
+        }
+    }
+
     for key in ["observability_source", "observability_quality"] {
         if let Some(value) = payload.get(key).filter(|v| !v.is_null()) {
             let Some(text) = value.as_str() else {
@@ -434,5 +450,63 @@ mod tests {
             "observability_quality": "estimated"
         })))
         .is_err());
+    }
+
+    /// first_response_at 晚于 completed_at 属口径异常，必须被拒（C9 防线）。
+    #[test]
+    fn first_response_after_completed_is_rejected() {
+        let payload = serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "completed_at": "2026-09-24T02:10:00+00:00",
+            "first_response_at": "2026-09-24T03:00:00+00:00",
+        });
+        let err = validate_call_payload(&payload).unwrap_err();
+        assert!(err.contains("first_response_at"), "实际报错: {err}");
+    }
+
+    /// 合法取值：first_response 在 started 之后、completed 之内。
+    #[test]
+    fn first_response_within_completed_is_accepted() {
+        let payload = serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "completed_at": "2026-09-24T02:10:00+00:00",
+            "first_response_at": "2026-09-24T02:00:30+00:00",
+            "duration_ms": 600_000,
+        });
+        assert!(validate_call_payload(&payload).is_ok());
+        // 等于 completed 也允许（同一毫秒完成）
+        let equal = serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "completed_at": "2026-09-24T02:10:00+00:00",
+            "first_response_at": "2026-09-24T02:10:00+00:00",
+        });
+        assert!(validate_call_payload(&equal).is_ok());
+    }
+
+    /// 没有 first_response_at（claude 恒为 None）或没有 completed_at 时不阻断。
+    #[test]
+    fn first_response_absent_is_accepted() {
+        assert!(validate_call_payload(&serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "completed_at": "2026-09-24T02:10:00+00:00",
+        }))
+        .is_ok());
+        assert!(validate_call_payload(&serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "first_response_at": "2026-09-24T02:00:30+00:00",
+        }))
+        .is_ok());
+    }
+
+    /// 无法解析的 first_response_at 同样拒绝（与其余时间戳一致）。
+    #[test]
+    fn malformed_first_response_is_rejected() {
+        let payload = serde_json::json!({
+            "started_at": "2026-09-24T02:00:00+00:00",
+            "completed_at": "2026-09-24T02:10:00+00:00",
+            "first_response_at": "not-a-time",
+        });
+        let err = validate_call_payload(&payload).unwrap_err();
+        assert!(err.contains("RFC3339"), "实际报错: {err}");
     }
 }

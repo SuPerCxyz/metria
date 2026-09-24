@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use metria_core::model::{
     CacheTransportBehavior, CallGranularity, ContextTransportMode, Id, Message, ModelCall, Session,
     SessionStatus, SubagentRelation, ToolEvent, TrafficEstimate, Turn, UsageEvent,
@@ -22,6 +22,26 @@ pub struct BuildCtx {
 
 /// 累积正文上限。
 const RUNNING_TEXT_CAP: usize = 512 * 1024;
+
+/// 回看上一条 user 消息作为 turn 起点的时间上界（小时）。
+///
+/// 依据：生产 28,123 个 turn 组中跨度 >6h 的仅 108 组（0.38%），跨更久的
+/// 「起点」几乎必然是跨天/挂机会话残留的 user 消息，而非当前回合的真实起点。
+///
+/// 这是防御层：`duration_ms` 与 `started_at` 的左端点已改为该条消息自身的
+/// `time.created`（见 [`SessionBuilder::add_call`]），turn 起点不再参与任何
+/// 调用字段计算；本上界用于保证 `current_turn_started_at` 这一内部状态不被
+/// 跨天残留的 user 起点污染，任何未来回退消费它的路径拿到的都是干净值。
+const MAX_TURN_START_LOOKBACK_HOURS: i64 = 6;
+
+/// turn 起点回看是否在上界内。
+///
+/// 要求候选点不晚于当前消息（时序正常），且两者跨度不超过
+/// [`MAX_TURN_START_LOOKBACK_HOURS`]。超出即视为「未找到 turn 起点」。
+pub(crate) fn within_turn_start_lookback(current: DateTime<Utc>, candidate: DateTime<Utc>) -> bool {
+    let lookback = current.signed_duration_since(candidate);
+    lookback >= Duration::zero() && lookback <= Duration::hours(MAX_TURN_START_LOOKBACK_HOURS)
+}
 
 /// OpenCode 会话构建状态。
 #[derive(Debug)]
@@ -284,7 +304,9 @@ impl SessionBuilder {
         turn_id: Id,
         source_call_id: String,
         observed_at: DateTime<Utc>,
-        turn_started_at: Option<DateTime<Utc>>,
+        // 该条消息自身的请求开始时间（opencode `data.time.created`）：
+        // 时长与 `started_at` 的唯一左端点，缺失时诚实置空，不回退成 turn 跨度。
+        message_created_at: Option<DateTime<Utc>>,
         first_response_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
         model: Option<&str>,
@@ -303,20 +325,31 @@ impl SessionBuilder {
             "error" | "cancelled" | "aborted" => Some(400),
             _ => Some(200),
         };
-        let valid_start = turn_started_at
+        // 左端点只认该条消息自己的请求开始时间。turn 起点会把整段回合跨度
+        // 计进每一条调用：同 turn 内多条调用共享同一左端点，SUM(duration_ms)
+        // 随调用数成倍虚增（生产实测最极端 10,212 条共享一个起点）。
+        let valid_message_start = message_created_at
             .filter(|start| completed_at.is_none_or(|completed| *start <= completed));
-        let valid_first = valid_start.and_then(|start| {
-            first_response_at.filter(|first| {
-                start <= *first && completed_at.is_none_or(|completed| *first <= completed)
-            })
-        });
-        let duration_ms = valid_start
+        // 起点缺失或起点晚于完成时刻 → 时长不可得，置 None（禁止回退成 turn 跨度）。
+        let duration_ms = valid_message_start
             .zip(completed_at)
             .map(|(start, completed)| (completed - start).num_milliseconds());
-        let started_at = valid_start
+        // 首响应必须落在 [请求起点, 完成] 内；请求起点缺失时只校验上界。
+        let valid_first = first_response_at.filter(|first| {
+            valid_message_start.is_none_or(|start| start <= *first)
+                && completed_at.is_none_or(|completed| *first <= completed)
+        });
+        // started_at 回退顺序保持既有优先级：请求起点 → 首响应 → 完成 → 观测时刻。
+        let started_at = valid_message_start
             .or(valid_first)
             .or(completed_at)
             .unwrap_or(observed_at);
+        // 时长拿不到就如实标注不可用，不伪装成 observed。
+        let timing_quality = if duration_ms.is_some() {
+            "observed"
+        } else {
+            "unavailable"
+        };
         let call = ModelCall {
             id: Id::new(),
             source_call_id: Some(source_call_id),
@@ -347,7 +380,7 @@ impl SessionBuilder {
             stall_count: None,
             stall_duration_ms: None,
             timing_source: Some("opencode_message_timestamps".into()),
-            timing_quality: Some("observed".into()),
+            timing_quality: Some(timing_quality.into()),
             observability_source: None,
             observability_quality: None,
             status: status.to_string(),
@@ -637,4 +670,39 @@ pub fn sqlite_cursor(
         last_primary_key: None,
         last_scan_at: Some(Utc::now()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{within_turn_start_lookback, MAX_TURN_START_LOOKBACK_HOURS};
+    use chrono::{DateTime, Utc};
+
+    fn at(ms: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(ms).expect("测试时间戳应合法")
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn lookback_accepts_candidate_within_upper_bound() {
+        // 6 小时以内的回看候选可用（含正好等于上界的边界）。
+        assert!(within_turn_start_lookback(at(7 * HOUR_MS), at(2 * HOUR_MS)));
+        assert!(within_turn_start_lookback(at(6 * HOUR_MS), at(0)));
+    }
+
+    #[test]
+    fn lookback_rejects_candidate_beyond_upper_bound() {
+        // 依据：生产 28,123 个 turn 组中跨度 >6h 仅 108 组（0.38%）。
+        assert_eq!(MAX_TURN_START_LOOKBACK_HOURS, 6);
+        assert!(!within_turn_start_lookback(at(6 * HOUR_MS + 1), at(0)));
+        // 跨天/挂机会话：24 小时前的 user 消息不得作为当前回合起点。
+        assert!(!within_turn_start_lookback(at(30 * HOUR_MS), at(0)));
+    }
+
+    #[test]
+    fn lookback_rejects_inverted_or_zero_span() {
+        // 候选晚于当前消息（时序倒挂）不采用，避免未来时间污染起点。
+        assert!(!within_turn_start_lookback(at(0), at(HOUR_MS)));
+        assert!(!within_turn_start_lookback(at(0), at(HOUR_MS / 2)));
+    }
 }

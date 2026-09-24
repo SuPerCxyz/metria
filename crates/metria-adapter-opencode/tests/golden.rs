@@ -178,22 +178,25 @@ fn golden_full_reads_session_usage_tools_subagents() {
     assert_eq!(batch.tool_events[0].name, "grep");
     assert!(batch.traffic_estimates.is_empty());
 
-    // OpenCode assistant.created 是首个可观察输出；耗时从对应 user turn 起点计算。
+    // OpenCode 该条消息自身的 time.created 是请求开始：耗时按它计算，而非 user turn 起点。
     let call = batch
         .model_calls
         .iter()
         .find(|c| c.source_call_id.as_deref() == Some("m2"))
         .expect("应有 m2 的模型调用");
-    assert_eq!(call.started_at, ts(1783137427100));
+    // 请求起点来自 assistant 消息自身的 created（1783137437000），
+    // 而不是 user 消息的 turn 起点（1783137427100）。
+    assert_eq!(call.started_at, ts(1783137437000));
     assert_eq!(call.first_response_at, Some(ts(1783137437000)));
     assert_eq!(call.completed_at, Some(ts(1783137438000)));
-    assert_eq!(call.duration_ms, Some(10_900));
+    assert_eq!(call.duration_ms, Some(1_000));
     assert_eq!(
         call.timing_source.as_deref(),
         Some("opencode_message_timestamps")
     );
     assert_eq!(call.timing_quality.as_deref(), Some("observed"));
-    assert_ne!(call.started_at, call.first_response_at.unwrap());
+    // 不再用 turn 起点：started_at 不等于 user 消息的 turn 起点。
+    assert_ne!(call.started_at, ts(1783137427100));
     assert_ne!(call.first_response_at, call.completed_at);
     assert_eq!(call.status, "success");
     assert_eq!(call.status_code, Some(200));
@@ -305,7 +308,8 @@ fn error_finish_maps_to_error_status() {
         .expect("应有 m2 的模型调用");
     assert_eq!(call.status, "error");
     assert_eq!(call.status_code, Some(400));
-    assert_eq!(call.duration_ms, Some(2500));
+    // 时长 = completed(3500) - 该消息自身 created(2000)，不是 turn 起点(1000)。
+    assert_eq!(call.duration_ms, Some(1500));
 }
 
 #[test]
@@ -334,10 +338,15 @@ fn missing_assistant_created_keeps_first_response_unavailable() {
     let (adapter, source) = open_adapter(&dir);
     let summary = scan_source(&adapter, &source);
     let call = &summary.batch.model_calls[0];
-    assert_eq!(call.started_at, ts(1000));
+    // 请求起点缺失 → started_at 按既有优先级回退到 completed_at（不再是 turn 起点）。
+    assert_eq!(call.started_at, ts(3000));
     assert_eq!(call.first_response_at, None);
     assert_eq!(call.completed_at, Some(ts(3000)));
-    assert_eq!(call.duration_ms, Some(2000));
+    // 该消息没有 time.created → 拿不到请求起点：时长诚实置空，
+    // **禁止**回退成 turn 跨度（旧实现为 2000 = 3000 - user 起点 1000）。
+    assert_eq!(call.duration_ms, None);
+    // 起点缺失时 started_at 按既有优先级回退到 completed_at。
+    assert_eq!(call.timing_quality.as_deref(), Some("unavailable"));
 }
 
 #[test]
@@ -374,10 +383,12 @@ fn incremental_assistant_restores_corresponding_user_turn_start() {
         .scan(&source, first.next_cursor.as_ref(), &identity)
         .unwrap();
     let call = &second.model_calls[0];
-    assert_eq!(call.started_at, ts(1000));
+    // 增量回看仍会恢复 turn 起点，但 call 的时长/起点只认该消息自身的 created。
+    assert_eq!(call.started_at, ts(2000));
     assert_eq!(call.first_response_at, Some(ts(2000)));
     assert_eq!(call.completed_at, Some(ts(3000)));
-    assert_eq!(call.duration_ms, Some(2000));
+    assert_eq!(call.duration_ms, Some(1000));
+    assert_ne!(call.started_at, ts(1000), "不得再用 user 消息的 turn 起点");
 }
 
 // ===== v2（session_v2 / session_message）=====
@@ -468,13 +479,16 @@ fn v2_reads_session_call_usage_and_tool() {
         Some(2_500),
         "v2 单条消息 cost 应作为 reported cost"
     );
-    assert_eq!(call.started_at, ts(1000), "回合起点来自 user 消息");
+    // 请求起点来自该条消息自身的 time.created，而非 user 消息的回合起点。
+    assert_eq!(call.started_at, ts(2000), "请求起点来自该消息 time.created");
     assert_eq!(
         call.first_response_at,
         Some(ts(2500)),
         "首个可观察输出来自 time.streamed"
     );
     assert_eq!(call.completed_at, Some(ts(6000)));
+    assert_eq!(call.duration_ms, Some(4000), "completed - created");
+    assert_eq!(call.timing_quality.as_deref(), Some("observed"));
 
     assert_eq!(batch.usage_events.len(), 1);
     assert_eq!(batch.messages.len(), 3, "user + assistant text + reasoning");
@@ -519,9 +533,11 @@ fn v2_cursor_is_incremental() {
         .unwrap();
     assert_eq!(second.model_calls.len(), 1, "只应产出新增调用");
     let call = &second.model_calls[0];
-    assert_eq!(call.started_at, ts(7000));
+    // 起点来自 assistant 自身 created(8000)，不是 user 消息 turn 起点(7000)。
+    assert_eq!(call.started_at, ts(8000));
     assert_eq!(call.first_response_at, Some(ts(8200)));
     assert_eq!(call.completed_at, Some(ts(9000)));
+    assert_eq!(call.duration_ms, Some(1000), "completed - created");
 
     let third = adapter
         .scan(&source, second.next_cursor.as_ref(), &identity)
@@ -559,4 +575,159 @@ fn v2_migration_rescans_after_schema_change() {
         "应记录指纹变化并重扫：{:?}",
         second.warnings
     );
+}
+
+// ===== 时长口径：左端点必须是该条消息自身的请求开始时间 =====
+
+/// 起点存在时：`started_at`/`duration_ms` 只认该消息的 `time.created`，不是 turn 起点。
+#[test]
+fn message_created_beats_turn_start_for_duration() {
+    let dir = temp_dir("created-beats-turn");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','起点', '1.0', 1000, 6000)",
+        [],
+    )
+    .unwrap();
+    // user 消息在 t=1000 → 会成为 turn 起点（旧实现的左端点）
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    // assistant 自身请求开始于 t=5000、完成于 t=6000
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',5000,6000, ?1)",
+        [r#"{"role":"assistant","time":{"created":5000,"completed":6000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = &summary.batch.model_calls[0];
+
+    assert_eq!(call.started_at, ts(5000), "起点取该消息 time.created");
+    assert_eq!(call.completed_at, Some(ts(6000)));
+    // 旧实现给 5000ms（6000 - turn 起点 1000）；新实现必须是 1000ms（6000 - 5000）。
+    assert_eq!(call.duration_ms, Some(1000), "completed - message.created");
+    assert_ne!(call.started_at, ts(1000), "不得再用 user 消息的 turn 起点");
+    assert_eq!(call.timing_quality.as_deref(), Some("observed"));
+}
+
+/// 起点缺失时：时长诚实置空，**禁止**回退成 turn 跨度。
+#[test]
+fn missing_message_created_yields_null_duration_not_turn_span() {
+    let dir = temp_dir("missing-created-null");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','缺起点', '1.0', 1000, 9000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    // 故意不给 time.created：旧实现会给出 8000ms（9000 - turn 起点 1000）的假时长。
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',9000,9000, ?1)",
+        [r#"{"role":"assistant","time":{"completed":9000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = &summary.batch.model_calls[0];
+
+    assert_eq!(call.duration_ms, None, "缺起点时不得回退成 turn 跨度");
+    assert_ne!(call.duration_ms, Some(8000), "旧的 turn 跨度值必须消失");
+    assert_eq!(call.timing_quality.as_deref(), Some("unavailable"));
+}
+
+/// 起点晚于完成时刻：防御路径不产生负 duration。
+#[test]
+fn message_created_after_completed_yields_no_negative_duration() {
+    let dir = temp_dir("created-after-completed");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','乱序', '1.0', 1000, 5000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',1000,1000, ?1)",
+        [r#"{"role":"user","time":{"created":1000}}"#],
+    )
+    .unwrap();
+    // 时序倒挂：created(5000) 晚于 completed(3000)
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',5000,5000, ?1)",
+        [r#"{"role":"assistant","time":{"created":5000,"completed":3000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = &summary.batch.model_calls[0];
+
+    assert_eq!(call.duration_ms, None, "起点晚于完成 → 不产生负时长");
+    assert!(
+        call.duration_ms.is_none_or(|d| d >= 0),
+        "任何路径都不得产出负 duration"
+    );
+    assert_eq!(call.timing_quality.as_deref(), Some("unavailable"));
+    assert_eq!(call.completed_at, Some(ts(3000)));
+}
+
+/// 回看上界：远早于本条消息的 user 起点不得污染该条调用的时长。
+///
+/// 说明：`within_turn_start_lookback` 的边界判定由 `build.rs` 的单元测试覆盖；
+/// 本用例验证跨天 user 消息存在时，call 的时长/起点仍只取该消息自身的时间。
+#[test]
+fn stale_user_turn_start_beyond_lookback_does_not_affect_duration() {
+    let dir = temp_dir("stale-lookback");
+    let db = dir.join("opencode.db");
+    let conn = Connection::open(&db).unwrap();
+    create_schema(&conn);
+    conn.execute(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('s1','global','s1','/p','挂机', '1.0', 0, 25202000)",
+        [],
+    )
+    .unwrap();
+    // user 消息在 7 小时前（超过 6 小时回看上界）
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m1','s1',0,0, ?1)",
+        [r#"{"role":"user","time":{"created":0}}"#],
+    )
+    .unwrap();
+    // assistant 在 7 小时后才完成
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('m2','s1',25201000,25202000, ?1)",
+        [r#"{"role":"assistant","time":{"created":25201000,"completed":25202000},"modelID":"x","tokens":{"input":10,"output":2},"finish":"end-turn"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (adapter, source) = open_adapter(&dir);
+    let summary = scan_source(&adapter, &source);
+    let call = &summary.batch.model_calls[0];
+
+    // 只有 1000ms（25202000 - 25201000），绝不是 7 小时的 turn 跨度。
+    assert_eq!(call.duration_ms, Some(1000));
+    assert_ne!(
+        call.started_at,
+        ts(0),
+        "7 小时前的 user 起点不得成为该调用起点"
+    );
+    assert_eq!(call.started_at, ts(25201000));
 }

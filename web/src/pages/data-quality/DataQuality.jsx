@@ -11,6 +11,7 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { fmtDateTime, fmtPct, fmtRelative, fmtTokensShort, outputTokens } from '../../services/format'
 import { isAvailable } from '../../services/dataAvailability'
+import { activeChecks, fmtHours, hasDurationOutliers, topSeverity } from '../../services/durationOutliers'
 
 export default function DataQuality() {
   const { range } = useTimeRange()
@@ -25,6 +26,14 @@ export default function DataQuality() {
   const cursorStatus = d.cursor_status || []
   const clockSkewWarnings = d.clock_skew_warnings || []
   const usageDistribution = d.usage_distribution || []
+  // 调用时长口径告警：旧后端或未启用时为 null / 缺失，或 checks 全为 0，此时不渲染该区块。
+  const durationOutliers = d.duration_outliers
+  const showDurationOutliers = hasDurationOutliers(durationOutliers)
+  const durationOutlierChecks = showDurationOutliers ? activeChecks(durationOutliers.checks) : []
+  const durationOutliersSeverity = showDurationOutliers ? topSeverity(durationOutliers.checks) : null
+  const durationOutliersByClient = showDurationOutliers && Array.isArray(durationOutliers.by_client)
+    ? durationOutliers.by_client
+    : []
   const observationCards = useMemo(() => {
     const data = performance.data || {}
     const cards = []
@@ -35,7 +44,7 @@ export default function DataQuality() {
     }
     return cards
   }, [performance.data])
-  const hasQualityDetails = sourceErrors.length > 0 || alerts.length > 0 || cursorStatus.length > 0 || clockSkewWarnings.length > 0 || usageDistribution.length > 0
+  const hasQualityDetails = sourceErrors.length > 0 || alerts.length > 0 || cursorStatus.length > 0 || clockSkewWarnings.length > 0 || usageDistribution.length > 0 || showDurationOutliers
 
   if (quality.error && !quality.data) return <ErrorState error={quality.error} onRetry={quality.refresh} />
   if (quality.loading && !quality.data) return <LoadingSkeleton rows={8} />
@@ -122,7 +131,53 @@ export default function DataQuality() {
           data={clockSkewWarnings}
         />
       </QualitySection>}
+
+      {showDurationOutliers && (
+        <QualitySection title={durationOutliers.label}>
+          <div className="px-2 mb-3 flex flex-wrap items-center gap-x-8 gap-y-2">
+            {durationOutliersSeverity && <StatusBadge status={durationOutliersSeverity} />}
+            <Stat label="超阈值占总时长" value={fmtPct(durationOutliers.share_of_total_duration)} />
+            <Stat label="超阈值累计时长" value={fmtHours(durationOutliers.over_threshold_duration_hours)} />
+            <Stat label="范围内总时长" value={fmtHours(durationOutliers.total_duration_hours)} />
+          </div>
+
+          <p className="px-2 mb-2 text-xs text-gray-400 dark:text-gray-500">检查项（仅列出命中阈值的项）</p>
+          <DataTable
+            columns={[
+              { key: 'severity', label: '级别', render: (r) => <StatusBadge status={r.severity} /> },
+              { key: 'threshold', label: '阈值口径' },
+              { key: 'count', label: '条数', sortValue: (r) => Number(r.count) || 0 },
+            ]}
+            data={durationOutlierChecks}
+            emptyText="未发现超阈值调用"
+          />
+
+          {durationOutliersByClient.length > 0 && (
+            <>
+              <p className="px-2 mt-5 mb-2 text-xs text-gray-400 dark:text-gray-500">按 Agent 分布</p>
+              <DataTable
+                columns={[
+                  { key: 'client_id', label: 'Agent' },
+                  { key: 'count', label: '条数', sortValue: (r) => Number(r.count) || 0 },
+                  { key: 'call_granularity', label: '调用粒度' },
+                  { key: 'timing_source', label: '时间来源' },
+                ]}
+                data={durationOutliersByClient}
+              />
+            </>
+          )}
+        </QualitySection>
+      )}
     </>
+  )
+}
+
+function Stat({ label, value }) {
+  return (
+    <div>
+      <p className="text-xs text-gray-400 dark:text-gray-500">{label}</p>
+      <p className="text-lg font-bold text-gray-800 dark:text-gray-100 tabular-nums">{value}</p>
+    </div>
   )
 }
 

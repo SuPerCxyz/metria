@@ -16,7 +16,7 @@ import { useVisibleQuery } from '../../hooks/useVisibleQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { currentWeekRange, previousTimeRange, withMinimumSpan } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtTokens, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, fmtDateTime, sumTokens, cacheHitRate, outputTokens, averageTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 import { ARCHIVED_UNAVAILABLE_LABEL, isActivityArchived } from '../../services/archiveRange'
 import { formatTimeLabel } from '../../components/charts/trendChartLabels'
@@ -40,6 +40,17 @@ const ARCHIVE_NOTICE = '所选时间早于归档水位，部分活动指标不�
 
 // 日趋势最小窗口 7 天：全局范围不足时补到最近 7 天，更长范围按所选显示。
 const DAILY_MIN_SPAN_MS = 7 * 24 * 60 * 60 * 1000
+
+// 环比窗口边界：复用 fmtDateTime（本地时区），去掉年份前缀得到 MM-DD HH:mm
+const fmtRangeBound = (iso) => {
+  const text = fmtDateTime(iso)
+  return text.length > 5 ? text.slice(5) : text
+}
+
+// 环比徽标 hover 提示：明确标注实际参与比较的两个窗口，避免被误读为「较昨天同时段」
+const compareWindowHint = (range, previousRange) => (previousRange
+  ? `当前 ${fmtRangeBound(range.from)} 至 ${fmtRangeBound(range.to)} vs 上一周期 ${fmtRangeBound(previousRange.from)} 至 ${fmtRangeBound(previousRange.to)}`
+  : null)
 
 export default function Overview() {
   const { range, setRange } = useTimeRange()
@@ -160,9 +171,13 @@ export default function Overview() {
   if (overview.loading && !overview.data) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
   const previous = previousOverview.data || null
+  // 当前窗口墙钟长度：与耗时类卡片并列展示，避免把并行累加值误读为墙钟
+  const windowDurationLabel = fmtDuration(new Date(range.to).getTime() - new Date(range.from).getTime())
+  const compareTitle = compareWindowHint(range, previousRange)
   const compare = (current, previousValue, inverse = false) => ({
     delta: previous ? fmtChange(current, previousValue) : null,
     deltaTone: previous ? changeTone(current, previousValue, inverse) : 'neutral',
+    deltaTitle: previous ? compareTitle : null,
   })
 
   // 活动类字段的归档展示：水位非 null 且后端置 null → 诚实标注「已归档，不可计算」；
@@ -314,8 +329,8 @@ export default function Overview() {
           <MetricCard span="xl:col-span-2" label="请求数" value={String(modelCalls)} {...compare(modelCalls, previousModelCalls)} sub="模型调用次数" hint={`涉及 ${o.models ?? 0} 个模型`} />
           <MetricCard span="xl:col-span-2" label="错误率" value={errorRate != null ? fmtPct100(errorRate) : '—'} {...compare(errorRate, previousErrorRate, true)} sub={errorRate != null ? `成功 ${fmtPct100(successRate)} · 失败 ${failed} 次` : '当前范围暂无请求数据'} hint="失败请求占全部请求比例；下降表示改善" />
           <MetricCard span="xl:col-span-2" label="活跃会话" value={activityValue(o.active_sessions, () => (isAvailable(o.active_sessions) ? String(o.active_sessions) : '—'))} {...activityDelta(o.active_sessions, previous?.active_sessions)} sub={archivedMetric(o.active_sessions) ? '所选时间早于归档水位' : (isAvailable(o.active_sessions) ? `${o.nodes ?? 0} 节点 · ${o.collectors ?? 0} 采集器` : '当前范围暂无会话数据')} hint="范围内新建或仍在活动的会话数" />
-          <MetricCard span="xl:col-span-2" label="活跃时长" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub="模型调用耗时合计" hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠" />
-          <MetricCard span="xl:col-span-2" label="会话总时长" value={activityValue(o.session_duration_ms, () => fmtDuration(o.session_duration_ms))} {...activityDelta(o.session_duration_ms, previous?.session_duration_ms)} sub="范围重叠的会话跨度合计" hint="与所选范围重叠的会话跨度（裁剪到范围边界）；不去重重叠会话" />
+          <MetricCard span="xl:col-span-2" label="调用耗时累计" value={fmtDuration(o.active_duration_ms)} {...compare(o.active_duration_ms, previous?.active_duration_ms)} sub={`窗口 ${windowDurationLabel} · 含并行重叠`} hint="仅统计有明确 duration_ms 的调用，调用之间可能重叠；并行调用会相互累加，合计可能远超窗口长度" />
+          <MetricCard span="xl:col-span-2" label="会话总时长" value={activityValue(o.session_duration_ms, () => fmtDuration(o.session_duration_ms))} {...activityDelta(o.session_duration_ms, previous?.session_duration_ms)} sub={`窗口 ${windowDurationLabel} · 重叠不合并`} hint="范围重叠的会话跨度合计（裁剪到范围边界）；不去重重叠会话" />
           <MetricCard span="xl:col-span-2" label="节点在线" value={isAvailable(o.collectors) ? `${o.collectors_online ?? 0} / ${o.collectors}` : '—'} sub={isAvailable(o.collectors) ? `${o.nodes ?? 0} 节点 · ${o.projects ?? 0} 项目` : '当前范围暂无采集器数据'} hint="在线采集器 / 总数" />
         </div>
       </div>

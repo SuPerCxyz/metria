@@ -48,6 +48,13 @@ pub struct ReportSendRow {
 
 const REPORT_HISTORY_LIMIT: i64 = 30;
 
+/// 单次调用时长软上限：超过即视为口径异常，入库时降级为 NULL。
+///
+/// 生产实测 >24h 仅 8 条（最长 24.2h，全部由 turn 起点虚增造成），而真实模型调用
+/// 不可能跨天（正确实现的 codex 最大 40 分钟）。降级而非拒收整批，兼顾零侵入与
+/// 数据诚实（缺失用 `null`、禁止填 0、不得用「observed」掩盖不可信时长）。
+const MAX_CALL_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// 运维表保留策略（键值驱动，默认值由 `migrations/021_table_retention.sql` 写入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -1374,6 +1381,11 @@ impl HubDb {
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
         let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
         let now = Utc::now().to_rfc3339();
+        // 软降级防线：超过 24h 的单次调用时长按口径异常处理，置 NULL 并把时长质量
+        // 标为不可用；不拒收整批，避免历史 backfill 因个别异常行整体丢失。
+        let raw_duration_ms = gn("duration_ms");
+        let duration_ms = raw_duration_ms.filter(|ms| *ms <= MAX_CALL_DURATION_MS);
+        let duration_over_limit = raw_duration_ms.is_some_and(|ms| ms > MAX_CALL_DURATION_MS);
         let n = c
             .execute(
                 "INSERT OR IGNORE INTO model_calls (
@@ -1407,7 +1419,7 @@ impl HubDb {
                     g("started_at"),
                     opt(g("first_response_at")),
                     opt(g("completed_at")),
-                    gn("duration_ms"),
+                    duration_ms,
                     g("status"),
                     gn("status_code"),
                     bool_i(v.get("streaming")),
@@ -1428,7 +1440,11 @@ impl HubDb {
                     now,
                     now,
                     opt(g("timing_source")),
-                    opt(g("timing_quality")),
+                    if duration_over_limit {
+                        Some("unavailable".to_string())
+                    } else {
+                        opt(g("timing_quality"))
+                    },
                     opt(g("first_byte_at")),
                     opt(g("first_token_at")),
                     opt(g("last_output_at")),

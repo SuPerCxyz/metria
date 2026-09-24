@@ -154,11 +154,22 @@ fn spawn_integrity_repair(db: db::HubDb) {
         const SUBAGENT_VERSION: &str = "2";
         // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
         const VERSION: &str = "4";
+        // v1：迁移 024 修复 opencode 时长起点后的全量分桶重建（started_at 后移会重排
+        // hourly/daily_rollups 里的 model_call_count；Token/费用/流量聚合有自己的
+        // 时间戳来源，不受时长修复影响）。
+        const DURATION_ORIGIN_KEY: &str = "duration_origin_repair_version";
+        const DURATION_ORIGIN_VERSION: &str = "1";
         let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
         let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
         let subagent_needed =
             db.setting_get(SUBAGENT_KEY).ok().flatten().as_deref() != Some(SUBAGENT_VERSION);
-        if !full_needed && !timing_needed && !subagent_needed {
+        let duration_origin_needed = db
+            .setting_get(DURATION_ORIGIN_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(DURATION_ORIGIN_VERSION);
+        if !full_needed && !timing_needed && !subagent_needed && !duration_origin_needed {
             return;
         }
         let result = (|| -> Result<usize, String> {
@@ -174,8 +185,9 @@ fn spawn_integrity_repair(db: db::HubDb) {
             }
             if full_needed {
                 crate::catalog::reprice_from_rules(&db, false)?;
-                db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
-            } else if timings > 0 || subagent_needed {
+            }
+            // 任何明细口径修复（计价、时序、子代理、时长起点）之后都要全量重建分桶聚合。
+            if full_needed || duration_origin_needed || timings > 0 || subagent_needed {
                 db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
             }
             if full_needed {
@@ -187,6 +199,10 @@ fn spawn_integrity_repair(db: db::HubDb) {
             }
             if subagent_needed {
                 db.setting_set(SUBAGENT_KEY, SUBAGENT_VERSION)
+                    .map_err(|e| e.to_string())?;
+            }
+            if duration_origin_needed {
+                db.setting_set(DURATION_ORIGIN_KEY, DURATION_ORIGIN_VERSION)
                     .map_err(|e| e.to_string())?;
             }
             Ok(timings)

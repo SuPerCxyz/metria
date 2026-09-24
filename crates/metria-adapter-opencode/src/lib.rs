@@ -256,10 +256,14 @@ impl SourceAdapter for OpenCodeAdapter {
             if data.role.as_deref() == Some("assistant")
                 && builder.current_turn_started_at().is_none()
             {
-                if let Some(started_at) =
+                if let Some(user_at) =
                     load_previous_user_time(&conn, &session_id, rowid, &mut tolerance)
                 {
-                    builder.restore_turn_start(started_at);
+                    // 超过回看上界的 user 起点不采用（等同未找到）：跨天/挂机会话
+                    // 会把很久以前的 user 消息当成本条消息的回合起点。
+                    if crate::build::within_turn_start_lookback(at, user_at) {
+                        builder.restore_turn_start(user_at);
+                    }
                 }
             }
 
@@ -450,7 +454,12 @@ fn process_message(
                     .and_then(|m| m.provider_id.clone())
                     .or_else(|| data.provider_id.clone());
                 let cache = tokens.cache.as_ref().map(|c| (c.read, c.write));
-                let turn_started_at = builder.current_turn_started_at();
+                // 该条消息自身的请求开始时间；时长与 started_at 的唯一左端点。
+                let message_created_at = data
+                    .time
+                    .as_ref()
+                    .and_then(|time| time.created)
+                    .and_then(from_millis);
                 let first_response_at = data
                     .time
                     .as_ref()
@@ -471,7 +480,7 @@ fn process_message(
                     turn,
                     msg_id.to_string(),
                     at,
-                    turn_started_at,
+                    message_created_at,
                     first_response_at,
                     completed_at,
                     model.as_deref(),

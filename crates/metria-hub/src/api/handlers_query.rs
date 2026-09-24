@@ -261,30 +261,54 @@ pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangePa
             .unwrap_or(0)
             .into(),
     };
-    // S3.9：平均调用延迟与 duration 分位数（来自上面的 perf_agg）。
-    // 平均值用 sum/count 精确计算，等价于原来的 AVG(duration_ms) 后取整；
-    // 分位数由对数分箱直方图合并得出，响应标注 quantile_approx。
+    // D1/D2：合计与平均按窗口裁剪，与「会话总时长」的边界裁剪口径一致。
+    // `to` 不早于当前时刻时（今天/近 7 天等常用范围）没有调用能跨越窗口终点——
+    // duration_ms 在调用完成后才写入、完成时刻 ≤ 当前时刻——裁剪是空操作，直接用
+    // 预聚合，刷新成本不变；否则用一条走 started_at 索引的 SQL 求裁剪后的合计与计数，
+    // 仅历史自定义范围触发（实测 40–150ms，仍在 ≤0.5s 的刷新预算内）。
+    let duration_stats: Option<(i64, i64)> = if to >= Utc::now() {
+        perf_agg
+            .as_ref()
+            .filter(|agg| agg.duration.count > 0)
+            .map(|agg| (agg.duration.sum, agg.duration.count as i64))
+    } else {
+        match clipped_duration_stats(&c, from, to, &call_filter, &call_fargs) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("按窗口裁剪的调用时长查询失败，回退未裁剪值: {e}");
+                perf_agg
+                    .as_ref()
+                    .filter(|agg| agg.duration.count > 0)
+                    .map(|agg| (agg.duration.sum, agg.duration.count as i64))
+            }
+        }
+    };
+    // S3.9：平均调用延迟与 duration 分位数。
+    // 平均值 = 裁剪后的合计 / 裁剪后的计数（D1/D2）；
+    // 分位数仍来自完整调用时长分布的直方图——裁剪需按查询终点重建直方图，
+    // 成本与复杂度不成比例，因此不参与裁剪、也不标注为窗口内裁剪值。
+    body["avg_duration_ms"] = match duration_stats {
+        Some((sum, count)) if count > 0 => {
+            serde_json::json!((sum as f64 / count as f64).round() as i64)
+        }
+        _ => serde_json::Value::Null,
+    };
     if let Some(agg) = &perf_agg {
-        body["avg_duration_ms"] = if agg.duration.count > 0 {
-            serde_json::json!((agg.duration.sum as f64 / agg.duration.count as f64).round() as i64)
-        } else {
-            serde_json::Value::Null
-        };
         body["duration_p50_ms"] = serde_json::json!(agg.duration.quantile(0.50));
         body["duration_p95_ms"] = serde_json::json!(agg.duration.quantile(0.95));
         body["duration_p99_ms"] = serde_json::json!(agg.duration.quantile(0.99));
         body["quantile_approx"] = serde_json::json!(true);
     } else {
         // 取不到聚合（明细回退也失败）时仍要写键，前端应读到诚实的 null 而不是 undefined。
-        body["avg_duration_ms"] = serde_json::Value::Null;
         body["duration_p50_ms"] = serde_json::Value::Null;
         body["duration_p95_ms"] = serde_json::Value::Null;
         body["duration_p99_ms"] = serde_json::Value::Null;
         body["quantile_approx"] = serde_json::Value::Null;
     }
-    // 活跃时长只统计明确记录了 duration_ms 的调用；没有记录时返回 null。
-    body["active_duration_ms"] = match perf_agg.as_ref() {
-        Some(agg) if agg.duration.count > 0 => serde_json::json!(agg.duration.sum),
+    // 活跃时长 = 窗口内裁剪后的调用时长合计（与会话总时长同口径）；
+    // 只统计明确记录了 duration_ms 的调用，没有样本时返回 null。
+    body["active_duration_ms"] = match duration_stats {
+        Some((sum, count)) if count > 0 => serde_json::json!(sum),
         _ => serde_json::Value::Null,
     };
     // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
@@ -2784,6 +2808,134 @@ pub(crate) async fn session_timeline(
     Json(serde_json::json!({ "messages": messages })).into_response()
 }
 
+/// 调用时长的口径异常检测（防线，不是修复手段）。
+///
+/// 阈值由生产分布支撑：p50≈37.6s、p99≈6.9h，因此 **6h 只作「占总时长比例」的口径
+/// 统计**（6h 会命中 1.3% 的行，作告警线会天天全红），24h 与首响应不自洽才作 error。
+///
+/// 已知根因（只读排查结论）：opencode adapter 把 turn 起点当作调用起点，同一 turn 内
+/// 多条调用共享同一 `started_at`，求和时被重复累加；`call_granularity` 标为 message
+/// 而时间跨度是 turn 级。这里只做可见化，不改历史数值。
+fn duration_outliers(
+    c: &metria_storage::rusqlite::Connection,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    p: &RangeParams,
+) -> serde_json::Value {
+    let (filter, fargs) = range_filter_usage(p);
+    let range = |sql: &str, fargs: Vec<SqlValue>| -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = c.prepare(sql) {
+            if let Ok(rows) = stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+                Ok(serde_json::json!({
+                    "client_id": r.get::<_, String>(0)?,
+                    "count": r.get::<_, i64>(1)?,
+                    "call_granularity": r.get::<_, Option<String>>(2)?,
+                    "timing_source": r.get::<_, Option<String>>(3)?,
+                }))
+            }) {
+                out = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        out
+    };
+
+    // 范围内总时长与「>6h」贡献的时长（口径统计用）
+    let (total_ms, over6h_ms) = c
+        .query_row(
+            &format!(
+                "SELECT COALESCE(SUM(duration_ms), 0),
+                        COALESCE(SUM(CASE WHEN duration_ms > 21600000 THEN duration_ms ELSE 0 END), 0)
+                 FROM model_calls
+                 WHERE started_at >= ?1 AND started_at < ?2 AND duration_ms IS NOT NULL {filter}"
+            ),
+            params_from_iter(range_args(&from, &to, fargs.clone())),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap_or((0, 0));
+
+    let over_24h = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM model_calls
+                 WHERE started_at >= ?1 AND started_at < ?2 AND duration_ms > 86400000 {filter}"
+            ),
+            params_from_iter(range_args(&from, &to, fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    // 首响应距起点 >1h，或干脆晚于该调用自身的时长（语义不可能，实测命中 TTFT=24.2h）
+    let ttft_invalid = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM model_calls
+                 WHERE started_at >= ?1 AND started_at < ?2 {filter}
+                   AND first_response_at IS NOT NULL
+                   AND ((julianday(first_response_at) - julianday(started_at)) * 86400000.0 > 3600000.0
+                        OR (julianday(first_response_at) - julianday(started_at)) * 86400000.0 > duration_ms)"
+            ),
+            params_from_iter(range_args(&from, &to, fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    // 同一 (session_id, started_at) 分组：多条调用共享起点且累计时长 > 组内墙钟 5 倍
+    let duplicate_start_groups = c
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM (
+                    SELECT session_id, started_at,
+                           SUM(COALESCE(duration_ms, 0)) AS s,
+                           (julianday(MAX(COALESCE(completed_at, started_at)))
+                            - julianday(MIN(started_at))) * 86400000.0 AS span
+                     FROM model_calls
+                     WHERE started_at >= ?1 AND started_at < ?2 AND duration_ms IS NOT NULL {filter}
+                     GROUP BY session_id, started_at
+                     HAVING COUNT(*) > 1 AND span > 0 AND s > 5 * span
+                 )"
+            ),
+            params_from_iter(range_args(&from, &to, fargs.clone())),
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    let by_client = range(
+        &format!(
+            "SELECT client_id, COUNT(*), call_granularity, timing_source
+             FROM model_calls
+             WHERE started_at >= ?1 AND started_at < ?2 AND duration_ms > 21600000 {filter}
+             GROUP BY client_id, call_granularity, timing_source
+             ORDER BY COUNT(*) DESC LIMIT 20"
+        ),
+        fargs.clone(),
+    );
+
+    serde_json::json!({
+        "label": "疑似采集口径异常（turn 起点被用作调用起点 / 同回合重复累计），不等同于真实模型响应时长",
+        "share_threshold_hours": 6,
+        "total_duration_hours": total_ms as f64 / 3_600_000.0,
+        "over_threshold_duration_hours": over6h_ms as f64 / 3_600_000.0,
+        "share_of_total_duration": if total_ms > 0 { over6h_ms as f64 / total_ms as f64 } else { 0.0 },
+        "checks": [
+            serde_json::json!({
+                "key": "over_24h", "severity": "error",
+                "threshold": "单条时长 > 24 小时", "count": over_24h,
+            }),
+            serde_json::json!({
+                "key": "ttft_invalid", "severity": "error",
+                "threshold": "首响应 > 1 小时或超过该调用时长", "count": ttft_invalid,
+            }),
+            serde_json::json!({
+                "key": "duplicate_start", "severity": "warning",
+                "threshold": "同一会话内共享起始时刻的分组，累计时长 > 组内墙钟 5 倍",
+                "count": duplicate_start_groups,
+            }),
+        ],
+        "by_client": by_client,
+    })
+}
+
 pub(crate) async fn data_quality(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
@@ -2955,6 +3107,9 @@ pub(crate) async fn data_quality(
         out
     };
 
+    // 时长口径异常检测（防线，不是修复）：见 duration_outliers 的阈值依据说明。
+    let duration_outliers = duration_outliers(&c, from, to, &p);
+
     Json(serde_json::json!({
         "usage_distribution": usage_dist,
         "parse_warnings": parse_warnings,
@@ -2963,6 +3118,7 @@ pub(crate) async fn data_quality(
         "clock_skew_warnings": clock_skew_warns,
         "cursor_status": cursor_status,
         "alerts": alerts,
+        "duration_outliers": duration_outliers,
     }))
     .into_response()
 }
@@ -3295,6 +3451,34 @@ fn fill_latency_timeseries(
 }
 
 /// 完整小时边界：from 向上取整、to 向下取整（UTC 整点）。
+/// 按窗口裁剪后的调用时长合计与计数：每条调用只累计落在 `[from, to)` 内的那部分时长，
+/// 与「会话总时长」按边界裁剪的口径一致（design D1）。
+///
+/// 只在 `to` 早于当前时刻时才需要调用——否则没有调用能跨越窗口终点。
+/// SQLite 标量 `MIN(a, NULL)` 返回 NULL：无法解析 `started_at` 的行在 `SUM` 与
+/// `COUNT(expr)` 中同时被跳过，合计与计数因此保持一致。
+/// `julianday` 的亚毫秒精度会被截断（约 1ms），仅影响跨越终点的少数调用，可接受。
+fn clipped_duration_stats(
+    c: &metria_storage::rusqlite::Connection,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    filter: &str,
+    fargs: &[SqlValue],
+) -> Result<Option<(i64, i64)>, metria_storage::rusqlite::Error> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(CAST(MIN(duration_ms, ROUND((julianday(?2) - julianday(started_at)) * 86400000.0)) AS INTEGER)), 0),
+                COUNT(CAST(MIN(duration_ms, ROUND((julianday(?2) - julianday(started_at)) * 86400000.0)) AS INTEGER))
+         FROM model_calls
+         WHERE started_at >= ?1 AND started_at < ?2 AND duration_ms IS NOT NULL {filter}"
+    );
+    let (sum, count) = c.query_row(
+        &sql,
+        params_from_iter(range_args(&from, &to, fargs.to_vec())),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
+    Ok((count > 0).then_some((sum, count)))
+}
+
 fn full_hour_bounds(from: DateTime<Utc>, to: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     let ceil = |ts: DateTime<Utc>| {
         let secs = ts.timestamp();

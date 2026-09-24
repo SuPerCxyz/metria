@@ -1,4 +1,4 @@
-// 每日使用量堆叠柱：Token 分层；费用与活跃时长使用单层聚合。
+// 每日使用量堆叠柱：Token 分层；费用与「调用耗时累计」使用单层聚合。
 
 import React, { useMemo } from 'react'
 import TrendChart, { COLORS, TOKEN_COLORS } from './TrendChart'
@@ -29,7 +29,7 @@ export default function DailyUsageChart({ series, range, metric, onMetricChange,
       return { labels, datasets: [{ label: '费用', color: METRIC.cost, values: points.map((point) => point.cost_micro_usd ?? null) }], formatY: fmtUsd }
     }
     if (metric === 'duration') {
-      return { labels, datasets: [{ label: '活跃时长', color: METRIC.duration, values: points.map((point) => point.duration_ms ?? null) }], formatY: fmtDuration, unavailable: !points.some((point) => point.duration_ms != null) }
+      return { labels, datasets: [{ label: '调用耗时累计', color: METRIC.duration, values: points.map((point) => point.duration_ms ?? null) }], formatY: fmtDuration, unavailable: !points.some((point) => point.duration_ms != null) }
     }
     return {
       labels,
