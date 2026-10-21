@@ -122,29 +122,6 @@ export function fmtPct100(p) {
   return `${Number(p).toFixed(1)}%`
 }
 
-/** 当前值相对上一等长周期的百分比变化；上一周期为 0 时不可比较。 */
-export function percentChange(current, previous) {
-  const currentValue = Number(current)
-  const previousValue = Number(previous)
-  if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue) || previousValue === 0) return null
-  return ((currentValue - previousValue) / Math.abs(previousValue)) * 100
-}
-
-/** KPI 对比标签：+12.3% / -4.0%。 */
-export function fmtChange(current, previous) {
-  const change = percentChange(current, previous)
-  if (change === null) return null
-  return `${change >= 0 ? '+' : ''}${change.toFixed(1)}%`
-}
-
-/** 返回 MetricCard 使用的涨跌语义；inverse 用于错误率等“越低越好”指标。 */
-export function changeTone(current, previous, inverse = false) {
-  const change = percentChange(current, previous)
-  if (change === null || change === 0) return 'neutral'
-  const positive = inverse ? change < 0 : change > 0
-  return positive ? 'up' : 'down'
-}
-
 /**
  * 缓存命中率：cache_read / (input + cache_write + cache_read)。
  * 返回 0-100 的百分比数值；无缓存数据或分母为 0 返回 null（前端显示「—」，不硬造）。

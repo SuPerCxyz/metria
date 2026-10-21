@@ -13,19 +13,15 @@ import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { previousTimeRange } from '../../hooks/timeRangeState'
-import { fmtChange, changeTone, fmtPct, fmtUsd } from '../../services/format'
+import { fmtPct, fmtUsd } from '../../services/format'
 
 export default function Costs() {
   const { range } = useTimeRange()
   const navigate = useNavigate()
   const { nodeId, clientId, model } = useNodeFilter()
   const params = usageRangeParams(range, { nodeId, clientId, model })
-  const previousRange = useMemo(() => previousTimeRange(range), [range])
-  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
 
   const overview = useQuery(`overview${q(params)}`, () => api(`/overview${q(params)}`))
-  const previousOverview = useQuery(`cost-overview-previous${q(previousParams)}`, () => api(`/overview${q(previousParams)}`), { enabled: Boolean(previousRange) })
   const series = useQuery(`ts${q(params)}`, () => api(`/usage/timeseries${q(params)}`))
   const byModel = useQuery(`bm${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`ba${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
@@ -40,13 +36,7 @@ export default function Costs() {
   if (overview.error) return <ErrorState error={overview.error} onRetry={overview.refresh} />
   if (overview.loading) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
-  const previous = previousOverview.data || null
   const totalCost = (o.reported_cost_micro_usd ?? 0) + (o.calculated_cost_micro_usd ?? 0) + (o.estimated_cost_micro_usd ?? 0)
-  const previousTotalCost = previous ? (previous.reported_cost_micro_usd ?? 0) + (previous.calculated_cost_micro_usd ?? 0) + (previous.estimated_cost_micro_usd ?? 0) : null
-  const compare = (current, previousValue) => ({
-    delta: previous ? fmtChange(current, previousValue) : null,
-    deltaTone: previous ? changeTone(current, previousValue) : 'neutral',
-  })
   const coverage = o.pricing_coverage || {}
   const costMode = (coverage.priced_calls ?? 0) > 0
     ? '客户端上报 / 规则计算 / 估算'
@@ -72,10 +62,10 @@ export default function Costs() {
       <DataQualityNote kind="estimated" text="费用口径：客户端上报 / 价格规则计算 / Token 估算；缺失价格不计入。估算值不代表精确账单。" />
 
       {(coverage.priced_calls > 0 || coverage.total_calls > 0) && <div className="mt-4 grid grid-cols-12 gap-6">
-        {coverage.priced_calls > 0 && <MetricCard label="总费用" value={fmtUsd(totalCost)} {...compare(totalCost, previousTotalCost)} sub={costMode} hint={costHint} />}
-        {coverage.priced_calls > 0 && o.sessions > 0 && <MetricCard label="平均单会话费用" value={fmtUsd(totalCost / o.sessions)} {...compare(totalCost / o.sessions, previous?.sessions > 0 ? previousTotalCost / previous.sessions : null)} />}
-        {coverage.priced_calls > 0 && <MetricCard label="平均已定价请求费用" value={fmtUsd(totalCost / coverage.priced_calls)} {...compare(totalCost / coverage.priced_calls, previous?.pricing_coverage?.priced_calls > 0 ? previousTotalCost / previous.pricing_coverage.priced_calls : null)} />}
-        {coverage.total_calls > 0 && <MetricCard label="价格覆盖率" value={fmtPct(coverage.ratio)} {...compare(coverage.ratio, previous?.pricing_coverage?.ratio)} sub={`${coverage.priced_calls ?? 0} / ${coverage.total_calls ?? 0} 次调用`} />}
+        {coverage.priced_calls > 0 && <MetricCard label="总费用" value={fmtUsd(totalCost)} sub={costMode} hint={costHint} />}
+        {coverage.priced_calls > 0 && o.sessions > 0 && <MetricCard label="平均单会话费用" value={fmtUsd(totalCost / o.sessions)} />}
+        {coverage.priced_calls > 0 && <MetricCard label="平均已定价请求费用" value={fmtUsd(totalCost / coverage.priced_calls)} />}
+        {coverage.total_calls > 0 && <MetricCard label="价格覆盖率" value={fmtPct(coverage.ratio)} sub={`${coverage.priced_calls ?? 0} / ${coverage.total_calls ?? 0} 次调用`} />}
       </div>}
 
       {(series.loading || series.error || hasCostSeries) && <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">

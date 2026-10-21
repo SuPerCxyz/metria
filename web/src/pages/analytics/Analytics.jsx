@@ -14,8 +14,7 @@ import { useVisibleQuery } from '../../hooks/useVisibleQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
-import { previousTimeRange } from '../../hooks/timeRangeState'
-import { fmtTokensShort, fmtUsd, fmtPct, fmtPct100, fmtDuration, fmtChange, changeTone, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
+import { fmtTokensShort, fmtUsd, fmtPct, fmtPct100, fmtDuration, sumTokens, cacheHitRate, outputTokens } from '../../services/format'
 import { isAvailable, performanceSourceLabel } from '../../services/dataAvailability'
 import { quantileApprox } from '../../services/quantileApprox'
 import { ARCHIVED_UNAVAILABLE_LABEL, isActivityArchived } from '../../services/archiveRange'
@@ -50,16 +49,8 @@ export default function Analytics() {
     ? { ...params, ...excludedParams }
     : params
   const detailSeriesParams = { ...params, dim: detailDimension }
-  const previousRange = useMemo(() => previousTimeRange(range), [range])
-  const previousParams = usageRangeParams(previousRange, { nodeId, clientId, model })
-  const previousScopedParams = { ...previousParams, ...excludedParams }
 
   const overview = useQuery(`overview${q(scopedParams)}`, () => api(`/overview${q(scopedParams)}`))
-  const previousOverview = useQuery(
-    `analytics-previous${q(previousScopedParams)}`,
-    () => api(`/overview${q(previousScopedParams)}`),
-    { enabled: Boolean(previousRange) }
-  )
   const series = useQuery(`ts${q(scopedParams)}`, () => api(`/usage/timeseries${q(scopedParams)}`))
   const byModel = useQuery(`breakdown${q({ ...params, dim: 'model' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'model' })}`))
   const byAgent = useQuery(`bclient${q({ ...params, dim: 'client' })}`, () => api(`/usage/breakdown${q({ ...params, dim: 'client' })}`))
@@ -159,12 +150,6 @@ export default function Analytics() {
   if (overview.error && !overview.data) return <ErrorState error={overview.error} onRetry={overview.refresh} />
   if (overview.loading && !overview.data) return <LoadingSkeleton rows={6} />
   const o = overview.data || {}
-  const previous = previousOverview.data || null
-  const compare = (current, previousValue, inverse = false) => ({
-    delta: previous ? fmtChange(current, previousValue) : null,
-    deltaTone: previous ? changeTone(current, previousValue, inverse) : 'neutral',
-  })
-
   const cacheHit = cacheHitRate(o)
   const hasTokenData = (o.token_calls ?? 0) > 0
   const hasRequestData = (o.model_calls ?? 0) > 0
@@ -201,10 +186,10 @@ export default function Analytics() {
       {tab === 'tokens' && (
         hasTokenData ? <>
           <div className="grid grid-cols-12 gap-6">
-            <MetricCard label="Token 消耗" value={fmtTokensShort(sumTokens(o))} {...compare(sumTokens(o), previous ? sumTokens(previous) : null)} sub={`输入 ${fmtTokensShort(o.input_tokens)} · 输出 ${fmtTokensShort(outputTokens(o))} · 缓存 ${fmtTokensShort((o.cache_read_tokens ?? 0) + (o.cache_write_tokens ?? 0))}`} />
-            <MetricCard label="输入 Token" value={fmtTokensShort(o.input_tokens)} {...compare(o.input_tokens, previous?.input_tokens)} sub="请求上下文" />
-            <MetricCard label="输出 Token" value={fmtTokensShort(outputTokens(o))} {...compare(outputTokens(o), previous ? outputTokens(previous) : null)} sub="模型生成（含推理）" />
-            <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
+            <MetricCard label="Token 消耗" value={fmtTokensShort(sumTokens(o))} sub={`输入 ${fmtTokensShort(o.input_tokens)} · 输出 ${fmtTokensShort(outputTokens(o))} · 缓存 ${fmtTokensShort((o.cache_read_tokens ?? 0) + (o.cache_write_tokens ?? 0))}`} />
+            <MetricCard label="输入 Token" value={fmtTokensShort(o.input_tokens)} sub="请求上下文" />
+            <MetricCard label="输出 Token" value={fmtTokensShort(outputTokens(o))} sub="模型生成（含推理）" />
+            <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} sub="缓存读取" />
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">Token 趋势</h2>
@@ -221,10 +206,10 @@ export default function Analytics() {
       {tab === 'requests' && (
         hasRequestData ? <>
           <div className="grid grid-cols-12 gap-6">
-            <MetricCard label="请求总数" value={fmtTokensShort(o.model_calls)} {...compare(o.model_calls, previous?.model_calls)} />
-            <MetricCard label="成功请求" value={fmtTokensShort((o.model_calls ?? 0) - (o.failed_calls ?? 0))} {...compare((o.model_calls ?? 0) - (o.failed_calls ?? 0), previous ? (previous.model_calls ?? 0) - (previous.failed_calls ?? 0) : null)} sub={`失败 ${o.failed_calls ?? 0} 次`} />
-            <MetricCard label="失败请求" value={fmtTokensShort(o.failed_calls ?? 0)} {...compare(o.failed_calls, previous?.failed_calls)} sub="状态非成功" />
-            <MetricCard label="平均请求频率" value={sessionsArchived ? ARCHIVED_UNAVAILABLE_LABEL : (o.sessions > 0 ? ((o.model_calls ?? 0) / o.sessions).toFixed(1) : '—')} {...(sessionsArchived ? { delta: null, deltaTone: 'neutral' } : compare(o.sessions > 0 ? (o.model_calls ?? 0) / o.sessions : null, previous?.sessions > 0 ? (previous.model_calls ?? 0) / previous.sessions : null))} sub="每会话请求数" />
+            <MetricCard label="请求总数" value={fmtTokensShort(o.model_calls)} />
+            <MetricCard label="成功请求" value={fmtTokensShort((o.model_calls ?? 0) - (o.failed_calls ?? 0))} sub={`失败 ${o.failed_calls ?? 0} 次`} />
+            <MetricCard label="失败请求" value={fmtTokensShort(o.failed_calls ?? 0)} sub="状态非成功" />
+            <MetricCard label="平均请求频率" value={sessionsArchived ? ARCHIVED_UNAVAILABLE_LABEL : (o.sessions > 0 ? ((o.model_calls ?? 0) / o.sessions).toFixed(1) : '—')} sub="每会话请求数" />
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">请求趋势</h2>
@@ -236,10 +221,10 @@ export default function Analytics() {
       {tab === 'cache' && (
         hasCacheData ? <>
           <div className="grid grid-cols-12 gap-6">
-            <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} {...compare(o.cache_read_tokens, previous?.cache_read_tokens)} sub="缓存读取" />
-            <MetricCard label="缓存命中率" value={fmtPct100(cacheHit)} {...compare(cacheHit, cacheHitRate(previous))} />
-            <MetricCard label="缓存节省费用" value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'} {...compare(o.cache_savings_micro_usd, previous?.cache_savings_micro_usd)} sub={o.cache_savings_micro_usd > 0 ? '按缓存读取单价估算' : '无价格规则或缓存数据'} />
-            {(o.cache_write_tokens ?? 0) > 0 && <MetricCard label="缓存写入" value={fmtTokensShort(o.cache_write_tokens)} {...compare(o.cache_write_tokens, previous?.cache_write_tokens)} />}
+            <MetricCard label="缓存 Token" value={fmtTokensShort(o.cache_read_tokens)} sub="缓存读取" />
+            <MetricCard label="缓存命中率" value={fmtPct100(cacheHit)} />
+            <MetricCard label="缓存节省费用" value={o.cache_savings_micro_usd > 0 ? fmtUsd(o.cache_savings_micro_usd) : '—'} sub={o.cache_savings_micro_usd > 0 ? '按缓存读取单价估算' : '无价格规则或缓存数据'} />
+            {(o.cache_write_tokens ?? 0) > 0 && <MetricCard label="缓存写入" value={fmtTokensShort(o.cache_write_tokens)} />}
           </div>
           <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
             <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 mb-4">缓存趋势</h2>
@@ -255,7 +240,6 @@ export default function Analytics() {
           metric={detailMetric}
           onMetricChange={setDetailMetric}
           overview={o}
-          previousOverview={previous}
           loading={detailSeries.loading}
           error={detailSeries.error}
           onRetry={detailSeries.refresh}
@@ -354,7 +338,6 @@ function DetailAnalysis({
   metric,
   onMetricChange,
   overview,
-  previousOverview,
   loading,
   error,
   onRetry,
@@ -374,17 +357,13 @@ function DetailAnalysis({
         : fmtTokensShort
   const title = tab === 'agent-detail' ? '按 Agent 详细分析' : '按模型详细分析'
   const chartTitle = tab === 'agent-detail' ? 'Agent 趋势对比' : '模型趋势对比'
-  const detailDelta = (current, previousValue) => ({
-    delta: previousOverview ? fmtChange(current, previousValue) : null,
-    deltaTone: previousOverview ? changeTone(current, previousValue) : 'neutral',
-  })
 
   return (
     <>
       <div className="grid grid-cols-12 gap-6">
-        {sumTokens(overview) > 0 && <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} {...detailDelta(sumTokens(overview), previousOverview ? sumTokens(previousOverview) : null)} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />}
-        {(overview.model_calls ?? 0) > 0 && <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} {...detailDelta(overview.model_calls, previousOverview?.model_calls)} sub={isActivityArchived(overview.activity_archived_before, overview.sessions) ? `会话 ${ARCHIVED_UNAVAILABLE_LABEL}` : `会话 ${fmtTokensShort(overview.sessions)}`} />}
-        {isAvailable(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd) && <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} {...detailDelta(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd, previousOverview?.calculated_cost_micro_usd ?? previousOverview?.estimated_cost_micro_usd)} sub="当前范围" />}
+        {sumTokens(overview) > 0 && <MetricCard label="范围 Token" value={fmtTokensShort(sumTokens(overview))} sub={`请求 ${fmtTokensShort(overview.model_calls)}`} />}
+        {(overview.model_calls ?? 0) > 0 && <MetricCard label="请求数" value={fmtTokensShort(overview.model_calls)} sub={isActivityArchived(overview.activity_archived_before, overview.sessions) ? `会话 ${ARCHIVED_UNAVAILABLE_LABEL}` : `会话 ${fmtTokensShort(overview.sessions)}`} />}
+        {isAvailable(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd) && <MetricCard label="费用" value={fmtUsd(overview.calculated_cost_micro_usd ?? overview.estimated_cost_micro_usd)} sub="当前范围" />}
         {latency?.avg_ms != null && <MetricCard label="平均日志时长" value={fmtDuration(latency.avg_ms)} sub="有记录的请求" />}
       </div>
 

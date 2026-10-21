@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { averageTokens, cacheHitRate, changeTone, fmtAgentAddress, fmtChange, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, outputTokens, percentChange, sumCosts, sumTokens } from './format.js'
+import { averageTokens, cacheHitRate, fmtAgentAddress, fmtDateTime, fmtDuration, fmtRelative, fmtSessionTitle, fmtUsd, outputTokens, sumCosts, sumTokens } from './format.js'
 
 test('includes cache tokens in the total (v2 semantics)', () => {
   assert.equal(sumTokens({
@@ -60,13 +60,6 @@ test('formats timestamps with a stable 24-hour shape', () => {
   const value = fmtDateTime('2026-08-21T13:47:05Z', { second: '2-digit' })
   assert.match(value, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
   assert.doesNotMatch(value, /AM|PM/)
-})
-
-test('percent change formats positive, negative, and incomparable values', () => {
-  assert.equal(percentChange(125, 100), 25)
-  assert.equal(fmtChange(96, 100), '-4.0%')
-  assert.equal(fmtChange(10, 0), null)
-  assert.equal(changeTone(90, 100, true), 'up')
 })
 
 test('formats missing ranking fees as unavailable while preserving free zero', () => {
