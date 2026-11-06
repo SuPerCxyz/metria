@@ -2,16 +2,33 @@
 
 const API = '/api/v1'
 
-let token = localStorage.getItem('metria-token')
+const storage = typeof localStorage !== 'undefined' ? localStorage : null
+let token = storage ? storage.getItem('metria-token') : null
+let activeSignal = null
+
+/**
+ * 在当前同步调用栈内绑定 AbortSignal；api() 会把 signal 透传给 fetch。
+ * useQuery 的 fetcher 是同步调用 api 的，因此无需改写每个页面请求。
+ */
+export function withAbortSignal(signal, fn) {
+  const previous = activeSignal
+  activeSignal = signal || null
+  try {
+    return fn()
+  } finally {
+    activeSignal = previous
+  }
+}
 
 export function getToken() {
-  return token || localStorage.getItem('metria-token')
+  return token || (storage ? storage.getItem('metria-token') : null)
 }
 
 export function setToken(t) {
   token = t
-  if (t) localStorage.setItem('metria-token', t)
-  else localStorage.removeItem('metria-token')
+  if (!storage) return
+  if (t) storage.setItem('metria-token', t)
+  else storage.removeItem('metria-token')
 }
 
 export class ApiError extends Error {
@@ -25,9 +42,15 @@ export async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) }
   if (token) headers['Authorization'] = `Bearer ${token}`
   if (opts.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json'
-  const res = await fetch(`${API}${path}`, { ...opts, headers })
+  const res = await fetch(`${API}${path}`, {
+    ...opts,
+    headers,
+    signal: opts.signal || activeSignal || undefined,
+  })
   if (res.status === 401) {
-    window.dispatchEvent(new CustomEvent('metria:unauth'))
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('metria:unauth'))
+    }
     throw new ApiError(401, '未登录')
   }
   if (!res.ok) {

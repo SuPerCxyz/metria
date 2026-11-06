@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use metria_storage::rusqlite::params;
 use metria_storage::StorageError;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::db::HubDb;
 
@@ -22,213 +23,330 @@ pub enum RollupKind {
     Traffic,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RollupDims {
+    node: String,
+    collector: String,
+    client: String,
+    source: String,
+    project: String,
+    provider: String,
+    model: String,
+    usage_source: String,
+    usage_granularity: String,
+    pricing_source: String,
+    traffic_source: String,
+    traffic_confidence: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RollupDelta {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    reasoning_tokens: i64,
+    reported_cost: i64,
+    calculated_cost: i64,
+    estimated_cost: i64,
+    estimated_request_bytes: i64,
+    estimated_response_bytes: i64,
+    estimated_total_bytes: i64,
+    estimated_lower_bound_bytes: i64,
+    estimated_upper_bound_bytes: i64,
+    session_count: i64,
+    model_call_count: i64,
+    turn_count: i64,
+    message_count: i64,
+    tool_call_count: i64,
+    subagent_count: i64,
+}
+
+impl RollupDelta {
+    fn add(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.reported_cost += other.reported_cost;
+        self.calculated_cost += other.calculated_cost;
+        self.estimated_cost += other.estimated_cost;
+        self.estimated_request_bytes += other.estimated_request_bytes;
+        self.estimated_response_bytes += other.estimated_response_bytes;
+        self.estimated_total_bytes += other.estimated_total_bytes;
+        self.estimated_lower_bound_bytes += other.estimated_lower_bound_bytes;
+        self.estimated_upper_bound_bytes += other.estimated_upper_bound_bytes;
+        self.session_count += other.session_count;
+        self.model_call_count += other.model_call_count;
+        self.turn_count += other.turn_count;
+        self.message_count += other.message_count;
+        self.tool_call_count += other.tool_call_count;
+        self.subagent_count += other.subagent_count;
+    }
+}
+
+/// 把一条事件拆成 rollup 维度与增量；批量路径按维度合并后再写入。
+fn rollup_parts(kind: RollupKind, v: &Value) -> (RollupDims, RollupDelta) {
+    let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let provider = g("provider_normalized").if_empty(|| g("provider"));
+    let model = g("model_normalized").if_empty(|| g("model"));
+
+    let (usage_source, granularity, pricing_source) = if kind == RollupKind::Usage {
+        let q = v.get("quality").unwrap_or(&Value::Null);
+        let cost = v.get("cost").unwrap_or(&Value::Null);
+        let ps = if cost
+            .get("reported_micro_usd")
+            .and_then(|x| x.as_i64())
+            .is_some()
+        {
+            "reported"
+        } else if cost
+            .get("calculated_micro_usd")
+            .and_then(|x| x.as_i64())
+            .is_some()
+        {
+            "calculated"
+        } else if cost
+            .get("estimated_micro_usd")
+            .and_then(|x| x.as_i64())
+            .is_some()
+        {
+            "estimated"
+        } else {
+            ""
+        };
+        (
+            q.get("usage_source").and_then(|x| x.as_str()).unwrap_or(""),
+            q.get("granularity").and_then(|x| x.as_str()).unwrap_or(""),
+            ps,
+        )
+    } else {
+        ("", "", "")
+    };
+
+    let (traffic_source, conf_level) = if kind == RollupKind::Traffic {
+        (
+            g("estimation_source"),
+            confidence_level(v.get("confidence").and_then(|x| x.as_f64())),
+        )
+    } else {
+        ("", "")
+    };
+
+    let getn = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    // model_call_count 仅由 call 事件累计，避免与 session 携带值重复计数。
+    // 子 Agent 会话不计入会话汇总（与 rebuild 的 `parent_session_id IS NULL` 同口径），
+    // 否则增量路径与重建结果互相矛盾，对账会把一致的数据误判为漂移。
+    let child_session = kind == RollupKind::Session && !g("parent_session_id").is_empty();
+    let (session_count, message_count, tool_count, subagent_count, call_count) = match kind {
+        RollupKind::Session if child_session => (0, 0, 0, 0, 0),
+        RollupKind::Session => (
+            1,
+            getn("message_count"),
+            getn("tool_call_count"),
+            getn("subagent_count"),
+            0,
+        ),
+        RollupKind::Call => (0, 0, 0, 0, 1),
+        _ => (0, 0, 0, 0, 0),
+    };
+
+    let (input, output, cr, cw, rea) = if kind == RollupKind::Usage {
+        let u = v.get("usage").unwrap_or(&Value::Null);
+        let un = |k: &str| u.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+        (
+            un("input"),
+            un("output"),
+            un("cache_read"),
+            un("cache_write"),
+            un("reasoning"),
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+
+    let (rep, calc, est) = if kind == RollupKind::Usage {
+        let c = v.get("cost").unwrap_or(&Value::Null);
+        let cn = |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+        (
+            cn("reported_micro_usd"),
+            cn("calculated_micro_usd"),
+            cn("estimated_micro_usd"),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let (req_bytes, resp_bytes, total_bytes, lo, hi) = if kind == RollupKind::Traffic {
+        (
+            getn("estimated_request_wire_bytes"),
+            getn("estimated_response_wire_bytes"),
+            getn("estimated_total_wire_bytes"),
+            getn("lower_bound_bytes"),
+            getn("upper_bound_bytes"),
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+
+    (
+        RollupDims {
+            node: g("node_id").to_string(),
+            collector: g("collector_id").to_string(),
+            client: g("client_id").to_string(),
+            source: g("source_id").to_string(),
+            project: g("project_id").to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            usage_source: usage_source.to_string(),
+            usage_granularity: granularity.to_string(),
+            pricing_source: pricing_source.to_string(),
+            traffic_source: traffic_source.to_string(),
+            traffic_confidence: conf_level.to_string(),
+        },
+        RollupDelta {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cr,
+            cache_write_tokens: cw,
+            reasoning_tokens: rea,
+            reported_cost: rep,
+            calculated_cost: calc,
+            estimated_cost: est,
+            estimated_request_bytes: req_bytes,
+            estimated_response_bytes: resp_bytes,
+            estimated_total_bytes: total_bytes,
+            estimated_lower_bound_bytes: lo,
+            estimated_upper_bound_bytes: hi,
+            session_count,
+            model_call_count: call_count,
+            turn_count: 0,
+            message_count,
+            tool_call_count: tool_count,
+            subagent_count,
+        },
+    )
+}
+
 impl HubDb {
     /// 对一条事件做增量 rollup（hourly + daily）。
     pub fn rollup_event(&self, kind: &str, v: &Value) -> Result<(), StorageError> {
-        let rk = match kind {
-            "session" => RollupKind::Session,
-            "call" => RollupKind::Call,
-            "usage" => RollupKind::Usage,
-            "traffic" => RollupKind::Traffic,
-            _ => return Ok(()),
-        };
-        let ts = event_time(v);
-        self.rollup_insert(&ts, rk, v, "hourly_rollups")?;
-        self.rollup_insert(&ts, rk, v, "daily_rollups")
+        self.rollup_events(&[(kind, v)])
     }
 
-    fn rollup_insert(
-        &self,
-        ts: &DateTime<Utc>,
-        kind: RollupKind,
-        v: &Value,
-        table: &str,
-    ) -> Result<(), StorageError> {
-        let bucket = match table {
-            "hourly_rollups" => {
-                metria_core::time::bucket_hour(*ts, chrono_tz::Tz::UTC).to_rfc3339()
-            }
-            _ => metria_core::time::bucket_day(*ts, chrono_tz::Tz::UTC).to_rfc3339(),
-        };
-        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-        let node = g("node_id");
-        let client = g("client_id");
-        let source = g("source_id");
-        let provider = g("provider_normalized").if_empty(|| g("provider"));
-        let model = g("model_normalized").if_empty(|| g("model"));
-
-        let (usage_source, granularity, pricing_source) = if kind == RollupKind::Usage {
-            let q = v.get("quality").unwrap_or(&Value::Null);
-            let cost = v.get("cost").unwrap_or(&Value::Null);
-            let ps = if cost
-                .get("reported_micro_usd")
-                .and_then(|x| x.as_i64())
-                .is_some()
-            {
-                "reported"
-            } else if cost
-                .get("calculated_micro_usd")
-                .and_then(|x| x.as_i64())
-                .is_some()
-            {
-                "calculated"
-            } else if cost
-                .get("estimated_micro_usd")
-                .and_then(|x| x.as_i64())
-                .is_some()
-            {
-                "estimated"
-            } else {
-                ""
+    /// 批量增量 rollup：先按 (表, 桶, 维度) 累加，再一次事务写入。
+    ///
+    /// 同一批次内落在同一桶/维度的事件只产生一条 UPSERT；调用方只应传入
+    /// 已确认新落库的事件，重复批次不会重复累计。
+    pub fn rollup_events(&self, events: &[(&str, &Value)]) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut hourly: HashMap<(String, RollupDims), RollupDelta> = HashMap::new();
+        let mut daily: HashMap<(String, RollupDims), RollupDelta> = HashMap::new();
+        for (kind, v) in events {
+            let rollup_kind = match *kind {
+                "session" => RollupKind::Session,
+                "call" => RollupKind::Call,
+                "usage" => RollupKind::Usage,
+                "traffic" => RollupKind::Traffic,
+                _ => continue,
             };
-            (
-                q.get("usage_source").and_then(|x| x.as_str()).unwrap_or(""),
-                q.get("granularity").and_then(|x| x.as_str()).unwrap_or(""),
-                ps,
-            )
-        } else {
-            ("", "", "")
-        };
-
-        let (traffic_source, conf_level) = if kind == RollupKind::Traffic {
-            (
-                g("estimation_source"),
-                confidence_level(v.get("confidence").and_then(|x| x.as_f64())),
-            )
-        } else {
-            ("", "")
-        };
-
-        let getn = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
-        // model_call_count 仅由 call 事件累计，避免与 session 携带值重复计数。
-        // 子 Agent 会话不计入会话汇总（与 rebuild 的 `parent_session_id IS NULL` 同口径），
-        // 否则增量路径与重建结果互相矛盾，对账会把一致的数据误判为漂移。
-        let child_session = kind == RollupKind::Session && !g("parent_session_id").is_empty();
-        let (session_count, message_count, tool_count, subagent_count, call_count) = match kind {
-            RollupKind::Session if child_session => (0, 0, 0, 0, 0),
-            RollupKind::Session => (
-                1,
-                getn("message_count"),
-                getn("tool_call_count"),
-                getn("subagent_count"),
-                0,
-            ),
-            RollupKind::Call => (0, 0, 0, 0, 1),
-            _ => (0, 0, 0, 0, 0),
-        };
-
-        let (input, output, cr, cw, rea) = if kind == RollupKind::Usage {
-            let u = v.get("usage").unwrap_or(&Value::Null);
-            let un = |k: &str| u.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
-            (
-                un("input"),
-                un("output"),
-                un("cache_read"),
-                un("cache_write"),
-                un("reasoning"),
-            )
-        } else {
-            (0, 0, 0, 0, 0)
-        };
-
-        let (rep, calc, est) = if kind == RollupKind::Usage {
-            let c = v.get("cost").unwrap_or(&Value::Null);
-            let cn = |k: &str| c.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
-            (
-                cn("reported_micro_usd"),
-                cn("calculated_micro_usd"),
-                cn("estimated_micro_usd"),
-            )
-        } else {
-            (0, 0, 0)
-        };
-
-        let (req_bytes, resp_bytes, total_bytes, lo, hi) = if kind == RollupKind::Traffic {
-            (
-                getn("estimated_request_wire_bytes"),
-                getn("estimated_response_wire_bytes"),
-                getn("estimated_total_wire_bytes"),
-                getn("lower_bound_bytes"),
-                getn("upper_bound_bytes"),
-            )
-        } else {
-            (0, 0, 0, 0, 0)
-        };
-
-        let sql = format!(
-            "INSERT INTO {table} (
-                bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
-                usage_source, usage_granularity, pricing_source, traffic_estimation_source, traffic_confidence_level,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                reported_cost, calculated_cost, estimated_cost,
-                estimated_request_bytes, estimated_response_bytes, estimated_total_bytes,
-                estimated_lower_bound_bytes, estimated_upper_bound_bytes,
-                session_count, model_call_count, turn_count, message_count, tool_call_count, subagent_count
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)
-            ON CONFLICT(bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
-                usage_source, usage_granularity, pricing_source, traffic_estimation_source, traffic_confidence_level)
-            DO UPDATE SET
-                input_tokens = input_tokens + excluded.input_tokens,
-                output_tokens = output_tokens + excluded.output_tokens,
-                cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                reported_cost = reported_cost + excluded.reported_cost,
-                calculated_cost = calculated_cost + excluded.calculated_cost,
-                estimated_cost = estimated_cost + excluded.estimated_cost,
-                estimated_request_bytes = estimated_request_bytes + excluded.estimated_request_bytes,
-                estimated_response_bytes = estimated_response_bytes + excluded.estimated_response_bytes,
-                estimated_total_bytes = estimated_total_bytes + excluded.estimated_total_bytes,
-                estimated_lower_bound_bytes = estimated_lower_bound_bytes + excluded.estimated_lower_bound_bytes,
-                estimated_upper_bound_bytes = estimated_upper_bound_bytes + excluded.estimated_upper_bound_bytes,
-                session_count = session_count + excluded.session_count,
-                model_call_count = model_call_count + excluded.model_call_count,
-                turn_count = turn_count + excluded.turn_count,
-                message_count = message_count + excluded.message_count,
-                tool_call_count = tool_call_count + excluded.tool_call_count,
-                subagent_count = subagent_count + excluded.subagent_count
-        "
-        );
+            let ts = event_time(v);
+            let (dims, delta) = rollup_parts(rollup_kind, v);
+            let hourly_bucket = metria_core::time::bucket_hour(ts, chrono_tz::Tz::UTC).to_rfc3339();
+            let daily_bucket = metria_core::time::bucket_day(ts, chrono_tz::Tz::UTC).to_rfc3339();
+            hourly
+                .entry((hourly_bucket, dims.clone()))
+                .or_default()
+                .add(&delta);
+            daily.entry((daily_bucket, dims)).or_default().add(&delta);
+        }
+        if hourly.is_empty() && daily.is_empty() {
+            return Ok(());
+        }
 
         let c = self.conn();
-        c.execute(
-            &sql,
-            params![
-                bucket,
-                node,
-                g("collector_id"),
-                client,
-                source,
-                g("project_id"),
-                provider,
-                model,
-                usage_source,
-                granularity,
-                pricing_source,
-                traffic_source,
-                conf_level,
-                input,
-                output,
-                cr,
-                cw,
-                rea,
-                rep,
-                calc,
-                est,
-                req_bytes,
-                resp_bytes,
-                total_bytes,
-                lo,
-                hi,
-                session_count,
-                call_count,
-                0,
-                message_count,
-                tool_count,
-                subagent_count,
-            ],
-        )
-        .map_err(StorageError::from)?;
+        let tx = c.unchecked_transaction().map_err(StorageError::from)?;
+        for (table, buckets) in [("hourly_rollups", &hourly), ("daily_rollups", &daily)] {
+            if buckets.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "INSERT INTO {table} (
+                    bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
+                    usage_source, usage_granularity, pricing_source, traffic_estimation_source, traffic_confidence_level,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    reported_cost, calculated_cost, estimated_cost,
+                    estimated_request_bytes, estimated_response_bytes, estimated_total_bytes,
+                    estimated_lower_bound_bytes, estimated_upper_bound_bytes,
+                    session_count, model_call_count, turn_count, message_count, tool_call_count, subagent_count
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)
+                ON CONFLICT(bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
+                    usage_source, usage_granularity, pricing_source, traffic_estimation_source, traffic_confidence_level)
+                DO UPDATE SET
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                    reported_cost = reported_cost + excluded.reported_cost,
+                    calculated_cost = calculated_cost + excluded.calculated_cost,
+                    estimated_cost = estimated_cost + excluded.estimated_cost,
+                    estimated_request_bytes = estimated_request_bytes + excluded.estimated_request_bytes,
+                    estimated_response_bytes = estimated_response_bytes + excluded.estimated_response_bytes,
+                    estimated_total_bytes = estimated_total_bytes + excluded.estimated_total_bytes,
+                    estimated_lower_bound_bytes = estimated_lower_bound_bytes + excluded.estimated_lower_bound_bytes,
+                    estimated_upper_bound_bytes = estimated_upper_bound_bytes + excluded.estimated_upper_bound_bytes,
+                    session_count = session_count + excluded.session_count,
+                    model_call_count = model_call_count + excluded.model_call_count,
+                    turn_count = turn_count + excluded.turn_count,
+                    message_count = message_count + excluded.message_count,
+                    tool_call_count = tool_call_count + excluded.tool_call_count,
+                    subagent_count = subagent_count + excluded.subagent_count
+                "
+            );
+            let mut stmt = tx.prepare(&sql).map_err(StorageError::from)?;
+            for ((bucket, dims), delta) in buckets {
+                stmt.execute(params![
+                    bucket.as_str(),
+                    dims.node.as_str(),
+                    dims.collector.as_str(),
+                    dims.client.as_str(),
+                    dims.source.as_str(),
+                    dims.project.as_str(),
+                    dims.provider.as_str(),
+                    dims.model.as_str(),
+                    dims.usage_source.as_str(),
+                    dims.usage_granularity.as_str(),
+                    dims.pricing_source.as_str(),
+                    dims.traffic_source.as_str(),
+                    dims.traffic_confidence.as_str(),
+                    delta.input_tokens,
+                    delta.output_tokens,
+                    delta.cache_read_tokens,
+                    delta.cache_write_tokens,
+                    delta.reasoning_tokens,
+                    delta.reported_cost,
+                    delta.calculated_cost,
+                    delta.estimated_cost,
+                    delta.estimated_request_bytes,
+                    delta.estimated_response_bytes,
+                    delta.estimated_total_bytes,
+                    delta.estimated_lower_bound_bytes,
+                    delta.estimated_upper_bound_bytes,
+                    delta.session_count,
+                    delta.model_call_count,
+                    delta.turn_count,
+                    delta.message_count,
+                    delta.tool_call_count,
+                    delta.subagent_count,
+                ])
+                .map_err(StorageError::from)?;
+            }
+        }
+        tx.commit().map_err(StorageError::from)?;
         Ok(())
     }
 
@@ -576,10 +694,10 @@ impl HubDb {
                 break;
             };
             last_rowid = last;
-            for (_, event) in events {
-                self.rollup_event("traffic", &event)?;
-                rebuilt += 1;
-            }
+            let refs: Vec<(&str, &Value)> =
+                events.iter().map(|(_, event)| ("traffic", event)).collect();
+            self.rollup_events(&refs)?;
+            rebuilt += events.len();
         }
         Ok(rebuilt)
     }
@@ -1026,5 +1144,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(traffic, 12000, "流量估算字节必须随重建恢复");
+    }
+
+    fn rollup_rows(db: &HubDb, table: &str) -> Vec<String> {
+        let c = db.conn();
+        let mut stmt = c.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let columns = stmt.column_count();
+        let rows = stmt
+            .query_map([], |r| {
+                let mut parts = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    parts.push(format!("{:?}", r.get_ref(index)?));
+                }
+                Ok(parts.join("|"))
+            })
+            .unwrap();
+        let mut rows: Vec<String> = rows.filter_map(Result::ok).collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn batch_rollup_matches_per_event_rollup() {
+        let single = test_db("batch-rollup-single");
+        let batched = test_db("batch-rollup-batched");
+        let events = vec![
+            ("session", sess_json("sess-a", "2026-08-10T08:00:00Z")),
+            ("call", call_json("2026-08-10T08:10:00Z")),
+            ("usage", usage_json(1, true)),
+            ("usage", usage_json(2, true)),
+        ];
+        for (kind, value) in &events {
+            single.rollup_event(kind, value).unwrap();
+        }
+        let refs: Vec<(&str, &Value)> = events.iter().map(|(kind, value)| (*kind, value)).collect();
+        batched.rollup_events(&refs).unwrap();
+
+        assert_eq!(
+            rollup_rows(&single, "hourly_rollups"),
+            rollup_rows(&batched, "hourly_rollups")
+        );
+        assert_eq!(
+            rollup_rows(&single, "daily_rollups"),
+            rollup_rows(&batched, "daily_rollups")
+        );
+    }
+
+    #[test]
+    fn batch_rollup_aggregates_same_bucket_dimensions() {
+        let db = test_db("batch-rollup-agg");
+        let first = call_json("2026-08-10T08:10:00Z");
+        let second = call_json("2026-08-10T08:20:00Z");
+        db.rollup_events(&[("call", &first), ("call", &second)])
+            .unwrap();
+
+        let (rows, calls): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(model_call_count), 0) FROM hourly_rollups",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "同一桶/维度应合并为一行");
+        assert_eq!(calls, 2, "两条调用应累计为 2");
     }
 }

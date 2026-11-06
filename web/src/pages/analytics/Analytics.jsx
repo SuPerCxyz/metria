@@ -60,10 +60,21 @@ export default function Analytics() {
     () => api(`/usage/timeseries${q(detailSeriesParams)}`),
     { enabled: detailMode }
   )
-  const latency = useQuery(`latency${q(scopedParams)}`, () => api(`/usage/latency${q(scopedParams)}`))
-  const latencySeries = useQuery(`latency-ts${q(scopedParams)}`, () => api(`/usage/latency/timeseries${q(scopedParams)}`))
-  // 性能查询成本高：所在区域（性能分析）可见后才发起；时间序列跟随同一区域激活
-  const performance = useVisibleQuery(`performance${q(scopedParams)}`, () => api(`/usage/performance${q(scopedParams)}`))
+  // 延迟摘要卡在详情标签也要用（B5 回归）：摘要常开，仅 timeseries 跟随延迟标签。
+  const latency = useQuery(
+    `latency${q(scopedParams)}`,
+    () => api(`/usage/latency${q(scopedParams)}`)
+  )
+  const latencySeries = useQuery(
+    `latency-ts${q(scopedParams)}`,
+    () => api(`/usage/latency/timeseries${q(scopedParams)}`),
+    { enabled: tab === 'latency' }
+  )
+  const performance = useVisibleQuery(
+    `performance${q(scopedParams)}`,
+    () => api(`/usage/performance${q(scopedParams)}`),
+    { enabled: tab === 'latency' }
+  )
   const performanceSeries = useQuery(
     `performance-ts${q(scopedParams)}`,
     () => api(`/usage/performance/timeseries${q(scopedParams)}`),

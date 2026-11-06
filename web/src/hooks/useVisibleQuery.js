@@ -9,7 +9,7 @@ import { useQuery } from './useQuery'
  * 所在区域的容器元素上；data / loading / error / refresh 与 useQuery 一致。
  * 未激活时 loading 恒为 true，避免把「还没请求」误报成「已加载的空数据」。
  */
-export function useVisibleQuery(key, fetcher) {
+export function useVisibleQuery(key, fetcher, { enabled = true } = {}) {
   const [container, setContainer] = useState(null)
   const [activated, setActivated] = useState(false)
 
@@ -38,11 +38,11 @@ export function useVisibleQuery(key, fetcher) {
     return () => window.removeEventListener('metria:refresh', onRefresh)
   }, [])
 
-  const query = useQuery(key, fetcher, { enabled: activated })
+  const query = useQuery(key, fetcher, { enabled: activated && enabled })
   return {
     ...query,
     ref,
-    ready: activated,
-    loading: activated ? query.loading : true,
+    ready: activated && enabled,
+    loading: activated && enabled ? query.loading : true,
   }
 }

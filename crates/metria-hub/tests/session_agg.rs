@@ -6,6 +6,7 @@
 use metria_hub::config::HubConfig;
 use metria_hub::db::HubDb;
 use serde_json::json;
+use std::collections::HashSet;
 
 fn test_cfg(dir: &std::path::Path) -> HubConfig {
     HubConfig {
@@ -190,4 +191,76 @@ fn usage_and_call_costs_link_in_either_arrival_order() {
         assert_eq!(linked_event.as_deref(), Some(event_id.as_str()));
         assert_eq!(cost, Some(1234));
     }
+}
+
+#[test]
+fn deferred_batch_refresh_matches_single_refresh() {
+    let single = temp_db("single-refresh");
+    let batched = temp_db("batch-refresh");
+    let node = "agg-node-3";
+    let sid = "agg-src-session-3";
+    let session_key = format!("{node}:{sid}");
+
+    for db in [&single, &batched] {
+        db.upsert_session(&sess_payload(node, sid)).unwrap();
+    }
+    for (cid, in_tok, out_tok) in [("call-a", 100, 10), ("call-b", 200, 20)] {
+        let payload = call_payload(node, sid, cid, in_tok, out_tok);
+        single.insert_call(&payload, &session_key).unwrap();
+        batched
+            .insert_call_deferred(&payload, &session_key)
+            .unwrap();
+    }
+    batched
+        .refresh_sessions(&HashSet::from([session_key.clone()]))
+        .unwrap();
+
+    let agg = |db: &HubDb| -> (i64, Option<i64>, Option<i64>, Option<String>) {
+        db.conn()
+            .query_row(
+                "SELECT model_call_count, input_tokens, output_tokens, primary_model_raw
+                 FROM sessions WHERE id = ?1",
+                [&session_key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(agg(&single), agg(&batched));
+    assert_eq!(agg(&batched).0, 2);
+}
+
+#[test]
+fn deferred_insert_does_not_refresh_until_flush() {
+    let db = temp_db("deferred-refresh");
+    let node = "agg-node-4";
+    let sid = "agg-src-session-4";
+    let session_key = format!("{node}:{sid}");
+    db.upsert_session(&sess_payload(node, sid)).unwrap();
+    db.insert_call_deferred(
+        &call_payload(node, sid, "call-deferred", 300, 30),
+        &session_key,
+    )
+    .unwrap();
+
+    let count = |db: &HubDb| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT model_call_count FROM sessions WHERE id = ?1",
+                [&session_key],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count(&db), 0, "延迟插入不应立即刷新会话聚合");
+
+    db.refresh_sessions(&HashSet::from([session_key.clone()]))
+        .unwrap();
+    assert_eq!(count(&db), 1);
 }

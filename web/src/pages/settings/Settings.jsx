@@ -11,9 +11,10 @@ import { ErrorState, LoadingSkeleton } from '../../components/feedback/Feedback'
 import { useToast } from '../../components/feedback/Toast'
 import { api, setToken } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
+import { useAuth } from '../../hooks/useAuth'
 import { fmtBytes, fmtDateTime, fmtUsd } from '../../services/format'
 import { EMPTY_LINK_DRAFT, EMPTY_RULE_DRAFT, PRICE_FIELDS, RULE_SOURCE_FILTERS, filterPricingRules, pricingRuleKind, pricingRuleKindMeta, serializeRuleDraft } from '../../services/pricing'
-import ReportSettings from './ReportSettings'
+const ReportSettings = React.lazy(() => import('./ReportSettings'))
 
 const TABS = ['模型价格', '数据保留', '节点接入', '用量报告', '系统设置']
 const TAB_KEYS = { pricing: '模型价格', retention: '数据保留', nodes: '节点接入', report: '用量报告', system: '系统设置' }
@@ -227,20 +228,27 @@ export default function Settings() {
   const [linkSaving, setLinkSaving] = useState(false)
   const [linkError, setLinkError] = useState('')
   const { notify } = useToast()
+  const { user } = useAuth()
 
   useEffect(() => {
     setTab(requestedTab)
   }, [requestedTab])
 
   useEffect(() => {
-    Promise.all([api('/auth/me'), api('/system/info')])
-      .then(([me, info]) => {
-        setProfile(me)
-        setProfileDraft({
-          display_name: me.display_name || '',
-          avatar_text: me.avatar_text || '',
-          avatar_color: me.avatar_color || 'indigo',
-        })
+    if (!user) return
+    setProfile(user)
+    setProfileDraft({
+      display_name: user.display_name || '',
+      avatar_text: user.avatar_text || '',
+      avatar_color: user.avatar_color || 'indigo',
+    })
+    setAccountError('')
+    setAccountLoading(false)
+  }, [user])
+
+  useEffect(() => {
+    api('/system/info')
+      .then((info) => {
         setSystemInfo(info)
         setAccountError('')
       })
@@ -763,7 +771,11 @@ export default function Settings() {
         </div>
       )}
 
-      {tab === '用量报告' && <ReportSettings />}
+      {tab === '用量报告' && (
+        <React.Suspense fallback={<div className="p-6 text-sm text-gray-400 dark:text-gray-500">加载报告设置…</div>}>
+          <ReportSettings />
+        </React.Suspense>
+      )}
 
       {tab === '系统设置' && (
         <AccountSettings

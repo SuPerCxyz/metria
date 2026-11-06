@@ -355,14 +355,60 @@ fn run_observe(
 }
 
 fn run_hub(demo: bool) -> Result<ExitCode, metria_hub::HubError> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| metria_hub::HubError::Io(std::io::Error::other(e)))?;
+    let rt = hub_runtime().map_err(|e| metria_hub::HubError::Io(std::io::Error::other(e)))?;
     rt.block_on(async {
         let mut cfg = metria_hub::HubConfig::from_env()?;
         cfg.demo = demo;
         metria_hub::serve(cfg).await?;
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// Hub 的 tokio 运行时。
+///
+/// 页面查询、全量重建、重计价、catalog sync、Pull 与 OIDC 共用 blocking 池；
+/// 8 条在多个长任务并发时会让查询排队。32 条按需创建（默认 2MiB 栈/线程），
+/// 峰值额外内存约 64MiB，长任务仍受读池/写锁与 rebuild guard 约束。
+fn hub_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(32)
+        .enable_all()
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "concurrency smoke test; run with --ignored --nocapture"]
+    fn blocking_pool_has_headroom_for_queries() {
+        let rt = hub_runtime().unwrap();
+        rt.block_on(async {
+            // 25 个 blocking 任务同时等待同一个 barrier：池上限 ≥25 才能全部启动。
+            // 页面查询与长任务共用该池，8 条时这里会超时。
+            let participants = 25;
+            let barrier = Arc::new(Barrier::new(participants));
+            let mut handles = Vec::new();
+            for _ in 0..participants {
+                let barrier = Arc::clone(&barrier);
+                handles.push(tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                }));
+            }
+            let wait = async {
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), wait)
+                    .await
+                    .is_ok(),
+                "blocking 池不足以同时运行 {participants} 个任务"
+            );
+        });
+    }
 }

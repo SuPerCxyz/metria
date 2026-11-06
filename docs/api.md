@@ -45,12 +45,50 @@
 | GET | `/models` `/models/{id}` | 模型列表/详情 |
 | GET | `/calls` `/calls/{id}` | 调用列表/详情 |
 | GET | `/sessions` `/sessions/{id}` | 会话列表/详情 |
-| GET | `/sessions/{id}/calls` `/tools` `/timeline` `/subagents` | 会话明细 |
+| GET | `/sessions/{id}/calls` `/tools` `/timeline` `/subagents` | 会话明细；前三者支持 `limit`/`cursor` 分页 |
+| GET | `/sessions/{id}/stats` | 会话全量统计与小时/日趋势（不受明细分页影响） |
 | GET | `/data-quality` | 数据来源分布与解析告警 |
 | GET | `/system/info` | 当前内容保存模式、时区和数据保留状态（只读） |
 | GET | `/export` | 导出（JSON/NDJSON/CSV） |
 
 账户资料：`GET/PUT /auth/profile` 读取或更新显示名称、头像文字和头像颜色；`POST /auth/change-password` 校验旧密码并更新密码哈希。密码修改成功后现有会话失效。
+
+### 会话明细分页与统计
+
+`GET /sessions/{id}/calls`、`/tools`、`/timeline` 支持可选分页参数：
+
+- `limit`：1–500；传入 `limit` 或 `cursor` 即进入分页模式，缺省 `limit` 为 100。
+- `cursor`：不透明游标；calls/tools 基于 `(started_at, id)`，timeline 基于 `(sequence, id)`。无效或越界游标返回 400 `invalid_cursor`；`limit` 不在 1–500 返回 400 `invalid_limit`。
+- 分页响应在原有 `calls` / `tools` / `messages` 字段之外增加 `next_cursor`、`total`、`has_more`。
+- 不传 `limit` 与 `cursor` 时完全保持旧响应结构（仅原字段），旧客户端无需修改。
+- 排序：calls/tools 为 `started_at, id`（旧调用保持 `started_at` 顺序）；timeline 为 `sequence, id`。跨页不重复、不遗漏。
+
+`GET /sessions/{id}/stats?granularity=hour|day`（默认 `hour`）返回：
+
+```json
+{
+  "call_count": 28000,
+  "error_count": 280,
+  "status_counts": [{ "status": "success", "count": 27720 }],
+  "granularity": "hour",
+  "series": [{
+    "bucket": "2026-10-01T10:00:00+00:00",
+    "call_count": 120,
+    "error_count": 1,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0,
+    "cost_micro_usd": null,
+    "duration_ms": null,
+    "avg_duration_ms": null,
+    "duration_samples": 0
+  }]
+}
+```
+
+统计基于会话全量明细；`duration_ms` 保留为该桶的时长总和（兼容旧客户端），`avg_duration_ms` 为单次调用的平均时长，`duration_samples` 为有效时长样本数。无费用/时长样本时对应字段为 `null`，不按 0 伪造。
 
 ## 用量报告设置
 

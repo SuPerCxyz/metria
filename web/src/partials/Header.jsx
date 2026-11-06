@@ -9,13 +9,14 @@ import UsageFilterPicker from '../components/filters/UsageFilterPicker'
 import { usePageMeta } from '../hooks/usePageMeta'
 import { beginRefreshWindow, endRefreshWindow, useQueryActivity } from '../hooks/useQuery'
 import { useTimeRange } from '../hooks/useTimeRange'
-import { api, setToken } from '../services/api'
+import { setToken } from '../services/api'
+import { useAuth } from '../hooks/useAuth'
 import { useToast } from '../components/feedback/Toast'
 
 function Header({ sidebarOpen, setSidebarOpen }) {
   const navigate = useNavigate()
   const [userMenuOpen, setUserMenuOpen] = useState(false)
-  const [user, setUser] = useState(null)
+  const { user } = useAuth()
   const { subtitle } = usePageMeta()
   const { refreshRange } = useTimeRange()
   const [refreshing, setRefreshing] = useState(false)
@@ -26,14 +27,6 @@ function Header({ sidebarOpen, setSidebarOpen }) {
   const activityRef = useRef(0)
   const { notify } = useToast()
   activityRef.current = activity
-
-  useEffect(() => {
-    const load = () => api('/auth/me').then(setUser).catch(() => setUser(null))
-    const onProfileUpdated = () => load()
-    load()
-    window.addEventListener('metria:profile-updated', onProfileUpdated)
-    return () => window.removeEventListener('metria:profile-updated', onProfileUpdated)
-  }, [])
 
   const logout = () => {
     setToken(null)

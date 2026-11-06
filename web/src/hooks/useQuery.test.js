@@ -2,7 +2,18 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { beginRefreshWindow, endRefreshWindow, markRefreshFailure, sharedRequest } from './useQuery.js'
+import {
+  QUERY_CACHE_TTL_MS,
+  beginRefreshWindow,
+  clearQueryCache,
+  endRefreshWindow,
+  getQueryCache,
+  isQueryCacheFresh,
+  markRefreshFailure,
+  putQueryCache,
+  sharedRequest,
+} from './useQuery.js'
+import { api } from '../services/api.js'
 
 test('refresh window reports success when no request failed', () => {
   beginRefreshWindow()
@@ -97,4 +108,79 @@ test('失败的在飞请求结束后清理，后续调用可重试', async () =>
   await assert.rejects(sharedRequest(key, () => Promise.reject(new Error('boom'))))
   const retry = sharedRequest(key, () => Promise.resolve('recovered'))
   assert.equal(await retry, 'recovered')
+})
+
+
+test('SWR cache returns data and expires after TTL', () => {
+  clearQueryCache()
+  putQueryCache('cache-key', { value: 1 }, 1_000)
+  const entry = getQueryCache('cache-key')
+  assert.deepEqual(entry.data, { value: 1 })
+  assert.equal(isQueryCacheFresh(entry, 1_000 + QUERY_CACHE_TTL_MS - 1), true)
+  assert.equal(isQueryCacheFresh(entry, 1_000 + QUERY_CACHE_TTL_MS), false)
+  clearQueryCache()
+  assert.equal(getQueryCache('cache-key'), null)
+})
+
+test('一个调用者 abort 只取消自己的等待，不影响其他复用者', async () => {
+  const key = 'signal-shared-one'
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  let underlyingSignal = null
+  const fetcher = ({ signal }) => {
+    underlyingSignal = signal
+    return gate.then(() => 'ok')
+  }
+  const first = new AbortController()
+  const second = new AbortController()
+  const p1 = sharedRequest(key, fetcher, { signal: first.signal })
+  const p2 = sharedRequest(key, fetcher, { signal: second.signal })
+  const rejected = assert.rejects(p1, (error) => error.name === 'AbortError')
+  first.abort()
+  await rejected
+  assert.equal(underlyingSignal.aborted, false, '第一个调用者 abort 不得取消共享请求')
+  release()
+  assert.equal(await p2, 'ok')
+})
+
+test('全部调用者 abort 后底层请求被取消', async () => {
+  const key = 'signal-shared-all'
+  let underlyingSignal = null
+  const fetcher = ({ signal }) => {
+    underlyingSignal = signal
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        const error = new Error('Aborted')
+        error.name = 'AbortError'
+        reject(error)
+      }, { once: true })
+    })
+  }
+  const first = new AbortController()
+  const second = new AbortController()
+  const p1 = sharedRequest(key, fetcher, { signal: first.signal })
+  const p2 = sharedRequest(key, fetcher, { signal: second.signal })
+  const both = Promise.allSettled([p1, p2])
+  first.abort()
+  second.abort()
+  const results = await both
+  assert.deepEqual(results.map((result) => result.status), ['rejected', 'rejected'])
+  assert.equal(underlyingSignal.aborted, true, '全部等待者取消后应 abort 底层请求')
+})
+
+
+test('api forwards an AbortSignal to fetch', async () => {
+  const original = globalThis.fetch
+  let seen = null
+  globalThis.fetch = async (_url, opts) => {
+    seen = opts.signal
+    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  }
+  try {
+    const controller = new AbortController()
+    await api('/signal-test', { signal: controller.signal })
+    assert.equal(seen, controller.signal)
+  } finally {
+    globalThis.fetch = original
+  }
 })

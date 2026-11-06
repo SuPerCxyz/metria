@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use metria_hub::api::AppState;
 use metria_hub::config::{HubConfig, OidcConfig};
@@ -65,20 +67,23 @@ async fn spawn_hub(dir: &std::path::Path, oidc: Option<OidcConfig>) -> (String, 
 }
 
 /// 极简 mock IdP：仅支持本测试所需端点，每连接处理一个请求后关闭。
-fn spawn_mock_idp() -> String {
+fn spawn_mock_idp() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let discovery_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&discovery_hits);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
             let base = format!("http://{addr}");
-            std::thread::spawn(move || handle_idp_conn(stream, &base));
+            let hits = Arc::clone(&hits);
+            std::thread::spawn(move || handle_idp_conn(stream, &base, &hits));
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), discovery_hits)
 }
 
-fn handle_idp_conn(stream: std::net::TcpStream, base: &str) {
+fn handle_idp_conn(stream: std::net::TcpStream, base: &str, discovery_hits: &Arc<AtomicUsize>) {
     let Ok(mut stream) = stream.try_clone() else {
         return;
     };
@@ -117,7 +122,7 @@ fn handle_idp_conn(stream: std::net::TcpStream, base: &str) {
         reader.read_exact(&mut body).unwrap();
     }
 
-    let (status, payload) = route_idp(&method, &full_path, &headers, &body, base);
+    let (status, payload) = route_idp(&method, &full_path, &headers, &body, base, discovery_hits);
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
@@ -132,19 +137,23 @@ fn route_idp(
     headers: &HashMap<String, String>,
     body: &[u8],
     base: &str,
+    discovery_hits: &Arc<AtomicUsize>,
 ) -> (&'static str, String) {
     let path = full_path.split('?').next().unwrap_or("");
     match (method, path) {
-        ("GET", "/.well-known/openid-configuration") => (
-            "200 OK",
-            json!({
-                "issuer": base,
-                "authorization_endpoint": format!("{base}/oauth2/authorize"),
-                "token_endpoint": format!("{base}/oauth2/token"),
-                "userinfo_endpoint": format!("{base}/oauth2/userinfo"),
-            })
-            .to_string(),
-        ),
+        ("GET", "/.well-known/openid-configuration") => {
+            discovery_hits.fetch_add(1, Ordering::SeqCst);
+            (
+                "200 OK",
+                json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{base}/oauth2/authorize"),
+                    "token_endpoint": format!("{base}/oauth2/token"),
+                    "userinfo_endpoint": format!("{base}/oauth2/userinfo"),
+                })
+                .to_string(),
+            )
+        }
         ("POST", "/oauth2/token") => {
             let form: HashMap<String, String> =
                 url::form_urlencoded::parse(body).into_owned().collect();
@@ -253,7 +262,7 @@ fn param_of(location: &str, key: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn oidc_status_reports_configuration() {
     let dir = tempfile::tempdir().unwrap();
-    let idp = spawn_mock_idp();
+    let (idp, _discovery_hits) = spawn_mock_idp();
 
     let (base_off, _) = spawn_hub(dir.path().join("off").as_path(), None).await;
     let (base_on, _) = spawn_hub(
@@ -282,7 +291,7 @@ async fn oidc_status_reports_configuration() {
 #[tokio::test(flavor = "multi_thread")]
 async fn oidc_full_flow_issues_session_for_allowed_user() {
     let dir = tempfile::tempdir().unwrap();
-    let idp = spawn_mock_idp();
+    let (idp, discovery_hits) = spawn_mock_idp();
     let (hub, _) = spawn_hub(dir.path(), Some(oidc_config(&idp, false))).await;
 
     // 1. login → 302 到 IdP authorize 端点
@@ -312,6 +321,11 @@ async fn oidc_full_flow_issues_session_for_allowed_user() {
             .call(),
     );
     assert!(loc.contains("/#/oidc-callback"), "location={loc}");
+    assert_eq!(
+        discovery_hits.load(Ordering::SeqCst),
+        1,
+        "登录 + 回调应共用一次 discovery 请求"
+    );
     let one_time = param_of(&loc, "code").expect("callback 应携带一次性交换码");
 
     // 3. exchange → 会话 token；me 返回白名单邮箱
@@ -371,7 +385,7 @@ async fn oidc_full_flow_issues_session_for_allowed_user() {
 #[tokio::test(flavor = "multi_thread")]
 async fn oidc_rejects_user_outside_allowlist_and_bad_state() {
     let dir = tempfile::tempdir().unwrap();
-    let idp = spawn_mock_idp();
+    let (idp, _discovery_hits) = spawn_mock_idp();
     let (hub, _) = spawn_hub(dir.path(), Some(oidc_config(&idp, false))).await;
 
     // 非白名单账号：IdP 正常发 token，但 userinfo 身份不匹配
@@ -410,7 +424,7 @@ async fn oidc_rejects_user_outside_allowlist_and_bad_state() {
 #[tokio::test(flavor = "multi_thread")]
 async fn oidc_disable_password_login_blocks_local_login() {
     let dir = tempfile::tempdir().unwrap();
-    let idp = spawn_mock_idp();
+    let (idp, _discovery_hits) = spawn_mock_idp();
     let (hub, _) = spawn_hub(dir.path(), Some(oidc_config(&idp, true))).await;
 
     let status: Value = ureq::get(&format!("{hub}/api/v1/auth/oidc/status"))

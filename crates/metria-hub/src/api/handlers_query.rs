@@ -10,9 +10,12 @@ use axum::Json;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValue};
+use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::api::{
-    add_exclusions, json_err, parse_range, range_args, range_filter, AppState, RangeParams,
+    add_exclusions, decode_cursor, encode_cursor, json_err, parse_range, range_args, range_filter,
+    run_blocking, AppState, RangeParams,
 };
 use crate::db::HubDb;
 use crate::q;
@@ -20,372 +23,514 @@ use crate::q;
 /// 会话闲置阈值：最后活跃超过该分钟数视为闲置。
 const IDLE_SESSION_MINUTES: i64 = 30;
 
-pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangeParams>) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter(&p);
-    let (call_filter, call_fargs) = range_filter_usage(&p);
-    // 时长相关统计统一来自同一份聚合：完整小时读小时级预聚合、带维度筛选或预聚合
-    // 缺桶时回退明细。必须在取得连接锁之前计算——内部会自行取锁，Mutex 不可重入。
-    let perf_agg: Option<crate::perfrollup::PerfHour> =
-        crate::perfrollup::fast_aggregate(&st.db, from, to, &call_filter).or_else(|| {
-            crate::perfrollup::scan_calls(&st.db, from, to, &call_filter, &call_fargs).ok()
-        });
-    // 归档水位决定活动类字段能否从明细算出。必须在取得连接锁之前读取
-    // （std::sync::Mutex 不可重入，持锁再取锁会把请求永久卡死）。
-    let archived_before = crate::archive::watermark(&st.db);
-    let activity_archived = archived_before
-        .as_deref()
-        .and_then(|w| DateTime::parse_from_rfc3339(w).ok())
-        .map(|watermark| from < watermark)
-        .unwrap_or(false);
-    let activity_archived_before: Option<String> = if activity_archived {
-        archived_before
-    } else {
-        None
-    };
-    let c = st.db.conn();
-    // rollup 按 UTC 整点分桶：完整小时读 rollup，两端不完整小时用原始明细补齐，
-    // 否则范围起点非整点时会把当前小时整桶丢弃（表现为卡片为 0）。
-    let (h_from, h_to) = full_hour_bounds(from, to);
-    let row = c.query_row(
-        &format!(
-            "SELECT
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                COALESCE(SUM(reasoning_tokens),0),
-                COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
-                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
-                COALESCE(SUM(message_count),0), COALESCE(SUM(tool_call_count),0)
-             FROM hourly_rollups WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}"
-        ),
-        params_from_iter(range_args(&h_from, &h_to, fargs)),
-        |r| {
-            Ok(serde_json::json!({
-                "input_tokens": r.get::<_, i64>(0)?,
-                "output_tokens": r.get::<_, i64>(1)?,
-                "cache_read_tokens": r.get::<_, i64>(2)?,
-                "cache_write_tokens": r.get::<_, i64>(3)?,
-                "reasoning_tokens": r.get::<_, i64>(4)?,
-                "reported_cost_micro_usd": r.get::<_, i64>(5)?,
-                "calculated_cost_micro_usd": r.get::<_, i64>(6)?,
-                "estimated_cost_micro_usd": r.get::<_, i64>(7)?,
-                "model_calls": r.get::<_, i64>(8)?,
-                "sessions": r.get::<_, i64>(9)?,
-                "message_count": r.get::<_, i64>(10)?,
-                "tool_call_count": r.get::<_, i64>(11)?,
-            }))
-        },
-    );
-    let mut body = row.unwrap_or_else(|e| {
-        tracing::error!(%e, "overview 查询失败");
-        serde_json::json!({})
-    });
-    add_overview_raw_edges(
-        &mut body,
-        &c,
-        &p,
-        from,
-        to,
-        h_from,
-        h_to,
-        &call_filter,
-        &call_fargs,
-    );
-    body["nodes"] = c
-        .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0)
-        .into();
-    body["collectors"] = c
-        .query_row("SELECT COUNT(*) FROM collectors", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .unwrap_or(0)
-        .into();
-    // S3.3：AgentTool(Client)/Model/Project 计数（范围过滤）
-    let range_clause = "started_at >= ?1 AND started_at < ?2";
-    body["agent_tools"] = match &perf_agg {
-            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
-            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
-            Some(agg) => serde_json::json!(agg.distinct_clients.len()),
-            None => c
-        .query_row(
-            &format!(
-                "SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause} {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into()
-        };
-    body["models"] = match &perf_agg {
-            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
-            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
-            Some(agg) => serde_json::json!(agg.distinct_models.len()),
-            None => c
-        .query_row(
-            &format!(
-                "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != '' {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into()
-        };
-    body["projects"] = match &perf_agg {
-        // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
-        // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
-        Some(agg) => serde_json::json!(agg.distinct_projects.len()),
-        None => c
-            .query_row(
-                &format!(
-                "SELECT COUNT(DISTINCT project_id) FROM model_calls
-                 WHERE {range_clause} AND project_id IS NOT NULL AND project_id != '' {call_filter}"
-            ),
-                params_from_iter(range_args(&from, &to, call_fargs.clone())),
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            .into(),
-    };
-    // S3.3：Collector 在线状态列表（最近心跳 ≤ 5 分钟视为在线）
-    let online_window = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
-    body["collectors_online"] = c
-        .query_row(
-            "SELECT COUNT(*) FROM collectors WHERE last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?1",
-            [&online_window],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into();
-    // S3.9：范围内失败调用数（status 非成功）。数据源缺失时返回 0，前端诚实标注。
-    body["failed_calls"] = match &perf_agg {
-            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
-            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
-            Some(agg) => serde_json::json!(agg.errors),
-            None => c
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM model_calls WHERE {range_clause} AND status != 'success' AND status != 'ok' AND status != 'completed' {call_filter}"
-            ),
-            params_from_iter(range_args(&from, &to, call_fargs.clone())),
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .into()
-        };
-    // 计价分母与已计价条数由 perf_agg 给出（原先这里要对 17.5 万行做一次全表扫描，
-    // 实测 74ms）；取不到聚合时保留原 SQL 降级，不把缺失填成 0。
-    let (total_cost_calls, priced_calls) = match &perf_agg {
-        Some(agg) => (agg.token_pair_call_count as i64, agg.priced_call_count as i64),
-        None => c
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0)
-                     FROM model_calls WHERE {range_clause}
-                       AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
-                ),
-                params_from_iter(range_args(&from, &to, call_fargs.clone())),
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .unwrap_or((0, 0)),
-    };
-    // 未计价模型分组同样来自 perf_agg 的逐小时分组（原 SQL 每次刷新都要全表
-    // 扫描 + GROUP BY，实测 85ms）；分组键保留原始 Option，渲染时才 COALESCE，
-    // 与 SQL 的 GROUP BY + COALESCE 语义完全一致。
-    let unpriced_models: Vec<serde_json::Value> = match &perf_agg {
-        Some(agg) => {
-            let mut rows: Vec<serde_json::Value> = agg
-                .unpriced_by_model
-                .iter()
-                .map(|(model, provider, calls)| {
-                    serde_json::json!({
-                        "model": model.clone().unwrap_or_else(|| "(unknown)".to_string()),
-                        "provider": provider.clone().unwrap_or_else(|| "(unknown)".to_string()),
-                        "calls": calls,
-                    })
-                })
-                .collect();
-            rows.sort_by(|a, b| b["calls"].as_i64().cmp(&a["calls"].as_i64()));
-            rows.truncate(8);
-            rows
-        }
-        None => {
-            let mut out = Vec::new();
-            if let Ok(mut stmt) = c.prepare(&format!(
-            "SELECT COALESCE(model_normalized,'(unknown)'), COALESCE(provider_normalized,'(unknown)'), COUNT(*)
-             FROM model_calls WHERE {range_clause}
-               AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-               AND reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL
-               AND estimated_cost_micro_usd IS NULL {call_filter}
-             GROUP BY model_normalized, provider_normalized ORDER BY COUNT(*) DESC LIMIT 8"
-        )) {
-            if let Ok(rows) = stmt.query_map(
-                params_from_iter(range_args(&from, &to, call_fargs.clone())),
-                |r| {
-                    Ok(serde_json::json!({
-                        "model": r.get::<_, String>(0)?,
-                        "provider": r.get::<_, String>(1)?,
-                        "calls": r.get::<_, i64>(2)?,
-                    }))
-                },
-            ) {
-                out = rows.filter_map(Result::ok).collect();
-            }
-        }
-            out
-        }
-    };
-    body["pricing_coverage"] = serde_json::json!({
-        "priced_calls": priced_calls,
-        "total_calls": total_cost_calls,
-        "ratio": if total_cost_calls > 0 { Some(priced_calls as f64 / total_cost_calls as f64) } else { None },
-        "unpriced_models": unpriced_models,
-    });
-    body["token_calls"] = match &perf_agg {
-        // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
-        // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
-        Some(agg) => serde_json::json!(agg.token_call_count),
-        None => c
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM model_calls WHERE {range_clause}
-                 AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL
-                      OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
-                      OR reasoning_tokens IS NOT NULL) {call_filter}"
-                ),
-                params_from_iter(range_args(&from, &to, call_fargs.clone())),
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            .into(),
-    };
-    // D1/D2：合计与平均按窗口裁剪，与「会话总时长」的边界裁剪口径一致。
-    // `to` 不早于当前时刻时（今天/近 7 天等常用范围）没有调用能跨越窗口终点——
-    // duration_ms 在调用完成后才写入、完成时刻 ≤ 当前时刻——裁剪是空操作，直接用
-    // 预聚合，刷新成本不变；否则用一条走 started_at 索引的 SQL 求裁剪后的合计与计数，
-    // 仅历史自定义范围触发（实测 40–150ms，仍在 ≤0.5s 的刷新预算内）。
-    let duration_stats: Option<(i64, i64)> = if to >= Utc::now() {
-        perf_agg
-            .as_ref()
-            .filter(|agg| agg.duration.count > 0)
-            .map(|agg| (agg.duration.sum, agg.duration.count as i64))
-    } else {
-        match clipped_duration_stats(&c, from, to, &call_filter, &call_fargs) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("按窗口裁剪的调用时长查询失败，回退未裁剪值: {e}");
-                perf_agg
-                    .as_ref()
-                    .filter(|agg| agg.duration.count > 0)
-                    .map(|agg| (agg.duration.sum, agg.duration.count as i64))
-            }
-        }
-    };
-    // S3.9：平均调用延迟与 duration 分位数。
-    // 平均值 = 裁剪后的合计 / 裁剪后的计数（D1/D2）；
-    // 分位数仍来自完整调用时长分布的直方图——裁剪需按查询终点重建直方图，
-    // 成本与复杂度不成比例，因此不参与裁剪、也不标注为窗口内裁剪值。
-    body["avg_duration_ms"] = match duration_stats {
-        Some((sum, count)) if count > 0 => {
-            serde_json::json!((sum as f64 / count as f64).round() as i64)
-        }
-        _ => serde_json::Value::Null,
-    };
-    if let Some(agg) = &perf_agg {
-        body["duration_p50_ms"] = serde_json::json!(agg.duration.quantile(0.50));
-        body["duration_p95_ms"] = serde_json::json!(agg.duration.quantile(0.95));
-        body["duration_p99_ms"] = serde_json::json!(agg.duration.quantile(0.99));
-        body["quantile_approx"] = serde_json::json!(true);
-    } else {
-        // 取不到聚合（明细回退也失败）时仍要写键，前端应读到诚实的 null 而不是 undefined。
-        body["duration_p50_ms"] = serde_json::Value::Null;
-        body["duration_p95_ms"] = serde_json::Value::Null;
-        body["duration_p99_ms"] = serde_json::Value::Null;
-        body["quantile_approx"] = serde_json::Value::Null;
+/// 会话明细分页参数；不传时保持旧的全量响应。
+#[derive(Debug, Default, Deserialize)]
+pub struct PageParams {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+/// 会话统计粒度。
+#[derive(Debug, Default, Deserialize)]
+pub struct StatsParams {
+    pub granularity: Option<String>,
+}
+
+fn page_limit(p: &PageParams) -> Result<Option<usize>, String> {
+    if p.limit.is_none() && p.cursor.is_none() {
+        return Ok(None);
     }
-    // 活跃时长 = 窗口内裁剪后的调用时长合计（与会话总时长同口径）；
-    // 只统计明确记录了 duration_ms 的调用，没有样本时返回 null。
-    body["active_duration_ms"] = match duration_stats {
-        Some((sum, count)) if count > 0 => serde_json::json!(sum),
-        _ => serde_json::Value::Null,
+    let limit = p.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return Err("limit 必须为 1–500".to_string());
+    }
+    Ok(Some(limit as usize))
+}
+
+fn decode_call_cursor(raw: &str) -> Result<(String, String), String> {
+    let (ts, id) = decode_cursor(raw).ok_or("cursor 无效")?;
+    if id.is_empty() || DateTime::parse_from_rfc3339(&ts).is_err() {
+        return Err("cursor 无效".to_string());
+    }
+    Ok((ts, id))
+}
+
+fn decode_sequence_cursor(raw: &str) -> Result<(i64, String), String> {
+    let (sequence, id) = decode_cursor(raw).ok_or("cursor 无效")?;
+    let sequence = sequence
+        .parse::<i64>()
+        .map_err(|_| "cursor 无效".to_string())?;
+    if id.is_empty() {
+        return Err("cursor 无效".to_string());
+    }
+    Ok((sequence, id))
+}
+
+type UsageCosts = (Option<i64>, Option<i64>, Option<i64>);
+
+fn load_usage_cost_rows(
+    c: &metria_storage::rusqlite::Connection,
+    predicate: &str,
+    args: Vec<SqlValue>,
+    by_call: &mut HashMap<String, UsageCosts>,
+    by_event: &mut HashMap<String, UsageCosts>,
+) {
+    let sql = format!(
+        "SELECT model_call_id, event_id, reported_cost_micro_usd,          calculated_cost_micro_usd, estimated_cost_micro_usd          FROM usage_events WHERE {predicate} ORDER BY timestamp, event_id"
+    );
+    let Ok(mut stmt) = c.prepare(&sql) else {
+        return;
     };
-    // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
-    let activity = overview_activity(&c, &p, from, to, activity_archived);
-    // Option 直接落 JSON：归档区间为 null（诚实标注「已归档，不可计算」），
-    // 否则是真实数值；绝不把不可算写成 0。
-    let opt_json = |v: Option<i64>| {
-        v.map(serde_json::Value::from)
-            .unwrap_or(serde_json::Value::Null)
+    let Ok(rows) = stmt.query_map(params_from_iter(args), |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, String>(1)?,
+            (
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ),
+        ))
+    }) else {
+        return;
     };
-    body["sessions"] = opt_json(activity.sessions);
-    body["active_sessions"] = opt_json(activity.active_sessions);
-    body["message_count"] = opt_json(activity.messages);
-    body["user_message_count"] = opt_json(activity.user_messages);
-    body["tool_call_count"] = opt_json(activity.tools);
-    body["session_duration_ms"] = opt_json(activity.session_duration_ms);
-    // 前端据此把上面这些 null 显示为「已归档，不可计算」而不是「无数据」
-    body["activity_archived_before"] = activity_archived_before
-        .map(serde_json::Value::from)
-        .unwrap_or(serde_json::Value::Null);
-    body["freshness"] = freshness_summary(&c, &p);
-    // S3.9：缓存读取节省费用 = 范围内各模型 cache_read_tokens × 匹配规则的缓存读取单价。
-    // c 在此之后不再使用；先 drop 释放 Mutex 锁，load_all_rules 才能安全取锁（Mutex 不可重入）。
-    std::mem::drop(c);
-    let cache_savings: i64 = {
-        let mut total = 0i64;
-        // 收集范围内各模型的缓存读取 token（需重新拿锁，块作用域结束后释放）
-        let model_cache: Vec<(String, i64)> = {
-            let c2 = st.db.conn();
-            let mut stmt = q!(c2.prepare(&format!(
-                "SELECT model_normalized, COALESCE(SUM(cache_read_tokens),0) FROM model_calls WHERE {range_clause} AND cache_read_tokens IS NOT NULL AND cache_read_tokens > 0 {call_filter} GROUP BY model_normalized"
-            )));
-            let rows = q!(stmt.query_map(
-                params_from_iter(range_args(&from, &to, call_fargs.clone())),
-                |r| Ok((
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, i64>(1)?,
-                )),
-            ));
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        // 加载启用规则（此时未持有 conn 锁）
-        let rules = st.db.load_all_rules();
-        let mut engine = metria_pricing::PricingEngine::new();
-        for r in rules {
-            engine.add_rule(r);
+    for row in rows.flatten() {
+        if let Some(call_id) = row.0 {
+            by_call.entry(call_id).or_insert(row.2);
         }
-        for (model, cache_tokens) in model_cache {
-            let usage = metria_core::model::Usage {
-                input: None,
-                output: None,
-                cache_read: Some(cache_tokens),
-                cache_write: None,
-                reasoning: None,
+        by_event.entry(row.1).or_insert(row.2);
+    }
+}
+
+/// 只为当前页补全 usage 费用，替代 session_calls 中逐行相关子查询。
+fn attach_usage_costs(c: &metria_storage::rusqlite::Connection, calls: &mut [serde_json::Value]) {
+    if calls.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let event_ids: Vec<String> = calls
+        .iter()
+        .filter_map(|call| {
+            call.get("_usage_event_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    if ids.is_empty() && event_ids.is_empty() {
+        return;
+    }
+
+    let mut by_call: HashMap<String, UsageCosts> = HashMap::new();
+    let mut by_event: HashMap<String, UsageCosts> = HashMap::new();
+    // 分块避免旧调用（无分页）把数万个 ID 放进 IN (...)，超过 SQLite 变量上限。
+    for chunk in ids.chunks(400) {
+        let predicate = format!("model_call_id IN ({})", vec!["?"; chunk.len()].join(","));
+        let args: Vec<SqlValue> = chunk.iter().cloned().map(SqlValue::Text).collect();
+        load_usage_cost_rows(c, &predicate, args, &mut by_call, &mut by_event);
+    }
+    for chunk in event_ids.chunks(400) {
+        let predicate = format!("event_id IN ({})", vec!["?"; chunk.len()].join(","));
+        let args: Vec<SqlValue> = chunk.iter().cloned().map(SqlValue::Text).collect();
+        load_usage_cost_rows(c, &predicate, args, &mut by_call, &mut by_event);
+    }
+
+    for call in calls.iter_mut() {
+        let call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let event_id = call
+            .get("_usage_event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let costs = by_call.get(call_id).or_else(|| by_event.get(event_id));
+        if let Some((reported, calculated, estimated)) = costs {
+            // usage 行是费用的优先来源；usage 缺失或该口径为空时保留 model_calls 自身值。
+            let set = |call: &mut serde_json::Value, key: &str, value: Option<i64>| {
+                if let Some(value) = value {
+                    call[key] = serde_json::json!(value);
+                }
             };
-            if let Ok(cost) = engine.compute(&usage, Some(&model), None, from, None) {
-                if let Some(calc) = cost.calculated_micro_usd {
-                    total += calc;
-                } else if let Some(est) = cost.estimated_micro_usd {
-                    total += est;
+            set(call, "reported_cost_micro_usd", *reported);
+            set(call, "calculated_cost_micro_usd", *calculated);
+            set(call, "estimated_cost_micro_usd", *estimated);
+        }
+        if let Some(obj) = call.as_object_mut() {
+            obj.remove("_usage_event_id");
+        }
+    }
+}
+
+pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangeParams>) -> Response {
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (filter, fargs) = range_filter(&p);
+        let (call_filter, call_fargs) = range_filter_usage(&p);
+        // 时长相关统计统一来自同一份聚合：完整小时读小时级预聚合、带维度筛选或预聚合
+        // 缺桶时回退明细。必须在取得连接锁之前计算——内部会自行取锁，Mutex 不可重入。
+        let perf_agg: Option<crate::perfrollup::PerfHour> =
+            crate::perfrollup::fast_aggregate(&st.db, from, to, &call_filter).or_else(|| {
+                crate::perfrollup::scan_calls(&st.db, from, to, &call_filter, &call_fargs).ok()
+            });
+        // 归档水位决定活动类字段能否从明细算出。必须在取得连接锁之前读取
+        // （std::sync::Mutex 不可重入，持锁再取锁会把请求永久卡死）。
+        let archived_before = crate::archive::watermark(&st.db);
+        let activity_archived = archived_before
+            .as_deref()
+            .and_then(|w| DateTime::parse_from_rfc3339(w).ok())
+            .map(|watermark| from < watermark)
+            .unwrap_or(false);
+        let activity_archived_before: Option<String> = if activity_archived {
+            archived_before
+        } else {
+            None
+        };
+        let c = st.db.read_conn();
+        // rollup 按 UTC 整点分桶：完整小时读 rollup，两端不完整小时用原始明细补齐，
+        // 否则范围起点非整点时会把当前小时整桶丢弃（表现为卡片为 0）。
+        let (h_from, h_to) = full_hour_bounds(from, to);
+        let row = c.query_row(
+            &format!(
+                "SELECT
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(reported_cost),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
+                    COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+                    COALESCE(SUM(message_count),0), COALESCE(SUM(tool_call_count),0)
+                 FROM hourly_rollups WHERE bucket >= ?1 AND bucket < ?2 {filter}"
+            ),
+            params_from_iter(range_args(&h_from, &h_to, fargs)),
+            |r| {
+                Ok(serde_json::json!({
+                    "input_tokens": r.get::<_, i64>(0)?,
+                    "output_tokens": r.get::<_, i64>(1)?,
+                    "cache_read_tokens": r.get::<_, i64>(2)?,
+                    "cache_write_tokens": r.get::<_, i64>(3)?,
+                    "reasoning_tokens": r.get::<_, i64>(4)?,
+                    "reported_cost_micro_usd": r.get::<_, i64>(5)?,
+                    "calculated_cost_micro_usd": r.get::<_, i64>(6)?,
+                    "estimated_cost_micro_usd": r.get::<_, i64>(7)?,
+                    "model_calls": r.get::<_, i64>(8)?,
+                    "sessions": r.get::<_, i64>(9)?,
+                    "message_count": r.get::<_, i64>(10)?,
+                    "tool_call_count": r.get::<_, i64>(11)?,
+                }))
+            },
+        );
+        let mut body = row.unwrap_or_else(|e| {
+            tracing::error!(%e, "overview 查询失败");
+            serde_json::json!({})
+        });
+        add_overview_raw_edges(
+            &mut body,
+            &c,
+            &p,
+            from,
+            to,
+            h_from,
+            h_to,
+            &call_filter,
+            &call_fargs,
+        );
+        body["nodes"] = c
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .into();
+        body["collectors"] = c
+            .query_row("SELECT COUNT(*) FROM collectors", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+            .into();
+        // S3.3：AgentTool(Client)/Model/Project 计数（范围过滤）
+        let range_clause = "started_at >= ?1 AND started_at < ?2";
+        body["agent_tools"] = match &perf_agg {
+                // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+                // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+                Some(agg) => serde_json::json!(agg.distinct_clients.len()),
+                None => c
+            .query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT client_id) FROM model_calls WHERE {range_clause} {call_filter}"
+                ),
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into()
+            };
+        body["models"] = match &perf_agg {
+                // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+                // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+                Some(agg) => serde_json::json!(agg.distinct_models.len()),
+                None => c
+            .query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT model_normalized) FROM model_calls WHERE {range_clause} AND model_normalized IS NOT NULL AND model_normalized != '' {call_filter}"
+                ),
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into()
+            };
+        body["projects"] = match &perf_agg {
+            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+            Some(agg) => serde_json::json!(agg.distinct_projects.len()),
+            None => c
+                .query_row(
+                    &format!(
+                    "SELECT COUNT(DISTINCT project_id) FROM model_calls
+                     WHERE {range_clause} AND project_id IS NOT NULL AND project_id != '' {call_filter}"
+                ),
+                    params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                .into(),
+        };
+        // S3.3：Collector 在线状态列表（最近心跳 ≤ 5 分钟视为在线）
+        let online_window = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        body["collectors_online"] = c
+            .query_row(
+                "SELECT COUNT(*) FROM collectors WHERE last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?1",
+                [&online_window],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into();
+        // S3.9：范围内失败调用数（status 非成功）。数据源缺失时返回 0，前端诚实标注。
+        body["failed_calls"] = match &perf_agg {
+                // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+                // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+                Some(agg) => serde_json::json!(agg.errors),
+                None => c
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM model_calls WHERE {range_clause} AND status != 'success' AND status != 'ok' AND status != 'completed' {call_filter}"
+                ),
+                params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .into()
+            };
+        // 计价分母与已计价条数由 perf_agg 给出（原先这里要对 17.5 万行做一次全表扫描，
+        // 实测 74ms）；取不到聚合时保留原 SQL 降级，不把缺失填成 0。
+        let (total_cost_calls, priced_calls) = match &perf_agg {
+            Some(agg) => (agg.token_pair_call_count as i64, agg.priced_call_count as i64),
+            None => c
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 ELSE 0 END),0)
+                         FROM model_calls WHERE {range_clause}
+                           AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL) {call_filter}"
+                    ),
+                    params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .unwrap_or((0, 0)),
+        };
+        // 未计价模型分组同样来自 perf_agg 的逐小时分组（原 SQL 每次刷新都要全表
+        // 扫描 + GROUP BY，实测 85ms）；分组键保留原始 Option，渲染时才 COALESCE，
+        // 与 SQL 的 GROUP BY + COALESCE 语义完全一致。
+        let unpriced_models: Vec<serde_json::Value> = match &perf_agg {
+            Some(agg) => {
+                let mut rows: Vec<serde_json::Value> = agg
+                    .unpriced_by_model
+                    .iter()
+                    .map(|(model, provider, calls)| {
+                        serde_json::json!({
+                            "model": model.clone().unwrap_or_else(|| "(unknown)".to_string()),
+                            "provider": provider.clone().unwrap_or_else(|| "(unknown)".to_string()),
+                            "calls": calls,
+                        })
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b["calls"].as_i64().cmp(&a["calls"].as_i64()));
+                rows.truncate(8);
+                rows
+            }
+            None => {
+                let mut out = Vec::new();
+                if let Ok(mut stmt) = c.prepare(&format!(
+                "SELECT COALESCE(model_normalized,'(unknown)'), COALESCE(provider_normalized,'(unknown)'), COUNT(*)
+                 FROM model_calls WHERE {range_clause}
+                   AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+                   AND reported_cost_micro_usd IS NULL AND calculated_cost_micro_usd IS NULL
+                   AND estimated_cost_micro_usd IS NULL {call_filter}
+                 GROUP BY model_normalized, provider_normalized ORDER BY COUNT(*) DESC LIMIT 8"
+            )) {
+                if let Ok(rows) = stmt.query_map(
+                    params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                    |r| {
+                        Ok(serde_json::json!({
+                            "model": r.get::<_, String>(0)?,
+                            "provider": r.get::<_, String>(1)?,
+                            "calls": r.get::<_, i64>(2)?,
+                        }))
+                    },
+                ) {
+                    out = rows.filter_map(Result::ok).collect();
                 }
             }
+                out
+            }
+        };
+        body["pricing_coverage"] = serde_json::json!({
+            "priced_calls": priced_calls,
+            "total_calls": total_cost_calls,
+            "ratio": if total_cost_calls > 0 { Some(priced_calls as f64 / total_cost_calls as f64) } else { None },
+            "unpriced_models": unpriced_models,
+        });
+        body["token_calls"] = match &perf_agg {
+            // 由 perf_agg 的集合合并/逐小时计数直接给出，省掉整段全表扫描；
+            // 取不到聚合时保留原 SQL 作为降级路径，绝不把缺失填成 0。
+            Some(agg) => serde_json::json!(agg.token_call_count),
+            None => c
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM model_calls WHERE {range_clause}
+                     AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+                          OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL
+                          OR reasoning_tokens IS NOT NULL) {call_filter}"
+                    ),
+                    params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                .into(),
+        };
+        // D1/D2：合计与平均按窗口裁剪，与「会话总时长」的边界裁剪口径一致。
+        // `to` 不早于当前时刻时（今天/近 7 天等常用范围）没有调用能跨越窗口终点——
+        // duration_ms 在调用完成后才写入、完成时刻 ≤ 当前时刻——裁剪是空操作，直接用
+        // 预聚合，刷新成本不变；否则用一条走 started_at 索引的 SQL 求裁剪后的合计与计数，
+        // 仅历史自定义范围触发（实测 40–150ms，仍在 ≤0.5s 的刷新预算内）。
+        let duration_stats: Option<(i64, i64)> = if to >= Utc::now() {
+            perf_agg
+                .as_ref()
+                .filter(|agg| agg.duration.count > 0)
+                .map(|agg| (agg.duration.sum, agg.duration.count as i64))
+        } else {
+            match clipped_duration_stats(&c, from, to, &call_filter, &call_fargs) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("按窗口裁剪的调用时长查询失败，回退未裁剪值: {e}");
+                    perf_agg
+                        .as_ref()
+                        .filter(|agg| agg.duration.count > 0)
+                        .map(|agg| (agg.duration.sum, agg.duration.count as i64))
+                }
+            }
+        };
+        // S3.9：平均调用延迟与 duration 分位数。
+        // 平均值 = 裁剪后的合计 / 裁剪后的计数（D1/D2）；
+        // 分位数仍来自完整调用时长分布的直方图——裁剪需按查询终点重建直方图，
+        // 成本与复杂度不成比例，因此不参与裁剪、也不标注为窗口内裁剪值。
+        body["avg_duration_ms"] = match duration_stats {
+            Some((sum, count)) if count > 0 => {
+                serde_json::json!((sum as f64 / count as f64).round() as i64)
+            }
+            _ => serde_json::Value::Null,
+        };
+        if let Some(agg) = &perf_agg {
+            body["duration_p50_ms"] = serde_json::json!(agg.duration.quantile(0.50));
+            body["duration_p95_ms"] = serde_json::json!(agg.duration.quantile(0.95));
+            body["duration_p99_ms"] = serde_json::json!(agg.duration.quantile(0.99));
+            body["quantile_approx"] = serde_json::json!(true);
+        } else {
+            // 取不到聚合（明细回退也失败）时仍要写键，前端应读到诚实的 null 而不是 undefined。
+            body["duration_p50_ms"] = serde_json::Value::Null;
+            body["duration_p95_ms"] = serde_json::Value::Null;
+            body["duration_p99_ms"] = serde_json::Value::Null;
+            body["quantile_approx"] = serde_json::Value::Null;
         }
-        total
-    };
-    body["cache_savings_micro_usd"] = serde_json::json!(cache_savings);
-    Json(body).into_response()
+        // 活跃时长 = 窗口内裁剪后的调用时长合计（与会话总时长同口径）；
+        // 只统计明确记录了 duration_ms 的调用，没有样本时返回 null。
+        body["active_duration_ms"] = match duration_stats {
+            Some((sum, count)) if count > 0 => serde_json::json!(sum),
+            _ => serde_json::Value::Null,
+        };
+        // 会话/消息/工具按“窗口内的活动与明细”统计，而不是按会话开始时间归属。
+        let activity = overview_activity(&c, &p, from, to, activity_archived);
+        // Option 直接落 JSON：归档区间为 null（诚实标注「已归档，不可计算」），
+        // 否则是真实数值；绝不把不可算写成 0。
+        let opt_json = |v: Option<i64>| {
+            v.map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null)
+        };
+        body["sessions"] = opt_json(activity.sessions);
+        body["active_sessions"] = opt_json(activity.active_sessions);
+        body["message_count"] = opt_json(activity.messages);
+        body["user_message_count"] = opt_json(activity.user_messages);
+        body["tool_call_count"] = opt_json(activity.tools);
+        body["session_duration_ms"] = opt_json(activity.session_duration_ms);
+        // 前端据此把上面这些 null 显示为「已归档，不可计算」而不是「无数据」
+        body["activity_archived_before"] = activity_archived_before
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        body["freshness"] = freshness_summary(&c, &p);
+        // S3.9：缓存读取节省费用 = 范围内各模型 cache_read_tokens × 匹配规则的缓存读取单价。
+        // c 在此之后不再使用；先 drop 释放 Mutex 锁，load_all_rules 才能安全取锁（Mutex 不可重入）。
+        std::mem::drop(c);
+        let cache_savings: i64 = {
+            let mut total = 0i64;
+            // 收集范围内各模型的缓存读取 token（需重新拿锁，块作用域结束后释放）
+            let model_cache: Vec<(String, i64)> = {
+                let c2 = st.db.read_conn();
+                let mut stmt = q!(c2.prepare(&format!(
+                    "SELECT model_normalized, COALESCE(SUM(cache_read_tokens),0) FROM model_calls WHERE {range_clause} AND cache_read_tokens IS NOT NULL AND cache_read_tokens > 0 {call_filter} GROUP BY model_normalized"
+                )));
+                let rows = q!(stmt.query_map(
+                    params_from_iter(range_args(&from, &to, call_fargs.clone())),
+                    |r| Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_, i64>(1)?,
+                    )),
+                ));
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            // 加载启用规则（此时未持有 conn 锁）
+            let rules = st.db.load_all_rules();
+            let mut engine = metria_pricing::PricingEngine::new();
+            for r in rules {
+                engine.add_rule(r);
+            }
+            for (model, cache_tokens) in model_cache {
+                let usage = metria_core::model::Usage {
+                    input: None,
+                    output: None,
+                    cache_read: Some(cache_tokens),
+                    cache_write: None,
+                    reasoning: None,
+                };
+                if let Ok(cost) = engine.compute(&usage, Some(&model), None, from, None) {
+                    if let Some(calc) = cost.calculated_micro_usd {
+                        total += calc;
+                    } else if let Some(est) = cost.estimated_micro_usd {
+                        total += est;
+                    }
+                }
+            }
+            total
+        };
+        body["cache_savings_micro_usd"] = serde_json::json!(cache_savings);
+        Json(body).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn usage_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    match query_usage_timeseries(&st.db, &p) {
+    run_blocking(move || match query_usage_timeseries(&st.db, &p) {
         Ok(points) => Json(serde_json::json!({ "series": points })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
-    }
+    })
+    .await
 }
 
 /// 全局筛选器选项：节点始终返回全部已登记节点；Agent 与模型只返回所选时间范围内
@@ -395,57 +540,179 @@ pub(crate) async fn usage_filter_options(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        match query_filter_options(&st.db, from, to) {
+            Ok(body) => Json(body).into_response(),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+        }
+    })
+    .await
+}
+
+/// 筛选候选：节点全量；Agent/模型优先读小时级 rollup，边缘小时与未覆盖范围回退明细。
+fn query_filter_options(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<serde_json::Value, String> {
+    let c = db.read_conn();
+    let nodes: Vec<serde_json::Value> = {
+        let mut stmt = c
+            .prepare("SELECT id, name FROM nodes ORDER BY name, id")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "label": r.get::<_, String>(1)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let min_bucket: Option<String> = c
+        .query_row("SELECT MIN(bucket) FROM hourly_rollups", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let covered_from = min_bucket
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let use_rollup = covered_from.is_some_and(|min| from >= min);
+    let h_from = ceil_hour(from);
+    let h_to = floor_hour(to);
+
+    let (agents, models) = if use_rollup && h_from < h_to {
+        query_filter_options_rollup(&c, from, to, h_from, h_to)?
+    } else {
+        query_filter_options_detail(&c, from, to)?
+    };
+
+    Ok(serde_json::json!({ "nodes": nodes, "agents": agents, "models": models }))
+}
+
+fn query_filter_options_detail(
+    c: &metria_storage::rusqlite::Connection,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
     let bounds = [from.to_rfc3339(), to.to_rfc3339()];
-    let c = st.db.conn();
-    let mut node_stmt = q!(c.prepare("SELECT id, name FROM nodes ORDER BY name, id"));
-    let node_rows = q!(node_stmt.query_map([], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "label": r.get::<_, String>(1)?,
-        }))
-    }));
-    let nodes: Vec<serde_json::Value> = node_rows.filter_map(Result::ok).collect();
+    let agents = {
+        let mut stmt = c
+            .prepare(
+                "SELECT id, MAX(label) AS label FROM (
+                     SELECT mc.client_id AS id, COALESCE(cl.display_name, mc.client_id) AS label
+                     FROM model_calls mc LEFT JOIN clients cl ON cl.id = mc.client_id
+                     WHERE mc.started_at >= ?1 AND mc.started_at < ?2
+                       AND mc.client_id IS NOT NULL AND mc.client_id != ''
+                     UNION ALL
+                     SELECT ue.client_id AS id, COALESCE(cl.display_name, ue.client_id) AS label
+                     FROM usage_events ue LEFT JOIN clients cl ON cl.id = ue.client_id
+                     WHERE ue.timestamp >= ?1 AND ue.timestamp < ?2
+                       AND ue.client_id IS NOT NULL AND ue.client_id != ''
+                 ) GROUP BY id ORDER BY label, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(bounds.clone()), |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "label": r.get::<_, String>(1)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
 
-    let mut agent_stmt = q!(c.prepare(
-        "SELECT id, MAX(label) AS label FROM (
-             SELECT mc.client_id AS id, COALESCE(cl.display_name, mc.client_id) AS label
-             FROM model_calls mc LEFT JOIN clients cl ON cl.id = mc.client_id
-             WHERE mc.started_at >= ?1 AND mc.started_at < ?2
-               AND mc.client_id IS NOT NULL AND mc.client_id != ''
-             UNION ALL
-             SELECT ue.client_id AS id, COALESCE(cl.display_name, ue.client_id) AS label
-             FROM usage_events ue LEFT JOIN clients cl ON cl.id = ue.client_id
-             WHERE ue.timestamp >= ?1 AND ue.timestamp < ?2
-               AND ue.client_id IS NOT NULL AND ue.client_id != ''
-         ) GROUP BY id ORDER BY label, id",
-    ));
-    let agent_rows = q!(agent_stmt.query_map(params_from_iter(bounds.clone()), |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "label": r.get::<_, String>(1)?,
-        }))
-    }));
-    let agents: Vec<serde_json::Value> = agent_rows.filter_map(Result::ok).collect();
+    let models = {
+        let mut stmt = c
+            .prepare(
+                "SELECT model_normalized FROM (
+                     SELECT model_normalized FROM model_calls
+                     WHERE started_at >= ?1 AND started_at < ?2
+                       AND model_normalized IS NOT NULL AND model_normalized != ''
+                     UNION
+                     SELECT model_normalized FROM usage_events
+                     WHERE timestamp >= ?1 AND timestamp < ?2
+                       AND model_normalized IS NOT NULL AND model_normalized != ''
+                 ) ORDER BY model_normalized",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(bounds), |r| {
+                let value = r.get::<_, String>(0)?;
+                Ok(serde_json::json!({ "id": value, "label": value }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    Ok((agents, models))
+}
 
-    let mut model_stmt = q!(c.prepare(
-        "SELECT model_normalized FROM (
-             SELECT model_normalized FROM model_calls
-             WHERE started_at >= ?1 AND started_at < ?2
-               AND model_normalized IS NOT NULL AND model_normalized != ''
-             UNION
-             SELECT model_normalized FROM usage_events
-             WHERE timestamp >= ?1 AND timestamp < ?2
-               AND model_normalized IS NOT NULL AND model_normalized != ''
-         ) ORDER BY model_normalized",
-    ));
-    let model_rows = q!(model_stmt.query_map(params_from_iter(bounds), |r| {
-        let value = r.get::<_, String>(0)?;
-        Ok(serde_json::json!({ "id": value, "label": value }))
-    }));
-    let models: Vec<serde_json::Value> = model_rows.filter_map(Result::ok).collect();
+fn query_filter_options_rollup(
+    c: &metria_storage::rusqlite::Connection,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    h_from: DateTime<Utc>,
+    h_to: DateTime<Utc>,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
+    let cte = "WITH filter_src(client_id, model) AS (
+            SELECT client_id, model FROM hourly_rollups
+            WHERE bucket >= ?3 AND bucket < ?4
+            UNION ALL
+            SELECT client_id, COALESCE(model_normalized, '') FROM model_calls
+            WHERE started_at >= ?1 AND started_at < ?2
+              AND (started_at < ?3 OR started_at >= ?4)
+            UNION ALL
+            SELECT client_id, COALESCE(model_normalized, '') FROM usage_events
+            WHERE timestamp >= ?1 AND timestamp < ?2
+              AND (timestamp < ?3 OR timestamp >= ?4)
+        )";
+    let args = [
+        from.to_rfc3339(),
+        to.to_rfc3339(),
+        h_from.to_rfc3339(),
+        h_to.to_rfc3339(),
+    ];
 
-    Json(serde_json::json!({ "nodes": nodes, "agents": agents, "models": models })).into_response()
+    let agents = {
+        let mut stmt = c
+            .prepare(&format!(
+                "{cte} SELECT id, MAX(label) AS label FROM (
+                     SELECT s.client_id AS id, COALESCE(cl.display_name, s.client_id) AS label
+                     FROM filter_src s LEFT JOIN clients cl ON cl.id = s.client_id
+                     WHERE s.client_id IS NOT NULL AND s.client_id != ''
+                 ) GROUP BY id ORDER BY label, id"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(args.clone()), |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "label": r.get::<_, String>(1)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let models = {
+        let mut stmt = c
+            .prepare(&format!(
+                "{cte} SELECT DISTINCT model FROM filter_src
+                 WHERE model IS NOT NULL AND model != '' ORDER BY model"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(args), |r| {
+                let value = r.get::<_, String>(0)?;
+                Ok(serde_json::json!({ "id": value, "label": value }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    Ok((agents, models))
 }
 
 /// 按用户时区聚合最近可观测的模型调用，返回固定 7×24 网格。
@@ -453,10 +720,11 @@ pub(crate) async fn usage_heatmap(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    match query_usage_heatmap(&st.db, &p) {
+    run_blocking(move || match query_usage_heatmap(&st.db, &p) {
         Ok(body) => Json(body).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
-    }
+    })
+    .await
 }
 
 /// 热力图与日趋势共用的按小时数据源：完整小时读预聚合，头部/当前小时回退明细。
@@ -575,10 +843,11 @@ pub(crate) async fn usage_daily(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    match query_usage_daily(&st.db, &p) {
+    run_blocking(move || match query_usage_daily(&st.db, &p) {
         Ok(series) => Json(serde_json::json!({ "series": series })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
-    }
+    })
+    .await
 }
 
 fn query_usage_daily(db: &HubDb, p: &RangeParams) -> Result<Vec<serde_json::Value>, String> {
@@ -768,7 +1037,7 @@ pub(crate) fn query_usage_timeseries(
         filter.clone()
     };
 
-    let c = db.conn();
+    let c = db.read_conn();
     let points: Vec<serde_json::Value> = if use_raw {
         // 原始事件细粒度分桶；不读取历史估算流量表。
         let mut stmt = c.prepare(&format!(
@@ -802,16 +1071,32 @@ pub(crate) fn query_usage_timeseries(
             .map_err(|e| e.to_string())?;
         rows.filter_map(|r| r.ok()).collect()
     } else {
-        let (source, cte) = if bucket_secs >= 86400 {
-            ("daily_rollups", String::new())
+        let h_from = ceil_hour(from);
+        let h_to = floor_hour(to);
+        let h_from_ph = 3 + fargs.len() as u8;
+        let (source, cte, where_clause) = if bucket_secs >= 86400 {
+            (
+                "daily_rollups",
+                String::new(),
+                "bucket >= ?1 AND bucket < ?2",
+            )
         } else {
-            ("rollup_src", rollup_source_cte(1, 2, from, to))
+            (
+                "rollup_src",
+                rollup_source_cte(1, 2, h_from_ph, h_from_ph + 1),
+                "1=1",
+            )
         };
         let bucket_col = if bucket_secs >= 86400 {
             "substr(bucket,1,10)"
         } else {
             // 统一历史数据可能使用的 `Z` 与当前写入使用的 `+00:00`。
             "strftime('%Y-%m-%dT%H:%M:%S+00:00', bucket)"
+        };
+        let args = if bucket_secs >= 86400 {
+            range_args(&from, &to, fargs)
+        } else {
+            range_args_with_hours(&from, &to, fargs, h_from, h_to)
         };
         let mut stmt = c
             .prepare(&format!(
@@ -821,12 +1106,12 @@ pub(crate) fn query_usage_timeseries(
                 COALESCE(SUM(reasoning_tokens),0),
                 COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
                 COALESCE(SUM(model_call_count),0)
-             FROM {source} WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2) {filter}
+             FROM {source} WHERE {where_clause} {filter}
              GROUP BY {group_sql} ORDER BY b"
             ))
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+            .query_map(params_from_iter(args), |r| {
                 Ok(serde_json::json!({
                     "bucket": r.get::<_, String>(0)?,
                     "dimension": r.get::<_, Option<String>>(1)?,
@@ -1148,86 +1433,103 @@ pub(crate) async fn usage_breakdown(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter(&p);
-    // 支持多维度汇总（S3.3）：node/client/model/provider/project
-    let (col, key) = match p.dim.as_deref() {
-        Some("client") => ("client_id", "client_id"),
-        Some("model") => ("model", "model"),
-        Some("provider") => ("provider", "provider"),
-        Some("project") => ("project_id", "project_id"),
-        _ => ("node_id", "node_id"),
-    };
-    let c = st.db.conn();
-    // 排除空 dimension（如 model=''）的零值汇总行，避免排行出现空结果。
-    let null_filter = match p.dim.as_deref() {
-        Some("model") => " AND model IS NOT NULL AND model != ''",
-        Some("client") => " AND client_id IS NOT NULL AND client_id != ''",
-        Some("provider") => " AND provider IS NOT NULL AND provider != ''",
-        Some("project") => " AND project_id IS NOT NULL AND project_id != ''",
-        _ => " AND node_id IS NOT NULL AND node_id != ''",
-    };
-    let cte = rollup_source_cte(1, 2, from, to);
-    let mut stmt = q!(c.prepare(&format!(
-        "{cte}SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-            COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-            COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(model_call_count),0),
-            COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-            COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0),
-            COUNT(CASE WHEN pricing_source != '' THEN 1 END)
-         FROM rollup_src WHERE 1=1 {filter}{null_filter}
-         GROUP BY {col} ORDER BY 10 DESC"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok(serde_json::json!({
-                "dimension": r.get::<_, String>(0)?,
-                "input_tokens": r.get::<_, i64>(1)?,
-                "output_tokens": r.get::<_, i64>(2)?,
-                "cache_read_tokens": r.get::<_, i64>(3)?,
-                "cache_write_tokens": r.get::<_, i64>(4)?,
-                "reasoning_tokens": r.get::<_, i64>(5)?,
-                "model_calls": r.get::<_, i64>(6)?,
-                "sessions": r.get::<_, i64>(7)?,
-                "cost_micro_usd": available_cost(r.get::<_, i64>(8)?, r.get::<_, i64>(12)?),
-                "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
-                "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
-                "reported_cost_micro_usd": r.get::<_, i64>(11)?,
-            }))
-        },)
-    );
-    let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "by": items, "dimension": key })).into_response()
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (filter, fargs) = range_filter(&p);
+        // 支持多维度汇总（S3.3）：node/client/model/provider/project
+        let (col, key) = match p.dim.as_deref() {
+            Some("client") => ("client_id", "client_id"),
+            Some("model") => ("model", "model"),
+            Some("provider") => ("provider", "provider"),
+            Some("project") => ("project_id", "project_id"),
+            _ => ("node_id", "node_id"),
+        };
+        let c = st.db.read_conn();
+        // 排除空 dimension（如 model=''）的零值汇总行，避免排行出现空结果。
+        let null_filter = match p.dim.as_deref() {
+            Some("model") => " AND model IS NOT NULL AND model != ''",
+            Some("client") => " AND client_id IS NOT NULL AND client_id != ''",
+            Some("provider") => " AND provider IS NOT NULL AND provider != ''",
+            Some("project") => " AND project_id IS NOT NULL AND project_id != ''",
+            _ => " AND node_id IS NOT NULL AND node_id != ''",
+        };
+        let cte = {
+            let h_from_ph = 3 + fargs.len() as u8;
+            rollup_source_cte(1, 2, h_from_ph, h_from_ph + 1)
+        };
+        let mut stmt = q!(c.prepare(&format!(
+            "{cte}SELECT {col}, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(model_call_count),0),
+                COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0), COALESCE(SUM(reported_cost),0),
+                COUNT(CASE WHEN pricing_source != '' THEN 1 END)
+             FROM rollup_src WHERE 1=1 {filter}{null_filter}
+             GROUP BY {col} ORDER BY 10 DESC"
+        )));
+        let rows = q!(
+            stmt.query_map(
+                params_from_iter(range_args_with_hours(
+                    &from,
+                    &to,
+                    fargs,
+                    ceil_hour(from),
+                    floor_hour(to),
+                )),
+                |r| {
+                Ok(serde_json::json!({
+                    "dimension": r.get::<_, String>(0)?,
+                    "input_tokens": r.get::<_, i64>(1)?,
+                    "output_tokens": r.get::<_, i64>(2)?,
+                    "cache_read_tokens": r.get::<_, i64>(3)?,
+                    "cache_write_tokens": r.get::<_, i64>(4)?,
+                    "reasoning_tokens": r.get::<_, i64>(5)?,
+                    "model_calls": r.get::<_, i64>(6)?,
+                    "sessions": r.get::<_, i64>(7)?,
+                    "cost_micro_usd": available_cost(r.get::<_, i64>(8)?, r.get::<_, i64>(12)?),
+                    "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
+                    "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
+                    "reported_cost_micro_usd": r.get::<_, i64>(11)?,
+                }))
+            },)
+        );
+        let items: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        Json(serde_json::json!({ "by": items, "dimension": key })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT n.id, n.name, n.platform, n.architecture, n.timezone, n.status, n.first_seen_at, n.last_seen_at,
-            (SELECT COUNT(DISTINCT client_id) FROM sources s WHERE s.node_id = n.id),
-            (SELECT COUNT(*) FROM collectors col WHERE col.node_id = n.id),
-            n.description, n.labels, n.ip
-         FROM nodes n ORDER BY n.last_seen_at DESC",
-    ));
-    let rows = q!(stmt.query_map([], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "name": r.get::<_, String>(1)?,
-            "platform": r.get::<_, Option<String>>(2)?,
-            "architecture": r.get::<_, Option<String>>(3)?,
-            "timezone": r.get::<_, Option<String>>(4)?,
-            "status": r.get::<_, String>(5)?,
-            "first_seen_at": r.get::<_, String>(6)?,
-            "last_seen_at": r.get::<_, String>(7)?,
-            "detected_clients": r.get::<_, i64>(8)?,
-            "collector_count": r.get::<_, i64>(9)?,
-            "description": r.get::<_, Option<String>>(10)?,
-            "labels": r.get::<_, Option<String>>(11)?,
-            "ip": r.get::<_, Option<String>>(12)?,
-        }))
-    }));
-    let nodes: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "nodes": nodes })).into_response()
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let mut stmt = q!(c.prepare(
+            "SELECT n.id, n.name, n.platform, n.architecture, n.timezone, n.status, n.first_seen_at, n.last_seen_at,
+                (SELECT COUNT(DISTINCT client_id) FROM sources s WHERE s.node_id = n.id),
+                (SELECT COUNT(*) FROM collectors col WHERE col.node_id = n.id),
+                n.description, n.labels, n.ip
+             FROM nodes n ORDER BY n.last_seen_at DESC",
+        ));
+        let rows = q!(stmt.query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "name": r.get::<_, String>(1)?,
+                "platform": r.get::<_, Option<String>>(2)?,
+                "architecture": r.get::<_, Option<String>>(3)?,
+                "timezone": r.get::<_, Option<String>>(4)?,
+                "status": r.get::<_, String>(5)?,
+                "first_seen_at": r.get::<_, String>(6)?,
+                "last_seen_at": r.get::<_, String>(7)?,
+                "detected_clients": r.get::<_, i64>(8)?,
+                "collector_count": r.get::<_, i64>(9)?,
+                "description": r.get::<_, Option<String>>(10)?,
+                "labels": r.get::<_, Option<String>>(11)?,
+                "ip": r.get::<_, Option<String>>(12)?,
+            }))
+        }));
+        let nodes: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        Json(serde_json::json!({ "nodes": nodes })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn node_detail(
@@ -1235,189 +1537,209 @@ pub(crate) async fn node_detail(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let c = st.db.conn();
-    let node = c
-        .query_row(
-            "SELECT id, name, platform, architecture, timezone, status, first_seen_at, last_seen_at, agent_url, last_pull_at, last_pull_error FROM nodes WHERE id = ?1",
-            [&id],
-            |r| {
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let c = st.db.read_conn();
+        let node = c
+            .query_row(
+                "SELECT id, name, platform, architecture, timezone, status, first_seen_at, last_seen_at, agent_url, last_pull_at, last_pull_error FROM nodes WHERE id = ?1",
+                [&id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "platform": r.get::<_, Option<String>>(2)?,
+                        "architecture": r.get::<_, Option<String>>(3)?,
+                        "timezone": r.get::<_, Option<String>>(4)?,
+                        "status": r.get::<_, String>(5)?,
+                        "first_seen_at": r.get::<_, String>(6)?,
+                        "last_seen_at": r.get::<_, String>(7)?,
+                        "agent_url": r.get::<_, Option<String>>(8)?,
+                        "last_pull_at": r.get::<_, Option<String>>(9)?,
+                        "last_pull_error": r.get::<_, Option<String>>(10)?,
+                    }))
+                },
+            )
+            .ok()
+            .unwrap_or(serde_json::json!({}));
+        // 分布统计（S3.4）：按 Model / Project 汇总本 Node 的调用与 token
+        let mut by_model = Vec::new();
+        if let Ok(mut stmt) = c.prepare(
+            "SELECT COALESCE(model_normalized,'(unknown)'), COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
+             FROM model_calls WHERE node_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized ORDER BY 2 DESC LIMIT 10",
+        ) {
+            if let Ok(rows) = stmt.query_map([&id], |r| {
+                let cost = r.get::<_, i64>(4)?;
+                let priced_calls = r.get::<_, i64>(5)?;
                 Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                    "platform": r.get::<_, Option<String>>(2)?,
-                    "architecture": r.get::<_, Option<String>>(3)?,
-                    "timezone": r.get::<_, Option<String>>(4)?,
-                    "status": r.get::<_, String>(5)?,
-                    "first_seen_at": r.get::<_, String>(6)?,
-                    "last_seen_at": r.get::<_, String>(7)?,
-                    "agent_url": r.get::<_, Option<String>>(8)?,
-                    "last_pull_at": r.get::<_, Option<String>>(9)?,
-                    "last_pull_error": r.get::<_, Option<String>>(10)?,
-                }))
-            },
-        )
-        .ok()
-        .unwrap_or(serde_json::json!({}));
-    // 分布统计（S3.4）：按 Model / Project 汇总本 Node 的调用与 token
-    let mut by_model = Vec::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT COALESCE(model_normalized,'(unknown)'), COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
-                COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-         FROM model_calls WHERE node_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized ORDER BY 2 DESC LIMIT 10",
-    ) {
-        if let Ok(rows) = stmt.query_map([&id], |r| {
-            let cost = r.get::<_, i64>(4)?;
-            let priced_calls = r.get::<_, i64>(5)?;
-            Ok(serde_json::json!({
-                "model": r.get::<_, String>(0)?,
-                "calls": r.get::<_, i64>(1)?,
-                "input_tokens": r.get::<_, i64>(2)?,
-                "output_tokens": r.get::<_, i64>(3)?,
-                "cost_micro_usd": available_cost(cost, priced_calls),
-            }))
-        }) {
-            by_model = rows.filter_map(|x| x.ok()).collect();
-        }
-    }
-    let mut by_project = Vec::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT COALESCE(project_id,'(none)'), COUNT(*),
-                COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
-                COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-         FROM sessions WHERE node_id = ?1 AND parent_session_id IS NULL GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
-    ) {
-        if let Ok(rows) = stmt.query_map([&id], |r| {
-            let cost = r.get::<_, i64>(2)?;
-            let priced_sessions = r.get::<_, i64>(3)?;
-            Ok(serde_json::json!({
-                "project_id": r.get::<_, String>(0)?,
-                "sessions": r.get::<_, i64>(1)?,
-                "cost_micro_usd": available_cost(cost, priced_sessions),
-            }))
-        }) {
-            by_project = rows.filter_map(|x| x.ok()).collect();
-        }
-    }
-    // Collector 信息（S3.4）
-    let collectors: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT id, agent_version, protocol_version, container_image, status,
-                    last_heartbeat_at, last_upload_at, spool_pending_events, spool_size_bytes, clock_skew_seconds
-             FROM collectors WHERE node_id = ?1 ORDER BY created_at",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([&id], |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "agent_version": r.get::<_, String>(1)?,
-                    "protocol_version": r.get::<_, i64>(2)?,
-                    "container_image": r.get::<_, Option<String>>(3)?,
-                    "status": r.get::<_, String>(4)?,
-                    "last_heartbeat_at": r.get::<_, Option<String>>(5)?,
-                    "last_upload_at": r.get::<_, Option<String>>(6)?,
-                    "spool_pending_events": r.get::<_, i64>(7)?,
-                    "spool_size_bytes": r.get::<_, i64>(8)?,
-                    "clock_skew_seconds": r.get::<_, i64>(9)?,
+                    "model": r.get::<_, String>(0)?,
+                    "calls": r.get::<_, i64>(1)?,
+                    "input_tokens": r.get::<_, i64>(2)?,
+                    "output_tokens": r.get::<_, i64>(3)?,
+                    "cost_micro_usd": available_cost(cost, priced_calls),
                 }))
             }) {
-                out = rows.filter_map(|x| x.ok()).collect();
+                by_model = rows.filter_map(|x| x.ok()).collect();
             }
         }
-        out
-    };
-
-    // S3.4：按 Client 分布（范围过滤，含 usage 汇总）
-    let cte = rollup_source_cte(2, 3, from, to);
-    let mut clients = Vec::new();
-    if let Ok(mut stmt) = c.prepare(&format!(
-        "{cte}SELECT s.client_id, COUNT(DISTINCT s.id) as src_count,
-                COALESCE((SELECT SUM(mc.model_call_count) FROM rollup_src mc
-                          WHERE mc.node_id = s.node_id AND mc.client_id = s.client_id),0)
-         FROM sources s
-         WHERE s.node_id = ?1 GROUP BY s.client_id"
-    )) {
-        if let Ok(rows) = stmt.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        }) {
-            for row in rows.flatten() {
-                clients.push(serde_json::json!({
-                    "client_id": row.0, "source_count": row.1, "model_calls": row.2
-                }));
-            }
-        }
-    }
-
-    // S3.4：时间范围统计（token/cost/calls/sessions/cache）
-    let range_summary = c
-        .query_row(
-            &format!(
-                "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                    COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
-                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                    COALESCE(SUM(reasoning_tokens),0)
-             FROM rollup_src WHERE node_id = ?1"
-            ),
-            params![id, from.to_rfc3339(), to.to_rfc3339()],
-            |r| {
+        let mut by_project = Vec::new();
+        if let Ok(mut stmt) = c.prepare(
+            "SELECT COALESCE(project_id,'(none)'), COUNT(*),
+                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
+             FROM sessions WHERE node_id = ?1 AND parent_session_id IS NULL GROUP BY project_id ORDER BY 2 DESC LIMIT 10",
+        ) {
+            if let Ok(rows) = stmt.query_map([&id], |r| {
+                let cost = r.get::<_, i64>(2)?;
+                let priced_sessions = r.get::<_, i64>(3)?;
                 Ok(serde_json::json!({
-                    "input_tokens": r.get::<_, i64>(0)?,
-                    "output_tokens": r.get::<_, i64>(1)?,
-                    "cost_micro_usd": r.get::<_, i64>(2)?,
-                    "model_calls": r.get::<_, i64>(3)?,
-                    "sessions": r.get::<_, i64>(4)?,
-                    "cache_read_tokens": r.get::<_, i64>(5)?,
-                    "cache_write_tokens": r.get::<_, i64>(6)?,
-                    "reasoning_tokens": r.get::<_, i64>(7)?,
+                    "project_id": r.get::<_, String>(0)?,
+                    "sessions": r.get::<_, i64>(1)?,
+                    "cost_micro_usd": available_cost(cost, priced_sessions),
                 }))
-            },
-        )
-        .unwrap_or(serde_json::json!({}));
+            }) {
+                by_project = rows.filter_map(|x| x.ok()).collect();
+            }
+        }
+        // Collector 信息（S3.4）
+        let collectors: Vec<serde_json::Value> = {
+            let st = c.prepare(
+                "SELECT id, agent_version, protocol_version, container_image, status,
+                        last_heartbeat_at, last_upload_at, spool_pending_events, spool_size_bytes, clock_skew_seconds
+                 FROM collectors WHERE node_id = ?1 ORDER BY created_at",
+            );
+            let mut out = Vec::new();
+            if let Ok(mut st) = st {
+                if let Ok(rows) = st.query_map([&id], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "agent_version": r.get::<_, String>(1)?,
+                        "protocol_version": r.get::<_, i64>(2)?,
+                        "container_image": r.get::<_, Option<String>>(3)?,
+                        "status": r.get::<_, String>(4)?,
+                        "last_heartbeat_at": r.get::<_, Option<String>>(5)?,
+                        "last_upload_at": r.get::<_, Option<String>>(6)?,
+                        "spool_pending_events": r.get::<_, i64>(7)?,
+                        "spool_size_bytes": r.get::<_, i64>(8)?,
+                        "clock_skew_seconds": r.get::<_, i64>(9)?,
+                    }))
+                }) {
+                    out = rows.filter_map(|x| x.ok()).collect();
+                }
+            }
+            out
+        };
 
-    Json(serde_json::json!({
-        "node": node,
-        "clients": clients,
-        "collectors": collectors,
-        "by_model": by_model,
-        "by_project": by_project,
-        "range_summary": range_summary,
-        "range": { "from": from.to_rfc3339(), "to": to.to_rfc3339() },
-    }))
-    .into_response()
+        // S3.4：按 Client 分布（范围过滤，含 usage 汇总）
+        let cte = rollup_source_cte(2, 3, 4, 5);
+        let mut clients = Vec::new();
+        if let Ok(mut stmt) = c.prepare(&format!(
+            "{cte}SELECT s.client_id, COUNT(DISTINCT s.id) as src_count,
+                    COALESCE((SELECT SUM(mc.model_call_count) FROM rollup_src mc
+                              WHERE mc.node_id = s.node_id AND mc.client_id = s.client_id),0)
+             FROM sources s
+             WHERE s.node_id = ?1 GROUP BY s.client_id"
+        )) {
+            if let Ok(rows) = stmt.query_map(
+                params![
+                    id,
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    ceil_hour(from).to_rfc3339(),
+                    floor_hour(to).to_rfc3339()
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+            }) {
+                for row in rows.flatten() {
+                    clients.push(serde_json::json!({
+                        "client_id": row.0, "source_count": row.1, "model_calls": row.2
+                    }));
+                }
+            }
+        }
+
+        // S3.4：时间范围统计（token/cost/calls/sessions/cache）
+        let range_summary = c
+            .query_row(
+                &format!(
+                    "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                        COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                        COALESCE(SUM(reasoning_tokens),0)
+                 FROM rollup_src WHERE node_id = ?1"
+                ),
+                params![
+                    id,
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    ceil_hour(from).to_rfc3339(),
+                    floor_hour(to).to_rfc3339()
+                ],
+                |r| {
+                    Ok(serde_json::json!({
+                        "input_tokens": r.get::<_, i64>(0)?,
+                        "output_tokens": r.get::<_, i64>(1)?,
+                        "cost_micro_usd": r.get::<_, i64>(2)?,
+                        "model_calls": r.get::<_, i64>(3)?,
+                        "sessions": r.get::<_, i64>(4)?,
+                        "cache_read_tokens": r.get::<_, i64>(5)?,
+                        "cache_write_tokens": r.get::<_, i64>(6)?,
+                        "reasoning_tokens": r.get::<_, i64>(7)?,
+                    }))
+                },
+            )
+            .unwrap_or(serde_json::json!({}));
+
+        Json(serde_json::json!({
+            "node": node,
+            "clients": clients,
+            "collectors": collectors,
+            "by_model": by_model,
+            "by_project": by_project,
+            "range_summary": range_summary,
+            "range": { "from": from.to_rfc3339(), "to": to.to_rfc3339() },
+        }))
+        .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn node_clients(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT client_id, adapter_id, adapter_version, source_path_hash, capabilities, status, client_version, last_scan_at, last_error, last_event_at
-         FROM sources WHERE node_id = ?1 ORDER BY client_id",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "client_id": r.get::<_, String>(0)?,
-            "adapter_id": r.get::<_, String>(1)?,
-            "adapter_version": r.get::<_, String>(2)?,
-            "source_path_hash": r.get::<_, String>(3)?,
-            "capabilities": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(4)?).unwrap_or_else(|_| serde_json::json!([])),
-            "status": r.get::<_, String>(5)?,
-            "client_version": r.get::<_, Option<String>>(6)?,
-            "last_scan_at": r.get::<_, Option<String>>(7)?,
-            "last_error": r.get::<_, Option<String>>(8)?,
-            "last_event_at": r.get::<_, Option<String>>(9)?,
-        }))
-    }));
-    let sources: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "sources": sources })).into_response()
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let mut stmt = q!(c.prepare(
+            "SELECT client_id, adapter_id, adapter_version, source_path_hash, capabilities, status, client_version, last_scan_at, last_error, last_event_at
+             FROM sources WHERE node_id = ?1 ORDER BY client_id",
+        ));
+        let rows = q!(stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "client_id": r.get::<_, String>(0)?,
+                "adapter_id": r.get::<_, String>(1)?,
+                "adapter_version": r.get::<_, String>(2)?,
+                "source_path_hash": r.get::<_, String>(3)?,
+                "capabilities": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(4)?).unwrap_or_else(|_| serde_json::json!([])),
+                "status": r.get::<_, String>(5)?,
+                "client_version": r.get::<_, Option<String>>(6)?,
+                "last_scan_at": r.get::<_, Option<String>>(7)?,
+                "last_error": r.get::<_, Option<String>>(8)?,
+                "last_event_at": r.get::<_, Option<String>>(9)?,
+            }))
+        }));
+        let sources: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        Json(serde_json::json!({ "sources": sources })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn node_sessions(
@@ -1425,81 +1747,84 @@ pub(crate) async fn node_sessions(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-    let archived_before = crate::archive::watermark(&st.db);
-    let c = st.db.conn();
-    let limit = p.limit.unwrap_or(50).min(500);
-    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
-    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
-        match crate::api::decode_cursor(cur) {
-            Some((ts, sid)) => (
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+        let archived_before = crate::archive::watermark(&st.db);
+        let c = st.db.read_conn();
+        let limit = p.limit.unwrap_or(50).min(500);
+        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+            match crate::api::decode_cursor(cur) {
+                Some((ts, sid)) => (
+                    format!(
+                        "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
+                         FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL
+                           AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
+                         ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                    ),
+                    vec![
+                        SqlValue::Text(id.clone()),
+                        SqlValue::Text(from.to_rfc3339()),
+                        SqlValue::Text(to.to_rfc3339()),
+                        SqlValue::Text(ts),
+                        SqlValue::Text(sid),
+                        SqlValue::Integer(limit),
+                    ],
+                ),
+                None => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_cursor",
+                        "分页游标无效",
+                    )
+                }
+            }
+        } else {
+            (
                 format!(
                     "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL
-                       AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
-                     ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL ORDER BY {tcol} DESC, id DESC LIMIT ?4",
                 ),
                 vec![
-                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(id),
                     SqlValue::Text(from.to_rfc3339()),
                     SqlValue::Text(to.to_rfc3339()),
-                    SqlValue::Text(ts),
-                    SqlValue::Text(sid),
                     SqlValue::Integer(limit),
                 ],
-            ),
-            None => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_cursor",
-                    "分页游标无效",
-                )
-            }
-        }
-    } else {
-        (
-            format!(
-                "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                 FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL ORDER BY {tcol} DESC, id DESC LIMIT ?4",
-            ),
-            vec![
-                SqlValue::Text(id),
-                SqlValue::Text(from.to_rfc3339()),
-                SqlValue::Text(to.to_rfc3339()),
-                SqlValue::Integer(limit),
-            ],
-        )
-    };
-    let mut stmt = q!(c.prepare(&sql));
-    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "source_session_id": r.get::<_, String>(1)?,
-            "client_id": r.get::<_, String>(2)?,
-            "title": r.get::<_, Option<String>>(3)?,
-            "model": r.get::<_, Option<String>>(4)?,
-            "started_at": r.get::<_, String>(5)?,
-            "ended_at": r.get::<_, Option<String>>(6)?,
-            "message_count": r.get::<_, i64>(7)?,
-            "model_call_count": r.get::<_, i64>(8)?,
-            "input_tokens": r.get::<_, Option<i64>>(9)?,
-            "output_tokens": r.get::<_, Option<i64>>(10)?,
+            )
+        };
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "source_session_id": r.get::<_, String>(1)?,
+                "client_id": r.get::<_, String>(2)?,
+                "title": r.get::<_, Option<String>>(3)?,
+                "model": r.get::<_, Option<String>>(4)?,
+                "started_at": r.get::<_, String>(5)?,
+                "ended_at": r.get::<_, Option<String>>(6)?,
+                "message_count": r.get::<_, i64>(7)?,
+                "model_call_count": r.get::<_, i64>(8)?,
+                "input_tokens": r.get::<_, Option<i64>>(9)?,
+                "output_tokens": r.get::<_, Option<i64>>(10)?,
+            }))
+        },));
+        let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let next_cursor = sessions.last().and_then(|v| {
+            let id = v.get("id")?.as_str()?;
+            let ts = v.get("started_at")?.as_str()?;
+            Some(crate::api::encode_cursor(ts, id))
+        });
+        Json(serde_json::json!({
+            "sessions": sessions,
+            "next_cursor": next_cursor,
+            "archived_before": archived_before,
         }))
-    },));
-    let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    let next_cursor = sessions.last().and_then(|v| {
-        let id = v.get("id")?.as_str()?;
-        let ts = v.get("started_at")?.as_str()?;
-        Some(crate::api::encode_cursor(ts, id))
-    });
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "next_cursor": next_cursor,
-        "archived_before": archived_before,
-    }))
-    .into_response()
+        .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn node_calls(
@@ -1507,112 +1832,129 @@ pub(crate) async fn node_calls(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-    let archived_before = crate::archive::watermark(&st.db);
-    let c = st.db.conn();
-    let limit = p.limit.unwrap_or(50).min(500);
-    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
-    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
-        match crate::api::decode_cursor(cur) {
-            Some((ts, cid)) => (
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+        let archived_before = crate::archive::watermark(&st.db);
+        let c = st.db.read_conn();
+        let limit = p.limit.unwrap_or(50).min(500);
+        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+            match crate::api::decode_cursor(cur) {
+                Some((ts, cid)) => (
+                    format!(
+                        "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
+                         FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
+                           AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
+                         ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                    ),
+                    vec![
+                        SqlValue::Text(id.clone()),
+                        SqlValue::Text(from.to_rfc3339()),
+                        SqlValue::Text(to.to_rfc3339()),
+                        SqlValue::Text(ts),
+                        SqlValue::Text(cid),
+                        SqlValue::Integer(limit),
+                    ],
+                ),
+                None => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_cursor",
+                        "分页游标无效",
+                    )
+                }
+            }
+        } else {
+            (
                 format!(
                     "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
-                     FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
-                       AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
-                     ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                     FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
                 ),
                 vec![
-                    SqlValue::Text(id.clone()),
+                    SqlValue::Text(id),
                     SqlValue::Text(from.to_rfc3339()),
                     SqlValue::Text(to.to_rfc3339()),
-                    SqlValue::Text(ts),
-                    SqlValue::Text(cid),
                     SqlValue::Integer(limit),
                 ],
-            ),
-            None => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_cursor",
-                    "分页游标无效",
-                )
-            }
-        }
-    } else {
-        (
-            format!(
-                "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
-                 FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
-            ),
-            vec![
-                SqlValue::Text(id),
-                SqlValue::Text(from.to_rfc3339()),
-                SqlValue::Text(to.to_rfc3339()),
-                SqlValue::Integer(limit),
-            ],
-        )
-    };
-    let mut stmt = q!(c.prepare(&sql));
-    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "model": r.get::<_, Option<String>>(1)?,
-            "provider": r.get::<_, Option<String>>(2)?,
-            "started_at": r.get::<_, String>(3)?,
-            "status": r.get::<_, String>(4)?,
-            "input_tokens": r.get::<_, Option<i64>>(5)?,
-            "output_tokens": r.get::<_, Option<i64>>(6)?,
-            "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
-            "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
-            "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
-            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
+            )
+        };
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "model": r.get::<_, Option<String>>(1)?,
+                "provider": r.get::<_, Option<String>>(2)?,
+                "started_at": r.get::<_, String>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "input_tokens": r.get::<_, Option<i64>>(5)?,
+                "output_tokens": r.get::<_, Option<i64>>(6)?,
+                "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
+                "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
+                "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
+                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
+            }))
+        },));
+        let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let next_cursor = calls.last().and_then(|v| {
+            let id = v.get("id")?.as_str()?;
+            let ts = v.get("started_at")?.as_str()?;
+            Some(crate::api::encode_cursor(ts, id))
+        });
+        // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而非「无数据」。
+        Json(serde_json::json!({
+            "calls": calls,
+            "next_cursor": next_cursor,
+            "archived_before": archived_before,
         }))
-    },));
-    let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    let next_cursor = calls.last().and_then(|v| {
-        let id = v.get("id")?.as_str()?;
-        let ts = v.get("started_at")?.as_str()?;
-        Some(crate::api::encode_cursor(ts, id))
-    });
-    // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而非「无数据」。
-    Json(serde_json::json!({
-        "calls": calls,
-        "next_cursor": next_cursor,
-        "archived_before": archived_before,
-    }))
-    .into_response()
+        .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn list_clients(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter(&p);
-    let c = st.db.conn();
-    let cte = rollup_source_cte(1, 2, from, to);
-    let mut stmt = q!(c.prepare(&format!(
-        "{cte}SELECT client_id,
-            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-            COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0)
-         FROM rollup_src WHERE 1=1 {filter} GROUP BY client_id ORDER BY 2 DESC"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok(serde_json::json!({
-                "client_id": r.get::<_, String>(0)?,
-                "input_tokens": r.get::<_, i64>(1)?,
-                "output_tokens": r.get::<_, i64>(2)?,
-                "model_calls": r.get::<_, i64>(3)?,
-                "sessions": r.get::<_, i64>(4)?,
-                "cost_micro_usd": r.get::<_, i64>(5)?,
-            }))
-        },)
-    );
-    let clients: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "clients": clients })).into_response()
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (filter, fargs) = range_filter(&p);
+        let c = st.db.read_conn();
+        let cte = {
+            let h_from_ph = 3 + fargs.len() as u8;
+            rollup_source_cte(1, 2, h_from_ph, h_from_ph + 1)
+        };
+        let mut stmt = q!(c.prepare(&format!(
+            "{cte}SELECT client_id,
+                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0)
+             FROM rollup_src WHERE 1=1 {filter} GROUP BY client_id ORDER BY 2 DESC"
+        )));
+        let rows = q!(
+            stmt.query_map(
+                params_from_iter(range_args_with_hours(
+                    &from,
+                    &to,
+                    fargs,
+                    ceil_hour(from),
+                    floor_hour(to),
+                )),
+                |r| {
+                Ok(serde_json::json!({
+                    "client_id": r.get::<_, String>(0)?,
+                    "input_tokens": r.get::<_, i64>(1)?,
+                    "output_tokens": r.get::<_, i64>(2)?,
+                    "model_calls": r.get::<_, i64>(3)?,
+                    "sessions": r.get::<_, i64>(4)?,
+                    "cost_micro_usd": r.get::<_, i64>(5)?,
+                }))
+            },)
+        );
+        let clients: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        Json(serde_json::json!({ "clients": clients })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn client_detail(
@@ -1620,59 +1962,67 @@ pub(crate) async fn client_detail(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let c = st.db.conn();
-    let cte = rollup_source_cte(2, 3, from, to);
-    let mut stmt = q!(c.prepare(&format!(
-        "{cte}SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
-                COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0), COUNT(CASE WHEN pricing_source != '' THEN 1 END)
-         FROM rollup_src WHERE client_id = ?1 GROUP BY node_id ORDER BY 2 DESC"
-    )));
-    let rows = q!(
-        stmt.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-            let cost = r.get::<_, i64>(5)?;
-            let priced_rows = r.get::<_, i64>(6)?;
-            Ok(serde_json::json!({
-                "node_id": r.get::<_, String>(0)?,
-                "input_tokens": r.get::<_, i64>(1)?,
-                "output_tokens": r.get::<_, i64>(2)?,
-                "model_calls": r.get::<_, i64>(3)?,
-                "sessions": r.get::<_, i64>(4)?,
-                "cost_micro_usd": available_cost(cost, priced_rows),
-            }))
-        },)
-    );
-    let by_node: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-
-    // 最近 sessions（Agent Tools Detail）
-    let recent: Vec<serde_json::Value> = {
-        let mut st = q!(c.prepare(
-            "SELECT id, source_session_id, node_id, title, primary_model_normalized, started_at,
-                    model_call_count, input_tokens, output_tokens
-             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
-             ORDER BY started_at DESC LIMIT 20",
-        ));
-        let r = q!(
-            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let c = st.db.read_conn();
+        let cte = rollup_source_cte(2, 3, 4, 5);
+        let mut stmt = q!(c.prepare(&format!(
+            "{cte}SELECT node_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0),
+                    COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0), COUNT(CASE WHEN pricing_source != '' THEN 1 END)
+             FROM rollup_src WHERE client_id = ?1 GROUP BY node_id ORDER BY 2 DESC"
+        )));
+        let rows = q!(
+            stmt.query_map(
+                params![
+                    id,
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    ceil_hour(from).to_rfc3339(),
+                    floor_hour(to).to_rfc3339()
+                ],
+                |r| {
+                let cost = r.get::<_, i64>(5)?;
+                let priced_rows = r.get::<_, i64>(6)?;
                 Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "source_session_id": r.get::<_, String>(1)?,
-                    "node_id": r.get::<_, String>(2)?,
-                    "title": r.get::<_, Option<String>>(3)?,
-                    "model": r.get::<_, Option<String>>(4)?,
-                    "started_at": r.get::<_, String>(5)?,
-                    "model_call_count": r.get::<_, i64>(6)?,
-                    "input_tokens": r.get::<_, Option<i64>>(7)?,
-                    "output_tokens": r.get::<_, Option<i64>>(8)?,
+                    "node_id": r.get::<_, String>(0)?,
+                    "input_tokens": r.get::<_, i64>(1)?,
+                    "output_tokens": r.get::<_, i64>(2)?,
+                    "model_calls": r.get::<_, i64>(3)?,
+                    "sessions": r.get::<_, i64>(4)?,
+                    "cost_micro_usd": available_cost(cost, priced_rows),
                 }))
             },)
         );
-        r.filter_map(|x| x.ok()).collect()
-    };
+        let by_node: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
-    // 汇总（三口径 cost / token / 缓存命中率）
-    let summary = c
-        .query_row(
+        // 最近 sessions（Agent Tools Detail）
+        let recent: Vec<serde_json::Value> = {
+            let mut st = q!(c.prepare(
+                "SELECT id, source_session_id, node_id, title, primary_model_normalized, started_at,
+                        model_call_count, input_tokens, output_tokens
+                 FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
+                 ORDER BY started_at DESC LIMIT 20",
+            ));
+            let r = q!(
+                st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_session_id": r.get::<_, String>(1)?,
+                        "node_id": r.get::<_, String>(2)?,
+                        "title": r.get::<_, Option<String>>(3)?,
+                        "model": r.get::<_, Option<String>>(4)?,
+                        "started_at": r.get::<_, String>(5)?,
+                        "model_call_count": r.get::<_, i64>(6)?,
+                        "input_tokens": r.get::<_, Option<i64>>(7)?,
+                        "output_tokens": r.get::<_, Option<i64>>(8)?,
+                    }))
+                },)
+            );
+            r.filter_map(|x| x.ok()).collect()
+        };
+
+        // 汇总（三口径 cost / token / 缓存命中率）
+        let summary = match c.query_row(
             &format!(
                 "{cte}SELECT COALESCE(SUM(reported_cost),0),
                     COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
@@ -1680,7 +2030,13 @@ pub(crate) async fn client_detail(
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0)
              FROM rollup_src WHERE client_id = ?1"
             ),
-            params![id, from.to_rfc3339(), to.to_rfc3339()],
+            params![
+                id,
+                from.to_rfc3339(),
+                to.to_rfc3339(),
+                ceil_hour(from).to_rfc3339(),
+                floor_hour(to).to_rfc3339()
+            ],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -1692,402 +2048,52 @@ pub(crate) async fn client_detail(
                     r.get::<_, i64>(6)?,
                 ))
             },
-        )
-        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
-    let (reported_cost, calculated_cost, estimated_cost, in_tok, out_tok, cr_tok, cw_tok) = summary;
-
-    // S3.5：按 Project 分布
-    let by_project: Vec<serde_json::Value> = {
-        let mut st = q!(c.prepare(
-            "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(model_call_count),0),
-                    COALESCE(SUM(input_tokens),0),
-                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
-                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-             FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
-             GROUP BY project_id ORDER BY 3 DESC LIMIT 10",
-        ));
-        let r = q!(
-            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-                let cost = r.get::<_, i64>(4)?;
-                let priced_sessions = r.get::<_, i64>(5)?;
-                Ok(serde_json::json!({
-                    "project_id": r.get::<_, String>(0)?,
-                    "sessions": r.get::<_, i64>(1)?,
-                    "model_calls": r.get::<_, i64>(2)?,
-                    "input_tokens": r.get::<_, i64>(3)?,
-                    "cost_micro_usd": available_cost(cost, priced_sessions),
-                }))
-            },)
-        );
-        r.filter_map(|x| x.ok()).collect()
-    };
-
-    // S3.5：最近 Calls
-    let recent_calls: Vec<serde_json::Value> = {
-        let mut st = q!(c.prepare(
-            "SELECT id, session_id, provider_normalized, model_normalized, started_at, status,
-                    input_tokens, output_tokens, calculated_cost_micro_usd
-             FROM model_calls WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
-             ORDER BY started_at DESC LIMIT 20",
-        ));
-        let r = q!(
-            st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "session_id": r.get::<_, String>(1)?,
-                    "provider": r.get::<_, Option<String>>(2)?,
-                    "model": r.get::<_, Option<String>>(3)?,
-                    "started_at": r.get::<_, String>(4)?,
-                    "status": r.get::<_, String>(5)?,
-                    "input_tokens": r.get::<_, Option<i64>>(6)?,
-                    "output_tokens": r.get::<_, Option<i64>>(7)?,
-                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(8)?,
-                }))
-            },)
-        );
-        r.filter_map(|x| x.ok()).collect()
-    };
-
-    // S3.5：Source 健康（总数/健康/错误）+ 版本分布
-    let source_health = c
-        .query_row(
-            "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
-             FROM sources WHERE client_id = ?1",
-            [&id],
-            |r| {
-                Ok(serde_json::json!({
-                    "total": r.get::<_, i64>(0)?,
-                    "healthy": r.get::<_, i64>(1)?,
-                    "with_errors": r.get::<_, i64>(2)?,
-                }))
-            },
-        )
-        .unwrap_or(serde_json::json!({}));
-
-    let version_dist: Vec<serde_json::Value> = {
-        let mut st = q!(c.prepare(
-            "SELECT COALESCE(adapter_version,'(unknown)'), COUNT(*)
-             FROM sources WHERE client_id = ?1 GROUP BY adapter_version ORDER BY 2 DESC",
-        ));
-        let r = q!(st.query_map([&id], |r| {
-            Ok(serde_json::json!({
-                "version": r.get::<_, String>(0)?,
-                "count": r.get::<_, i64>(1)?,
-            }))
-        }));
-        r.filter_map(|x| x.ok()).collect()
-    };
-
-    let observation_modes: Vec<&str> = {
-        let mut modes = Vec::new();
-        if let Ok(mut stmt) = c.prepare("SELECT capabilities FROM sources WHERE client_id = ?1") {
-            if let Ok(rows) = stmt.query_map([&id], |r| r.get::<_, String>(0)) {
-                for value in rows.flatten() {
-                    let runtime = serde_json::from_str::<serde_json::Value>(&value)
-                        .ok()
-                        .and_then(|v| v.as_array().cloned())
-                        .is_some_and(|items| {
-                            items
-                                .iter()
-                                .any(|item| item.as_str() == Some("runtime_observation"))
-                        });
-                    let mode = if runtime {
-                        "native_runtime"
-                    } else {
-                        "ordinary"
-                    };
-                    if !modes.contains(&mode) {
-                        modes.push(mode);
-                    }
-                }
-            }
-        }
-        modes
-    };
-
-    Json(serde_json::json!({
-        "client_id": id,
-        "by_node": by_node,
-        "by_project": by_project,
-        "recent_sessions": recent,
-        "recent_calls": recent_calls,
-        "source_health": source_health,
-        "version_dist": version_dist,
-        "observation_modes": observation_modes,
-        "reported_cost_micro_usd": reported_cost,
-        "calculated_cost_micro_usd": calculated_cost,
-        "estimated_cost_micro_usd": estimated_cost,
-        "cost_micro_usd": reported_cost + calculated_cost + estimated_cost,
-        "input_tokens": in_tok,
-        "output_tokens": out_tok,
-        "cache_read_tokens": cr_tok,
-        "cache_write_tokens": cw_tok,
-    }))
-    .into_response()
-}
-
-pub(crate) async fn client_models(
-    State(st): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
-    let models: Vec<serde_json::Value> = {
-        // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
-        let c = st.db.conn();
-        let mut stmt = q!(c.prepare(
-            "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
-                    COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
-             FROM model_calls WHERE client_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized, provider_normalized ORDER BY cnt DESC",
-        ));
-        let rows = q!(stmt.query_map([&id], |r| {
-            let cost = r.get::<_, i64>(5)?;
-            let priced_calls = r.get::<_, i64>(6)?;
-            Ok(serde_json::json!({
-                "model": r.get::<_, String>(0)?,
-                "provider": r.get::<_, Option<String>>(1)?,
-                "calls": r.get::<_, i64>(2)?,
-                "input_tokens": r.get::<_, i64>(3)?,
-                "output_tokens": r.get::<_, i64>(4)?,
-                "cost_micro_usd": available_cost(cost, priced_calls),
-            }))
-        }));
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    // 附带每个模型的实际定价来源，与费用计算共用同一匹配器。
-    let mut pricing = metria_pricing::PricingEngine::new();
-    for rule in st.db.load_all_rules() {
-        pricing.add_rule(rule);
-    }
-    let models: Vec<serde_json::Value> = models
-        .into_iter()
-        .map(|mut m| {
-            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let provider = m.get("provider").and_then(|v| v.as_str());
-            let src = pricing
-                .pricing_source(Some(model), provider, Utc::now())
-                .unwrap_or_else(|| "unavailable".into());
-            m["pricing_source"] = serde_json::json!(src);
-            m
-        })
-        .collect();
-    Json(serde_json::json!({ "models": models })).into_response()
-}
-
-pub(crate) async fn list_models(
-    State(st): State<AppState>,
-    Query(p): Query<RangeParams>,
-) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter(&p);
-    let mut models: Vec<serde_json::Value> = {
-        // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
-        let c = st.db.conn();
-        let cte = rollup_source_cte(1, 2, from, to);
-        let mut stmt = q!(c.prepare(&format!(
-            "{cte}SELECT model, MAX(provider),
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id),
-                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
-                COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cache_write_tokens),0)
-             FROM rollup_src WHERE 1=1 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
-        )));
-        let rows = q!(
-            stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-                Ok(serde_json::json!({
-                    "model": r.get::<_, String>(0)?,
-                    "provider": r.get::<_, String>(1)?,
-                    "input_tokens": r.get::<_, i64>(2)?,
-                    "output_tokens": r.get::<_, i64>(3)?,
-                    "model_calls": r.get::<_, i64>(4)?,
-                    "sessions": r.get::<_, i64>(5)?,
-                    "clients": r.get::<_, i64>(6)?,
-                    "nodes": r.get::<_, i64>(7)?,
-                    "cache_read_tokens": r.get::<_, i64>(8)?,
-                    "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
-                    "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
-                    "reported_cost_micro_usd": r.get::<_, i64>(11)?,
-                    "reasoning_tokens": r.get::<_, i64>(12)?,
-                    "cache_write_tokens": r.get::<_, i64>(13)?,
-                }))
-            },)
-        );
-        let mut models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-        // 缓存命中率：cache_read / (input + cache_write + cache_read)
-        for m in &mut models {
-            let in_t = m.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            let cr = m
-                .get("cache_read_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let cw = m
-                .get("cache_write_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            m["cache_hit_rate"] = match cache_hit_rate(in_t, cw, cr) {
-                Some(rate) => serde_json::json!(rate),
-                None => serde_json::Value::Null,
-            };
-        }
-        models
-    };
-    // 每个模型从 model_calls 统计平均耗时与错误率（数据存在时）
-    {
-        let (mc_filter, mc_fargs) = range_filter_usage(&p);
-        let c = st.db.conn();
-        let mut stmt = q!(c.prepare(
-            &format!(
-                "SELECT model_normalized,
-                        AVG(duration_ms), COALESCE(SUM(CASE WHEN status != 'success' AND status != 'ok' AND status != 'completed' THEN 1 ELSE 0 END),0), COUNT(*)
-                 FROM model_calls WHERE model_normalized IS NOT NULL AND model_normalized != '' AND started_at >= ?1 AND started_at < ?2 {mc_filter}
-                 GROUP BY model_normalized",
-            ),
-        ));
-        let rows = q!(
-            stmt.query_map(params_from_iter(range_args(&from, &to, mc_fargs)), |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<f64>>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
-        );
-        let mut meta: std::collections::HashMap<String, (Option<f64>, i64, i64)> =
-            std::collections::HashMap::new();
-        for row in rows.flatten() {
-            meta.insert(row.0, (row.1, row.2, row.3));
-        }
-        for m in &mut models {
-            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some((avg_dur, err_cnt, total)) = meta.get(model) {
-                m["avg_duration_ms"] = avg_dur
-                    .map(|d| serde_json::json!(d.round() as i64))
-                    .unwrap_or(serde_json::Value::Null);
-                m["error_rate"] = serde_json::json!(if *total > 0 {
-                    (*err_cnt as f64) / (*total as f64)
-                } else {
-                    0.0
-                });
-            } else {
-                m["avg_duration_ms"] = serde_json::Value::Null;
-                m["error_rate"] = serde_json::json!(0.0);
-            }
-        }
-    }
-    // 附带每个模型的实际定价来源，与费用计算共用同一匹配器。
-    let mut pricing = metria_pricing::PricingEngine::new();
-    for rule in st.db.load_all_rules() {
-        pricing.add_rule(rule);
-    }
-    let models: Vec<serde_json::Value> = models
-        .into_iter()
-        .map(|mut m| {
-            let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let provider = m.get("provider").and_then(|v| v.as_str());
-            let src = pricing
-                .pricing_source(Some(model), provider, Utc::now())
-                .unwrap_or_else(|| "unavailable".into());
-            m["pricing_source"] = serde_json::json!(src);
-            m
-        })
-        .collect();
-    Json(serde_json::json!({ "models": models })).into_response()
-}
-
-pub(crate) async fn model_detail(
-    State(st): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    Query(p): Query<RangeParams>,
-) -> Response {
-    let (from, to) = parse_range(&p);
-    // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
-    let (raws, summary, recent_sessions, recent_calls, series) = {
-        let c = st.db.conn();
-        let cte = rollup_source_cte(2, 3, from, to);
-        // raw 名称 + provider 分布
-        let mut stmt = q!(c.prepare(
-            "SELECT model_raw, provider_raw, COUNT(*) as cnt FROM model_calls WHERE model_normalized = ?1 GROUP BY model_raw, provider_raw ORDER BY cnt DESC",
-        ));
-        let rows = q!(stmt.query_map([&id], |r| {
-            Ok(serde_json::json!({
-                "model_raw": r.get::<_, Option<String>>(0)?,
-                "provider": r.get::<_, Option<String>>(1)?,
-                "calls": r.get::<_, i64>(2)?,
-            }))
-        }));
-        let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-
-        // 汇总（Token/Cost/Cache Hit）
-        let summary = match c.query_row(
-            &format!(
-                "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                    COALESCE(SUM(reasoning_tokens),0),
-                    COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                    COALESCE(SUM(model_call_count),0),
-                    COALESCE(SUM(session_count),0)
-             FROM rollup_src WHERE model = ?1"
-            ),
-            params![id, from.to_rfc3339(), to.to_rfc3339()],
-            |r| {
-                Ok(serde_json::json!({
-                    "input_tokens": r.get::<_, i64>(0)?,
-                    "output_tokens": r.get::<_, i64>(1)?,
-                    "cache_read_tokens": r.get::<_, i64>(2)?,
-                    "cache_write_tokens": r.get::<_, i64>(3)?,
-                    "reasoning_tokens": r.get::<_, i64>(4)?,
-                    "cost_micro_usd": r.get::<_, i64>(5)?,
-                    "model_calls": r.get::<_, i64>(6)?,
-                    "sessions": r.get::<_, i64>(7)?,
-                }))
-            },
         ) {
-            Ok(v) => v,
+            Ok(values) => values,
             Err(e) => {
-                tracing::error!(%e, model=%id, "model_detail summary 查询失败");
-                serde_json::json!({})
+                tracing::error!(error = %e, client_id = %id, "clients summary 查询失败");
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_error",
+                    &e.to_string(),
+                );
             }
         };
+        let (reported_cost, calculated_cost, estimated_cost, in_tok, out_tok, cr_tok, cw_tok) = summary;
 
-        // 最近 sessions / calls
-        let recent_sessions: Vec<serde_json::Value> = {
+        // S3.5：按 Project 分布
+        let by_project: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(
-                "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at,
-                        model_call_count, input_tokens, output_tokens, cache_read_tokens,
-                        reasoning_tokens
-                 FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
-                 ORDER BY started_at DESC LIMIT 20",
+                "SELECT COALESCE(project_id,'(none)'), COUNT(*), COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(input_tokens),0),
+                        COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                        COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
+                 FROM sessions WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
+                 GROUP BY project_id ORDER BY 3 DESC LIMIT 10",
             ));
             let r = q!(
                 st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    let cost = r.get::<_, i64>(4)?;
+                    let priced_sessions = r.get::<_, i64>(5)?;
                     Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0)?,
-                        "source_session_id": r.get::<_, String>(1)?,
-                        "client_id": r.get::<_, String>(2)?,
-                        "title": r.get::<_, Option<String>>(3)?,
-                        "model": r.get::<_, Option<String>>(4)?,
-                        "started_at": r.get::<_, String>(5)?,
-                        "model_call_count": r.get::<_, i64>(6)?,
-                        "input_tokens": r.get::<_, Option<i64>>(7)?,
-                        "output_tokens": r.get::<_, Option<i64>>(8)?,
-                        "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
-                        "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
+                        "project_id": r.get::<_, String>(0)?,
+                        "sessions": r.get::<_, i64>(1)?,
+                        "model_calls": r.get::<_, i64>(2)?,
+                        "input_tokens": r.get::<_, i64>(3)?,
+                        "cost_micro_usd": available_cost(cost, priced_sessions),
                     }))
                 },)
             );
             r.filter_map(|x| x.ok()).collect()
         };
 
-        // S3.6：最近 Calls
+        // S3.5：最近 Calls
         let recent_calls: Vec<serde_json::Value> = {
             let mut st = q!(c.prepare(
-                "SELECT m.id, m.session_id, m.provider_normalized, m.model_normalized, m.started_at, m.status,
-                        m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd
-                 FROM model_calls m
-                 WHERE m.model_normalized = ?1 AND m.started_at >= ?2 AND m.started_at < ?3
-                 ORDER BY m.started_at DESC LIMIT 20",
+                "SELECT id, session_id, provider_normalized, model_normalized, started_at, status,
+                        input_tokens, output_tokens, calculated_cost_micro_usd
+                 FROM model_calls WHERE client_id = ?1 AND started_at >= ?2 AND started_at < ?3
+                 ORDER BY started_at DESC LIMIT 20",
             ));
             let r = q!(
                 st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
@@ -2107,84 +2113,509 @@ pub(crate) async fn model_detail(
             r.filter_map(|x| x.ok()).collect()
         };
 
-        // Token/Cost 时间序列（按小时）
-        let series: Vec<serde_json::Value> = {
-            let mut st = q!(c.prepare(&format!(
-                "{cte}SELECT bucket,
-                        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
-                        COALESCE(SUM(model_call_count),0),
-                        COALESCE(SUM(reasoning_tokens),0)
-                 FROM rollup_src WHERE model = ?1
-                 GROUP BY bucket ORDER BY bucket"
-            )));
-            let r = q!(
-                st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+        // S3.5：Source 健康（总数/健康/错误）+ 版本分布
+        let source_health = c
+            .query_row(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+                 FROM sources WHERE client_id = ?1",
+                [&id],
+                |r| {
                     Ok(serde_json::json!({
-                        "bucket": r.get::<_, String>(0)?,
-                        "input_tokens": r.get::<_, i64>(1)?,
-                        "output_tokens": r.get::<_, i64>(2)?,
-                        "cost_micro_usd": r.get::<_, i64>(3)?,
-                        "model_calls": r.get::<_, i64>(4)?,
-                        "reasoning_tokens": r.get::<_, i64>(5)?,
+                        "total": r.get::<_, i64>(0)?,
+                        "healthy": r.get::<_, i64>(1)?,
+                        "with_errors": r.get::<_, i64>(2)?,
                     }))
-                },)
-            );
+                },
+            )
+            .unwrap_or(serde_json::json!({}));
+
+        let version_dist: Vec<serde_json::Value> = {
+            let mut st = q!(c.prepare(
+                "SELECT COALESCE(adapter_version,'(unknown)'), COUNT(*)
+                 FROM sources WHERE client_id = ?1 GROUP BY adapter_version ORDER BY 2 DESC",
+            ));
+            let r = q!(st.query_map([&id], |r| {
+                Ok(serde_json::json!({
+                    "version": r.get::<_, String>(0)?,
+                    "count": r.get::<_, i64>(1)?,
+                }))
+            }));
             r.filter_map(|x| x.ok()).collect()
         };
 
-        (raws, summary, recent_sessions, recent_calls, series)
-    };
+        let observation_modes: Vec<&str> = {
+            let mut modes = Vec::new();
+            if let Ok(mut stmt) = c.prepare("SELECT capabilities FROM sources WHERE client_id = ?1") {
+                if let Ok(rows) = stmt.query_map([&id], |r| r.get::<_, String>(0)) {
+                    for value in rows.flatten() {
+                        let runtime = serde_json::from_str::<serde_json::Value>(&value)
+                            .ok()
+                            .and_then(|v| v.as_array().cloned())
+                            .is_some_and(|items| {
+                                items
+                                    .iter()
+                                    .any(|item| item.as_str() == Some("runtime_observation"))
+                            });
+                        let mode = if runtime {
+                            "native_runtime"
+                        } else {
+                            "ordinary"
+                        };
+                        if !modes.contains(&mode) {
+                            modes.push(mode);
+                        }
+                    }
+                }
+            }
+            modes
+        };
 
-    // 匹配的定价规则
-    let rules: Vec<serde_json::Value> = st
-        .db
-        .list_pricing_rules()
-        .into_iter()
-        .filter(|r| {
-            let pat = r
-                .get("model_pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            metria_pricing::model_matches_pattern(pat, &id)
-        })
-        .collect();
-    let mut pricing = metria_pricing::PricingEngine::new();
-    for rule in st.db.load_all_rules() {
-        pricing.add_rule(rule);
-    }
-    let pricing_source = pricing
-        .pricing_source(Some(&id), None, Utc::now())
-        .unwrap_or_else(|| "unavailable".into());
+        Json(serde_json::json!({
+            "client_id": id,
+            "by_node": by_node,
+            "by_project": by_project,
+            "recent_sessions": recent,
+            "recent_calls": recent_calls,
+            "source_health": source_health,
+            "version_dist": version_dist,
+            "observation_modes": observation_modes,
+            "reported_cost_micro_usd": reported_cost,
+            "calculated_cost_micro_usd": calculated_cost,
+            "estimated_cost_micro_usd": estimated_cost,
+            "cost_micro_usd": reported_cost + calculated_cost + estimated_cost,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "cache_read_tokens": cr_tok,
+            "cache_write_tokens": cw_tok,
+        }))
+        .into_response()
+    })
+    .await
+}
 
-    Json(serde_json::json!({
-        "model": id,
-        "pricing_source": pricing_source,
-        "raw_names": raws,
-        "summary": summary,
-        "pricing_rules": rules,
-        "recent_sessions": recent_sessions,
-        "recent_calls": recent_calls,
-        "series": series,
-    }))
-    .into_response()
+pub(crate) async fn client_models(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    run_blocking(move || {
+        let models: Vec<serde_json::Value> = {
+            // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
+            let c = st.db.read_conn();
+            let mut stmt = q!(c.prepare(
+                "SELECT model_normalized, provider_normalized, COUNT(*) as cnt, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0),
+                        COUNT(CASE WHEN reported_cost_micro_usd IS NOT NULL OR calculated_cost_micro_usd IS NOT NULL OR estimated_cost_micro_usd IS NOT NULL THEN 1 END)
+                 FROM model_calls WHERE client_id = ?1 AND model_normalized IS NOT NULL GROUP BY model_normalized, provider_normalized ORDER BY cnt DESC",
+            ));
+            let rows = q!(stmt.query_map([&id], |r| {
+                let cost = r.get::<_, i64>(5)?;
+                let priced_calls = r.get::<_, i64>(6)?;
+                Ok(serde_json::json!({
+                    "model": r.get::<_, String>(0)?,
+                    "provider": r.get::<_, Option<String>>(1)?,
+                    "calls": r.get::<_, i64>(2)?,
+                    "input_tokens": r.get::<_, i64>(3)?,
+                    "output_tokens": r.get::<_, i64>(4)?,
+                    "cost_micro_usd": available_cost(cost, priced_calls),
+                }))
+            }));
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        // 附带每个模型的实际定价来源，与费用计算共用同一匹配器。
+        let mut pricing = metria_pricing::PricingEngine::new();
+        for rule in st.db.load_all_rules() {
+            pricing.add_rule(rule);
+        }
+        let models: Vec<serde_json::Value> = models
+            .into_iter()
+            .map(|mut m| {
+                let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let provider = m.get("provider").and_then(|v| v.as_str());
+                let src = pricing
+                    .pricing_source(Some(model), provider, Utc::now())
+                    .unwrap_or_else(|| "unavailable".into());
+                m["pricing_source"] = serde_json::json!(src);
+                m
+            })
+            .collect();
+        Json(serde_json::json!({ "models": models })).into_response()
+    })
+    .await
+}
+
+pub(crate) async fn list_models(
+    State(st): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (filter, fargs) = range_filter(&p);
+        let mut models: Vec<serde_json::Value> = {
+            // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
+            let c = st.db.read_conn();
+            let cte = {
+                let h_from_ph = 3 + fargs.len() as u8;
+                rollup_source_cte(1, 2, h_from_ph, h_from_ph + 1)
+            };
+            let mut stmt = q!(c.prepare(&format!(
+                "{cte}SELECT model, MAX(provider),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(model_call_count),0), COALESCE(SUM(session_count),0), COUNT(DISTINCT client_id), COUNT(DISTINCT node_id),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(calculated_cost),0), COALESCE(SUM(estimated_cost),0),
+                    COALESCE(SUM(reported_cost),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cache_write_tokens),0)
+                 FROM rollup_src WHERE 1=1 AND model != '' {filter} GROUP BY model ORDER BY 6 DESC"
+            )));
+            let rows = q!(
+                stmt.query_map(
+                    params_from_iter(range_args_with_hours(
+                        &from,
+                        &to,
+                        fargs,
+                        ceil_hour(from),
+                        floor_hour(to),
+                    )),
+                    |r| {
+                    Ok(serde_json::json!({
+                        "model": r.get::<_, String>(0)?,
+                        "provider": r.get::<_, String>(1)?,
+                        "input_tokens": r.get::<_, i64>(2)?,
+                        "output_tokens": r.get::<_, i64>(3)?,
+                        "model_calls": r.get::<_, i64>(4)?,
+                        "sessions": r.get::<_, i64>(5)?,
+                        "clients": r.get::<_, i64>(6)?,
+                        "nodes": r.get::<_, i64>(7)?,
+                        "cache_read_tokens": r.get::<_, i64>(8)?,
+                        "calculated_cost_micro_usd": r.get::<_, i64>(9)?,
+                        "estimated_cost_micro_usd": r.get::<_, i64>(10)?,
+                        "reported_cost_micro_usd": r.get::<_, i64>(11)?,
+                        "reasoning_tokens": r.get::<_, i64>(12)?,
+                        "cache_write_tokens": r.get::<_, i64>(13)?,
+                    }))
+                },)
+            );
+            let mut models: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+            // 缓存命中率：cache_read / (input + cache_write + cache_read)
+            for m in &mut models {
+                let in_t = m.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let cr = m
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let cw = m
+                    .get("cache_write_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                m["cache_hit_rate"] = match cache_hit_rate(in_t, cw, cr) {
+                    Some(rate) => serde_json::json!(rate),
+                    None => serde_json::Value::Null,
+                };
+            }
+            models
+        };
+        // 每个模型从 model_calls 统计平均耗时与错误率（数据存在时）
+        {
+            let (mc_filter, mc_fargs) = range_filter_usage(&p);
+            let c = st.db.read_conn();
+            let mut stmt = q!(c.prepare(
+                &format!(
+                    "SELECT model_normalized,
+                            AVG(duration_ms), COALESCE(SUM(CASE WHEN status != 'success' AND status != 'ok' AND status != 'completed' THEN 1 ELSE 0 END),0), COUNT(*)
+                     FROM model_calls WHERE model_normalized IS NOT NULL AND model_normalized != '' AND started_at >= ?1 AND started_at < ?2 {mc_filter}
+                     GROUP BY model_normalized",
+                ),
+            ));
+            let rows = q!(
+                stmt.query_map(params_from_iter(range_args(&from, &to, mc_fargs)), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+            );
+            let mut meta: std::collections::HashMap<String, (Option<f64>, i64, i64)> =
+                std::collections::HashMap::new();
+            for row in rows.flatten() {
+                meta.insert(row.0, (row.1, row.2, row.3));
+            }
+            for m in &mut models {
+                let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some((avg_dur, err_cnt, total)) = meta.get(model) {
+                    m["avg_duration_ms"] = avg_dur
+                        .map(|d| serde_json::json!(d.round() as i64))
+                        .unwrap_or(serde_json::Value::Null);
+                    m["error_rate"] = serde_json::json!(if *total > 0 {
+                        (*err_cnt as f64) / (*total as f64)
+                    } else {
+                        0.0
+                    });
+                } else {
+                    m["avg_duration_ms"] = serde_json::Value::Null;
+                    m["error_rate"] = serde_json::json!(0.0);
+                }
+            }
+        }
+        // 附带每个模型的实际定价来源，与费用计算共用同一匹配器。
+        let mut pricing = metria_pricing::PricingEngine::new();
+        for rule in st.db.load_all_rules() {
+            pricing.add_rule(rule);
+        }
+        let models: Vec<serde_json::Value> = models
+            .into_iter()
+            .map(|mut m| {
+                let model = m.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let provider = m.get("provider").and_then(|v| v.as_str());
+                let src = pricing
+                    .pricing_source(Some(model), provider, Utc::now())
+                    .unwrap_or_else(|| "unavailable".into());
+                m["pricing_source"] = serde_json::json!(src);
+                m
+            })
+            .collect();
+        Json(serde_json::json!({ "models": models })).into_response()
+    })
+    .await
+}
+
+pub(crate) async fn model_detail(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(p): Query<RangeParams>,
+) -> Response {
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
+        let (raws, summary, recent_sessions, recent_calls, series) = {
+            let c = st.db.read_conn();
+            let cte = rollup_source_cte(2, 3, 4, 5);
+            // raw 名称 + provider 分布
+            let mut stmt = q!(c.prepare(
+                "SELECT model_raw, provider_raw, COUNT(*) as cnt FROM model_calls WHERE model_normalized = ?1 GROUP BY model_raw, provider_raw ORDER BY cnt DESC",
+            ));
+            let rows = q!(stmt.query_map([&id], |r| {
+                Ok(serde_json::json!({
+                    "model_raw": r.get::<_, Option<String>>(0)?,
+                    "provider": r.get::<_, Option<String>>(1)?,
+                    "calls": r.get::<_, i64>(2)?,
+                }))
+            }));
+            let raws: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+
+            // 汇总（Token/Cost/Cache Hit）
+            let summary = match c.query_row(
+                &format!(
+                    "{cte}SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                        COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                        COALESCE(SUM(reasoning_tokens),0),
+                        COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                        COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(session_count),0)
+                 FROM rollup_src WHERE model = ?1"
+                ),
+                params![
+                    id,
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    ceil_hour(from).to_rfc3339(),
+                    floor_hour(to).to_rfc3339()
+                ],
+                |r| {
+                    Ok(serde_json::json!({
+                        "input_tokens": r.get::<_, i64>(0)?,
+                        "output_tokens": r.get::<_, i64>(1)?,
+                        "cache_read_tokens": r.get::<_, i64>(2)?,
+                        "cache_write_tokens": r.get::<_, i64>(3)?,
+                        "reasoning_tokens": r.get::<_, i64>(4)?,
+                        "cost_micro_usd": r.get::<_, i64>(5)?,
+                        "model_calls": r.get::<_, i64>(6)?,
+                        "sessions": r.get::<_, i64>(7)?,
+                    }))
+                },
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(%e, model=%id, "model_detail summary 查询失败");
+                    serde_json::json!({})
+                }
+            };
+
+            // 最近 sessions / calls
+            let recent_sessions: Vec<serde_json::Value> = {
+                let mut st = q!(c.prepare(
+                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at,
+                            model_call_count, input_tokens, output_tokens, cache_read_tokens,
+                            reasoning_tokens
+                     FROM sessions WHERE primary_model_normalized = ?1 AND started_at >= ?2 AND started_at < ?3 AND parent_session_id IS NULL
+                     ORDER BY started_at DESC LIMIT 20",
+                ));
+                let r = q!(
+                    st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, String>(0)?,
+                            "source_session_id": r.get::<_, String>(1)?,
+                            "client_id": r.get::<_, String>(2)?,
+                            "title": r.get::<_, Option<String>>(3)?,
+                            "model": r.get::<_, Option<String>>(4)?,
+                            "started_at": r.get::<_, String>(5)?,
+                            "model_call_count": r.get::<_, i64>(6)?,
+                            "input_tokens": r.get::<_, Option<i64>>(7)?,
+                            "output_tokens": r.get::<_, Option<i64>>(8)?,
+                            "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
+                            "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
+                        }))
+                    },)
+                );
+                r.filter_map(|x| x.ok()).collect()
+            };
+
+            // S3.6：最近 Calls
+            let recent_calls: Vec<serde_json::Value> = {
+                let mut st = q!(c.prepare(
+                    "SELECT m.id, m.session_id, m.provider_normalized, m.model_normalized, m.started_at, m.status,
+                            m.input_tokens, m.output_tokens, m.calculated_cost_micro_usd
+                     FROM model_calls m
+                     WHERE m.model_normalized = ?1 AND m.started_at >= ?2 AND m.started_at < ?3
+                     ORDER BY m.started_at DESC LIMIT 20",
+                ));
+                let r = q!(
+                    st.query_map(params![id, from.to_rfc3339(), to.to_rfc3339()], |r| {
+                        Ok(serde_json::json!({
+                            "id": r.get::<_, String>(0)?,
+                            "session_id": r.get::<_, String>(1)?,
+                            "provider": r.get::<_, Option<String>>(2)?,
+                            "model": r.get::<_, Option<String>>(3)?,
+                            "started_at": r.get::<_, String>(4)?,
+                            "status": r.get::<_, String>(5)?,
+                            "input_tokens": r.get::<_, Option<i64>>(6)?,
+                            "output_tokens": r.get::<_, Option<i64>>(7)?,
+                            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(8)?,
+                        }))
+                    },)
+                );
+                r.filter_map(|x| x.ok()).collect()
+            };
+
+            // Token/Cost 时间序列（按小时）
+            let series: Vec<serde_json::Value> = {
+                let mut st = q!(c.prepare(&format!(
+                    "{cte}SELECT bucket,
+                            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                            COALESCE(SUM(reported_cost+calculated_cost+estimated_cost),0),
+                            COALESCE(SUM(model_call_count),0),
+                            COALESCE(SUM(reasoning_tokens),0)
+                     FROM rollup_src WHERE model = ?1
+                     GROUP BY bucket ORDER BY bucket"
+                )));
+                let r = q!(
+                    st.query_map(
+                        params![
+                            id,
+                            from.to_rfc3339(),
+                            to.to_rfc3339(),
+                            ceil_hour(from).to_rfc3339(),
+                            floor_hour(to).to_rfc3339()
+                        ],
+                        |r| {
+                        Ok(serde_json::json!({
+                            "bucket": r.get::<_, String>(0)?,
+                            "input_tokens": r.get::<_, i64>(1)?,
+                            "output_tokens": r.get::<_, i64>(2)?,
+                            "cost_micro_usd": r.get::<_, i64>(3)?,
+                            "model_calls": r.get::<_, i64>(4)?,
+                            "reasoning_tokens": r.get::<_, i64>(5)?,
+                        }))
+                    },)
+                );
+                r.filter_map(|x| x.ok()).collect()
+            };
+
+            (raws, summary, recent_sessions, recent_calls, series)
+        };
+
+        // 匹配的定价规则
+        let rules: Vec<serde_json::Value> = st
+            .db
+            .list_pricing_rules()
+            .into_iter()
+            .filter(|r| {
+                let pat = r
+                    .get("model_pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                metria_pricing::model_matches_pattern(pat, &id)
+            })
+            .collect();
+        let mut pricing = metria_pricing::PricingEngine::new();
+        for rule in st.db.load_all_rules() {
+            pricing.add_rule(rule);
+        }
+        let pricing_source = pricing
+            .pricing_source(Some(&id), None, Utc::now())
+            .unwrap_or_else(|| "unavailable".into());
+
+        Json(serde_json::json!({
+            "model": id,
+            "pricing_source": pricing_source,
+            "raw_names": raws,
+            "summary": summary,
+            "pricing_rules": rules,
+            "recent_sessions": recent_sessions,
+            "recent_calls": recent_calls,
+            "series": series,
+        }))
+        .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn list_calls(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-    let archived_before = crate::archive::watermark(&st.db);
-    let c = st.db.conn();
-    let limit = p.limit.unwrap_or(100).min(1000);
-    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
-    // cursor 分页：基于 (时间, id) 排序键的游标
-    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
-        match crate::api::decode_cursor(cur) {
-            Some((ts, id)) => (
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+        let archived_before = crate::archive::watermark(&st.db);
+        let c = st.db.read_conn();
+        let limit = p.limit.unwrap_or(100).min(1000);
+        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        // cursor 分页：基于 (时间, id) 排序键的游标
+        let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+            match crate::api::decode_cursor(cur) {
+                Some((ts, id)) => (
+                    format!(
+                        "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
+                            input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
+                            reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                            ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
+                            observability_source, observability_quality, observed_request_payload_bytes,
+                            observed_response_payload_bytes
+                         FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
+                           AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
+                         ORDER BY {tcol} DESC, id DESC LIMIT ?5"
+                    ),
+                    vec![
+                        SqlValue::Text(from.to_rfc3339()),
+                        SqlValue::Text(to.to_rfc3339()),
+                        SqlValue::Text(ts),
+                        SqlValue::Text(id),
+                        SqlValue::Integer(limit),
+                    ],
+                ),
+                None => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_cursor",
+                        "分页游标无效",
+                    )
+                }
+            }
+        } else {
+            (
                 format!(
                     "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
                         input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
@@ -2193,201 +2624,201 @@ pub(crate) async fn list_calls(
                         observability_source, observability_quality, observed_request_payload_bytes,
                         observed_response_payload_bytes
                      FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
-                       AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
-                     ORDER BY {tcol} DESC, id DESC LIMIT ?5"
+                     ORDER BY {tcol} DESC, id DESC LIMIT ?3"
                 ),
                 vec![
                     SqlValue::Text(from.to_rfc3339()),
                     SqlValue::Text(to.to_rfc3339()),
-                    SqlValue::Text(ts),
-                    SqlValue::Text(id),
                     SqlValue::Integer(limit),
                 ],
-            ),
-            None => {
-                return json_err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_cursor",
-                    "分页游标无效",
-                )
-            }
-        }
-    } else {
-        (
-            format!(
-                "SELECT id, client_id, session_id, provider_normalized, model_normalized, started_at, status,
-                    input_tokens, output_tokens, cache_read_tokens, reasoning_tokens,
-                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                    ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
-                    observability_source, observability_quality, observed_request_payload_bytes,
-                    observed_response_payload_bytes
-                 FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
-                 ORDER BY {tcol} DESC, id DESC LIMIT ?3"
-            ),
-            vec![
-                SqlValue::Text(from.to_rfc3339()),
-                SqlValue::Text(to.to_rfc3339()),
-                SqlValue::Integer(limit),
-            ],
-        )
-    };
-    let mut stmt = q!(c.prepare(&sql));
-    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "client_id": r.get::<_, String>(1)?,
-            "session_id": r.get::<_, String>(2)?,
-            "provider": r.get::<_, Option<String>>(3)?,
-            "model": r.get::<_, Option<String>>(4)?,
-            "started_at": r.get::<_, String>(5)?,
-            "status": r.get::<_, String>(6)?,
-            "input_tokens": r.get::<_, Option<i64>>(7)?,
-            "output_tokens": r.get::<_, Option<i64>>(8)?,
-            "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
-            "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
-            "reported_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
-            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
-            "estimated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
-            "ttft_ms": r.get::<_, Option<i64>>(14)?,
-            "output_tokens_per_second_milli": r.get::<_, Option<i64>>(15)?,
-            "first_byte_latency_ms": r.get::<_, Option<i64>>(16)?,
-            "generation_duration_ms": r.get::<_, Option<i64>>(17)?,
-            "observability_source": r.get::<_, Option<String>>(18)?,
-            "observability_quality": r.get::<_, Option<String>>(19)?,
-            "observed_request_payload_bytes": r.get::<_, Option<i64>>(20)?,
-            "observed_response_payload_bytes": r.get::<_, Option<i64>>(21)?,
+            )
+        };
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "client_id": r.get::<_, String>(1)?,
+                "session_id": r.get::<_, String>(2)?,
+                "provider": r.get::<_, Option<String>>(3)?,
+                "model": r.get::<_, Option<String>>(4)?,
+                "started_at": r.get::<_, String>(5)?,
+                "status": r.get::<_, String>(6)?,
+                "input_tokens": r.get::<_, Option<i64>>(7)?,
+                "output_tokens": r.get::<_, Option<i64>>(8)?,
+                "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
+                "reasoning_tokens": r.get::<_, Option<i64>>(10)?,
+                "reported_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
+                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
+                "estimated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+                "ttft_ms": r.get::<_, Option<i64>>(14)?,
+                "output_tokens_per_second_milli": r.get::<_, Option<i64>>(15)?,
+                "first_byte_latency_ms": r.get::<_, Option<i64>>(16)?,
+                "generation_duration_ms": r.get::<_, Option<i64>>(17)?,
+                "observability_source": r.get::<_, Option<String>>(18)?,
+                "observability_quality": r.get::<_, Option<String>>(19)?,
+                "observed_request_payload_bytes": r.get::<_, Option<i64>>(20)?,
+                "observed_response_payload_bytes": r.get::<_, Option<i64>>(21)?,
+            }))
+        },));
+        let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        // 生成下一页游标（取最后一条）
+        let next_cursor = calls.last().and_then(|v| {
+            let id = v.get("id")?.as_str()?;
+            let ts = v.get("started_at")?.as_str()?;
+            Some(crate::api::encode_cursor(ts, id))
+        });
+        // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而不是「暂无数据」。
+        Json(serde_json::json!({
+            "calls": calls,
+            "next_cursor": next_cursor,
+            "archived_before": archived_before,
         }))
-    },));
-    let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    // 生成下一页游标（取最后一条）
-    let next_cursor = calls.last().and_then(|v| {
-        let id = v.get("id")?.as_str()?;
-        let ts = v.get("started_at")?.as_str()?;
-        Some(crate::api::encode_cursor(ts, id))
-    });
-    // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而不是「暂无数据」。
-    Json(serde_json::json!({
-        "calls": calls,
-        "next_cursor": next_cursor,
-        "archived_before": archived_before,
-    }))
-    .into_response()
+        .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn call_detail(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let c = st.db.conn();
-    let call = c
-        .query_row(
-            "SELECT id, client_id, session_id, provider_raw, provider_normalized, model_raw, model_normalized,
-                started_at, completed_at, duration_ms, status, call_granularity,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                COALESCE(reported_cost_micro_usd, (SELECT u.reported_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
-                COALESCE(calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
-                COALESCE(estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
-                first_byte_at, first_token_at, last_output_at, first_byte_latency_ms, ttft_ms,
-                generation_duration_ms, output_tokens_per_second_milli, inter_token_latency_avg_ms,
-                inter_token_latency_p95_ms, stall_count, stall_duration_ms, observability_source,
-                observability_quality, endpoint, finish_reason, error_kind, rate_limited,
-                observed_request_payload_bytes, observed_response_payload_bytes,
-                observed_request_wire_bytes, observed_response_wire_bytes, streaming, stream_completed, retry_count,
-                status_code, first_response_at
-             FROM model_calls WHERE id = ?1",
-            [&id],
-            |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "client_id": r.get::<_, String>(1)?,
-                    "session_id": r.get::<_, String>(2)?,
-                    "provider_raw": r.get::<_, Option<String>>(3)?,
-                    "provider": r.get::<_, Option<String>>(4)?,
-                    "model_raw": r.get::<_, Option<String>>(5)?,
-                    "model": r.get::<_, Option<String>>(6)?,
-                    "started_at": r.get::<_, String>(7)?,
-                    "completed_at": r.get::<_, Option<String>>(8)?,
-                    "duration_ms": r.get::<_, Option<i64>>(9)?,
-                    "status": r.get::<_, String>(10)?,
-                    "call_granularity": r.get::<_, String>(11)?,
-                    "input_tokens": r.get::<_, Option<i64>>(12)?,
-                    "output_tokens": r.get::<_, Option<i64>>(13)?,
-                    "cache_read_tokens": r.get::<_, Option<i64>>(14)?,
-                    "cache_write_tokens": r.get::<_, Option<i64>>(15)?,
-                    "reasoning_tokens": r.get::<_, Option<i64>>(16)?,
-                    "reported_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
-                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
-                    "estimated_cost_micro_usd": r.get::<_, Option<i64>>(19)?,
-                    "first_byte_at": r.get::<_, Option<String>>(20)?,
-                    "first_token_at": r.get::<_, Option<String>>(21)?,
-                    "last_output_at": r.get::<_, Option<String>>(22)?,
-                    "first_byte_latency_ms": r.get::<_, Option<i64>>(23)?,
-                    "ttft_ms": r.get::<_, Option<i64>>(24)?,
-                    "generation_duration_ms": r.get::<_, Option<i64>>(25)?,
-                    "output_tokens_per_second_milli": r.get::<_, Option<i64>>(26)?,
-                    "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(27)?,
-                    "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(28)?,
-                    "stall_count": r.get::<_, Option<i64>>(29)?,
-                    "stall_duration_ms": r.get::<_, Option<i64>>(30)?,
-                    "observability_source": r.get::<_, Option<String>>(31)?,
-                    "observability_quality": r.get::<_, Option<String>>(32)?,
-                    "endpoint": r.get::<_, Option<String>>(33)?,
-                    "finish_reason": r.get::<_, Option<String>>(34)?,
-                    "error_kind": r.get::<_, Option<String>>(35)?,
-                    "rate_limited": r.get::<_, Option<bool>>(36)?,
-                    "observed_request_payload_bytes": r.get::<_, Option<i64>>(37)?,
-                    "observed_response_payload_bytes": r.get::<_, Option<i64>>(38)?,
-                    "observed_request_wire_bytes": r.get::<_, Option<i64>>(39)?,
-                    "observed_response_wire_bytes": r.get::<_, Option<i64>>(40)?,
-                    "streaming": r.get::<_, bool>(41)?,
-                    "stream_completed": r.get::<_, Option<bool>>(42)?,
-                    "retry_count": r.get::<_, i64>(43)?,
-                    "status_code": r.get::<_, Option<i64>>(44)?,
-                    "first_response_at": r.get::<_, Option<String>>(45)?,
-                }))
-            },
-        )
-        .ok()
-        .unwrap_or(serde_json::json!({}));
-    Json(serde_json::json!({ "call": call })).into_response()
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let call = c
+            .query_row(
+                "SELECT id, client_id, session_id, provider_raw, provider_normalized, model_raw, model_normalized,
+                    started_at, completed_at, duration_ms, status, call_granularity,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    COALESCE(reported_cost_micro_usd, (SELECT u.reported_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
+                    COALESCE(calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
+                    COALESCE(estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = model_calls.id OR u.event_id = model_calls.usage_event_id LIMIT 1)),
+                    first_byte_at, first_token_at, last_output_at, first_byte_latency_ms, ttft_ms,
+                    generation_duration_ms, output_tokens_per_second_milli, inter_token_latency_avg_ms,
+                    inter_token_latency_p95_ms, stall_count, stall_duration_ms, observability_source,
+                    observability_quality, endpoint, finish_reason, error_kind, rate_limited,
+                    observed_request_payload_bytes, observed_response_payload_bytes,
+                    observed_request_wire_bytes, observed_response_wire_bytes, streaming, stream_completed, retry_count,
+                    status_code, first_response_at
+                 FROM model_calls WHERE id = ?1",
+                [&id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "client_id": r.get::<_, String>(1)?,
+                        "session_id": r.get::<_, String>(2)?,
+                        "provider_raw": r.get::<_, Option<String>>(3)?,
+                        "provider": r.get::<_, Option<String>>(4)?,
+                        "model_raw": r.get::<_, Option<String>>(5)?,
+                        "model": r.get::<_, Option<String>>(6)?,
+                        "started_at": r.get::<_, String>(7)?,
+                        "completed_at": r.get::<_, Option<String>>(8)?,
+                        "duration_ms": r.get::<_, Option<i64>>(9)?,
+                        "status": r.get::<_, String>(10)?,
+                        "call_granularity": r.get::<_, String>(11)?,
+                        "input_tokens": r.get::<_, Option<i64>>(12)?,
+                        "output_tokens": r.get::<_, Option<i64>>(13)?,
+                        "cache_read_tokens": r.get::<_, Option<i64>>(14)?,
+                        "cache_write_tokens": r.get::<_, Option<i64>>(15)?,
+                        "reasoning_tokens": r.get::<_, Option<i64>>(16)?,
+                        "reported_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
+                        "calculated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
+                        "estimated_cost_micro_usd": r.get::<_, Option<i64>>(19)?,
+                        "first_byte_at": r.get::<_, Option<String>>(20)?,
+                        "first_token_at": r.get::<_, Option<String>>(21)?,
+                        "last_output_at": r.get::<_, Option<String>>(22)?,
+                        "first_byte_latency_ms": r.get::<_, Option<i64>>(23)?,
+                        "ttft_ms": r.get::<_, Option<i64>>(24)?,
+                        "generation_duration_ms": r.get::<_, Option<i64>>(25)?,
+                        "output_tokens_per_second_milli": r.get::<_, Option<i64>>(26)?,
+                        "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(27)?,
+                        "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(28)?,
+                        "stall_count": r.get::<_, Option<i64>>(29)?,
+                        "stall_duration_ms": r.get::<_, Option<i64>>(30)?,
+                        "observability_source": r.get::<_, Option<String>>(31)?,
+                        "observability_quality": r.get::<_, Option<String>>(32)?,
+                        "endpoint": r.get::<_, Option<String>>(33)?,
+                        "finish_reason": r.get::<_, Option<String>>(34)?,
+                        "error_kind": r.get::<_, Option<String>>(35)?,
+                        "rate_limited": r.get::<_, Option<bool>>(36)?,
+                        "observed_request_payload_bytes": r.get::<_, Option<i64>>(37)?,
+                        "observed_response_payload_bytes": r.get::<_, Option<i64>>(38)?,
+                        "observed_request_wire_bytes": r.get::<_, Option<i64>>(39)?,
+                        "observed_response_wire_bytes": r.get::<_, Option<i64>>(40)?,
+                        "streaming": r.get::<_, bool>(41)?,
+                        "stream_completed": r.get::<_, Option<bool>>(42)?,
+                        "retry_count": r.get::<_, i64>(43)?,
+                        "status_code": r.get::<_, Option<i64>>(44)?,
+                        "first_response_at": r.get::<_, Option<String>>(45)?,
+                    }))
+                },
+            )
+            .ok()
+            .unwrap_or(serde_json::json!({}));
+        Json(serde_json::json!({ "call": call })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn list_sessions(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-    // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-    let archived_before = crate::archive::watermark(&st.db);
-    let c = st.db.conn();
-    let limit = p.limit.unwrap_or(100).min(1000);
-    let tcol = crate::api::time_column(p.allocation_mode.as_deref());
-    let (session_filter, session_fargs) = range_filter_sessions(&p);
-    // 会话在所选时间范围内仍活跃（last_activity_at 落在范围内）也展示，
-    // 而非仅按 started_at 过滤，避免"还在用"的会话从列表消失。
-    let range_overlap = format!(
-        "((s.{tcol} >= ?1 AND s.{tcol} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
-    );
-    // 默认只返回主 Agent 会话；显式 include_subagents=true 时返回全部。
-    let subagent_filter = if p.include_subagents == Some(true) {
-        ""
-    } else {
-        " AND s.parent_session_id IS NULL"
-    };
-    let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
-        match crate::api::decode_cursor(cur) {
-            Some((ts, id)) => {
-                let cursor_index = 3 + session_fargs.len();
-                let limit_index = cursor_index + 2;
-                let mut args = range_args(&from, &to, session_fargs.clone());
-                args.extend([
-                    SqlValue::Text(ts),
-                    SqlValue::Text(id),
-                    SqlValue::Integer(limit),
-                ]);
-                (
-                    format!(
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
+        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
+        let archived_before = crate::archive::watermark(&st.db);
+        let c = st.db.read_conn();
+        let limit = p.limit.unwrap_or(100).min(1000);
+        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        let (session_filter, session_fargs) = range_filter_sessions(&p);
+        // 会话在所选时间范围内仍活跃（last_activity_at 落在范围内）也展示，
+        // 而非仅按 started_at 过滤，避免"还在用"的会话从列表消失。
+        let range_overlap = format!(
+            "((s.{tcol} >= ?1 AND s.{tcol} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
+        );
+        // 默认只返回主 Agent 会话；显式 include_subagents=true 时返回全部。
+        let subagent_filter = if p.include_subagents == Some(true) {
+            ""
+        } else {
+            " AND s.parent_session_id IS NULL"
+        };
+        let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
+            match crate::api::decode_cursor(cur) {
+                Some((ts, id)) => {
+                    let cursor_index = 3 + session_fargs.len();
+                    let limit_index = cursor_index + 2;
+                    let mut args = range_args(&from, &to, session_fargs.clone());
+                    args.extend([
+                        SqlValue::Text(ts),
+                        SqlValue::Text(id),
+                        SqlValue::Integer(limit),
+                    ]);
+                    (
+                        format!(
+                        "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
+                            message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
+                            reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                            status,
+                            CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
+                                 THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
+                            reasoning_tokens
+                         FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
+                           AND (s.{tcol} < ?{cursor_index} OR (s.{tcol} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
+                         ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}",
+                        next_cursor_index = cursor_index + 1,
+                    ),
+                        args,
+                    )
+                }
+                None => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", "分页游标无效"),
+            }
+        } else {
+            let limit_index = 3 + session_fargs.len();
+            let mut args = range_args(&from, &to, session_fargs);
+            args.push(SqlValue::Integer(limit));
+            (
+                format!(
                     "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
                         message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
                         reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
@@ -2396,76 +2827,144 @@ pub(crate) async fn list_sessions(
                              THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
                         reasoning_tokens
                      FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
-                       AND (s.{tcol} < ?{cursor_index} OR (s.{tcol} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
-                     ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}",
-                    next_cursor_index = cursor_index + 1,
+                     ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}"
                 ),
-                    args,
-                )
-            }
-            None => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", "分页游标无效"),
-        }
-    } else {
-        let limit_index = 3 + session_fargs.len();
-        let mut args = range_args(&from, &to, session_fargs);
-        args.push(SqlValue::Integer(limit));
-        (
-            format!(
-                "SELECT s.id, s.source_session_id, s.client_id, s.node_id, s.title, s.provider_normalized, s.primary_model_normalized, s.started_at, s.ended_at, s.last_activity_at,
-                    message_count, tool_call_count, model_call_count, input_tokens, output_tokens, cache_read_tokens,
-                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                    status,
-                    CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
-                         THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
-                    reasoning_tokens
-                 FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
-                 ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}"
-            ),
-            args,
-        )
-    };
-    let mut stmt = q!(c.prepare(&sql));
-    let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "source_session_id": r.get::<_, String>(1)?,
-            "client_id": r.get::<_, String>(2)?,
-            "node_id": r.get::<_, String>(3)?,
-            "title": r.get::<_, Option<String>>(4)?,
-            "provider": r.get::<_, Option<String>>(5)?,
-            "model": r.get::<_, Option<String>>(6)?,
-            "started_at": r.get::<_, String>(7)?,
-            "ended_at": r.get::<_, Option<String>>(8)?,
-            "last_activity_at": r.get::<_, Option<String>>(9)?,
-            "message_count": r.get::<_, i64>(10)?,
-            "tool_call_count": r.get::<_, i64>(11)?,
-            "model_call_count": r.get::<_, i64>(12)?,
-            "input_tokens": r.get::<_, Option<i64>>(13)?,
-            "output_tokens": r.get::<_, Option<i64>>(14)?,
-            "cache_read_tokens": r.get::<_, Option<i64>>(15)?,
-            "reported_cost_micro_usd": r.get::<_, Option<i64>>(16)?,
-            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
-            "estimated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
-            "status": r.get::<_, String>(19)?,
-            "duration_ms": r.get::<_, Option<i64>>(20)?,
-            "reasoning_tokens": r.get::<_, Option<i64>>(21)?,
+                args,
+            )
+        };
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args.iter()), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "source_session_id": r.get::<_, String>(1)?,
+                "client_id": r.get::<_, String>(2)?,
+                "node_id": r.get::<_, String>(3)?,
+                "title": r.get::<_, Option<String>>(4)?,
+                "provider": r.get::<_, Option<String>>(5)?,
+                "model": r.get::<_, Option<String>>(6)?,
+                "started_at": r.get::<_, String>(7)?,
+                "ended_at": r.get::<_, Option<String>>(8)?,
+                "last_activity_at": r.get::<_, Option<String>>(9)?,
+                "message_count": r.get::<_, i64>(10)?,
+                "tool_call_count": r.get::<_, i64>(11)?,
+                "model_call_count": r.get::<_, i64>(12)?,
+                "input_tokens": r.get::<_, Option<i64>>(13)?,
+                "output_tokens": r.get::<_, Option<i64>>(14)?,
+                "cache_read_tokens": r.get::<_, Option<i64>>(15)?,
+                "reported_cost_micro_usd": r.get::<_, Option<i64>>(16)?,
+                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(17)?,
+                "estimated_cost_micro_usd": r.get::<_, Option<i64>>(18)?,
+                "status": r.get::<_, String>(19)?,
+                "duration_ms": r.get::<_, Option<i64>>(20)?,
+                "reasoning_tokens": r.get::<_, Option<i64>>(21)?,
+            }))
+        },));
+        let sessions: Vec<serde_json::Value> = rows
+            .filter_map(|r| r.ok())
+            .map(|mut v| {
+                // 状态依据最后活跃时间判定，而非信任 adapter 标记：
+                //   - last_activity_at 距今 ≤ IDLE 阈值 → active（活跃）
+                //   - 距今 > 阈值 → idle（闲置）
+                //   - ended_at 明确存在且无后续活动 → ended（已结束）
+                let now = Utc::now();
+                let idle_cutoff = now - chrono::Duration::minutes(IDLE_SESSION_MINUTES);
+                let la = v
+                    .get("last_activity_at")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc));
+                let ended_at = v
+                    .get("ended_at")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&Utc));
+                let status = match (la, ended_at) {
+                    (Some(la), _) if la >= idle_cutoff => "active",
+                    (Some(la), Some(ended)) if la <= ended => "ended",
+                    _ => "idle",
+                };
+                v["status"] = serde_json::json!(status);
+                v
+            })
+            .collect();
+        let next_cursor = sessions.last().and_then(|v| {
+            let id = v.get("id")?.as_str()?;
+            let ts = v.get("started_at")?.as_str()?;
+            Some(crate::api::encode_cursor(ts, id))
+        });
+        Json(serde_json::json!({
+            "sessions": sessions,
+            "next_cursor": next_cursor,
+            "archived_before": archived_before,
         }))
-    },));
-    let sessions: Vec<serde_json::Value> = rows
-        .filter_map(|r| r.ok())
-        .map(|mut v| {
-            // 状态依据最后活跃时间判定，而非信任 adapter 标记：
-            //   - last_activity_at 距今 ≤ IDLE 阈值 → active（活跃）
-            //   - 距今 > 阈值 → idle（闲置）
-            //   - ended_at 明确存在且无后续活动 → ended（已结束）
+        .into_response()
+    })
+    .await
+}
+
+pub(crate) async fn session_detail(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let session = c
+            .query_row(
+                "SELECT id, source_session_id, node_id, client_id, project_id, title, provider_normalized, primary_model_normalized,
+                    started_at, ended_at, last_activity_at, status,
+                    message_count, tool_call_count, subagent_count, model_call_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                    COALESCE((SELECT p.id FROM sessions p
+                              WHERE p.id = sessions.parent_session_id
+                                 OR p.source_session_id = sessions.parent_session_id),
+                             sessions.parent_session_id)
+                 FROM sessions WHERE id = ?1",
+                [&id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_session_id": r.get::<_, String>(1)?,
+                        "node_id": r.get::<_, String>(2)?,
+                        "client_id": r.get::<_, String>(3)?,
+                        "project_id": r.get::<_, Option<String>>(4)?,
+                        "title": r.get::<_, Option<String>>(5)?,
+                        "provider": r.get::<_, Option<String>>(6)?,
+                        "model": r.get::<_, Option<String>>(7)?,
+                        "started_at": r.get::<_, String>(8)?,
+                        "ended_at": r.get::<_, Option<String>>(9)?,
+                        "last_activity_at": r.get::<_, Option<String>>(10)?,
+                        "status": r.get::<_, String>(11)?,
+                        "message_count": r.get::<_, i64>(12)?,
+                        "tool_call_count": r.get::<_, i64>(13)?,
+                        "subagent_count": r.get::<_, i64>(14)?,
+                        "model_call_count": r.get::<_, i64>(15)?,
+                        "input_tokens": r.get::<_, Option<i64>>(16)?,
+                        "output_tokens": r.get::<_, Option<i64>>(17)?,
+                        "cache_read_tokens": r.get::<_, Option<i64>>(18)?,
+                        "cache_write_tokens": r.get::<_, Option<i64>>(19)?,
+                        "reasoning_tokens": r.get::<_, Option<i64>>(20)?,
+                        "reported_cost_micro_usd": r.get::<_, Option<i64>>(21)?,
+                        "calculated_cost_micro_usd": r.get::<_, Option<i64>>(22)?,
+                        "estimated_cost_micro_usd": r.get::<_, Option<i64>>(23)?,
+                        "parent_session_id": r.get::<_, Option<String>>(24)?,
+                        "startup_command": serde_json::Value::Null,
+                    }))
+                },
+            )
+            .ok()
+            .unwrap_or(serde_json::json!({}));
+        // 状态依据最后活跃时间判定，与列表一致。
+        let mut session = session;
+        if !session.is_null() {
             let now = Utc::now();
             let idle_cutoff = now - chrono::Duration::minutes(IDLE_SESSION_MINUTES);
-            let la = v
+            let la = session
                 .get("last_activity_at")
                 .and_then(|x| x.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|t| t.with_timezone(&Utc));
-            let ended_at = v
+            let ended_at = session
                 .get("ended_at")
                 .and_then(|x| x.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -2475,337 +2974,569 @@ pub(crate) async fn list_sessions(
                 (Some(la), Some(ended)) if la <= ended => "ended",
                 _ => "idle",
             };
-            v["status"] = serde_json::json!(status);
-            v
-        })
-        .collect();
-    let next_cursor = sessions.last().and_then(|v| {
-        let id = v.get("id")?.as_str()?;
-        let ts = v.get("started_at")?.as_str()?;
-        Some(crate::api::encode_cursor(ts, id))
-    });
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "next_cursor": next_cursor,
-        "archived_before": archived_before,
-    }))
-    .into_response()
-}
-
-pub(crate) async fn session_detail(
-    State(st): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
-    let c = st.db.conn();
-    let session = c
-        .query_row(
-            "SELECT id, source_session_id, node_id, client_id, project_id, title, provider_normalized, primary_model_normalized,
-                started_at, ended_at, last_activity_at, status,
-                message_count, tool_call_count, subagent_count, model_call_count,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                COALESCE((SELECT p.id FROM sessions p
-                          WHERE p.id = sessions.parent_session_id
-                             OR p.source_session_id = sessions.parent_session_id),
-                         sessions.parent_session_id)
-             FROM sessions WHERE id = ?1",
-            [&id],
-            |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "source_session_id": r.get::<_, String>(1)?,
-                    "node_id": r.get::<_, String>(2)?,
-                    "client_id": r.get::<_, String>(3)?,
-                    "project_id": r.get::<_, Option<String>>(4)?,
-                    "title": r.get::<_, Option<String>>(5)?,
-                    "provider": r.get::<_, Option<String>>(6)?,
-                    "model": r.get::<_, Option<String>>(7)?,
-                    "started_at": r.get::<_, String>(8)?,
-                    "ended_at": r.get::<_, Option<String>>(9)?,
-                    "last_activity_at": r.get::<_, Option<String>>(10)?,
-                    "status": r.get::<_, String>(11)?,
-                    "message_count": r.get::<_, i64>(12)?,
-                    "tool_call_count": r.get::<_, i64>(13)?,
-                    "subagent_count": r.get::<_, i64>(14)?,
-                    "model_call_count": r.get::<_, i64>(15)?,
-                    "input_tokens": r.get::<_, Option<i64>>(16)?,
-                    "output_tokens": r.get::<_, Option<i64>>(17)?,
-                    "cache_read_tokens": r.get::<_, Option<i64>>(18)?,
-                    "cache_write_tokens": r.get::<_, Option<i64>>(19)?,
-                    "reasoning_tokens": r.get::<_, Option<i64>>(20)?,
-                    "reported_cost_micro_usd": r.get::<_, Option<i64>>(21)?,
-                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(22)?,
-                    "estimated_cost_micro_usd": r.get::<_, Option<i64>>(23)?,
-                    "parent_session_id": r.get::<_, Option<String>>(24)?,
-                    "startup_command": serde_json::Value::Null,
-                }))
-            },
-        )
-        .ok()
-        .unwrap_or(serde_json::json!({}));
-    // 状态依据最后活跃时间判定，与列表一致。
-    let mut session = session;
-    if !session.is_null() {
-        let now = Utc::now();
-        let idle_cutoff = now - chrono::Duration::minutes(IDLE_SESSION_MINUTES);
-        let la = session
-            .get("last_activity_at")
-            .and_then(|x| x.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.with_timezone(&Utc));
-        let ended_at = session
-            .get("ended_at")
-            .and_then(|x| x.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.with_timezone(&Utc));
-        let status = match (la, ended_at) {
-            (Some(la), _) if la >= idle_cutoff => "active",
-            (Some(la), Some(ended)) if la <= ended => "ended",
-            _ => "idle",
-        };
-        session["status"] = serde_json::json!(status);
-    }
-    Json(serde_json::json!({ "session": session })).into_response()
+            session["status"] = serde_json::json!(status);
+        }
+        Json(serde_json::json!({ "session": session })).into_response()
+    })
+    .await
 }
 
 pub(crate) async fn session_calls(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(p): Query<PageParams>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT m.id, m.model_normalized, m.provider_normalized, m.started_at, m.status, m.input_tokens, m.output_tokens, m.cache_read_tokens, m.reasoning_tokens,
-                COALESCE(m.reported_cost_micro_usd, (SELECT u.reported_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
-                COALESCE(m.calculated_cost_micro_usd, (SELECT u.calculated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
-                COALESCE(m.estimated_cost_micro_usd, (SELECT u.estimated_cost_micro_usd FROM usage_events u WHERE u.model_call_id = m.id OR u.event_id = m.usage_event_id LIMIT 1)),
-                m.duration_ms, m.ttft_ms, m.output_tokens_per_second_milli,
-                m.observability_source, m.observability_quality,
-                m.observed_request_payload_bytes, m.observed_response_payload_bytes,
-                m.observed_request_wire_bytes, m.observed_response_wire_bytes,
-                m.first_byte_latency_ms, m.generation_duration_ms,
-                m.inter_token_latency_avg_ms, m.inter_token_latency_p95_ms,
-                m.stall_count, m.stall_duration_ms, m.status_code, m.endpoint,
-                m.finish_reason, m.error_kind, m.rate_limited, m.retry_count
-         FROM model_calls m WHERE m.session_id = ?1 ORDER BY m.started_at",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "model": r.get::<_, Option<String>>(1)?,
-            "provider": r.get::<_, Option<String>>(2)?,
-            "started_at": r.get::<_, String>(3)?,
-            "status": r.get::<_, String>(4)?,
-            "input_tokens": r.get::<_, Option<i64>>(5)?,
-            "output_tokens": r.get::<_, Option<i64>>(6)?,
-            "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
-            "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
-            "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
-            "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
-            "estimated_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
-            "duration_ms": r.get::<_, Option<i64>>(12)?,
-            "ttft_ms": r.get::<_, Option<i64>>(13)?,
-            "output_tokens_per_second_milli": r.get::<_, Option<i64>>(14)?,
-            "observability_source": r.get::<_, Option<String>>(15)?,
-            "observability_quality": r.get::<_, Option<String>>(16)?,
-            "observed_request_payload_bytes": r.get::<_, Option<i64>>(17)?,
-            "observed_response_payload_bytes": r.get::<_, Option<i64>>(18)?,
-            "observed_request_wire_bytes": r.get::<_, Option<i64>>(19)?,
-            "observed_response_wire_bytes": r.get::<_, Option<i64>>(20)?,
-            "first_byte_latency_ms": r.get::<_, Option<i64>>(21)?,
-            "generation_duration_ms": r.get::<_, Option<i64>>(22)?,
-            "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(23)?,
-            "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(24)?,
-            "stall_count": r.get::<_, Option<i64>>(25)?,
-            "stall_duration_ms": r.get::<_, Option<i64>>(26)?,
-            "status_code": r.get::<_, Option<i64>>(27)?,
-            "endpoint": r.get::<_, Option<String>>(28)?,
-            "finish_reason": r.get::<_, Option<String>>(29)?,
-            "error_kind": r.get::<_, Option<String>>(30)?,
-            "rate_limited": r.get::<_, Option<bool>>(31)?,
-            "retry_count": r.get::<_, Option<i64>>(32)?,
-        }))
-    }));
-    let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "calls": calls })).into_response()
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let paginated = match page_limit(&p) {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_limit", &e),
+        };
+        let cursor = match p.cursor.as_deref().map(decode_call_cursor).transpose() {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", &e),
+        };
+
+        let mut sql = String::from(
+            "SELECT m.id, m.model_normalized, m.provider_normalized, m.started_at, m.status,
+                    m.input_tokens, m.output_tokens, m.cache_read_tokens, m.reasoning_tokens,
+                    m.reported_cost_micro_usd, m.calculated_cost_micro_usd, m.estimated_cost_micro_usd,
+                    m.duration_ms, m.ttft_ms, m.output_tokens_per_second_milli,
+                    m.observability_source, m.observability_quality,
+                    m.observed_request_payload_bytes, m.observed_response_payload_bytes,
+                    m.observed_request_wire_bytes, m.observed_response_wire_bytes,
+                    m.first_byte_latency_ms, m.generation_duration_ms,
+                    m.inter_token_latency_avg_ms, m.inter_token_latency_p95_ms,
+                    m.stall_count, m.stall_duration_ms, m.status_code, m.endpoint,
+                    m.finish_reason, m.error_kind, m.rate_limited, m.retry_count,
+                    m.usage_event_id
+             FROM model_calls m WHERE m.session_id = ?1",
+        );
+        let mut args = vec![SqlValue::Text(id.clone())];
+        if let Some((ts, cursor_id)) = cursor {
+            sql.push_str(" AND (m.started_at > ?2 OR (m.started_at = ?2 AND m.id > ?3))");
+            args.push(SqlValue::Text(ts));
+            args.push(SqlValue::Text(cursor_id));
+        }
+        if let Some(limit) = paginated {
+            let ph = args.len() + 1;
+            sql.push_str(&format!(" ORDER BY m.started_at, m.id LIMIT ?{ph}"));
+            args.push(SqlValue::Integer(limit as i64 + 1));
+        } else {
+            // 旧调用：保持原排序与无分页字段。
+            sql.push_str(" ORDER BY m.started_at");
+        }
+
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "model": r.get::<_, Option<String>>(1)?,
+                "provider": r.get::<_, Option<String>>(2)?,
+                "started_at": r.get::<_, String>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "input_tokens": r.get::<_, Option<i64>>(5)?,
+                "output_tokens": r.get::<_, Option<i64>>(6)?,
+                "cache_read_tokens": r.get::<_, Option<i64>>(7)?,
+                "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
+                "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
+                "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
+                "estimated_cost_micro_usd": r.get::<_, Option<i64>>(11)?,
+                "duration_ms": r.get::<_, Option<i64>>(12)?,
+                "ttft_ms": r.get::<_, Option<i64>>(13)?,
+                "output_tokens_per_second_milli": r.get::<_, Option<i64>>(14)?,
+                "observability_source": r.get::<_, Option<String>>(15)?,
+                "observability_quality": r.get::<_, Option<String>>(16)?,
+                "observed_request_payload_bytes": r.get::<_, Option<i64>>(17)?,
+                "observed_response_payload_bytes": r.get::<_, Option<i64>>(18)?,
+                "observed_request_wire_bytes": r.get::<_, Option<i64>>(19)?,
+                "observed_response_wire_bytes": r.get::<_, Option<i64>>(20)?,
+                "first_byte_latency_ms": r.get::<_, Option<i64>>(21)?,
+                "generation_duration_ms": r.get::<_, Option<i64>>(22)?,
+                "inter_token_latency_avg_ms": r.get::<_, Option<i64>>(23)?,
+                "inter_token_latency_p95_ms": r.get::<_, Option<i64>>(24)?,
+                "stall_count": r.get::<_, Option<i64>>(25)?,
+                "stall_duration_ms": r.get::<_, Option<i64>>(26)?,
+                "status_code": r.get::<_, Option<i64>>(27)?,
+                "endpoint": r.get::<_, Option<String>>(28)?,
+                "finish_reason": r.get::<_, Option<String>>(29)?,
+                "error_kind": r.get::<_, Option<String>>(30)?,
+                "rate_limited": r.get::<_, Option<bool>>(31)?,
+                "retry_count": r.get::<_, Option<i64>>(32)?,
+                "_usage_event_id": r.get::<_, Option<String>>(33)?,
+            }))
+        }));
+        let mut calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let total: Option<i64> = paginated.map(|_| {
+            c.query_row(
+                "SELECT COUNT(*) FROM model_calls WHERE session_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        });
+        let has_more = paginated.is_some_and(|limit| calls.len() > limit);
+        if let Some(limit) = paginated {
+            calls.truncate(limit);
+        }
+        attach_usage_costs(&c, &mut calls);
+        let next_cursor = has_more
+            .then(|| {
+                calls.last().and_then(|call| {
+                    let ts = call.get("started_at")?.as_str()?;
+                    let call_id = call.get("id")?.as_str()?;
+                    Some(encode_cursor(ts, call_id))
+                })
+            })
+            .flatten();
+
+        if paginated.is_some() {
+            Json(serde_json::json!({
+                "calls": calls,
+                "next_cursor": next_cursor,
+                "total": total.unwrap_or(0),
+                "has_more": has_more,
+            }))
+            .into_response()
+        } else {
+            Json(serde_json::json!({ "calls": calls })).into_response()
+        }
+    })
+    .await
 }
 
 pub(crate) async fn session_tools(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(p): Query<PageParams>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT id, name, tool_type, status, input_length, output_length, started_at, completed_at, error FROM tool_events WHERE session_id = ?1 ORDER BY started_at",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "name": r.get::<_, String>(1)?,
-            "tool_type": r.get::<_, String>(2)?,
-            "status": r.get::<_, String>(3)?,
-            "input_length": r.get::<_, i64>(4)?,
-            "output_length": r.get::<_, i64>(5)?,
-            "started_at": r.get::<_, String>(6)?,
-            "completed_at": r.get::<_, Option<String>>(7)?,
-            "error": r.get::<_, Option<String>>(8)?,
-        }))
-    }));
-    let tools: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "tools": tools })).into_response()
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let paginated = match page_limit(&p) {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_limit", &e),
+        };
+        let cursor = match p.cursor.as_deref().map(decode_call_cursor).transpose() {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", &e),
+        };
+
+        let mut sql = String::from(
+            "SELECT id, name, tool_type, status, input_length, output_length, started_at, completed_at, error
+             FROM tool_events WHERE session_id = ?1",
+        );
+        let mut args = vec![SqlValue::Text(id.clone())];
+        if let Some((ts, cursor_id)) = cursor {
+            sql.push_str(" AND (started_at > ?2 OR (started_at = ?2 AND id > ?3))");
+            args.push(SqlValue::Text(ts));
+            args.push(SqlValue::Text(cursor_id));
+        }
+        if let Some(limit) = paginated {
+            let ph = args.len() + 1;
+            sql.push_str(&format!(" ORDER BY started_at, id LIMIT ?{ph}"));
+            args.push(SqlValue::Integer(limit as i64 + 1));
+        } else {
+            sql.push_str(" ORDER BY started_at");
+        }
+
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args), |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "name": r.get::<_, String>(1)?,
+                "tool_type": r.get::<_, String>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "input_length": r.get::<_, i64>(4)?,
+                "output_length": r.get::<_, i64>(5)?,
+                "started_at": r.get::<_, String>(6)?,
+                "completed_at": r.get::<_, Option<String>>(7)?,
+                "error": r.get::<_, Option<String>>(8)?,
+            }))
+        }));
+        let mut tools: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+        let total: Option<i64> = paginated.map(|_| {
+            c.query_row(
+                "SELECT COUNT(*) FROM tool_events WHERE session_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        });
+        let has_more = paginated.is_some_and(|limit| tools.len() > limit);
+        if let Some(limit) = paginated {
+            tools.truncate(limit);
+        }
+        let next_cursor = has_more
+            .then(|| {
+                tools.last().and_then(|tool| {
+                    let ts = tool.get("started_at")?.as_str()?;
+                    let tool_id = tool.get("id")?.as_str()?;
+                    Some(encode_cursor(ts, tool_id))
+                })
+            })
+            .flatten();
+
+        if paginated.is_some() {
+            Json(serde_json::json!({
+                "tools": tools,
+                "next_cursor": next_cursor,
+                "total": total.unwrap_or(0),
+                "has_more": has_more,
+            }))
+            .into_response()
+        } else {
+            Json(serde_json::json!({ "tools": tools })).into_response()
+        }
+    })
+    .await
 }
 
 pub(crate) async fn session_subagents(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let c = st.db.conn();
-    // 同一子会话只保留最早一条关系（历史 Agent 曾按扫描轮次重复写入）
-    let mut stmt = q!(c.prepare(
-        "SELECT MIN(id) AS id, child_session_id, MIN(relation) AS relation, MIN(created_at) AS created_at
-         FROM subagent_relations WHERE session_id = ?1
-         GROUP BY child_session_id ORDER BY MIN(created_at)",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "child_session_id": r.get::<_, String>(1)?,
-            "relation": r.get::<_, String>(2)?,
-            "created_at": r.get::<_, String>(3)?,
-        }))
-    }));
-    let rels: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        // 同一子会话只保留最早一条关系（历史 Agent 曾按扫描轮次重复写入）
+        let mut stmt = q!(c.prepare(
+            "SELECT MIN(id) AS id, child_session_id, MIN(relation) AS relation, MIN(created_at) AS created_at
+             FROM subagent_relations WHERE session_id = ?1
+             GROUP BY child_session_id ORDER BY MIN(created_at)",
+        ));
+        let rows = q!(stmt.query_map([&id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "child_session_id": r.get::<_, String>(1)?,
+                "relation": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+            }))
+        }));
+        let rels: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
-    // 解析子会话摘要（按 id 或 source_session_id 匹配）
-    let child_ids: Vec<String> = rels
-        .iter()
-        .filter_map(|r| {
-            r.get("child_session_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .collect();
-    let (children, totals): (Vec<serde_json::Value>, serde_json::Value) = if child_ids.is_empty() {
-        (Vec::new(), serde_json::Value::Null)
-    } else {
-        let placeholders = child_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id, source_session_id, title, primary_model_normalized, message_count, tool_call_count, model_call_count,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                    reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
-                    started_at, last_activity_at, status,
-                    CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
-                         THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms
-             FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})
-             ORDER BY started_at, id"
-        );
-        let mut params: Vec<&str> = Vec::new();
-        for id in &child_ids {
-            params.push(id);
-        }
-        for id in &child_ids {
-            params.push(id);
-        }
-        let mut stmt = q!(c.prepare(&sql));
-        let rows = q!(
-            stmt.query_map(params_from_iter(params.iter().copied()), |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "source_session_id": r.get::<_, String>(1)?,
-                    "title": r.get::<_, Option<String>>(2)?,
-                    "model": r.get::<_, Option<String>>(3)?,
-                    "message_count": r.get::<_, i64>(4)?,
-                    "tool_call_count": r.get::<_, i64>(5)?,
-                    "model_call_count": r.get::<_, i64>(6)?,
-                    "input_tokens": r.get::<_, Option<i64>>(7)?,
-                    "output_tokens": r.get::<_, Option<i64>>(8)?,
-                    "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
-                    "cache_write_tokens": r.get::<_, Option<i64>>(10)?,
-                    "reasoning_tokens": r.get::<_, Option<i64>>(11)?,
-                    "reported_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
-                    "calculated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
-                    "estimated_cost_micro_usd": r.get::<_, Option<i64>>(14)?,
-                    "started_at": r.get::<_, String>(15)?,
-                    "last_activity_at": r.get::<_, Option<String>>(16)?,
-                    "status": r.get::<_, String>(17)?,
-                    "duration_ms": r.get::<_, Option<i64>>(18)?,
-                }))
+        // 解析子会话摘要（按 id 或 source_session_id 匹配）
+        let child_ids: Vec<String> = rels
+            .iter()
+            .filter_map(|r| {
+                r.get("child_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
             })
-        );
-        let children: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-        // 合计：Token 直接求和；费用沿用列表口径（calculated 优先、回退 estimated），
-        // 任一子会话有可用费用才给出合计，否则为不可用。
-        let sum_opt = |key: &str| -> i64 {
-            children
-                .iter()
-                .map(|c| c.get(key).and_then(|v| v.as_i64()).unwrap_or(0))
-                .sum()
-        };
-        let mut cost_total = 0i64;
-        let mut cost_available = false;
-        let mut reported_total = 0i64;
-        let mut calculated_total = 0i64;
-        let mut estimated_total = 0i64;
-        for child in &children {
-            let reported = child
-                .get("reported_cost_micro_usd")
-                .and_then(|v| v.as_i64());
-            let calculated = child
-                .get("calculated_cost_micro_usd")
-                .and_then(|v| v.as_i64());
-            let estimated = child
-                .get("estimated_cost_micro_usd")
-                .and_then(|v| v.as_i64());
-            reported_total += reported.unwrap_or(0);
-            calculated_total += calculated.unwrap_or(0);
-            estimated_total += estimated.unwrap_or(0);
-            if let Some(cost) = calculated.or(estimated) {
-                cost_total += cost;
-                cost_available = true;
+            .collect();
+        let (children, totals): (Vec<serde_json::Value>, serde_json::Value) = if child_ids.is_empty() {
+            (Vec::new(), serde_json::Value::Null)
+        } else {
+            let placeholders = child_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, source_session_id, title, primary_model_normalized, message_count, tool_call_count, model_call_count,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                        reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
+                        started_at, last_activity_at, status,
+                        CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
+                             THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms
+                 FROM sessions WHERE id IN ({placeholders}) OR source_session_id IN ({placeholders})
+                 ORDER BY started_at, id"
+            );
+            let mut params: Vec<&str> = Vec::new();
+            for id in &child_ids {
+                params.push(id);
             }
-        }
-        let totals = serde_json::json!({
-            "children": children.len(),
-            "model_calls": sum_opt("model_call_count"),
-            "messages": sum_opt("message_count"),
-            "input_tokens": sum_opt("input_tokens"),
-            "output_tokens": sum_opt("output_tokens"),
-            "cache_read_tokens": sum_opt("cache_read_tokens"),
-            "cache_write_tokens": sum_opt("cache_write_tokens"),
-            "reasoning_tokens": sum_opt("reasoning_tokens"),
-            "cost_micro_usd": if cost_available { serde_json::json!(cost_total) } else { serde_json::Value::Null },
-            "reported_cost_micro_usd": if reported_total > 0 { serde_json::json!(reported_total) } else { serde_json::Value::Null },
-            "calculated_cost_micro_usd": if calculated_total > 0 { serde_json::json!(calculated_total) } else { serde_json::Value::Null },
-            "estimated_cost_micro_usd": if estimated_total > 0 { serde_json::json!(estimated_total) } else { serde_json::Value::Null },
-        });
-        (children, totals)
-    };
+            for id in &child_ids {
+                params.push(id);
+            }
+            let mut stmt = q!(c.prepare(&sql));
+            let rows = q!(
+                stmt.query_map(params_from_iter(params.iter().copied()), |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_session_id": r.get::<_, String>(1)?,
+                        "title": r.get::<_, Option<String>>(2)?,
+                        "model": r.get::<_, Option<String>>(3)?,
+                        "message_count": r.get::<_, i64>(4)?,
+                        "tool_call_count": r.get::<_, i64>(5)?,
+                        "model_call_count": r.get::<_, i64>(6)?,
+                        "input_tokens": r.get::<_, Option<i64>>(7)?,
+                        "output_tokens": r.get::<_, Option<i64>>(8)?,
+                        "cache_read_tokens": r.get::<_, Option<i64>>(9)?,
+                        "cache_write_tokens": r.get::<_, Option<i64>>(10)?,
+                        "reasoning_tokens": r.get::<_, Option<i64>>(11)?,
+                        "reported_cost_micro_usd": r.get::<_, Option<i64>>(12)?,
+                        "calculated_cost_micro_usd": r.get::<_, Option<i64>>(13)?,
+                        "estimated_cost_micro_usd": r.get::<_, Option<i64>>(14)?,
+                        "started_at": r.get::<_, String>(15)?,
+                        "last_activity_at": r.get::<_, Option<String>>(16)?,
+                        "status": r.get::<_, String>(17)?,
+                        "duration_ms": r.get::<_, Option<i64>>(18)?,
+                    }))
+                })
+            );
+            let children: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
+            // 合计：Token 直接求和；费用沿用列表口径（calculated 优先、回退 estimated），
+            // 任一子会话有可用费用才给出合计，否则为不可用。
+            let sum_opt = |key: &str| -> i64 {
+                children
+                    .iter()
+                    .map(|c| c.get(key).and_then(|v| v.as_i64()).unwrap_or(0))
+                    .sum()
+            };
+            let mut cost_total = 0i64;
+            let mut cost_available = false;
+            let mut reported_total = 0i64;
+            let mut calculated_total = 0i64;
+            let mut estimated_total = 0i64;
+            for child in &children {
+                let reported = child
+                    .get("reported_cost_micro_usd")
+                    .and_then(|v| v.as_i64());
+                let calculated = child
+                    .get("calculated_cost_micro_usd")
+                    .and_then(|v| v.as_i64());
+                let estimated = child
+                    .get("estimated_cost_micro_usd")
+                    .and_then(|v| v.as_i64());
+                reported_total += reported.unwrap_or(0);
+                calculated_total += calculated.unwrap_or(0);
+                estimated_total += estimated.unwrap_or(0);
+                if let Some(cost) = calculated.or(estimated) {
+                    cost_total += cost;
+                    cost_available = true;
+                }
+            }
+            let totals = serde_json::json!({
+                "children": children.len(),
+                "model_calls": sum_opt("model_call_count"),
+                "messages": sum_opt("message_count"),
+                "input_tokens": sum_opt("input_tokens"),
+                "output_tokens": sum_opt("output_tokens"),
+                "cache_read_tokens": sum_opt("cache_read_tokens"),
+                "cache_write_tokens": sum_opt("cache_write_tokens"),
+                "reasoning_tokens": sum_opt("reasoning_tokens"),
+                "cost_micro_usd": if cost_available { serde_json::json!(cost_total) } else { serde_json::Value::Null },
+                "reported_cost_micro_usd": if reported_total > 0 { serde_json::json!(reported_total) } else { serde_json::Value::Null },
+                "calculated_cost_micro_usd": if calculated_total > 0 { serde_json::json!(calculated_total) } else { serde_json::Value::Null },
+                "estimated_cost_micro_usd": if estimated_total > 0 { serde_json::json!(estimated_total) } else { serde_json::Value::Null },
+            });
+            (children, totals)
+        };
 
-    Json(serde_json::json!({ "relations": rels, "children": children, "totals": totals }))
-        .into_response()
+        Json(serde_json::json!({ "relations": rels, "children": children, "totals": totals }))
+            .into_response()
+    })
+    .await
 }
 
 pub(crate) async fn session_timeline(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(p): Query<PageParams>,
 ) -> Response {
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(
-        "SELECT id, role, content_type, content, content_length, utf8_bytes, created_at, redacted FROM messages WHERE session_id = ?1 ORDER BY sequence",
-    ));
-    let rows = q!(stmt.query_map([&id], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, String>(0)?,
-            "role": r.get::<_, String>(1)?,
-            "content_type": r.get::<_, String>(2)?,
-            "content": r.get::<_, Option<String>>(3)?,
-            "content_length": r.get::<_, i64>(4)?,
-            "utf8_bytes": r.get::<_, i64>(5)?,
-            "created_at": r.get::<_, String>(6)?,
-            "redacted": r.get::<_, i64>(7)?,
+    run_blocking(move || {
+        let c = st.db.read_conn();
+        let paginated = match page_limit(&p) {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_limit", &e),
+        };
+        let cursor = match p.cursor.as_deref().map(decode_sequence_cursor).transpose() {
+            Ok(v) => v,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, "invalid_cursor", &e),
+        };
+
+        let mut sql = String::from(
+            "SELECT sequence, id, role, content_type, content, content_length, utf8_bytes, created_at, redacted
+             FROM messages WHERE session_id = ?1",
+        );
+        let mut args = vec![SqlValue::Text(id.clone())];
+        if let Some((sequence, cursor_id)) = cursor {
+            sql.push_str(" AND (sequence > ?2 OR (sequence = ?2 AND id > ?3))");
+            args.push(SqlValue::Integer(sequence));
+            args.push(SqlValue::Text(cursor_id));
+        }
+        if let Some(limit) = paginated {
+            let ph = args.len() + 1;
+            sql.push_str(&format!(" ORDER BY sequence, id LIMIT ?{ph}"));
+            args.push(SqlValue::Integer(limit as i64 + 1));
+        } else {
+            sql.push_str(" ORDER BY sequence, id");
+        }
+
+        let mut stmt = q!(c.prepare(&sql));
+        let rows = q!(stmt.query_map(params_from_iter(args), |r| {
+            let sequence = r.get::<_, i64>(0)?;
+            Ok((
+                sequence,
+                serde_json::json!({
+                    "id": r.get::<_, String>(1)?,
+                    "role": r.get::<_, String>(2)?,
+                    "content_type": r.get::<_, String>(3)?,
+                    "content": r.get::<_, Option<String>>(4)?,
+                    "content_length": r.get::<_, i64>(5)?,
+                    "utf8_bytes": r.get::<_, i64>(6)?,
+                    "created_at": r.get::<_, String>(7)?,
+                    "redacted": r.get::<_, i64>(8)?,
+                }),
+            ))
+        }));
+        let mut rows: Vec<(i64, serde_json::Value)> = rows.filter_map(|r| r.ok()).collect();
+        let total: Option<i64> = paginated.map(|_| {
+            c.query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        });
+        let has_more = paginated.is_some_and(|limit| rows.len() > limit);
+        if let Some(limit) = paginated {
+            rows.truncate(limit);
+        }
+        let next_cursor = has_more
+            .then(|| {
+                rows.last().and_then(|(sequence, value)| {
+                    let id = value.get("id").and_then(|v| v.as_str())?;
+                    Some(encode_cursor(&sequence.to_string(), id))
+                })
+            })
+            .flatten();
+        let messages: Vec<serde_json::Value> = rows.into_iter().map(|(_, value)| value).collect();
+
+        if paginated.is_some() {
+            Json(serde_json::json!({
+                "messages": messages,
+                "next_cursor": next_cursor,
+                "total": total.unwrap_or(0),
+                "has_more": has_more,
+            }))
+            .into_response()
+        } else {
+            Json(serde_json::json!({ "messages": messages })).into_response()
+        }
+    })
+    .await
+}
+
+/// GET /sessions/{id}/stats：会话全量统计，供趋势图与错误统计使用。
+pub(crate) async fn session_stats(
+    State(st): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(p): Query<StatsParams>,
+) -> Response {
+    run_blocking(move || {
+        let granularity = match p.granularity.as_deref() {
+            None | Some("hour") => "hour",
+            Some("day") => "day",
+            Some(_) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_granularity",
+                    "granularity 仅支持 hour 或 day",
+                )
+            }
+        };
+        let c = st.db.read_conn();
+
+        let mut status_counts: Vec<serde_json::Value> = Vec::new();
+        let mut call_count = 0i64;
+        let mut error_count = 0i64;
+        let mut status_stmt = q!(c.prepare(
+            "SELECT status, COUNT(*) FROM model_calls WHERE session_id = ?1
+             GROUP BY status ORDER BY COUNT(*) DESC, status"
+        ));
+        let status_rows = q!(status_stmt.query_map([&id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        }));
+        for row in status_rows.flatten() {
+            call_count += row.1;
+            if !matches!(row.0.as_str(), "success" | "ok" | "completed") {
+                error_count += row.1;
+            }
+            status_counts.push(serde_json::json!({
+                "status": row.0,
+                "count": row.1,
+            }));
+        }
+
+        let bucket_expr = if granularity == "day" {
+            "strftime('%Y-%m-%d', started_at)"
+        } else {
+            "strftime('%Y-%m-%dT%H:00:00+00:00', started_at)"
+        };
+        let mut series_stmt = q!(c.prepare(&format!(
+            "SELECT COALESCE({bucket_expr}, 'unavailable') AS b,
+                    COUNT(*),
+                    SUM(CASE WHEN status IN ('success','ok','completed') THEN 0 ELSE 1 END),
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    SUM(COALESCE(reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd)),
+                    COUNT(COALESCE(reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd)),
+                    SUM(duration_ms),
+                    COUNT(duration_ms),
+                    AVG(duration_ms)
+             FROM model_calls WHERE session_id = ?1
+             GROUP BY b ORDER BY b"
+        )));
+        let series_rows = q!(series_stmt.query_map([&id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, i64>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, Option<f64>>(12)?,
+            ))
+        }));
+        let series: Vec<serde_json::Value> = series_rows
+            .flatten()
+            .map(
+                |(
+                    bucket,
+                    calls,
+                    errors,
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                    reasoning,
+                    cost,
+                    cost_count,
+                    duration,
+                    duration_count,
+                    avg_duration,
+                )| {
+                    serde_json::json!({
+                        "bucket": bucket,
+                        "call_count": calls,
+                        "error_count": errors,
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_read_tokens": cache_read,
+                        "cache_write_tokens": cache_write,
+                        "reasoning_tokens": reasoning,
+                        "cost_micro_usd": if cost_count > 0 { cost.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null },
+                        "duration_ms": if duration_count > 0 { duration.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null },
+                        "avg_duration_ms": if duration_count > 0 { avg_duration.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null },
+                        "duration_samples": duration_count,
+                    })
+                },
+            )
+            .collect();
+
+        Json(serde_json::json!({
+            "call_count": call_count,
+            "error_count": error_count,
+            "status_counts": status_counts,
+            "granularity": granularity,
+            "series": series,
         }))
-    }));
-    let messages: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    Json(serde_json::json!({ "messages": messages })).into_response()
+        .into_response()
+    })
+    .await
 }
 
 /// 调用时长的口径异常检测（防线，不是修复手段）。
@@ -2940,187 +3671,190 @@ pub(crate) async fn data_quality(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let c = st.db.conn();
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let c = st.db.read_conn();
 
-    // 用量来源分布：仅统计 Usage 行（Call/Session 行不带 Token 与 usage_source），
-    // 按来源汇总 Token 构成，避免与调用计数混在一张表里产生镜像行。
-    let mut usage_dist = Vec::new();
-    if let Ok(mut stmt) = c.prepare(
-        "SELECT usage_source,
-                COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
-                COALESCE(SUM(reasoning_tokens),0)
-         FROM hourly_rollups
-         WHERE julianday(bucket) >= julianday(?1) AND julianday(bucket) < julianday(?2)
-           AND usage_source != ''
-         GROUP BY usage_source
-         ORDER BY 2 DESC, 1",
-    ) {
-        if let Ok(rows) = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        }) {
-            for row in rows.flatten() {
-                usage_dist.push(serde_json::json!({
-                    "usage_source": row.0,
-                    "tokens": row.1,
-                    "output_tokens": row.2,
-                    "cache_read_tokens": row.3,
-                    "cache_write_tokens": row.4,
-                    "reasoning_tokens": row.5,
-                }));
-            }
-        }
-    }
-
-    let parse_warnings = c
-        .query_row("SELECT COUNT(*) FROM source_errors", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .unwrap_or(0);
-
-    // 来源错误明细（S3.8）
-    let source_errors: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT id, source_id, phase, severity, pattern, sample_count, first_seen_at, last_seen_at, last_message
-             FROM source_errors ORDER BY last_seen_at DESC LIMIT 100",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "source_id": r.get::<_, String>(1)?,
-                    "phase": r.get::<_, String>(2)?,
-                    "severity": r.get::<_, String>(3)?,
-                    "pattern": r.get::<_, String>(4)?,
-                    "sample_count": r.get::<_, i64>(5)?,
-                    "first_seen_at": r.get::<_, String>(6)?,
-                    "last_seen_at": r.get::<_, String>(7)?,
-                    "last_message": r.get::<_, String>(8)?,
-                }))
+        // 用量来源分布：仅统计 Usage 行（Call/Session 行不带 Token 与 usage_source），
+        // 按来源汇总 Token 构成，避免与调用计数混在一张表里产生镜像行。
+        let mut usage_dist = Vec::new();
+        if let Ok(mut stmt) = c.prepare(
+            "SELECT usage_source,
+                    COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0)
+             FROM hourly_rollups
+             WHERE bucket >= ?1 AND bucket < ?2
+               AND usage_source != ''
+             GROUP BY usage_source
+             ORDER BY 2 DESC, 1",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
             }) {
-                out = rows.filter_map(|x| x.ok()).collect();
+                for row in rows.flatten() {
+                    usage_dist.push(serde_json::json!({
+                        "usage_source": row.0,
+                        "tokens": row.1,
+                        "output_tokens": row.2,
+                        "cache_read_tokens": row.3,
+                        "cache_write_tokens": row.4,
+                        "reasoning_tokens": row.5,
+                    }));
+                }
             }
         }
-        out
-    };
 
-    // 来源扫描状态（S3.8）：总数/健康/最近扫描
-    let source_scan = c
-        .query_row(
-            "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(last_scan_at),''),
-                COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
-             FROM sources",
-            [],
-            |r| {
-                Ok(serde_json::json!({
-                    "total": r.get::<_, i64>(0)?,
-                    "healthy": r.get::<_, i64>(1)?,
-                    "last_scan_at": r.get::<_, String>(2)?,
-                    "with_errors": r.get::<_, i64>(3)?,
-                }))
-            },
-        )
-        .unwrap_or(serde_json::json!({}));
+        let parse_warnings = c
+            .query_row("SELECT COUNT(*) FROM source_errors", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0);
 
-    // 时钟偏移告警（S3.8）：|skew| > 60s 视为异常
-    let clock_skew_warns: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT id, node_id, clock_skew_seconds, last_heartbeat_at
-             FROM collectors WHERE ABS(clock_skew_seconds) > 60 ORDER BY ABS(clock_skew_seconds) DESC LIMIT 50",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "collector_id": r.get::<_, String>(0)?,
-                    "node_id": r.get::<_, String>(1)?,
-                    "clock_skew_seconds": r.get::<_, i64>(2)?,
-                    "last_heartbeat_at": r.get::<_, String>(3)?,
-                }))
-            }) {
-                out = rows.filter_map(|x| x.ok()).collect();
+        // 来源错误明细（S3.8）
+        let source_errors: Vec<serde_json::Value> = {
+            let st = c.prepare(
+                "SELECT id, source_id, phase, severity, pattern, sample_count, first_seen_at, last_seen_at, last_message
+                 FROM source_errors ORDER BY last_seen_at DESC LIMIT 100",
+            );
+            let mut out = Vec::new();
+            if let Ok(mut st) = st {
+                if let Ok(rows) = st.query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_id": r.get::<_, String>(1)?,
+                        "phase": r.get::<_, String>(2)?,
+                        "severity": r.get::<_, String>(3)?,
+                        "pattern": r.get::<_, String>(4)?,
+                        "sample_count": r.get::<_, i64>(5)?,
+                        "first_seen_at": r.get::<_, String>(6)?,
+                        "last_seen_at": r.get::<_, String>(7)?,
+                        "last_message": r.get::<_, String>(8)?,
+                    }))
+                }) {
+                    out = rows.filter_map(|x| x.ok()).collect();
+                }
             }
-        }
-        out
-    };
+            out
+        };
 
-    // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康 + 最近数据新鲜度）
-    let cursor_status: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT id, client_id, adapter_id, status, last_scan_at, last_error, last_event_at
-             FROM sources
-             ORDER BY COALESCE(last_event_at,'') DESC, last_scan_at DESC
-             LIMIT 100",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "source_id": r.get::<_, String>(0)?,
-                    "client_id": r.get::<_, String>(1)?,
-                    "adapter_id": r.get::<_, String>(2)?,
-                    "status": r.get::<_, String>(3)?,
-                    "last_scan_at": r.get::<_, Option<String>>(4)?,
-                    "last_error": r.get::<_, Option<String>>(5)?,
-                    "last_event_at": r.get::<_, Option<String>>(6)?,
-                }))
-            }) {
-                out = rows.filter_map(|x| x.ok()).collect();
+        // 来源扫描状态（S3.8）：总数/健康/最近扫描
+        let source_scan = c
+            .query_row(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END),0),
+                    COALESCE(MAX(last_scan_at),''),
+                    COALESCE(SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END),0)
+                 FROM sources",
+                [],
+                |r| {
+                    Ok(serde_json::json!({
+                        "total": r.get::<_, i64>(0)?,
+                        "healthy": r.get::<_, i64>(1)?,
+                        "last_scan_at": r.get::<_, String>(2)?,
+                        "with_errors": r.get::<_, i64>(3)?,
+                    }))
+                },
+            )
+            .unwrap_or(serde_json::json!({}));
+
+        // 时钟偏移告警（S3.8）：|skew| > 60s 视为异常
+        let clock_skew_warns: Vec<serde_json::Value> = {
+            let st = c.prepare(
+                "SELECT id, node_id, clock_skew_seconds, last_heartbeat_at
+                 FROM collectors WHERE ABS(clock_skew_seconds) > 60 ORDER BY ABS(clock_skew_seconds) DESC LIMIT 50",
+            );
+            let mut out = Vec::new();
+            if let Ok(mut st) = st {
+                if let Ok(rows) = st.query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "collector_id": r.get::<_, String>(0)?,
+                        "node_id": r.get::<_, String>(1)?,
+                        "clock_skew_seconds": r.get::<_, i64>(2)?,
+                        "last_heartbeat_at": r.get::<_, String>(3)?,
+                    }))
+                }) {
+                    out = rows.filter_map(|x| x.ok()).collect();
+                }
             }
-        }
-        out
-    };
+            out
+        };
 
-    // S3.8：告警（spool 满/死信 → Hub 侧以严重 source_errors 与解析错误为代表）
-    let alerts: Vec<serde_json::Value> = {
-        let st = c.prepare(
-            "SELECT id, source_id, phase, severity, pattern, sample_count, last_seen_at
-             FROM source_errors WHERE severity IN ('error','critical') ORDER BY last_seen_at DESC LIMIT 50",
-        );
-        let mut out = Vec::new();
-        if let Ok(mut st) = st {
-            if let Ok(rows) = st.query_map([], |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "source_id": r.get::<_, String>(1)?,
-                    "phase": r.get::<_, String>(2)?,
-                    "severity": r.get::<_, String>(3)?,
-                    "pattern": r.get::<_, String>(4)?,
-                    "sample_count": r.get::<_, i64>(5)?,
-                    "last_seen_at": r.get::<_, String>(6)?,
-                }))
-            }) {
-                out = rows.filter_map(|x| x.ok()).collect();
+        // S3.8：Source cursor 状态（来自 sources 表：scan/cursor 健康 + 最近数据新鲜度）
+        let cursor_status: Vec<serde_json::Value> = {
+            let st = c.prepare(
+                "SELECT id, client_id, adapter_id, status, last_scan_at, last_error, last_event_at
+                 FROM sources
+                 ORDER BY COALESCE(last_event_at,'') DESC, last_scan_at DESC
+                 LIMIT 100",
+            );
+            let mut out = Vec::new();
+            if let Ok(mut st) = st {
+                if let Ok(rows) = st.query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "source_id": r.get::<_, String>(0)?,
+                        "client_id": r.get::<_, String>(1)?,
+                        "adapter_id": r.get::<_, String>(2)?,
+                        "status": r.get::<_, String>(3)?,
+                        "last_scan_at": r.get::<_, Option<String>>(4)?,
+                        "last_error": r.get::<_, Option<String>>(5)?,
+                        "last_event_at": r.get::<_, Option<String>>(6)?,
+                    }))
+                }) {
+                    out = rows.filter_map(|x| x.ok()).collect();
+                }
             }
-        }
-        out
-    };
+            out
+        };
 
-    // 时长口径异常检测（防线，不是修复）：见 duration_outliers 的阈值依据说明。
-    let duration_outliers = duration_outliers(&c, from, to, &p);
+        // S3.8：告警（spool 满/死信 → Hub 侧以严重 source_errors 与解析错误为代表）
+        let alerts: Vec<serde_json::Value> = {
+            let st = c.prepare(
+                "SELECT id, source_id, phase, severity, pattern, sample_count, last_seen_at
+                 FROM source_errors WHERE severity IN ('error','critical') ORDER BY last_seen_at DESC LIMIT 50",
+            );
+            let mut out = Vec::new();
+            if let Ok(mut st) = st {
+                if let Ok(rows) = st.query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "source_id": r.get::<_, String>(1)?,
+                        "phase": r.get::<_, String>(2)?,
+                        "severity": r.get::<_, String>(3)?,
+                        "pattern": r.get::<_, String>(4)?,
+                        "sample_count": r.get::<_, i64>(5)?,
+                        "last_seen_at": r.get::<_, String>(6)?,
+                    }))
+                }) {
+                    out = rows.filter_map(|x| x.ok()).collect();
+                }
+            }
+            out
+        };
 
-    Json(serde_json::json!({
-        "usage_distribution": usage_dist,
-        "parse_warnings": parse_warnings,
-        "source_errors": source_errors,
-        "source_scan": source_scan,
-        "clock_skew_warnings": clock_skew_warns,
-        "cursor_status": cursor_status,
-        "alerts": alerts,
-        "duration_outliers": duration_outliers,
-    }))
-    .into_response()
+        // 时长口径异常检测（防线，不是修复）：见 duration_outliers 的阈值依据说明。
+        let duration_outliers = duration_outliers(&c, from, to, &p);
+
+        Json(serde_json::json!({
+            "usage_distribution": usage_dist,
+            "parse_warnings": parse_warnings,
+            "source_errors": source_errors,
+            "source_scan": source_scan,
+            "clock_skew_warnings": clock_skew_warns,
+            "cursor_status": cursor_status,
+            "alerts": alerts,
+            "duration_outliers": duration_outliers,
+        }))
+        .into_response()
+    })
+    .await
 }
 
 /// 延迟分位数统计：范围内 model_calls.duration_ms 的 P50/P95/P99。
@@ -3129,29 +3863,32 @@ pub(crate) async fn usage_latency(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let (mc_filter, mc_fargs) = range_filter_usage(&p);
-    // 快速路径读小时级预聚合；带维度筛选或预聚合缺桶时回退明细。
-    // 两条路径共用 perfrollup 的累加逻辑，样本数、平均值精确，分位数为直方图近似。
-    let duration = match crate::perfrollup::fast_aggregate(&st.db, from, to, &mc_filter) {
-        Some(agg) => agg.duration,
-        None => {
-            let agg = q!(crate::perfrollup::scan_calls(
-                &st.db, from, to, &mc_filter, &mc_fargs
-            ));
-            agg.duration
-        }
-    };
-    Json(serde_json::json!({
-        "count": duration.count,
-        "p50_ms": duration.quantile(0.50),
-        "p95_ms": duration.quantile(0.95),
-        "p99_ms": duration.quantile(0.99),
-        "avg_ms": duration.avg(),
-        // 分位数由对数分箱直方图合并得出；count 与 avg_ms 为精确统计
-        "quantile_approx": true,
-    }))
-    .into_response()
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (mc_filter, mc_fargs) = range_filter_usage(&p);
+        // 快速路径读小时级预聚合；带维度筛选或预聚合缺桶时回退明细。
+        // 两条路径共用 perfrollup 的累加逻辑，样本数、平均值精确，分位数为直方图近似。
+        let duration = match crate::perfrollup::fast_aggregate(&st.db, from, to, &mc_filter) {
+            Some(agg) => agg.duration,
+            None => {
+                let agg = q!(crate::perfrollup::scan_calls(
+                    &st.db, from, to, &mc_filter, &mc_fargs
+                ));
+                agg.duration
+            }
+        };
+        Json(serde_json::json!({
+            "count": duration.count,
+            "p50_ms": duration.quantile(0.50),
+            "p95_ms": duration.quantile(0.95),
+            "p99_ms": duration.quantile(0.99),
+            "avg_ms": duration.avg(),
+            // 分位数由对数分箱直方图合并得出；count 与 avg_ms 为精确统计
+            "quantile_approx": true,
+        }))
+        .into_response()
+    })
+    .await
 }
 
 /// Runtime/日志性能指标；缺失字段保持 null，并按来源分别统计覆盖率。
@@ -3159,17 +3896,20 @@ pub(crate) async fn usage_performance(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let (filter, fargs) = range_filter_usage(&p);
-    // 快速路径读小时级预聚合（完整小时）；带维度筛选或预聚合缺桶时回退明细。
-    // 两条路径共用 perfrollup 的逐行累加逻辑，保证口径一致。
-    let acc = match crate::perfrollup::fast_aggregate(&st.db, from, to, &filter) {
-        Some(agg) => agg,
-        None => q!(crate::perfrollup::scan_calls(
-            &st.db, from, to, &filter, &fargs
-        )),
-    };
-    Json(performance_json(&acc)).into_response()
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let (filter, fargs) = range_filter_usage(&p);
+        // 快速路径读小时级预聚合（完整小时）；带维度筛选或预聚合缺桶时回退明细。
+        // 两条路径共用 perfrollup 的逐行累加逻辑，保证口径一致。
+        let acc = match crate::perfrollup::fast_aggregate(&st.db, from, to, &filter) {
+            Some(agg) => agg,
+            None => q!(crate::perfrollup::scan_calls(
+                &st.db, from, to, &filter, &fargs
+            )),
+        };
+        Json(performance_json(&acc)).into_response()
+    })
+    .await
 }
 
 /// 把聚合结果渲染成 `/usage/performance` 响应。
@@ -3265,62 +4005,145 @@ pub(crate) async fn usage_performance_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let bucket_secs = bucket_granularity(&p, from, to);
-    let (filter, fargs) = range_filter_usage(&p);
-    let c = st.db.conn();
-    let mut stmt = q!(c.prepare(&format!(
-        "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00',
-                    datetime((CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b,
-                ttft_ms, first_byte_latency_ms, generation_duration_ms,
-                output_tokens_per_second_milli, inter_token_latency_avg_ms
-         FROM model_calls
-         WHERE started_at >= ?1 AND started_at < ?2 {filter}"
-    )));
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<i64>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-            ))
-        })
-    );
-    let mut buckets: std::collections::HashMap<String, Vec<[Option<i64>; 5]>> = Default::default();
-    for row in rows.flatten() {
-        buckets
-            .entry(row.0)
-            .or_default()
-            .push([row.1, row.2, row.3, row.4, row.5]);
-    }
-    let mut points = Vec::new();
-    for (bucket, values) in buckets {
-        let avg = |index: usize| -> Option<i64> {
-            let values: Vec<i64> = values.iter().filter_map(|row| row[index]).collect();
-            if values.is_empty() {
-                None
-            } else {
-                Some(values.iter().sum::<i64>() / values.len() as i64)
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let bucket_secs = bucket_granularity(&p, from, to);
+        let (filter, fargs) = range_filter_usage(&p);
+        // 无维度筛选且分桶 ≥1 小时时，完整小时读性能预聚合；当前/缺失小时由
+        // fast_hours 按小时补明细。24 小时内的 5/15 分钟桶保持明细精确路径。
+        if should_use_perf_rollup(bucket_secs, &filter) {
+            if let Some(hours) = crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
+                let (points, _) = perf_hours_to_points(&hours, bucket_secs, "performance");
+                return Json(serde_json::json!({
+                    "series": fill_performance_timeseries(points, from, to, bucket_secs)
+                }))
+                .into_response();
             }
+        }
+        let c = st.db.read_conn();
+        let bucket_expr = if bucket_secs >= 86_400 {
+            "strftime('%Y-%m-%d', datetime((CAST(strftime('%s', started_at) AS INTEGER) / 86400) * 86400, 'unixepoch'))".to_string()
+        } else {
+            format!("strftime('%Y-%m-%dT%H:%M:%S+00:00', datetime((CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch'))")
         };
-        points.push(serde_json::json!({
-            "bucket": bucket,
-            "count": values.len(),
-            "ttft_avg_ms": avg(0),
-            "first_byte_avg_ms": avg(1),
-            "generation_avg_ms": avg(2),
-            "output_tokens_per_second_milli_avg": avg(3),
-            "inter_token_latency_avg_ms": avg(4),
-        }));
+        let mut stmt = q!(c.prepare(&format!(
+            "SELECT {bucket_expr} AS b,
+                    ttft_ms, first_byte_latency_ms, generation_duration_ms,
+                    output_tokens_per_second_milli, inter_token_latency_avg_ms
+             FROM model_calls
+             WHERE started_at >= ?1 AND started_at < ?2 {filter}"
+        )));
+        let rows = q!(
+            stmt.query_map(params_from_iter(range_args(&from, &to, fargs)), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
+            })
+        );
+        let mut buckets: std::collections::HashMap<String, Vec<[Option<i64>; 5]>> = Default::default();
+        for row in rows.flatten() {
+            buckets
+                .entry(row.0)
+                .or_default()
+                .push([row.1, row.2, row.3, row.4, row.5]);
+        }
+        let mut points = Vec::new();
+        for (bucket, values) in buckets {
+            let avg = |index: usize| -> Option<i64> {
+                let values: Vec<i64> = values.iter().filter_map(|row| row[index]).collect();
+                if values.is_empty() {
+                    None
+                } else {
+                    Some(values.iter().sum::<i64>() / values.len() as i64)
+                }
+            };
+            points.push(serde_json::json!({
+                "bucket": bucket,
+                "count": values.len(),
+                "ttft_avg_ms": avg(0),
+                "first_byte_avg_ms": avg(1),
+                "generation_avg_ms": avg(2),
+                "output_tokens_per_second_milli_avg": avg(3),
+                "inter_token_latency_avg_ms": avg(4),
+            }));
+        }
+        points.sort_by(|a, b| a["bucket"].as_str().cmp(&b["bucket"].as_str()));
+        Json(serde_json::json!({
+            "series": fill_performance_timeseries(points, from, to, bucket_secs)
+        }))
+        .into_response()
+    })
+    .await
+}
+
+/// 何时可从性能预聚合生成时序：无维度筛选且分桶不细于 1 小时。
+fn should_use_perf_rollup(bucket_secs: i64, filter: &str) -> bool {
+    bucket_secs >= 3600 && filter.trim().is_empty()
+}
+
+/// 时序桶键：与 `fill_*` 的补桶键保持一致（日粒度用日期，其余用 RFC3339）。
+fn timeseries_bucket_key(ts: DateTime<Utc>, bucket_secs: i64) -> String {
+    if bucket_secs >= 86_400 {
+        ts.format("%Y-%m-%d").to_string()
+    } else {
+        ts.to_rfc3339()
     }
-    points.sort_by(|a, b| a["bucket"].as_str().cmp(&b["bucket"].as_str()));
-    Json(serde_json::json!({
-        "series": fill_performance_timeseries(points, from, to, bucket_secs)
-    }))
-    .into_response()
+}
+
+/// 把 `fast_hours` 的逐小时 `PerfHour` 合并成目标时序桶（1 小时或 1 天）。
+///
+/// 返回 `(points, used_rollup)`；`used_rollup` 表示是否至少一个桶来自预聚合。
+/// 快路径内的明细补桶同样使用直方图，响应级近似标注由调用方决定。
+fn perf_hours_to_points(
+    hours: &[(DateTime<Utc>, crate::perfrollup::PerfHour, bool)],
+    bucket_secs: i64,
+    metric: &str,
+) -> (Vec<serde_json::Value>, bool) {
+    use std::collections::BTreeMap;
+
+    let mut merged: BTreeMap<String, crate::perfrollup::PerfHour> = BTreeMap::new();
+    let mut used_rollup = false;
+    for (bucket, hour, from_rollup) in hours {
+        used_rollup |= *from_rollup;
+        let start = floor_ts(*bucket, bucket_secs);
+        let key = timeseries_bucket_key(start, bucket_secs);
+        merged.entry(key).or_default().merge(hour);
+    }
+
+    let points = merged
+        .into_iter()
+        .map(|(bucket, hour)| {
+            if metric == "latency" {
+                serde_json::json!({
+                    "bucket": bucket,
+                    "count": hour.duration.count,
+                    "avg_ms": hour.duration.avg(),
+                    "p50_ms": hour.duration.quantile(0.50),
+                    "p95_ms": hour.duration.quantile(0.95),
+                    "p99_ms": hour.duration.quantile(0.99),
+                })
+            } else {
+                serde_json::json!({
+                    "bucket": bucket,
+                    "count": hour.call_count,
+                    "ttft_avg_ms": hour.ttft.avg(),
+                    "first_byte_avg_ms": hour.first_byte.avg(),
+                    "generation_avg_ms": hour.generation.avg(),
+                    "output_tokens_per_second_milli_avg": hour
+                        .speed
+                        .avg()
+                        .map(|value| (value * 1000.0).round() as i64),
+                    "inter_token_latency_avg_ms": hour.inter_token.avg(),
+                })
+            }
+        })
+        .collect();
+    (points, used_rollup)
 }
 
 fn fill_performance_timeseries(
@@ -3364,60 +4187,82 @@ pub(crate) async fn usage_latency_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    let (from, to) = parse_range(&p);
-    let bucket_secs = bucket_granularity(&p, from, to);
-    let (mc_filter, mc_fargs) = range_filter_usage(&p);
-    let c = st.db.conn();
-
-    // 按 started_at 分桶聚合 duration_ms；分位数在内存计算（与 usage_latency 一致），
-    // 空桶由 fill_timeseries 补齐且统计字段为 null（诚实展示，不填充 0）。
-    let mut stmt = q!(c.prepare(&format!(
-        "SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00',
-                    datetime((CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch')) AS b,
-                duration_ms
-             FROM model_calls
-             WHERE duration_ms IS NOT NULL AND started_at >= ?1 AND started_at < ?2 {mc_filter}
-             ORDER BY b, duration_ms"
-    )));
-    let mut per_bucket: std::collections::HashMap<String, Vec<i64>> = Default::default();
-    let rows = q!(
-        stmt.query_map(params_from_iter(range_args(&from, &to, mc_fargs)), |r| {
-            let b: String = r.get(0)?;
-            let d: i64 = r.get(1)?;
-            Ok((b, d))
-        })
-    );
-    for row in rows.flatten() {
-        per_bucket.entry(row.0).or_default().push(row.1);
-    }
-    let percentile = |sorted: &[i64], q: f64| -> Option<i64> {
-        let n = sorted.len();
-        if n == 0 {
-            return None;
+    run_blocking(move || {
+        let (from, to) = parse_range(&p);
+        let bucket_secs = bucket_granularity(&p, from, to);
+        let (mc_filter, mc_fargs) = range_filter_usage(&p);
+        // 无筛选且分桶 ≥1 小时：完整小时读性能预聚合，当前/缺失小时按小时补明细；
+        // 24 小时内的 5/15 分钟桶继续走明细精确分位数。
+        if should_use_perf_rollup(bucket_secs, &mc_filter) {
+            if let Some(hours) = crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
+                let (points, _used_rollup) = perf_hours_to_points(&hours, bucket_secs, "latency");
+                let filled = fill_latency_timeseries(points, from, to, bucket_secs);
+                // 快速路径内即使某些小时回退明细，也由直方图合并计算分位数（近似）；
+                // 纯明细路径在下方单独标 false。
+                return Json(serde_json::json!({
+                    "series": filled,
+                    "quantile_approx": true,
+                }))
+                .into_response();
+            }
         }
-        let idx = ((n as f64) * q).ceil() as usize;
-        Some(sorted[idx.saturating_sub(1).min(n - 1)])
-    };
+        let c = st.db.read_conn();
+        let bucket_expr = if bucket_secs >= 86_400 {
+            "strftime('%Y-%m-%d', datetime((CAST(strftime('%s', started_at) AS INTEGER) / 86400) * 86400, 'unixepoch'))".to_string()
+        } else {
+            format!("strftime('%Y-%m-%dT%H:%M:%S+00:00', datetime((CAST(strftime('%s', started_at) AS INTEGER) / {bucket_secs}) * {bucket_secs}, 'unixepoch'))")
+        };
 
-    let points: Vec<serde_json::Value> = per_bucket
-        .into_iter()
-        .map(|(bucket, mut values)| {
-            values.sort_unstable();
-            let count = values.len() as i64;
-            let sum: i64 = values.iter().sum();
-            serde_json::json!({
-                "bucket": bucket,
-                "count": count,
-                "avg_ms": if count > 0 { Some(sum / count) } else { None },
-                "p50_ms": percentile(&values, 0.50),
-                "p95_ms": percentile(&values, 0.95),
-                "p99_ms": percentile(&values, 0.99),
+        // 按 started_at 分桶聚合 duration_ms；分位数在内存计算（与 usage_latency 一致），
+        // 空桶由 fill_timeseries 补齐且统计字段为 null（诚实展示，不填充 0）。
+        let mut stmt = q!(c.prepare(&format!(
+            "SELECT {bucket_expr} AS b,
+                    duration_ms
+                 FROM model_calls
+                 WHERE duration_ms IS NOT NULL AND started_at >= ?1 AND started_at < ?2 {mc_filter}
+                 ORDER BY b, duration_ms"
+        )));
+        let mut per_bucket: std::collections::HashMap<String, Vec<i64>> = Default::default();
+        let rows = q!(
+            stmt.query_map(params_from_iter(range_args(&from, &to, mc_fargs)), |r| {
+                let b: String = r.get(0)?;
+                let d: i64 = r.get(1)?;
+                Ok((b, d))
             })
-        })
-        .collect();
-    let filled = fill_latency_timeseries(points, from, to, bucket_secs);
-    // 该接口仍在明细上按桶精确计算分位数，明确标注为非近似，避免前端误标「近似」。
-    Json(serde_json::json!({ "series": filled, "quantile_approx": false })).into_response()
+        );
+        for row in rows.flatten() {
+            per_bucket.entry(row.0).or_default().push(row.1);
+        }
+        let percentile = |sorted: &[i64], q: f64| -> Option<i64> {
+            let n = sorted.len();
+            if n == 0 {
+                return None;
+            }
+            let idx = ((n as f64) * q).ceil() as usize;
+            Some(sorted[idx.saturating_sub(1).min(n - 1)])
+        };
+
+        let points: Vec<serde_json::Value> = per_bucket
+            .into_iter()
+            .map(|(bucket, mut values)| {
+                values.sort_unstable();
+                let count = values.len() as i64;
+                let sum: i64 = values.iter().sum();
+                serde_json::json!({
+                    "bucket": bucket,
+                    "count": count,
+                    "avg_ms": if count > 0 { Some(sum / count) } else { None },
+                    "p50_ms": percentile(&values, 0.50),
+                    "p95_ms": percentile(&values, 0.95),
+                    "p99_ms": percentile(&values, 0.99),
+                })
+            })
+            .collect();
+        let filled = fill_latency_timeseries(points, from, to, bucket_secs);
+        // 该接口仍在明细上按桶精确计算分位数，明确标注为非近似，避免前端误标「近似」。
+        Json(serde_json::json!({ "series": filled, "quantile_approx": false })).into_response()
+    })
+    .await
 }
 
 /// 把延迟序列补齐为范围内完整 bucket 序列；缺失桶统计字段为 null。
@@ -3743,13 +4588,10 @@ fn add_json_number(body: &mut serde_json::Value, key: &str, delta: i64) {
 /// `from_ph`/`to_ph` 指定 from/to 绑定的参数序号（只使用这两个参数）。
 /// 明细侧无法提供的字段（usage_source/pricing_source、
 /// session/message/tool/turn/subagent 计数）以空串或 0 补齐。
-fn rollup_source_cte(from_ph: u8, to_ph: u8, from: DateTime<Utc>, to: DateTime<Utc>) -> String {
-    // 边缘判定原先对**每一行**执行 CAST(strftime(started_at))（解析整个时间戳），
-    // 30 天范围 17.5 万行上是 breakdown/timeseries 各 ~70ms 的主要来源。
-    // 改用 13 位小时前缀 `YYYY-MM-DDTHH` 比较：与 `Z` / `+00:00` 尾缀无关，
-    // 也不需要解析时间戳，语义仍是「整点小时落在 [ceil(from), floor(to)) 内的走 rollup」。
-    let full_from = ceil_hour(from).format("%Y-%m-%dT%H").to_string();
-    let full_to = floor_hour(to).format("%Y-%m-%dT%H").to_string();
+fn rollup_source_cte(from_ph: u8, to_ph: u8, h_from_ph: u8, h_to_ph: u8) -> String {
+    // 完整小时由 rollup 提供，两端不完整小时与当前小时只扫描明细。这里直接比较
+    // RFC3339 边界（rollup bucket 与 from/to 都使用 +00:00），不再对每行执行
+    // substr/julianday；h_from >= h_to 时 rollup 为空、明细覆盖整个范围。
     format!(
         r#"WITH rollup_src AS (
             SELECT bucket, node_id, collector_id, client_id, source_id, project_id, provider, model,
@@ -3758,8 +4600,8 @@ fn rollup_source_cte(from_ph: u8, to_ph: u8, from: DateTime<Utc>, to: DateTime<U
                    reported_cost, calculated_cost, estimated_cost,
                    session_count, model_call_count, turn_count, message_count, tool_call_count, subagent_count
             FROM hourly_rollups
-            WHERE substr(bucket, 1, 13) >= '{full_from}'
-              AND substr(bucket, 1, 13) < '{full_to}'
+            WHERE bucket >= ?{h_from_ph}
+              AND bucket < ?{h_to_ph}
             UNION ALL
             SELECT strftime('%Y-%m-%dT%H:00:00+00:00', started_at), node_id, collector_id, client_id, source_id,
                    COALESCE(project_id,''), COALESCE(provider_normalized,''), COALESCE(model_normalized,''),
@@ -3769,10 +4611,25 @@ fn rollup_source_cte(from_ph: u8, to_ph: u8, from: DateTime<Utc>, to: DateTime<U
                    0, 1, 0, 0, 0, 0
             FROM model_calls
             WHERE started_at >= ?{from_ph} AND started_at < ?{to_ph}
-              AND NOT (substr(started_at, 1, 13) >= '{full_from}'
-                   AND substr(started_at, 1, 13) < '{full_to}')
+              AND (?{h_from_ph} >= ?{h_to_ph}
+                   OR started_at < ?{h_from_ph}
+                   OR started_at >= ?{h_to_ph})
         ) "#
     )
+}
+
+/// 绑定 from/to 与两个完整小时边界；h 参数始终追加在筛选参数之后。
+fn range_args_with_hours(
+    from: &DateTime<Utc>,
+    to: &DateTime<Utc>,
+    extra: Vec<SqlValue>,
+    h_from: DateTime<Utc>,
+    h_to: DateTime<Utc>,
+) -> Vec<SqlValue> {
+    let mut args = range_args(from, to, extra);
+    args.push(SqlValue::Text(h_from.to_rfc3339()));
+    args.push(SqlValue::Text(h_to.to_rfc3339()));
+    args
 }
 
 #[cfg(test)]
@@ -3853,5 +4710,451 @@ mod cache_hit_rate_tests {
     #[test]
     fn only_cache_writes_still_reports_zero_hit_rate() {
         assert_eq!(cache_hit_rate(0, 500, 0), Some(0.0));
+    }
+}
+
+#[cfg(test)]
+mod query_optimization_tests {
+    use super::{
+        perf_hours_to_points, query_filter_options, query_filter_options_detail, rollup_source_cte,
+        should_use_perf_rollup,
+    };
+    use crate::config::HubConfig;
+    use crate::db::HubDb;
+    use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+    use metria_storage::rusqlite::params;
+    use serde_json::{json, Value};
+
+    fn test_db(tag: &str) -> HubDb {
+        let dir =
+            std::env::temp_dir().join(format!("metria-query-opt-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            database_url: format!("sqlite://{}/hub.db", dir.display()),
+            content_mode: metria_core::ContentMode::Metadata,
+            timezone: chrono_tz::Tz::UTC,
+            log_filter: "error".into(),
+            demo: false,
+            oidc: None,
+        };
+        let db = HubDb::open(&cfg).unwrap();
+        db.apply_migrations().unwrap();
+        db
+    }
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn current_hour() -> DateTime<Utc> {
+        let now = Utc::now();
+        Utc.with_ymd_and_hms(now.year(), now.month(), now.day(), now.hour(), 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    fn seed_call(
+        db: &HubDb,
+        id: &str,
+        started: &str,
+        client: &str,
+        model: &str,
+        duration_ms: i64,
+    ) -> Value {
+        let value = json!({
+            "id": id,
+            "source_call_id": id,
+            "node_id": "n1", "collector_id": "c1", "client_id": client,
+            "source_id": "s1", "session_id": "sess",
+            "provider_normalized": "openai", "model_raw": model, "model_normalized": model,
+            "started_at": started,
+            "first_byte_at": started,
+            "first_token_at": started,
+            "completed_at": started,
+            "duration_ms": duration_ms,
+            "ttft_ms": duration_ms / 2,
+            "generation_duration_ms": duration_ms / 2,
+            "output_tokens_per_second_milli": 1500,
+            "inter_token_latency_avg_ms": 20,
+            "status": "success", "call_granularity": "call",
+        });
+        assert!(db.insert_call(&value, "n1:sess").unwrap());
+        db.rollup_event("call", &value).unwrap();
+        value
+    }
+
+    fn seed_usage_detail(db: &HubDb, event_id: &str, started: &str, client: &str, model: &str) {
+        let value = json!({
+            "event_id": event_id, "schema_version": 1,
+            "node_id": "n1", "collector_id": "c1", "source_id": "s1", "client_id": client,
+            "adapter_id": "codex", "adapter_version": "0.1.0",
+            "timestamp": started,
+            "provider_normalized": "openai", "model_normalized": model,
+            "usage": {"input": 1000, "output": 100},
+            "cost": {"calculated_micro_usd": 777},
+            "quality": {"usage_source": "reported", "granularity": "call", "confidence": 1.0},
+        });
+        assert!(db.insert_usage(&value, "n1:sess").unwrap());
+    }
+
+    fn seed_usage(db: &HubDb, event_id: &str, started: &str, client: &str, model: &str) {
+        let value = json!({
+            "event_id": event_id, "schema_version": 1,
+            "node_id": "n1", "collector_id": "c1", "source_id": "s1", "client_id": client,
+            "adapter_id": "codex", "adapter_version": "0.1.0",
+            "timestamp": started,
+            "provider_normalized": "openai", "model_normalized": model,
+            "usage": {"input": 1000, "output": 100},
+            "cost": {"calculated_micro_usd": 777},
+            "quality": {"usage_source": "reported", "granularity": "call", "confidence": 1.0},
+        });
+        assert!(db.insert_usage(&value, "n1:sess").unwrap());
+        db.rollup_event("usage", &value).unwrap();
+    }
+
+    #[test]
+    fn filter_options_rollup_matches_detail_and_falls_back_before_coverage() {
+        let db = test_db("filter-options");
+        let now = Utc::now();
+        let recent = (current_hour() - Duration::hours(2) + Duration::minutes(10)).to_rfc3339();
+        seed_usage(&db, "usage-recent", &recent, "agent-recent", "model-recent");
+        seed_usage(
+            &db,
+            "usage-old",
+            &(current_hour() - Duration::hours(10) + Duration::minutes(5)).to_rfc3339(),
+            "agent-old",
+            "model-old",
+        );
+
+        let from = current_hour() - Duration::hours(2);
+        let to = now + Duration::seconds(2);
+        let rollup = query_filter_options(&db, from, to).unwrap();
+        let detail = {
+            let c = db.read_conn();
+            query_filter_options_detail(&c, from, to).unwrap()
+        };
+        assert_eq!(rollup["agents"], json!(detail.0));
+        assert_eq!(rollup["models"], json!(detail.1));
+
+        // 当前小时新出现但尚未进入 rollup 的 Agent/模型必须由边缘明细补齐。
+        seed_usage_detail(
+            &db,
+            "usage-current",
+            &Utc::now().to_rfc3339(),
+            "agent-current",
+            "model-current",
+        );
+        let with_current = query_filter_options(&db, from, to).unwrap();
+        let recent_models: Vec<&str> = with_current["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(
+            !recent_models.contains(&"model-old"),
+            "范围变化后不得保留旧范围候选"
+        );
+        let current_agents: Vec<&str> = with_current["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(current_agents.contains(&"agent-current"));
+        let current_models: Vec<&str> = with_current["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(current_models.contains(&"model-current"));
+
+        // 查询早于 rollup 覆盖起点：必须回退明细，旧 Agent/模型仍可见。
+        let old_from = current_hour() - Duration::hours(10);
+        let old_to = current_hour() - Duration::hours(9);
+        let old = query_filter_options(&db, old_from, old_to).unwrap();
+        let old_models: Vec<&str> = old["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(
+            old_models.contains(&"model-old"),
+            "早于 min(bucket) 必须回退明细"
+        );
+    }
+
+    #[test]
+    fn rollup_cte_edges_do_not_double_count() {
+        let db = test_db("cte-edges");
+        // 混合 Z / +00:00，覆盖非整点、跨小时与跨日。
+        seed_call(&db, "c1", "2026-09-30T23:40:00Z", "agent-a", "model-a", 100);
+        seed_call(
+            &db,
+            "c2",
+            "2026-10-01T00:10:00+00:00",
+            "agent-a",
+            "model-a",
+            200,
+        );
+        seed_call(&db, "c3", "2026-10-01T00:20:00Z", "agent-b", "model-b", 300);
+        seed_call(
+            &db,
+            "c4",
+            "2026-10-01T01:15:00+00:00",
+            "agent-b",
+            "model-b",
+            400,
+        );
+
+        let from = ts("2026-09-30T23:40:00Z");
+        let to = ts("2026-10-01T01:20:00Z");
+        let h_from = crate::perfrollup::ceil_hour(from);
+        let h_to = crate::perfrollup::floor_hour(to);
+        let cte = rollup_source_cte(1, 2, 3, 4);
+        let sql = format!("{cte}SELECT COALESCE(SUM(model_call_count),0) FROM rollup_src");
+        let count: i64 = db
+            .read_conn()
+            .query_row(
+                &sql,
+                params![
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    h_from.to_rfc3339(),
+                    h_to.to_rfc3339()
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let detail: i64 = db
+            .read_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM model_calls WHERE started_at >= ?1 AND started_at < ?2",
+                params![from.to_rfc3339(), to.to_rfc3339()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, detail, "边缘窗口 + rollup 必须不重不漏");
+        assert_eq!(detail, 4);
+
+        let plan: String = {
+            let c = db.read_conn();
+            let mut stmt = c
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {cte} SELECT COUNT(*) FROM rollup_src"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map(
+                    params![
+                        from.to_rfc3339(),
+                        to.to_rfc3339(),
+                        h_from.to_rfc3339(),
+                        h_to.to_rfc3339()
+                    ],
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap();
+            rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("\n")
+        };
+        assert!(
+            plan.contains("idx_calls_time"),
+            "明细边缘窗口应使用 started_at 索引，实际计划: {plan}"
+        );
+        assert!(!cte.contains("substr(bucket"), "rollup 侧不得再包裹 substr");
+        assert!(
+            !cte.contains("julianday(bucket)"),
+            "rollup 侧不得再包裹 julianday"
+        );
+    }
+
+    #[test]
+    fn usage_timeseries_cte_matches_detail_totals_for_nonaligned_range() {
+        let db = test_db("timeseries-cte");
+        let base = current_hour() - Duration::hours(3);
+        seed_usage(
+            &db,
+            "ts-u1",
+            &(base + Duration::minutes(10)).to_rfc3339(),
+            "agent-a",
+            "model-a",
+        );
+        seed_usage(
+            &db,
+            "ts-u2",
+            &(base + Duration::hours(1) + Duration::minutes(20)).to_rfc3339(),
+            "agent-a",
+            "model-a",
+        );
+        seed_usage(
+            &db,
+            "ts-u3",
+            &(base + Duration::hours(2) + Duration::minutes(40)).to_rfc3339(),
+            "agent-b",
+            "model-b",
+        );
+
+        let from = current_hour() - Duration::hours(4) + Duration::minutes(20);
+        let to = current_hour() - Duration::minutes(10);
+        let p = crate::api::RangeParams {
+            from: Some(from.to_rfc3339()),
+            to: Some(to.to_rfc3339()),
+            ..Default::default()
+        };
+        let series = super::query_usage_timeseries(&db, &p).unwrap();
+        let sum = |key: &str| -> i64 {
+            series
+                .iter()
+                .map(|point| point[key].as_i64().unwrap_or(0))
+                .sum()
+        };
+        let detail = |sql: &str| -> i64 {
+            db.read_conn()
+                .query_row(sql, params![from.to_rfc3339(), to.to_rfc3339()], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            sum("input_tokens"),
+            detail("SELECT COALESCE(SUM(input_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2")
+        );
+        assert_eq!(
+            sum("output_tokens"),
+            detail("SELECT COALESCE(SUM(output_tokens),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2")
+        );
+        assert_eq!(
+            sum("cost_micro_usd"),
+            detail("SELECT COALESCE(SUM(COALESCE(reported_cost_micro_usd,0)+COALESCE(calculated_cost_micro_usd,0)+COALESCE(estimated_cost_micro_usd,0)),0) FROM usage_events WHERE timestamp >= ?1 AND timestamp < ?2")
+        );
+    }
+
+    #[test]
+    fn thirty_day_rollup_queries_stay_within_budget() {
+        let db = test_db("30d-budget");
+        let now = Utc::now();
+        let from = now - Duration::days(30);
+        let h_from = crate::perfrollup::ceil_hour(from);
+        let h_to = crate::perfrollup::floor_hour(now);
+        {
+            let mut c = db.conn();
+            let tx = c.transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO hourly_rollups
+                         (bucket,node_id,collector_id,client_id,source_id,project_id,provider,model,
+                          input_tokens,output_tokens,model_call_count)
+                         VALUES (?1,'n1','c1','agent-a','s1','','openai','model-a',1000,100,1)",
+                    )
+                    .unwrap();
+                let mut bucket = h_from;
+                while bucket < h_to {
+                    stmt.execute([bucket.to_rfc3339()]).unwrap();
+                    bucket += Duration::hours(1);
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let _ = query_filter_options(&db, from, now).unwrap();
+        let filter_cost = started.elapsed();
+
+        let cte = rollup_source_cte(1, 2, 3, 4);
+        let started = std::time::Instant::now();
+        let _: i64 = db
+            .read_conn()
+            .query_row(
+                &format!("{cte}SELECT COALESCE(SUM(model_call_count),0) FROM rollup_src"),
+                params![
+                    from.to_rfc3339(),
+                    now.to_rfc3339(),
+                    h_from.to_rfc3339(),
+                    h_to.to_rfc3339()
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cte_cost = started.elapsed();
+        println!("30d filter-options={filter_cost:?} breakdown-cte={cte_cost:?}");
+        assert!(
+            filter_cost < std::time::Duration::from_millis(20),
+            "30d filter-options 超预算: {filter_cost:?}"
+        );
+        assert!(
+            cte_cost < std::time::Duration::from_millis(5),
+            "30d breakdown CTE 超预算: {cte_cost:?}"
+        );
+    }
+
+    #[test]
+    fn perf_hours_to_points_match_detail_and_mark_sources() {
+        let db = test_db("perf-points");
+        for (offset, id) in [(-3, "pc1"), (-2, "pc2"), (-1, "pc3")] {
+            let started =
+                (current_hour() + Duration::hours(offset) + Duration::minutes(10)).to_rfc3339();
+            seed_call(&db, id, &started, "agent-a", "model-a", 300);
+        }
+        crate::perfrollup::rebuild_history(&db).unwrap();
+
+        let from = current_hour() - Duration::hours(4);
+        let to = Utc::now();
+        let hours = crate::perfrollup::fast_hours_with_source(&db, from, to, "").unwrap();
+        let (latency, latency_rollup) = perf_hours_to_points(&hours, 3600, "latency");
+        let raw = crate::perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+        let latency_count: u64 = latency
+            .iter()
+            .map(|p| p["count"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(latency_count, raw.duration.count);
+        assert!(latency_rollup, "覆盖完整小时时应至少有一个 rollup 桶");
+        // 预聚合与明细逐小时平均值一致（样本数/平均值是精确统计）。
+        for (bucket, _, from_rollup) in &hours {
+            if !from_rollup {
+                continue;
+            }
+            let detail_hour =
+                crate::perfrollup::scan_calls(&db, *bucket, *bucket + Duration::hours(1), "", &[])
+                    .unwrap();
+            let point = latency
+                .iter()
+                .find(|p| p["bucket"] == bucket.to_rfc3339())
+                .unwrap();
+            assert_eq!(point["avg_ms"].as_i64(), detail_hour.duration.avg());
+            assert_eq!(point["count"].as_u64(), Some(detail_hour.duration.count));
+        }
+
+        let (performance, _) = perf_hours_to_points(&hours, 3600, "performance");
+        let perf_count: u64 = performance
+            .iter()
+            .map(|p| p["count"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(perf_count, raw.call_count);
+
+        let empty = crate::perfrollup::PerfHour::new();
+        let (empty_points, used) =
+            perf_hours_to_points(&[(current_hour(), empty, true)], 3600, "latency");
+        assert!(used);
+        assert_eq!(empty_points[0]["count"], 0);
+        assert!(empty_points[0]["avg_ms"].is_null(), "空桶不得填 0");
+
+        let (_, used_detail) = perf_hours_to_points(
+            &[(current_hour(), crate::perfrollup::PerfHour::new(), false)],
+            3600,
+            "latency",
+        );
+        assert!(!used_detail, "纯明细来源必须标注为精确");
+        assert!(!should_use_perf_rollup(900, ""));
+        assert!(should_use_perf_rollup(3600, ""));
+        assert!(should_use_perf_rollup(86_400, ""));
+        assert!(!should_use_perf_rollup(3600, "AND node_id = ?3"));
     }
 }

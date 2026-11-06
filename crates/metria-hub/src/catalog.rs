@@ -279,8 +279,8 @@ pub fn reprice_from_rules(db: &HubDb, only_unpriced: bool) -> Result<i64, String
         let n = db
             .reprice_all(&engine, only_unpriced)
             .map_err(|e| e.to_string())?;
-        // 历史规则可能命中任意时间的事件，必须全量重建费用口径。
-        if n > 0 || !only_unpriced {
+        // 没有任何费用变化时无需重建费用口径的聚合；reprice_all 已确认全量/增量结果一致。
+        if n > 0 {
             db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
         }
         Ok(n)

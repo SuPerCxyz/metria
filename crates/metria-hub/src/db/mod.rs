@@ -3,8 +3,12 @@
 //! 会话引用统一为规范键 `{node_id}:{source_session_id}`，保证幂等与跨表 join。
 //! 所有事件 insert 方法返回 `bool`（是否新插入），用于幂等与 rollup 判定。
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use metria_storage::rusqlite::{params, Connection, OptionalExtension};
@@ -16,12 +20,45 @@ use crate::config::HubConfig;
 pub mod pricing;
 pub mod traffic;
 
+/// 只读连接池：固定数量连接，轮询取用。
+#[derive(Debug)]
+struct ReadPool {
+    conns: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+/// 查询连接：优先使用只读池，池未初始化时回退写连接。
+#[derive(Debug)]
+pub enum ReadConn<'a> {
+    Pooled(std::sync::MutexGuard<'a, Connection>),
+    Writer(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pooled(c) => c,
+            Self::Writer(c) => c,
+        }
+    }
+}
+
 /// Hub 数据库。
 #[derive(Debug, Clone)]
 pub struct HubDb {
     conn: Arc<Mutex<Connection>>,
+    /// 只读连接池；迁移完成后显式初始化，未初始化时查询回退写连接。
+    read_pool: Arc<OnceLock<ReadPool>>,
+    db_path: Arc<PathBuf>,
+    read_pool_size: usize,
+    busy_timeout_ms: u64,
     /// 串行化 rollup 重建：同一时间只允许一个重建任务执行。
     rebuild_lock: Arc<Mutex<()>>,
+    /// 测试用：统计会话聚合刷新次数，验证批次内每会话只刷新一次。
+    #[cfg(test)]
+    refresh_agg_calls: Arc<AtomicUsize>,
 }
 
 /// 可安全返回给 Web 的用户资料。
@@ -122,10 +159,72 @@ impl HubDb {
             }
         }
         let conn = metria_storage::open(&path, &metria_storage::DbOptions::default())?;
+        let read_pool_size = std::env::var("METRIA_DB_READ_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(2, 4))
+            .unwrap_or(4);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_pool: Arc::new(OnceLock::new()),
+            db_path: Arc::new(path),
+            read_pool_size,
+            busy_timeout_ms: metria_storage::DbOptions::default().busy_timeout_ms,
             rebuild_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            refresh_agg_calls: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// 在迁移完成后初始化只读连接池；重复调用为空操作。
+    ///
+    /// 只读连接使用普通打开 + `query_only=ON`，不修改 `journal_mode`；
+    /// WAL 模式下的读连接仍能访问 `-wal`/`-shm`，由 SQLite 保证快照一致性。
+    pub fn init_read_pool(&self) -> Result<(), StorageError> {
+        if self.read_pool.get().is_some() {
+            return Ok(());
+        }
+        let mut conns = Vec::with_capacity(self.read_pool_size);
+        for _ in 0..self.read_pool_size {
+            let conn = Connection::open(self.db_path.as_path())
+                .map_err(|e| StorageError::Open(e.to_string()))?;
+            conn.busy_timeout(Duration::from_millis(self.busy_timeout_ms))
+                .map_err(|e| StorageError::Open(e.to_string()))?;
+            conn.pragma_update(None, "query_only", true)
+                .map_err(|e| StorageError::Open(e.to_string()))?;
+            conn.pragma_update(None, "foreign_keys", true)
+                .map_err(|e| StorageError::Open(e.to_string()))?;
+            conns.push(Mutex::new(conn));
+        }
+        let pool = ReadPool {
+            conns,
+            next: AtomicUsize::new(0),
+        };
+        // 并发初始化时只保留先设置成功的池，其余连接随 Err 丢弃。
+        let _ = self.read_pool.set(pool);
+        Ok(())
+    }
+
+    /// 只读查询连接；未初始化读池或连接被 poison 时回退写连接，保证旧测试可用。
+    pub fn read_conn(&self) -> ReadConn<'_> {
+        if let Some(pool) = self.read_pool.get() {
+            let idx = pool.next.fetch_add(1, Ordering::Relaxed) % pool.conns.len();
+            if let Ok(guard) = pool.conns[idx].lock() {
+                return ReadConn::Pooled(guard);
+            }
+        }
+        ReadConn::Writer(self.conn())
+    }
+
+    /// 在只读连接上执行闭包，便于只读 handler 统一取池。
+    pub fn with_read<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        let c = self.read_conn();
+        f(&c)
+    }
+
+    /// 当前读池大小（未初始化时仍返回配置值）。
+    pub fn read_pool_size(&self) -> usize {
+        self.read_pool_size
     }
 
     /// 阻塞获取重建锁（启动时的全量修复使用）。
@@ -1378,6 +1477,22 @@ impl HubDb {
 
     pub fn insert_call(&self, v: &Value, session_key: &str) -> Result<bool, StorageError> {
         let c = self.conn();
+        self.insert_call_with(&c, v, session_key, true)
+    }
+
+    /// 批次内插入调用但不立即刷新会话聚合；由调用方在批次结束后统一刷新。
+    pub fn insert_call_deferred(&self, v: &Value, session_key: &str) -> Result<bool, StorageError> {
+        let c = self.conn();
+        self.insert_call_with(&c, v, session_key, false)
+    }
+
+    fn insert_call_with(
+        &self,
+        c: &Connection,
+        v: &Value,
+        session_key: &str,
+        refresh_agg: bool,
+    ) -> Result<bool, StorageError> {
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
         let gn = |k: &str| v.get(k).and_then(|x| x.as_i64());
         let now = Utc::now().to_rfc3339();
@@ -1476,10 +1591,12 @@ impl HubDb {
              ) WHERE id = ?1",
             [g("id")],
         )?;
-        self.link_usage_to_call(&c, g("id"))?;
+        self.link_usage_to_call(c, g("id"))?;
         // 即使这是上传重试中的重复 call，也重算一次；若上次 call 已提交但聚合刷新失败，
-        // 本次重试仍能修复 session 摘要。
-        self.refresh_session_agg(&c, session_key)?;
+        // 本次重试仍能修复 session 摘要。批次路径由调用方统一刷新。
+        if refresh_agg {
+            self.refresh_session_agg(c, session_key)?;
+        }
         Ok(n > 0)
     }
 
@@ -1554,6 +1671,8 @@ impl HubDb {
         if session_key.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.refresh_agg_calls.fetch_add(1, Ordering::Relaxed);
         let agg = c
             .query_row(
                 "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
@@ -1633,9 +1752,52 @@ impl HubDb {
         Ok(())
     }
 
+    /// 批量刷新多个会话的聚合；同一事务内逐会话复用单条刷新逻辑。
+    ///
+    /// 入参用 `HashSet` 表达“每会话一次”的语义；批次内重复的 call/usage
+    /// 不会重复执行聚合查询。
+    pub fn refresh_sessions(&self, session_keys: &HashSet<String>) -> Result<(), StorageError> {
+        if session_keys.is_empty() {
+            return Ok(());
+        }
+        let c = self.conn();
+        let tx = c.unchecked_transaction().map_err(StorageError::from)?;
+        for session_key in session_keys {
+            self.refresh_session_agg(&tx, session_key)?;
+        }
+        tx.commit().map_err(StorageError::from)?;
+        Ok(())
+    }
+
+    /// 测试用：本进程内会话聚合刷新次数。
+    #[cfg(test)]
+    pub(crate) fn refresh_agg_calls(&self) -> usize {
+        self.refresh_agg_calls.load(Ordering::Relaxed)
+    }
+
     /// 落库 usage_event（幂等），返回是否为新事件。
     pub fn insert_usage(&self, v: &Value, session_key: &str) -> Result<bool, StorageError> {
         let c = self.conn();
+        self.insert_usage_with(&c, v, session_key, true)
+    }
+
+    /// 批次内插入用量但不立即刷新会话聚合；由调用方在批次结束后统一刷新。
+    pub fn insert_usage_deferred(
+        &self,
+        v: &Value,
+        session_key: &str,
+    ) -> Result<bool, StorageError> {
+        let c = self.conn();
+        self.insert_usage_with(&c, v, session_key, false)
+    }
+
+    fn insert_usage_with(
+        &self,
+        c: &Connection,
+        v: &Value,
+        session_key: &str,
+        refresh_agg: bool,
+    ) -> Result<bool, StorageError> {
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
         let usage = v.get("usage").unwrap_or(&Value::Null);
         let u = |k: &str| usage.get(k).and_then(|x| x.as_i64());
@@ -1706,8 +1868,10 @@ impl HubDb {
         }
         let model_call_id = g("model_call_id");
         if !model_call_id.is_empty() {
-            self.link_usage_to_call(&c, model_call_id)?;
-            self.refresh_session_agg(&c, session_key)?;
+            self.link_usage_to_call(c, model_call_id)?;
+            if refresh_agg {
+                self.refresh_session_agg(c, session_key)?;
+            }
         }
         Ok(n > 0)
     }

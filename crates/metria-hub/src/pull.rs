@@ -28,7 +28,16 @@ pub fn spawn_pull_scheduler(st: AppState) {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut backoffs: HashMap<String, (u32, Instant)> = HashMap::new();
         loop {
-            let nodes = st.db.list_pull_nodes();
+            let nodes = {
+                let worker = st.clone();
+                match tokio::task::spawn_blocking(move || worker.db.list_pull_nodes()).await {
+                    Ok(nodes) => nodes,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Pull 节点列表读取任务异常");
+                        Vec::new()
+                    }
+                }
+            };
             for (node_id, agent_url, token_enc) in nodes {
                 // 节点级退避：未到期跳过
                 if let Some((fails, until)) = backoffs.get(&node_id) {
@@ -36,7 +45,16 @@ pub fn spawn_pull_scheduler(st: AppState) {
                         continue;
                     }
                 }
-                let result = pull_node(&st, &node_id, &agent_url, token_enc.as_deref());
+                let worker = st.clone();
+                let node = node_id.clone();
+                let result = match tokio::task::spawn_blocking(move || {
+                    pull_node(&worker, &node, &agent_url, token_enc.as_deref())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => Err(format!("Pull 任务异常: {e}")),
+                };
                 match result {
                     Ok(()) => {
                         backoffs.remove(&node_id);

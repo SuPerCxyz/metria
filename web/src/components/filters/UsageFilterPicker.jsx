@@ -5,9 +5,29 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
+import { primeNodeNames } from '../../hooks/useNodeNames'
 import { api, q, rangeParams } from '../../services/api'
 
 const EMPTY = []
+const OPTIONS_CACHE = new Map()
+const OPTIONS_CACHE_TTL_MS = 30_000
+const OPTIONS_CACHE_MAX = 20
+
+function loadOptions(key, url) {
+  const cached = OPTIONS_CACHE.get(key)
+  if (cached && Date.now() - cached.at < OPTIONS_CACHE_TTL_MS) {
+    primeNodeNames(cached.data?.nodes)
+    return Promise.resolve(cached.data)
+  }
+  return api(url).then((data) => {
+    OPTIONS_CACHE.set(key, { data, at: Date.now() })
+    if (OPTIONS_CACHE.size > OPTIONS_CACHE_MAX) {
+      OPTIONS_CACHE.delete(OPTIONS_CACHE.keys().next().value)
+    }
+    primeNodeNames(data?.nodes)
+    return data
+  })
+}
 
 function withSelected(items, selected) {
   if (!selected || items.some((item) => item.id === selected)) return items
@@ -58,7 +78,12 @@ export default function UsageFilterPicker({ className = '' }) {
   const { range } = useTimeRange()
   // 候选项跟随全局时间范围刷新：Agent/模型只列范围内有数据的，节点全列。
   const filterRange = q(rangeParams(range))
-  const options = useQuery(`usage-filter-options${filterRange}`, () => api(`/usage/filter-options${filterRange}`))
+  const optionsKey = `usage-filter-options${filterRange}`
+  const options = useQuery(
+    optionsKey,
+    () => loadOptions(optionsKey, `/usage/filter-options${filterRange}`),
+    { enabled: open }
+  )
   const nodes = useMemo(() => withSelected(options.data?.nodes || EMPTY, nodeId), [options.data, nodeId])
   const agents = useMemo(() => withSelected(options.data?.agents || EMPTY, clientId), [options.data, clientId])
   const models = useMemo(() => withSelected(options.data?.models || EMPTY, model), [options.data, model])

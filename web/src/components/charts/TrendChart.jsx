@@ -2,7 +2,7 @@
 // legendDisplay=false 时隐藏内置图例（由调用方提供自定义图例，如全部模型 chips）。
 
 import React, { useEffect, useRef } from 'react'
-import Chart from 'chart.js/auto'
+import { Chart } from 'chart.js'
 import { downsampleIndices, formatTimeLabel, isRangeLongerThanDay } from './trendChartLabels'
 import chartTheme from '../../../chart-theme.json'
 

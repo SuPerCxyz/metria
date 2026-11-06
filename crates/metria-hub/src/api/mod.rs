@@ -8,11 +8,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use metria_protocol::{
-    CollectorStatusResponse, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
+    BatchEvent, CollectorStatusResponse, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
     RegisterResponse, UploadBatch, UploadResponse,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tower_http::trace::TraceLayer;
@@ -158,6 +158,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/sessions/{id}/tools", get(session_tools))
         .route("/api/v1/sessions/{id}/subagents", get(session_subagents))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
+        .route("/api/v1/sessions/{id}/stats", get(session_stats))
         .route("/api/v1/data-quality", get(data_quality))
         .route("/api/v1/shares", post(share_create).get(share_list))
         .route("/api/v1/shares/audits", get(share_audits))
@@ -280,6 +281,21 @@ pub(crate) fn json_err(status: StatusCode, error: &str, message: &str) -> Respon
         Json(serde_json::json!({ "error": error, "message": message })),
     )
         .into_response()
+}
+
+/// 把同步数据库/网络工作移出 async 执行器；任务 panic 转成明确 500，不拖垮进程。
+pub(crate) async fn run_blocking<F>(f: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(response) => response,
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "blocking_task_failed",
+            &e.to_string(),
+        ),
+    }
 }
 
 fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -1107,6 +1123,16 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
     let mut accepted = Vec::new();
     let mut duplicate = Vec::new();
     let mut failed = Vec::new();
+    // 批次内按既有幂等键去重；同一批重复事件只进入写事务一次。
+    let mut seen_events: HashSet<String> = HashSet::new();
+    // 本批次涉及的会话键；批次结束后每个会话只刷新一次聚合。
+    let mut sessions_to_refresh: HashSet<String> = HashSet::new();
+    // 本批次新事件的 rollup 输入；批次结束后合并为一次批量写入。
+    let mut rollup_batch: Vec<(String, serde_json::Value)> = Vec::new();
+    // 晚到补采可能落在已构建预聚合的旧小时；批次结束后失效这些小时。
+    let perf_invalidate_cutoff =
+        crate::perfrollup::floor_hour(Utc::now()) - chrono::Duration::hours(3);
+    let mut perf_hours_to_invalidate: HashSet<DateTime<Utc>> = HashSet::new();
     // 每个批次只构造一次引擎，使新 usage 在落库和 rollup 前立即得到费用。
     let pricing_engine = crate::catalog::pricing_engine(&st.db);
     let session_map = st.db.session_key_map(&serde_json::json!({
@@ -1132,6 +1158,12 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
             // 旧估算表或新 rollup；返回 duplicate 让重试方停止反复上传。
             duplicate.push(ev.event_id.clone());
             continue;
+        }
+        if let Some(identity) = event_identity_key(ev) {
+            if !seen_events.insert(identity) {
+                duplicate.push(ev.event_id.clone());
+                continue;
+            }
         }
         let mut payload = ev.payload.clone();
         if ev.kind == "usage" {
@@ -1211,10 +1243,10 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                 .insert_message(v, resolved.as_deref().unwrap_or_default()),
             "call" => st
                 .db
-                .insert_call(v, resolved.as_deref().unwrap_or_default()),
+                .insert_call_deferred(v, resolved.as_deref().unwrap_or_default()),
             "usage" => st
                 .db
-                .insert_usage(v, resolved.as_deref().unwrap_or_default()),
+                .insert_usage_deferred(v, resolved.as_deref().unwrap_or_default()),
             "tool" => st.db.insert_tool(v),
             "subagent" => st.db.insert_subagent(v),
             other => Err(metria_storage::StorageError::Query(format!(
@@ -1224,14 +1256,35 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
 
         match result {
             Ok(is_new) => {
+                // 即使调用/用量是重传的重复事件，也纳入聚合刷新：
+                // 上次明细已提交但聚合刷新失败时，本次重试可以修复会话摘要。
+                let refresh_key = match ev.kind.as_str() {
+                    "call" => resolved.clone().filter(|key| !key.is_empty()),
+                    "usage"
+                        if v.get("model_call_id")
+                            .and_then(|x| x.as_str())
+                            .is_some_and(|id| !id.is_empty()) =>
+                    {
+                        resolved.clone().filter(|key| !key.is_empty())
+                    }
+                    _ => None,
+                };
+                if let Some(key) = refresh_key {
+                    sessions_to_refresh.insert(key);
+                }
+                if matches!(ev.kind.as_str(), "call" | "usage") {
+                    if let Some(ts) = perf_event_time(&ev.kind, v) {
+                        let hour = crate::perfrollup::floor_hour(ts);
+                        if hour < perf_invalidate_cutoff {
+                            perf_hours_to_invalidate.insert(hour);
+                        }
+                    }
+                }
                 if is_new {
                     accepted.push(ev.event_id.clone());
                     // 子 Agent 会话不计入会话汇总（session_count 等），其 call/usage 照常计入
                     let is_subagent_session = ev.kind == "session"
                         && v.get("parent_session_id").is_some_and(|x| !x.is_null());
-                    if !is_subagent_session {
-                        let _ = st.db.rollup_event(&ev.kind, v);
-                    }
                     publish_ingest(st, &ev.kind);
                     // 仅在事件首次落库时推进来源新鲜度，避免重传回写
                     if let Some(raw_id) = v
@@ -1246,6 +1299,9 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                             }
                         }
                     }
+                    if !is_subagent_session {
+                        rollup_batch.push((ev.kind.clone(), payload));
+                    }
                 } else {
                     duplicate.push(ev.event_id.clone());
                 }
@@ -1257,6 +1313,29 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                     retryable: false,
                 });
             }
+        }
+    }
+
+    if !sessions_to_refresh.is_empty() {
+        if let Err(e) = st.db.refresh_sessions(&sessions_to_refresh) {
+            tracing::warn!(%e, "批量刷新会话聚合失败");
+        }
+    }
+
+    if !rollup_batch.is_empty() {
+        let refs: Vec<(&str, &serde_json::Value)> = rollup_batch
+            .iter()
+            .map(|(kind, payload)| (kind.as_str(), payload))
+            .collect();
+        if let Err(e) = st.db.rollup_events(&refs) {
+            tracing::warn!(%e, "批量写入 rollup 失败");
+        }
+    }
+
+    if !perf_hours_to_invalidate.is_empty() {
+        let hours: Vec<DateTime<Utc>> = perf_hours_to_invalidate.into_iter().collect();
+        if let Err(e) = crate::perfrollup::invalidate_hours(&st.db, &hours) {
+            tracing::warn!(%e, "失效性能预聚合小时失败");
         }
     }
 
@@ -1286,6 +1365,44 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
         failed,
         message: None,
     }
+}
+
+/// 批次内去重键：与各表既有幂等键一致，只按身份去重，不按内容去重。
+fn event_identity_key(ev: &BatchEvent) -> Option<String> {
+    let payload = &ev.payload;
+    let id = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    match ev.kind.as_str() {
+        "session" => {
+            let node = payload
+                .get("node_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            Some(format!("session:{node}:{}", id("source_session_id")?))
+        }
+        "call" | "message" | "tool" | "subagent" | "source" => {
+            Some(format!("{}:{}", ev.kind, id("id")?))
+        }
+        "usage" => id("event_id").map(|event_id| format!("usage:{event_id}")),
+        _ => None,
+    }
+}
+
+/// 性能预聚合使用的事件时间：call 用 started_at，usage 用 timestamp。
+fn perf_event_time(kind: &str, v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let key = match kind {
+        "call" => "started_at",
+        "usage" => "timestamp",
+        _ => return None,
+    };
+    v.get(key)
+        .and_then(|value| value.as_str())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 /// 事件自身的时间戳（用于 sources.last_event_at 新鲜度回写）。
@@ -1389,7 +1506,12 @@ async fn sse_stream(
             }
         }
     };
-    Sse::new(stream).into_response()
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -1434,5 +1556,313 @@ mod auth_tests {
         assert_eq!(args.len(), 4);
         assert_eq!(args[0], "codex".to_string().into());
         assert_eq!(args[3], "model-b".to_string().into());
+    }
+}
+
+#[cfg(test)]
+mod ingest_batch_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "metria-ingest-batch-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            database_url: format!("sqlite://{}/hub.db", dir.display()),
+            content_mode: metria_core::ContentMode::Metadata,
+            timezone: chrono_tz::Tz::UTC,
+            log_filter: "error".into(),
+            demo: false,
+            oidc: None,
+        };
+        let db = HubDb::open(&cfg).unwrap();
+        db.apply_migrations().unwrap();
+        AppState {
+            db,
+            cfg,
+            sse: SseHub::new(),
+            sessions: Default::default(),
+            collector_token: None,
+            oidc: Default::default(),
+        }
+    }
+
+    fn session_event(sid: &str) -> BatchEvent {
+        BatchEvent {
+            kind: "session".into(),
+            event_id: format!("event-session-{sid}"),
+            payload: json!({
+                "id": format!("ulid-{sid}"),
+                "source_session_id": sid,
+                "node_id": "n1",
+                "collector_id": "c1",
+                "source_id": "src1",
+                "client_id": "codex",
+                "started_at": "2026-08-10T08:00:00Z",
+                "last_activity_at": "2026-08-10T08:10:00Z",
+                "status": "active",
+                "created_at": "2026-08-10T08:00:00Z"
+            }),
+        }
+    }
+
+    fn call_event(sid: &str, call_id: &str, event_id: &str) -> BatchEvent {
+        BatchEvent {
+            kind: "call".into(),
+            event_id: event_id.into(),
+            payload: json!({
+                "id": call_id,
+                "source_call_id": format!("src-{call_id}"),
+                "node_id": "n1",
+                "collector_id": "c1",
+                "source_id": "src1",
+                "client_id": "codex",
+                "session_id": format!("ulid-{sid}"),
+                "model_raw": "gpt-5.6-sol",
+                "model_normalized": "gpt-5.6-sol",
+                "started_at": "2026-08-10T08:10:00Z",
+                "completed_at": "2026-08-10T08:11:00Z",
+                "status": "success",
+                "call_granularity": "call",
+                "input_tokens": 100,
+                "output_tokens": 10
+            }),
+        }
+    }
+
+    fn usage_event(sid: &str, call_id: &str, usage_id: &str, event_id: &str) -> BatchEvent {
+        BatchEvent {
+            kind: "usage".into(),
+            event_id: event_id.into(),
+            payload: json!({
+                "event_id": usage_id,
+                "schema_version": 1,
+                "node_id": "n1",
+                "collector_id": "c1",
+                "source_id": "src1",
+                "client_id": "codex",
+                "adapter_id": "codex",
+                "adapter_version": "0.1.0",
+                "model_call_id": call_id,
+                "session_id": format!("ulid-{sid}"),
+                "timestamp": "2026-08-10T08:10:30Z",
+                "provider_normalized": "openai",
+                "model_normalized": "gpt-5.6-sol",
+                "usage": {
+                    "input": 1000,
+                    "output": 500,
+                    "cache_read": null,
+                    "cache_write": null,
+                    "reasoning": null
+                },
+                "cost": {
+                    "reported_micro_usd": null,
+                    "calculated_micro_usd": null,
+                    "estimated_micro_usd": null
+                },
+                "quality": {
+                    "usage_source": "reported",
+                    "granularity": "call",
+                    "confidence": 1.0
+                }
+            }),
+        }
+    }
+
+    fn batch(events: Vec<BatchEvent>) -> UploadBatch {
+        UploadBatch {
+            schema_version: 1,
+            batch_id: format!("batch-{}", events.len()),
+            node_id: "n1".into(),
+            collector_id: "c1".into(),
+            agent_version: "0.1.0".into(),
+            events,
+        }
+    }
+
+    fn count(st: &AppState, table: &str) -> i64 {
+        st.db
+            .conn()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn rollup_totals(st: &AppState) -> (i64, i64, i64, i64) {
+        st.db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(session_count),0),
+                        COALESCE(SUM(model_call_count),0),
+                        COALESCE(SUM(input_tokens),0),
+                        COALESCE(SUM(output_tokens),0)
+                 FROM hourly_rollups",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn batch_dedupes_same_identity_and_refreshes_session_once() {
+        let st = test_state("dedupe");
+        let events = vec![
+            session_event("s1"),
+            call_event("s1", "call-1", "event-call-1"),
+            call_event("s1", "call-1", "event-call-1-retry"),
+            usage_event("s1", "call-1", "usage-1", "event-usage-1"),
+            usage_event("s1", "call-1", "usage-1", "event-usage-1-retry"),
+        ];
+        let resp = process_batch(&st, &batch(events), 0);
+
+        assert_eq!(resp.accepted.len(), 3, "session + 首个 call + 首个 usage");
+        assert_eq!(resp.duplicate.len(), 2, "同批重复的 call/usage 应被去重");
+        assert_eq!(count(&st, "model_calls"), 1);
+        assert_eq!(count(&st, "usage_events"), 1);
+        assert_eq!(rollup_totals(&st), (1, 1, 1000, 500));
+        assert_eq!(st.db.refresh_agg_calls(), 1, "同一会话每批只刷新一次");
+    }
+
+    #[test]
+    fn different_call_ids_are_not_deduped() {
+        let st = test_state("distinct");
+        let events = vec![
+            session_event("s2"),
+            call_event("s2", "call-a", "event-a"),
+            call_event("s2", "call-b", "event-b"),
+        ];
+        let resp = process_batch(&st, &batch(events), 0);
+
+        assert_eq!(resp.accepted.len(), 3);
+        assert!(resp.duplicate.is_empty());
+        assert_eq!(count(&st, "model_calls"), 2);
+        assert_eq!(rollup_totals(&st).1, 2);
+        assert_eq!(st.db.refresh_agg_calls(), 1);
+    }
+
+    #[test]
+    fn duplicate_session_event_only_counts_once() {
+        let st = test_state("session-dup");
+        let first = session_event("s4");
+        let mut retry = session_event("s4");
+        retry.event_id = "event-session-s4-retry".into();
+        let resp = process_batch(&st, &batch(vec![first, retry]), 0);
+
+        assert_eq!(resp.accepted.len(), 1);
+        assert_eq!(resp.duplicate.len(), 1);
+        assert_eq!(count(&st, "sessions"), 1);
+        assert_eq!(rollup_totals(&st).0, 1);
+    }
+
+    #[test]
+    fn repeated_batch_does_not_double_count() {
+        let st = test_state("repeat");
+        let events = vec![
+            session_event("s3"),
+            call_event("s3", "call-3", "event-call-3"),
+            usage_event("s3", "call-3", "usage-3", "event-usage-3"),
+        ];
+        let first = process_batch(&st, &batch(events.clone()), 0);
+        assert_eq!(first.accepted.len(), 3);
+        let before = rollup_totals(&st);
+
+        let second = process_batch(&st, &batch(events), 0);
+        assert!(second.accepted.is_empty());
+        assert_eq!(second.duplicate.len(), 3);
+        assert_eq!(count(&st, "model_calls"), 1);
+        assert_eq!(count(&st, "usage_events"), 1);
+        assert_eq!(rollup_totals(&st), before);
+    }
+
+    #[test]
+    fn late_call_invalidates_perf_rollup_hour() {
+        let st = test_state("perf-invalidate");
+        let hour = crate::perfrollup::floor_hour(Utc::now()) - chrono::Duration::hours(4);
+        let started = (hour + chrono::Duration::minutes(10)).to_rfc3339();
+        let sid = "perf-late";
+        let session_key = format!("n1:{sid}");
+        let session_payload = json!({
+            "id": format!("ulid-{sid}"),
+            "source_session_id": sid,
+            "node_id": "n1",
+            "collector_id": "c1",
+            "source_id": "src1",
+            "client_id": "codex",
+            "started_at": started,
+            "last_activity_at": started,
+            "status": "active",
+            "created_at": started
+        });
+        assert!(st.db.upsert_session(&session_payload).unwrap());
+
+        let call_payload = |id: &str| {
+            json!({
+                "id": id,
+                "source_call_id": id,
+                "node_id": "n1",
+                "collector_id": "c1",
+                "source_id": "src1",
+                "client_id": "codex",
+                "session_id": format!("ulid-{sid}"),
+                "model_normalized": "gpt-5.6-sol",
+                "started_at": started,
+                "completed_at": (hour + chrono::Duration::minutes(11)).to_rfc3339(),
+                "status": "success",
+                "call_granularity": "call",
+                "duration_ms": 1000
+            })
+        };
+        assert!(st
+            .db
+            .insert_call(&call_payload("perf-call-1"), &session_key)
+            .unwrap());
+        crate::perfrollup::rebuild_history(&st.db).unwrap();
+
+        let bucket = crate::perfrollup::hour_bucket(hour);
+        let perf_rows = |st: &AppState| -> i64 {
+            st.db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM hourly_performance_rollups WHERE bucket = ?1",
+                    [&bucket],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(perf_rows(&st), 1, "4 小时前应已构建预聚合");
+
+        let resp = process_batch(
+            &st,
+            &batch(vec![
+                BatchEvent {
+                    kind: "session".into(),
+                    event_id: "event-session-perf-late".into(),
+                    payload: session_payload,
+                },
+                BatchEvent {
+                    kind: "call".into(),
+                    event_id: "event-call-perf-2".into(),
+                    payload: call_payload("perf-call-2"),
+                },
+            ]),
+            0,
+        );
+        assert!(resp.ok);
+        assert_eq!(perf_rows(&st), 0, "晚到补采应失效旧小时预聚合");
+
+        let fast =
+            crate::perfrollup::fast_aggregate(&st.db, hour, hour + chrono::Duration::hours(1), "")
+                .unwrap();
+        let raw =
+            crate::perfrollup::scan_calls(&st.db, hour, hour + chrono::Duration::hours(1), "", &[])
+                .unwrap();
+        assert_eq!(fast.call_count, raw.call_count, "失效后应按明细补齐");
+        assert_eq!(fast.call_count, 2, "两条调用各计一次");
     }
 }

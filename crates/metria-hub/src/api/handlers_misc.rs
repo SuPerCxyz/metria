@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::net::IpAddr;
 
-use crate::api::{admin_user, auth_user, json_err, AppState};
+use crate::api::{admin_user, auth_user, json_err, run_blocking, AppState};
 
 // ============ 数据归档 ============
 
@@ -291,47 +291,50 @@ pub(crate) async fn pricing_catalog_refresh(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let defs = crate::catalog::catalogs_from_db(&st.db);
-    let Some(cat) = defs.into_iter().find(|c| c.id == id) else {
-        return json_err(
-            StatusCode::NOT_FOUND,
-            "catalog_not_found",
-            "目录不存在或未启用",
-        );
-    };
-    match crate::catalog::sync_catalog(&st.db, &cat) {
-        Ok(r) => {
-            let repriced = if r.fetched {
-                match crate::catalog::reprice_from_rules(&st.db, false) {
-                    Ok(n) => Some(n),
-                    Err(e) => {
-                        tracing::warn!("同步后重新计价失败: {e}");
-                        None
+    run_blocking(move || {
+        let defs = crate::catalog::catalogs_from_db(&st.db);
+        let Some(cat) = defs.into_iter().find(|c| c.id == id) else {
+            return json_err(
+                StatusCode::NOT_FOUND,
+                "catalog_not_found",
+                "目录不存在或未启用",
+            );
+        };
+        match crate::catalog::sync_catalog(&st.db, &cat) {
+            Ok(r) => {
+                let repriced = if r.fetched {
+                    match crate::catalog::reprice_from_rules(&st.db, false) {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            tracing::warn!("同步后重新计价失败: {e}");
+                            None
+                        }
                     }
-                }
-            } else {
-                None
-            };
-            st.sse.publish("pricing.updated", "{}");
-            Json(serde_json::json!({
-                "ok": true,
-                "fetched": r.fetched,
-                "rules": r.rules,
-                "etag": r.etag,
-                "repriced": repriced,
-            }))
-            .into_response()
+                } else {
+                    None
+                };
+                st.sse.publish("pricing.updated", "{}");
+                Json(serde_json::json!({
+                    "ok": true,
+                    "fetched": r.fetched,
+                    "rules": r.rules,
+                    "etag": r.etag,
+                    "repriced": repriced,
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                let _ = st.db.mark_catalog_error(&cat.id, &e);
+                Json(serde_json::json!({
+                        "ok": false,
+                        "error": e,
+                        "note": "同步失败，继续使用最后一个有效快照",
+                }))
+                .into_response()
+            }
         }
-        Err(e) => {
-            let _ = st.db.mark_catalog_error(&cat.id, &e);
-            Json(serde_json::json!({
-                "ok": false,
-                "error": e,
-                "note": "同步失败，继续使用最后一个有效快照",
-            }))
-            .into_response()
-        }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn pricing_snapshots(State(st): State<AppState>) -> Response {
@@ -366,22 +369,25 @@ pub(crate) async fn pricing_reprice(
     State(st): State<AppState>,
     _req: Json<RepriceRequest>,
 ) -> Response {
-    match crate::catalog::reprice_from_rules(&st.db, false) {
-        Ok(n) => {
-            st.sse.publish("pricing.updated", "{}");
-            Json(serde_json::json!({
-                "ok": true,
-                "repriced": n,
-                "note": "重新计价生成新版本，随后按保留策略只保留每个用量行的最新计价记录",
-            }))
-            .into_response()
-        }
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reprice_failed",
-            &e.to_string(),
-        ),
-    }
+    run_blocking(
+        move || match crate::catalog::reprice_from_rules(&st.db, false) {
+            Ok(n) => {
+                st.sse.publish("pricing.updated", "{}");
+                Json(serde_json::json!({
+                    "ok": true,
+                    "repriced": n,
+                    "note": "重新计价生成新版本，随后按保留策略只保留每个用量行的最新计价记录",
+                }))
+                .into_response()
+            }
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reprice_failed",
+                &e.to_string(),
+            ),
+        },
+    )
+    .await
 }
 
 // ============ Share / Export ============

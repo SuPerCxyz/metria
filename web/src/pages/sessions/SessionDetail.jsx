@@ -1,10 +1,9 @@
 // 会话详情：摘要 + 趋势图 + Token 构成 + 模型调用列表 + 错误异常。
 
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 import PageHeader from '../../components/common/PageHeader'
 import DetailSummary from '../../components/common/DetailSummary'
-import SortableList from '../../components/common/SortableList'
 import StatusBadge from '../../components/common/StatusBadge'
 import DataTable from '../../components/tables/DataTable'
 import TrendChart from '../../components/charts/TrendChart'
@@ -14,12 +13,16 @@ import { api } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeNames } from '../../hooks/useNodeNames'
+import { usePagedSessionList } from '../../hooks/usePagedSessionList'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { buildSessionTrend } from './sessionTrend'
+import { trendViewState } from './trendState'
 import { fmtTokensShort, fmtUsd, fmtDateTime, fmtDuration, fmtSessionTitle, sumTokens, outputTokens } from '../../services/format'
 
 const TREND_TABS = [
   { key: 'tokens', label: 'Token' },
   { key: 'cost', label: '费用' },
-  { key: 'latency', label: '延迟' },
+  { key: 'latency', label: '平均延迟' },
 ]
 
 export default function SessionDetail() {
@@ -29,26 +32,30 @@ export default function SessionDetail() {
   const [trendTab, setTrendTab] = useState('tokens')
 
   const query = useQuery(`session-detail-${id}`, () => api(`/sessions/${encodeURIComponent(id)}`))
-  const calls = useQuery(`session-calls-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/calls`))
-  const timeline = useQuery(`session-timeline-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/timeline`))
+  const calls = usePagedSessionList(`/sessions/${encodeURIComponent(id)}/calls`, 'calls')
+  const timeline = usePagedSessionList(`/sessions/${encodeURIComponent(id)}/timeline`, 'messages')
+  const tools = usePagedSessionList(`/sessions/${encodeURIComponent(id)}/tools`, 'tools')
+  const stats = useQuery(`session-stats-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/stats`))
   const subagents = useQuery(`session-subagents-${id}`, () => api(`/sessions/${encodeURIComponent(id)}/subagents`))
   const nodeNames = useNodeNames()
 
-  const callList = calls.data?.calls || []
-  const messageList = timeline.data?.messages || []
+  const callList = calls.items
+  const messageList = timeline.items
+  const toolList = tools.items
   const subagentRelations = subagents.data?.relations || []
   const subagentChildren = subagents.data?.children || []
   const subagentTotals = subagents.data?.totals || null
 
-  const trendData = useMemo(() => {
-    const pts = callList
-    switch (trendTab) {
-      case 'tokens': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => sumTokens(p)) }
-      case 'cost': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.reported_cost_micro_usd ?? p.calculated_cost_micro_usd ?? p.estimated_cost_micro_usd ?? null) }
-      case 'latency': return { labels: pts.map((p) => p.started_at), values: pts.map((p) => p.duration_ms ?? null) }
-      default: return { labels: [], values: [] }
-    }
-  }, [callList, trendTab])
+  const trendData = useMemo(
+    () => buildSessionTrend(stats.data?.series, trendTab),
+    [stats.data, trendTab],
+  )
+  const trendState = trendViewState({
+    // SWR 命中缓存时保留图表，只有首次无数据才显示加载态。
+    loading: stats.loading && !stats.data,
+    error: stats.error,
+    labels: trendData.labels,
+  })
 
   const formatY = (v) => {
     if (trendTab === 'tokens') return fmtTokensShort(v)
@@ -67,6 +74,15 @@ export default function SessionDetail() {
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
   ]
 
+  const toolColumns = [
+    { key: 'started_at', label: '时间', sortable: true, render: (r) => fmtDateTime(r.started_at) },
+    { key: 'name', label: '工具', render: (r) => r.name || '—' },
+    { key: 'tool_type', label: '类型', render: (r) => r.tool_type || '—' },
+    { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
+    { key: 'input_length', label: '输入长度', render: (r) => Number(r.input_length ?? 0).toLocaleString() },
+    { key: 'output_length', label: '输出长度', render: (r) => Number(r.output_length ?? 0).toLocaleString() },
+  ]
+
   const childColumns = [
     { key: 'title', label: '标题', render: (r) => <span className="block min-w-[8rem] max-w-[16rem] truncate" title={r.title || r.source_session_id}>{r.title || r.source_session_id}</span> },
     { key: 'model', label: '模型', render: (r) => r.model || '—' },
@@ -79,7 +95,6 @@ export default function SessionDetail() {
     { key: 'status', label: '状态', render: (r) => <StatusBadge status={r.status} /> },
   ]
 
-  const errors = (callList || []).filter((c) => c.status && !['success', 'ok', 'completed'].includes(String(c.status).toLowerCase()))
 
   if (query.error) return <ErrorState error={query.error} onRetry={query.refresh} />
   if (query.loading) return <LoadingSkeleton rows={8} />
@@ -129,7 +144,19 @@ export default function SessionDetail() {
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">会话趋势</h2>
           <Segmented items={TREND_TABS} value={trendTab} onChange={setTrendTab} />
         </div>
-        {trendData.labels.length === 0 ? <EmptyState title="该会话暂无模型调用" /> : <TrendChart labels={trendData.labels} values={trendData.values} range={range} height={320} formatY={formatY} />}
+        {trendState === 'loading' && <LoadingSkeleton rows={4} />}
+        {trendState === 'error' && <ErrorState error={stats.error} onRetry={stats.refresh} />}
+        {trendState === 'empty' && <EmptyState title="该会话暂无模型调用" />}
+        {trendState === 'chart' && (
+          <TrendChart
+            labels={trendData.labels}
+            values={trendData.values}
+            range={range}
+            height={320}
+            formatY={formatY}
+            ariaLabel={trendTab === 'latency' ? '平均延迟趋势' : '会话趋势'}
+          />
+        )}
       </div>
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
@@ -154,7 +181,7 @@ export default function SessionDetail() {
         </div>
       </div>
 
-      <ConversationTimeline query={timeline} messages={messageList} />
+      <ConversationTimeline query={timeline} messages={messageList} total={timeline.total} hasMore={timeline.hasMore} loadingMore={timeline.loadingMore} onLoadMore={timeline.loadMore} />
 
       {subagentRelations.length > 0 && (
         <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-6">
@@ -178,29 +205,57 @@ export default function SessionDetail() {
       )}
 
       <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
-        <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100 p-2">模型调用列表</h2>
+        <div className="flex flex-wrap items-center justify-between gap-2 p-2">
+          <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">模型调用列表</h2>
+          <span className="text-xs tabular-nums text-gray-400 dark:text-gray-500">
+            已加载 {callList.length.toLocaleString()} / {calls.total != null ? calls.total.toLocaleString() : '—'} 次调用
+          </span>
+        </div>
+        {calls.error && <ErrorState error={calls.error} onRetry={calls.refresh} />}
         <DataTable columns={callColumns} data={callList} pageSize={12} onRowClick={(r) => navigate(`/calls/${encodeURIComponent(r.id)}`, { state: { from: `/sessions/${encodeURIComponent(id)}` } })} />
+        {calls.hasMore && (
+          <div className="flex justify-center p-3">
+            <button type="button" onClick={calls.loadMore} disabled={calls.loadingMore} className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700/40">
+              {calls.loadingMore ? '加载中…' : '加载更多调用'}
+            </button>
+          </div>
+        )}
       </div>
 
-      {errors.length > 0 && (
+      {(toolList.length > 0 || tools.total > 0) && (
+        <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 p-2">
+            <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">工具调用</h2>
+            <span className="text-xs tabular-nums text-gray-400 dark:text-gray-500">
+              已加载 {toolList.length.toLocaleString()} / {tools.total != null ? tools.total.toLocaleString() : '—'} 次工具
+            </span>
+          </div>
+          {tools.error && <ErrorState error={tools.error} onRetry={tools.refresh} />}
+          <DataTable columns={toolColumns} data={toolList} pageSize={10} />
+          {tools.hasMore && (
+            <div className="flex justify-center p-3">
+              <button type="button" onClick={tools.loadMore} disabled={tools.loadingMore} className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700/40">
+                {tools.loadingMore ? '加载中…' : '加载更多工具'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {(stats.data?.error_count ?? 0) > 0 && (
         <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-red-200 dark:border-red-800/60 p-6">
           <h2 className="text-lg font-bold text-red-600 dark:text-red-400 mb-4">错误和异常</h2>
-          <SortableList
-            items={errors}
-            limit={10}
-            options={[
-              { key: 'started_at', label: '时间', getValue: (e) => e.started_at },
-              { key: 'model', label: '模型', getValue: (e) => e.model },
-              { key: 'status', label: '状态', getValue: (e) => e.status },
-            ]}
-            className="space-y-2"
-            renderItem={(e) => (
-              <div key={e.id} className="flex items-center justify-between px-3 py-2 rounded-lg bg-red-50 dark:bg-red-400/5 text-sm">
-                <span className="text-gray-700 dark:text-gray-200">{e.model || '—'} · {fmtDateTime(e.started_at)}</span>
-                <StatusBadge status={e.status} />
-              </div>
-            )}
-          />
+          <p className="mb-3 text-sm text-gray-600 dark:text-gray-300">
+            当前会话共 <strong>{stats.data.error_count.toLocaleString()}</strong> 次失败调用（统计来自全量数据，不受列表分页影响）。
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(stats.data.status_counts || []).map((item) => (
+              <span key={item.status} className="inline-flex items-center gap-2 rounded-lg bg-red-50 px-3 py-1.5 text-sm dark:bg-red-400/5">
+                <StatusBadge status={item.status} />
+                <span className="tabular-nums text-gray-600 dark:text-gray-300">{Number(item.count ?? 0).toLocaleString()}</span>
+              </span>
+            ))}
+          </div>
         </div>
       )}
     </>
@@ -250,23 +305,94 @@ function ContextItem({ label, value }) {
   )
 }
 
-function ConversationTimeline({ query, messages }) {
+function ConversationTimeline({ query, messages, total, hasMore, loadingMore, onLoadMore }) {
+  const parentRef = useRef(null)
+  const sentinelRef = useRef(null)
+  const virtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 140,
+    overscan: 5,
+  })
+  const setSize = total ?? messages.length
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current
+    if (!sentinel || !hasMore) return undefined
+    if (typeof IntersectionObserver === 'undefined') return undefined
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) onLoadMore()
+    }, { root: parentRef.current, rootMargin: '200px' })
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [hasMore, onLoadMore])
+
   return (
     <div className="mt-4 bg-white dark:bg-gray-800 shadow-xs rounded-2xl border border-gray-200 dark:border-gray-700/60 p-5">
       <div className="flex items-center justify-between gap-3 mb-4">
         <div>
           <h2 className="text-lg font-bold text-gray-800 dark:text-gray-100">对话列表</h2>
-          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">按会话发生顺序展示已采集的消息。</p>
+          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">按会话发生顺序展示已采集的消息，长列表使用虚拟滚动。</p>
         </div>
-        {messages.length > 0 && <span className="text-xs text-gray-400 dark:text-gray-500">{messages.length} 条</span>}
+        {messages.length > 0 && (
+          <span className="text-xs tabular-nums text-gray-400 dark:text-gray-500">
+            已加载 {messages.length.toLocaleString()} / {setSize.toLocaleString()} 条
+          </span>
+        )}
       </div>
       {query.loading && <LoadingSkeleton rows={4} />}
       {query.error && <ErrorState error={query.error} onRetry={query.refresh} />}
       {!query.loading && !query.error && messages.length === 0 && <EmptyState title="暂无对话内容" desc="当前会话没有可展示的消息，或内容保存策略未记录正文。" />}
       {!query.loading && !query.error && messages.length > 0 && (
-        <div className="space-y-3">
-          {messages.map((message, index) => <ConversationMessage key={message.id || index} message={message} />)}
-        </div>
+        <>
+          <div
+            ref={parentRef}
+            role="list"
+            aria-label="对话消息列表"
+            className="max-h-[640px] overflow-auto pr-1"
+          >
+            <div style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}>
+              {virtualizer.getVirtualItems().map((item) => {
+                const message = messages[item.index]
+                return (
+                  <div
+                    key={message.id || item.index}
+                    ref={virtualizer.measureElement}
+                    data-index={item.index}
+                    role="listitem"
+                    aria-setsize={setSize}
+                    aria-posinset={item.index + 1}
+                    className="pb-3"
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      transform: `translateY(${item.start}px)`,
+                    }}
+                  >
+                    <ConversationMessage message={message} />
+                  </div>
+                )
+              })}
+            </div>
+            <div ref={sentinelRef} className="h-px" aria-hidden="true" />
+          </div>
+          <div className="mt-3 flex justify-center">
+            {hasMore ? (
+              <button
+                type="button"
+                onClick={onLoadMore}
+                disabled={loadingMore}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700/40"
+              >
+                {loadingMore ? '加载中…' : '加载更多消息'}
+              </button>
+            ) : (
+              <span className="text-xs text-gray-400 dark:text-gray-500">已加载全部消息</span>
+            )}
+          </div>
+        </>
       )}
     </div>
   )

@@ -306,6 +306,25 @@ async fn full_ingest_rollup_query_cycle() {
     );
     assert!(overview["active_duration_ms"].is_null());
 
+    // 客户端详情汇总：CTE 使用 ?2..?5，summary 必须绑定完整的 5 个参数，
+    // 不能因参数数量错误静默返回 0。
+    let client: Value = ureq::get(&format!(
+        "{base}/api/v1/clients/claude-code?from={from}&to={to}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(client["reported_cost_micro_usd"], 0);
+    assert_eq!(client["calculated_cost_micro_usd"], 33218 + 11100);
+    assert_eq!(client["estimated_cost_micro_usd"], 0);
+    assert_eq!(client["cost_micro_usd"], 33218 + 11100);
+    assert_eq!(client["input_tokens"], 3000);
+    assert_eq!(client["output_tokens"], 800);
+    assert_eq!(client["cache_read_tokens"], 100);
+    assert_eq!(client["cache_write_tokens"], 50);
+
     let filter_options: Value = ureq::get(&format!(
         "{base}/api/v1/usage/filter-options?from={from}&to={to}"
     ))
@@ -1591,6 +1610,22 @@ async fn latency_timeseries_buckets_aggregates_and_gapfills() {
         .into_json()
         .unwrap();
     assert_eq!(overall["count"], 3);
+
+    // 1 小时桶走性能快路径：即使没有预聚合、回退明细，分位数也由直方图合并，
+    // 响应必须标注近似。
+    let fast_latency: Value = ureq::get(&format!(
+        "{base}/api/v1/usage/latency/timeseries?from=2026-08-04T00:00:00Z&to=2026-08-06T00:00:00Z"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(
+        fast_latency["quantile_approx"].as_bool(),
+        Some(true),
+        "1 小时桶快路径必须标注近似"
+    );
 
     let performance: Value = ureq::get(&format!(
         "{base}/api/v1/usage/performance?from={from}&to={to}"

@@ -15,6 +15,7 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use metria_storage::rusqlite::{params_from_iter, types::Value as SqlValue};
 use metria_storage::StorageError;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::db::HubDb;
 
@@ -26,7 +27,9 @@ const MS_HIST_MAX: f64 = 10_000_000.0;
 /// 输出速度上界（token/s）。
 const SPEED_HIST_MAX: f64 = 100_000.0;
 /// payload 结构版本；变更字段语义时递增，旧版本行会被重建覆盖。
-const PAYLOAD_VERSION: u32 = 1;
+pub const PAYLOAD_VERSION: u32 = 1;
+/// 全量重建成功后持久化的版本键；用于避免每次启动逐行扫描 payload。
+pub const PAYLOAD_VERSION_KEY: &str = "perf_rollup_payload_version";
 
 /// 单个分箱的样本数。
 pub type BinCounts = [u32; HIST_BINS];
@@ -606,30 +609,6 @@ pub fn hour_bucket(ts: DateTime<Utc>) -> String {
         .unwrap_or_else(|| ts.to_rfc3339())
 }
 
-/// 读取预聚合：按小时区间返回 payload 行。
-///
-/// 返回 `None` 表示区间内存在缺失或版本过期的小时，调用方应回退明细，
-/// 绝不能把缺失当成 0。
-pub fn load_range(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Option<Vec<PerfHour>> {
-    if to <= from {
-        return Some(Vec::new());
-    }
-    let c = db.conn();
-    let mut stmt = c
-        .prepare("SELECT bucket, payload FROM hourly_performance_rollups WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket")
-        .ok()?;
-    let rows = stmt
-        .query_map([from.to_rfc3339(), to.to_rfc3339()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .ok()?;
-    let mut out = Vec::new();
-    for row in rows.flatten() {
-        out.push(PerfHour::from_payload(&row.1)?);
-    }
-    Some(out)
-}
-
 /// 覆盖历史区间的整点小时序列（不含当前未完成小时）。
 pub fn complete_hours(from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<DateTime<Utc>> {
     let floor = |ts: DateTime<Utc>| {
@@ -659,93 +638,196 @@ fn bind_range(from: DateTime<Utc>, to: DateTime<Utc>, extra_args: &[SqlValue]) -
     args
 }
 
-/// 按 UTC 小时返回 `[from, to)` 的聚合：完整小时读预聚合，两端不整点片段回退明细。
+/// 解码预聚合 payload。
 ///
-/// 三段互不重叠且并集恰为 `[from, to)`：
-///   * S1 `[from, mid_start)`：头部不整点片段与「查询早于预聚合起点」的空白区间，
-///     一律走明细扫描（空白区间没有行，索引区间 seek 即返回，代价可忽略）；
-///   * S2 `[mid_start, mid_end)`：完整小时读预聚合，**缺行即整体回退**，绝不把缺失当 0；
-///   * S3 `[mid_end, to)`：当前未完成小时，走明细扫描，因此**新数据立即可见**。
+/// * `Ok(Some(hour))`：版本一致且可解析；
+/// * `Ok(None)`：版本过期，按“需补桶”处理；
+/// * `Err`：JSON 损坏，调用方整体回退明细。
+fn decode_payload(payload: &str) -> Result<Option<PerfHour>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    let version = value.get("v").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != PAYLOAD_VERSION as u64 {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some)
+}
+
+/// 读取 `[from, to)` 内可用的完整小时桶；缺失、早建、版本过期均视为“需补桶”。
+fn load_rollup_meta(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<BTreeMap<DateTime<Utc>, PerfHour>, StorageError> {
+    let mut out = BTreeMap::new();
+    if to <= from {
+        return Ok(out);
+    }
+    let c = db.read_conn();
+    let mut stmt = c.prepare(
+        "SELECT bucket, built_at, payload FROM hourly_performance_rollups \
+         WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+    )?;
+    let mut rows = stmt.query([from.to_rfc3339(), to.to_rfc3339()])?;
+    while let Some(row) = rows.next()? {
+        let bucket_raw: String = row.get(0)?;
+        let built_at_raw: String = row.get(1)?;
+        let payload: String = row.get(2)?;
+        let Some(bucket) = parse_ts(&bucket_raw) else {
+            continue;
+        };
+        let hour_end = bucket + chrono::Duration::hours(1);
+        let built_at = match parse_ts(&built_at_raw) {
+            Some(ts) => ts,
+            None => {
+                debug!(bucket = %bucket_raw, "性能预聚合 built_at 无法解析，按需补桶处理");
+                continue;
+            }
+        };
+        if built_at < hour_end {
+            continue;
+        }
+        match decode_payload(&payload).map_err(|e| StorageError::Query(e.to_string()))? {
+            Some(hour) => {
+                out.insert(bucket, hour);
+            }
+            None => continue,
+        }
+    }
+    Ok(out)
+}
+
+/// 按小时分组扫描明细；用于补一个连续缺失区间内的多个小时。
+fn build_hours_from_detail(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<BTreeMap<DateTime<Utc>, PerfHour>, StorageError> {
+    let buckets = build_window(db, from, to)?;
+    let mut out = BTreeMap::new();
+    for (key, hour) in buckets {
+        if let Some(ts) = parse_ts(&key) {
+            out.insert(ts, hour);
+        }
+    }
+    Ok(out)
+}
+
+/// 按 UTC 小时返回 `[from, to)` 的聚合：逐小时决定读预聚合还是补该小时明细。
 ///
-/// 返回 `None` 表示本次必须整体回退明细（带维度筛选、或预聚合缺桶/版本过期）。
+/// 覆盖规则：
+/// * 完整小时且 payload 版本一致、`built_at >= hour_end`：读预聚合；
+/// * 缺行、`built_at` 早于小时结束、版本过期：只用该小时明细补齐；
+/// * 连续多个需补小时合并为一次按小时分桶的明细扫描；
+/// * 两端不完整小时与当前未完成小时走明细。
+///
+/// 返回 `None` 仅表示本次无法安全给出结果（带维度筛选、DB 错误或 payload 损坏），
+/// 调用方应整体回退明细。单个缺桶不再触发整段回退。
 pub fn fast_hours(
     db: &HubDb,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     filter: &str,
 ) -> Option<Vec<(DateTime<Utc>, PerfHour)>> {
+    fast_hours_with_source(db, from, to, filter).map(|hours| {
+        hours
+            .into_iter()
+            .map(|(bucket, hour, _)| (bucket, hour))
+            .collect()
+    })
+}
+
+/// 与 [`fast_hours`] 相同，但额外返回每个桶是否来自预聚合。
+///
+/// 注意：未命中预聚合的小时在快路径内也由直方图聚合（近似分位数），
+/// 因此延迟时序只要走快路径就应标注 `quantile_approx=true`；`from_rollup`
+/// 仅用于区分数据来源，不直接等同于精确/近似。
+pub fn fast_hours_with_source(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    filter: &str,
+) -> Option<Vec<(DateTime<Utc>, PerfHour, bool)>> {
     if !filter.trim().is_empty() {
         return None;
     }
     if to <= from {
         return Some(Vec::new());
     }
-    let first_bucket = min_bucket(db)?;
-    let head_end = ceil_hour(from);
-    let mid_start = head_end.max(first_bucket);
-    let mid_end = floor_hour(to).min(floor_hour(Utc::now()));
 
-    // 没有可用的完整小时：只有整个区间确实落在**同一个** UTC 小时时，才能安全地把结果
-    // 压进单个桶——桶 key 会被热力图与日趋势用来定格。跨小时的短区间（如 10:30→11:30，
-    // 此时 ceil(from)==floor(to)）若压成一个桶，11:00 之后的行会被算进 10:00 那一格，
-    // 跨日界时更会记到前一天；这时返回 None，让调用方按小时分组扫明细。
-    if mid_start >= mid_end {
-        if floor_hour(from) != floor_hour(to - chrono::Duration::nanoseconds(1)) {
+    let now = Utc::now();
+    let mid_start = ceil_hour(from);
+    let mid_end = floor_hour(to).min(floor_hour(now));
+    let mut out: Vec<(DateTime<Utc>, PerfHour, bool)> = Vec::new();
+
+    // 头部不完整小时。
+    let head_end = mid_start.min(to);
+    if from < head_end {
+        match scan_calls(db, from, head_end, "", &[]) {
+            Ok(agg) => out.push((floor_hour(from), agg, false)),
+            Err(e) => {
+                warn!(error = %e, "性能预聚合头部明细扫描失败，整体回退");
+                return None;
+            }
+        }
+    }
+
+    let full_hours = complete_hours(from, mid_end);
+    let rollups = match load_rollup_meta(db, mid_start, mid_end) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "读取性能预聚合失败，整体回退");
             return None;
         }
-        return Some(vec![(
-            floor_hour(from),
-            scan_calls(db, from, to, "", &[]).ok()?,
-        )]);
+    };
+
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+    while index < full_hours.len() {
+        let hour = full_hours[index];
+        if let Some(acc) = rollups.get(&hour) {
+            out.push((hour, acc.clone(), true));
+            index += 1;
+            continue;
+        }
+        // 连续需补小时合并为一次明细扫描，但仍按小时独立入桶，禁止合并后再拆。
+        let run_start = index;
+        while index < full_hours.len() && !rollups.contains_key(&full_hours[index]) {
+            index += 1;
+        }
+        let run = &full_hours[run_start..index];
+        let detail_from = run[0];
+        let detail_to = run[run.len() - 1] + chrono::Duration::hours(1);
+        let mut detail = match build_hours_from_detail(db, detail_from, detail_to) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "性能预聚合补桶扫描失败，整体回退");
+                return None;
+            }
+        };
+        repaired += run.len();
+        for hour in run {
+            out.push((*hour, detail.remove(hour).unwrap_or_default(), false));
+        }
     }
 
-    let mut out: Vec<(DateTime<Utc>, PerfHour)> = Vec::new();
-    if from < mid_start {
-        out.push((
-            floor_hour(from),
-            scan_calls(db, from, mid_start, "", &[]).ok()?,
-        ));
-    }
-
-    let hours = (mid_end.timestamp() - mid_start.timestamp()) / 3600;
-    if hours > 0 {
-        let present = count_buckets(db, mid_start, mid_end)?;
-        if present != hours {
-            return None;
-        }
-        let rows = load_range(db, mid_start, mid_end)?;
-        if rows.len() as i64 != hours {
-            return None;
-        }
-        let mut bucket = mid_start;
-        for row in rows {
-            out.push((bucket, row));
-            bucket += chrono::Duration::hours(1);
+    // 尾部：当前未完成小时或未对齐到整点的结束片段。
+    if mid_end >= mid_start && mid_end < to {
+        match scan_calls(db, mid_end, to, "", &[]) {
+            Ok(agg) => out.push((floor_hour(mid_end), agg, false)),
+            Err(e) => {
+                warn!(error = %e, "性能预聚合尾部明细扫描失败，整体回退");
+                return None;
+            }
         }
     }
 
-    if mid_end < to {
-        out.push((
-            floor_hour(mid_end),
-            scan_calls(db, mid_end, to, "", &[]).ok()?,
-        ));
-    }
+    debug!(
+        rollup_hours = rollups.len(),
+        repaired_hours = repaired,
+        buckets = out.len(),
+        "性能预聚合快速路径"
+    );
     Some(out)
-}
-
-/// 把时间夹到所在 UTC 整点（供 rollup CTE 计算完整小时边界）。
-///
-/// 预聚合中最早的一个小时；表为空时返回 `None`（尚未构建，回退明细）。
-fn min_bucket(db: &HubDb) -> Option<DateTime<Utc>> {
-    let c = db.conn();
-    let raw: Option<String> = c
-        .query_row(
-            "SELECT MIN(bucket) FROM hourly_performance_rollups",
-            [],
-            |r| r.get(0),
-        )
-        .ok()?;
-    raw.as_deref().and_then(parse_ts)
 }
 
 /// 把 [`fast_hours`] 的结果合并成整段聚合（延迟/性能/总览分位数用）。
@@ -779,31 +861,145 @@ pub fn ceil_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// 区间内已存在的预聚合行数；缺行时返回 `None` 触发回退。
-fn count_buckets(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Option<i64> {
-    let c = db.conn();
-    c.query_row(
-        "SELECT COUNT(*) FROM hourly_performance_rollups WHERE bucket >= ?1 AND bucket < ?2",
-        [from.to_rfc3339(), to.to_rfc3339()],
-        |r| r.get::<_, i64>(0),
-    )
-    .ok()
-}
-
-/// 重建全部历史预聚合（启动时与周期维护调用）。
+/// 重建全部历史预聚合（启动时与显式历史修复调用）。
 ///
 /// 全量重建保证：Agent 尾部补采、历史回填、重新计价等改动都能被吸收，
 /// 避免「预聚合与明细不一致」。按窗口分批推进，内存与总行数解耦。
 pub fn rebuild_history(db: &HubDb) -> Result<usize, StorageError> {
+    let _guard = db.rebuild_guard();
     let Some(earliest) = earliest_call_time(db)? else {
         return Ok(0);
     };
-    rebuild(db, earliest, Utc::now())
+    let written = rebuild(db, earliest, Utc::now())?;
+    // 成功完成全量重建后持久化 payload 版本，后续启动不再逐行解析 payload。
+    db.setting_set(PAYLOAD_VERSION_KEY, &PAYLOAD_VERSION.to_string())?;
+    if let Err(e) = audit_archived_rollups(db) {
+        warn!(error = %e, "归档水位前的性能预聚合审计失败");
+    }
+    Ok(written)
+}
+
+/// 只重建最近 `hours` 个已结束小时（默认由维护任务传 3）。
+///
+/// 调用方负责与全量重建互斥（维护任务使用 `try_rebuild_guard`）。
+pub fn rebuild_recent(db: &HubDb, hours: u32) -> Result<usize, StorageError> {
+    if earliest_call_time(db)?.is_none() {
+        return Ok(0);
+    }
+    let hours = hours.clamp(1, 24) as i64;
+    let end = floor_hour(Utc::now());
+    let start = end - chrono::Duration::hours(hours);
+    rebuild(db, start, end)
+}
+
+/// 失效指定小时（UTC 整点）的性能预聚合，让 `fast_hours` 下次从明细补齐。
+///
+/// 只删除归档水位所在小时之后的桶；水位之前的明细已归档，删除后无法重建，
+/// 保留旧聚合。返回实际删除的行数。
+pub fn invalidate_hours(db: &HubDb, hours: &[DateTime<Utc>]) -> Result<usize, StorageError> {
+    if hours.is_empty() {
+        return Ok(0);
+    }
+    let min_bucket = match crate::archive::watermark(db) {
+        Some(raw) => match parse_ts(&raw) {
+            Some(ts) => Some(ceil_hour(ts)),
+            None => {
+                warn!(watermark = %raw, "归档水位无法解析，跳过性能预聚合失效");
+                return Ok(0);
+            }
+        },
+        None => None,
+    };
+    let mut unique = std::collections::BTreeSet::new();
+    for hour in hours {
+        let bucket = floor_hour(*hour);
+        if min_bucket.is_some_and(|min| bucket < min) {
+            continue;
+        }
+        unique.insert(bucket);
+    }
+    if unique.is_empty() {
+        return Ok(0);
+    }
+
+    let c = db.conn();
+    let tx = c.unchecked_transaction().map_err(StorageError::from)?;
+    let mut deleted = 0usize;
+    {
+        let mut stmt = tx.prepare("DELETE FROM hourly_performance_rollups WHERE bucket = ?1")?;
+        for hour in unique {
+            deleted += stmt.execute([hour_bucket(hour)])?;
+        }
+    }
+    tx.commit().map_err(StorageError::from)?;
+    Ok(deleted)
+}
+
+/// 审计归档水位之前无法重建的预聚合行：只告警计数，不删除。
+///
+/// 这些小时的明细已归档，旧行是唯一可用的历史聚合；删除后无法从明细重建，
+/// 因此保留旧行并让 `fast_hours` 对旧版本/损坏行按明细不可用处理。
+fn audit_archived_rollups(db: &HubDb) -> Result<usize, StorageError> {
+    let Some(raw) = crate::archive::watermark(db) else {
+        return Ok(0);
+    };
+    let Some(watermark) = parse_ts(&raw) else {
+        warn!(watermark = %raw, "归档水位无法解析，跳过预聚合审计");
+        return Ok(0);
+    };
+    let cutoff = ceil_hour(watermark).to_rfc3339();
+    let c = db.read_conn();
+    let mut stmt = c.prepare("SELECT payload FROM hourly_performance_rollups WHERE bucket < ?1")?;
+    let mut rows = stmt.query([cutoff])?;
+    let mut bad = 0usize;
+    while let Some(row) = rows.next()? {
+        let payload: String = row.get(0)?;
+        let version_ok = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|value| value.get("v").and_then(|v| v.as_u64()))
+            == Some(PAYLOAD_VERSION as u64);
+        if !version_ok {
+            bad += 1;
+        }
+    }
+    if bad > 0 {
+        warn!(
+            count = bad,
+            watermark = %raw,
+            "归档水位前的性能预聚合存在旧版本/损坏行；明细已归档，保留旧行"
+        );
+    }
+    Ok(bad)
+}
+
+/// 是否需要一次全量重建：版本键缺失/不一致、或表为空但有明细。
+///
+/// 版本键一致且表非空时不再逐行解析 payload；损坏行由 `fast_hours` 按小时
+/// 回退明细，不会导致每次启动都全量重建。
+pub fn needs_full_rebuild(db: &HubDb) -> Result<bool, StorageError> {
+    if earliest_call_time(db)?.is_none() {
+        return Ok(false);
+    }
+    let stored = db.setting_get(PAYLOAD_VERSION_KEY)?;
+    let version_matches = stored
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(PAYLOAD_VERSION);
+    if !version_matches {
+        return Ok(true);
+    }
+    let c = db.read_conn();
+    let has_rows: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hourly_performance_rollups)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(!has_rows)
 }
 
 /// 最早的调用时间；没有调用数据时返回 `None`。
 fn earliest_call_time(db: &HubDb) -> Result<Option<DateTime<Utc>>, StorageError> {
-    let c = db.conn();
+    let c = db.read_conn();
     let raw: Option<String> = c
         .query_row("SELECT MIN(started_at) FROM model_calls", [], |r| r.get(0))
         .map_err(StorageError::from)?;
@@ -822,7 +1018,7 @@ pub fn scan_calls(
 ) -> Result<PerfHour, StorageError> {
     let mut acc = PerfHour::new();
     {
-        let c = db.conn();
+        let c = db.read_conn();
         let sql = format!(
             "SELECT started_at, duration_ms, first_byte_at, first_token_at, first_response_at,
                     output_tokens, output_tokens_per_second_milli, generation_duration_ms,
@@ -895,7 +1091,7 @@ pub fn scan_heatmap_grouped(
     let sub = |col: &str| {
         format!("(SELECT SUM(u.{col}) FROM usage_events u WHERE u.model_call_id = m.id)")
     };
-    let c = db.conn();
+    let c = db.read_conn();
     let sql = format!(
         "SELECT m.started_at, m.duration_ms,
                 COALESCE({s_input}, m.input_tokens), COALESCE({s_output}, m.output_tokens),
@@ -955,7 +1151,7 @@ fn build_window(
     let mut buckets: BTreeMap<String, PerfHour> = BTreeMap::new();
     let fallback_bucket = hour_bucket(from);
     {
-        let c = db.conn();
+        let c = db.read_conn();
         let sql =
             "SELECT started_at, duration_ms, first_byte_at, first_token_at, first_response_at, \
                    output_tokens, output_tokens_per_second_milli, generation_duration_ms, \
@@ -1026,6 +1222,18 @@ fn build_window(
 /// 按窗口推进（默认 24 小时），单批只保留一个窗口的聚合结果，内存与历史行数解耦，
 /// 满足 `hub-runtime-memory` 对有界处理的要求。
 pub fn rebuild(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<usize, StorageError> {
+    // 归档水位之前的小时明细已被删除，重建会把缺口写成不完整聚合并覆盖已有 rollup。
+    // 因此从水位所在小时的下一个整点开始；水位无法解析时放弃本次重建。
+    let from = match crate::archive::watermark(db) {
+        Some(raw) => match parse_ts(&raw) {
+            Some(ts) => from.max(ceil_hour(ts)),
+            None => {
+                warn!(watermark = %raw, "归档水位无法解析，跳过性能预聚合重建");
+                return Ok(0);
+            }
+        },
+        None => from,
+    };
     if to <= from {
         return Ok(0);
     }

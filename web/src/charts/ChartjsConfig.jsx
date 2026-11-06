@@ -1,9 +1,32 @@
-// Import Chart.js
-import { Chart, Tooltip } from 'chart.js';
+// 显式注册 TrendChart 实际使用的 Chart.js 组件，避免 chart.js/auto 全量打包。
+import {
+  BarController,
+  BarElement,
+  CategoryScale,
+  Chart,
+  Filler,
+  Legend,
+  LineController,
+  LineElement,
+  LinearScale,
+  PointElement,
+  Tooltip,
+} from 'chart.js';
 // Import Tailwind config
 import { adjustColorOpacity, getCssVariable } from '../utils/Utils';
 
-Chart.register(Tooltip);
+Chart.register(
+  LineController,
+  BarController,
+  LineElement,
+  PointElement,
+  BarElement,
+  CategoryScale,
+  LinearScale,
+  Tooltip,
+  Legend,
+  Filler,
+);
 
 // Define Chart.js default settings
 Chart.defaults.font.family = '"Inter", sans-serif';

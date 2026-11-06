@@ -108,6 +108,28 @@ fn seed_calls(db: &HubDb, hour_offset: i64, count: i64) -> (i64, i64) {
     (inserted, duration_sum)
 }
 
+/// 插入单条额外调用（ID 唯一），用于模拟预聚合构建后的补采。
+fn seed_extra_call(db: &HubDb, hour_offset: i64, id: &str) {
+    let started = current_hour() + Duration::hours(hour_offset) + Duration::minutes(45);
+    let call = json!({
+        "id": id,
+        "source_call_id": id,
+        "node_id": "n1", "collector_id": "c1", "client_id": "codex",
+        "source_id": "s1", "session_id": format!("sess-{hour_offset}"),
+        "model_raw": "gpt-5.6-sol", "model_normalized": "gpt-5.6-sol",
+        "provider_normalized": "openai",
+        "started_at": started.to_rfc3339(),
+        "completed_at": (started + Duration::milliseconds(333)).to_rfc3339(),
+        "duration_ms": 333,
+        "status": "success",
+        "call_granularity": "call",
+        "input_tokens": 1_000, "output_tokens": 200,
+    });
+    assert!(db
+        .insert_call(&call, &format!("n1:sess-{hour_offset}"))
+        .unwrap());
+}
+
 fn heatmap_totals(list: &[(DateTime<Utc>, perfrollup::PerfHour)]) -> (i64, u64, i64) {
     list.iter()
         .fold((0, 0, 0), |(tokens, calls, cost), (_, hour)| {
@@ -245,10 +267,60 @@ fn fast_path_matches_detail_scan_including_quiet_hours() {
     assert_eq!(fast_tokens.1, raw_tokens.1, "热力图调用数必须一致");
     assert_eq!(fast_tokens.0, raw_tokens.0, "热力图 Token 必须一致");
     assert_eq!(fast_tokens.2, raw_tokens.2, "热力图费用必须一致");
+    // 逐字段对照：除浮点累加顺序导致的末位差异外，所有指标、来源分布与热力图字段必须一致。
+    let mut fast_cmp = fast.clone();
+    let mut raw_cmp = raw.clone();
+    fast_cmp.speed.sum = 0.0;
+    raw_cmp.speed.sum = 0.0;
+    assert_eq!(fast_cmp, raw_cmp, "快慢路径逐字段必须一致");
+    assert!(
+        (fast.speed.sum - raw.speed.sum).abs() < 1e-9,
+        "输出速度总和只允许浮点末位差异: {} vs {}",
+        fast.speed.sum,
+        raw.speed.sum
+    );
 }
 
 #[test]
-fn missing_bucket_falls_back_instead_of_reporting_zero() {
+fn recent_rebuild_matches_full_for_recent_hours() {
+    let (_dir, db) = test_db("recent-rebuild");
+    for offset in -5..0 {
+        seed_calls(&db, offset, 20);
+    }
+    perfrollup::rebuild_history(&db).unwrap();
+
+    // 删掉最近 3 个已结束小时，模拟维护任务尚未补齐。
+    for offset in [-3, -2, -1] {
+        let bucket = perfrollup::hour_bucket(current_hour() + Duration::hours(offset));
+        db.conn()
+            .execute(
+                "DELETE FROM hourly_performance_rollups WHERE bucket = ?1",
+                [&bucket],
+            )
+            .unwrap();
+    }
+    let rebuilt = perfrollup::rebuild_recent(&db, 3).unwrap();
+    assert!(rebuilt >= 3, "最近 3 小时应重新写入: {rebuilt}");
+
+    for offset in [-3, -2, -1] {
+        let hour = current_hour() + Duration::hours(offset);
+        let start = hour.to_rfc3339();
+        let end = (hour + Duration::hours(1)).to_rfc3339();
+        let fast = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "").unwrap();
+        let raw = perfrollup::scan_calls(&db, hour, hour + Duration::hours(1), "", &[]).unwrap();
+        assert_eq!(
+            fast.call_count, raw.call_count,
+            "{start}..{end} 调用数不一致"
+        );
+        assert_eq!(
+            fast.duration.sum, raw.duration.sum,
+            "{start}..{end} 时长不一致"
+        );
+    }
+}
+
+#[test]
+fn missing_bucket_uses_detail_for_only_that_hour() {
     let (_dir, db) = test_db("missing");
     // 覆盖 -4..-1 四个完整小时，然后删掉**中间**的 -3 桶
     seed_calls(&db, -4, 30);
@@ -262,7 +334,7 @@ fn missing_bucket_falls_back_instead_of_reporting_zero() {
         "覆盖完整时应命中快速路径"
     );
 
-    // 中间桶缺失：必须整体回退，绝不能把缺失当成 0
+    // 中间桶缺失：只补该小时，绝不整段回退，也不把缺失当成 0。
     let victim = perfrollup::hour_bucket(current_hour() - Duration::hours(3));
     db.conn()
         .execute(
@@ -270,18 +342,52 @@ fn missing_bucket_falls_back_instead_of_reporting_zero() {
             [&victim],
         )
         .unwrap();
+    let fast = perfrollup::fast_aggregate(&db, from, to, "").expect("单桶缺失不应导致整段回退");
+    let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count);
+    assert_eq!(fast.duration.sum, raw.duration.sum);
+    let hours = perfrollup::fast_hours(&db, from, to, "").unwrap();
     assert!(
-        perfrollup::fast_aggregate(&db, from, to, "").is_none(),
-        "缺桶必须返回 None 触发明细回退"
-    );
-    assert!(
-        perfrollup::fast_hours(&db, from, to, "").is_none(),
-        "热力图同样必须回退"
+        hours
+            .iter()
+            .any(|(bucket, _)| perfrollup::hour_bucket(*bucket) == victim),
+        "缺失小时仍应出现在返回桶序列中"
     );
 }
 
 #[test]
-fn stale_payload_version_falls_back() {
+fn early_built_bucket_is_repaired_from_detail() {
+    let (_dir, db) = test_db("early-built");
+    seed_calls(&db, -2, 30);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(2);
+    let bucket = perfrollup::hour_bucket(hour);
+    // 模拟该桶在小时结束前就构建：后续补采的行不在 payload 里。
+    db.conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET built_at = ?1 WHERE bucket = ?2",
+            [(hour + Duration::minutes(5)).to_rfc3339(), bucket.clone()],
+        )
+        .unwrap();
+    seed_extra_call(&db, -2, "call-early-extra");
+
+    let from = hour;
+    let to = hour + Duration::hours(1);
+    let fast = perfrollup::fast_aggregate(&db, from, to, "").unwrap();
+    let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+    assert_eq!(
+        fast.call_count, raw.call_count,
+        "早建桶必须用该小时明细补齐"
+    );
+    assert_eq!(fast.duration.sum, raw.duration.sum);
+
+    let hours = perfrollup::fast_hours(&db, from, to, "").unwrap();
+    assert_eq!(hours.len(), 1);
+    assert_eq!(hours[0].1.call_count, raw.call_count);
+}
+
+#[test]
+fn payload_version_mismatch_uses_detail_for_that_hour() {
     let (_dir, db) = test_db("stale-payload");
     seed_calls(&db, -3, 20);
     perfrollup::rebuild_history(&db).unwrap();
@@ -293,9 +399,30 @@ fn stale_payload_version_falls_back() {
         )
         .unwrap();
     let from = current_hour() - Duration::hours(4);
+    let to = Utc::now();
+    let fast = perfrollup::fast_aggregate(&db, from, to, "")
+        .expect("版本过期的单桶应回退该小时明细，而不是整段回退");
+    let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count);
+    assert_eq!(fast.duration.sum, raw.duration.sum);
+    assert!(perfrollup::fast_hours(&db, from, to, "").is_some());
+}
+
+#[test]
+fn corrupt_payload_falls_back_entirely() {
+    let (_dir, db) = test_db("corrupt-payload");
+    seed_calls(&db, -3, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let bucket = perfrollup::hour_bucket(current_hour() - Duration::hours(3));
+    db.conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET payload = '{ broken' WHERE bucket = ?1",
+            [&bucket],
+        )
+        .unwrap();
     assert!(
-        perfrollup::fast_aggregate(&db, from, Utc::now(), "").is_none(),
-        "payload 版本不符必须回退，避免读到语义已变的旧结果"
+        perfrollup::fast_hours(&db, current_hour() - Duration::hours(4), Utc::now(), "").is_none(),
+        "payload 损坏必须整体回退，交给明细路径"
     );
 }
 
@@ -458,10 +585,19 @@ fn cross_hour_short_range_falls_back_instead_of_single_bucket() {
     let base = current_hour() - Duration::hours(3);
     let from = base + Duration::minutes(50);
     let to = base + Duration::hours(1) + Duration::minutes(10);
-    assert!(
-        perfrollup::fast_hours(&db, from, to, "").is_none(),
-        "跨小时且无完整小时的区间必须回退，交给按小时分组的明细扫描"
+    let list = perfrollup::fast_hours(&db, from, to, "")
+        .expect("跨小时短区间应由逐小时明细补齐，而不是整段回退");
+    assert_eq!(list.len(), 2, "跨小时短区间应产出两个独立小时桶");
+    assert_eq!(
+        list.iter().map(|(_, hour)| hour.call_count).sum::<u64>(),
+        perfrollup::scan_calls(&db, from, to, "", &[])
+            .unwrap()
+            .call_count,
+        "逐小时补齐不得重复计数"
     );
+    let fast = perfrollup::fast_aggregate(&db, from, to, "").unwrap();
+    let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count);
 
     // 单个小时内的区间仍可安全压成一个桶
     let single = base + Duration::minutes(10);
@@ -473,4 +609,109 @@ fn cross_hour_short_range_falls_back_instead_of_single_bucket() {
     // 回退路径的口径仍与明细一致（不因回退而变慢或变错）
     let agg = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
     assert!(agg.call_count > 0, "该区间应有调用数据");
+}
+
+#[test]
+fn late_call_invalidates_old_perf_rollup() {
+    let (_dir, db) = test_db("late-invalidate");
+    seed_calls(&db, -4, 20);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    let before = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "")
+        .unwrap()
+        .call_count;
+
+    seed_extra_call(&db, -4, "call-late-extra");
+    let deleted = perfrollup::invalidate_hours(&db, &[hour]).unwrap();
+    assert_eq!(deleted, 1, "应删除目标小时的预聚合行");
+
+    let fast = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "").unwrap();
+    let raw = perfrollup::scan_calls(&db, hour, hour + Duration::hours(1), "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count, "失效后应按明细补齐");
+    assert_eq!(fast.call_count, before + 1, "补采事件必须被计入且只计一次");
+}
+
+#[test]
+fn payload_version_key_prevents_repeated_full_rebuild() {
+    let (_dir, db) = test_db("version-key");
+    seed_calls(&db, -3, 10);
+    assert!(
+        perfrollup::needs_full_rebuild(&db).unwrap(),
+        "版本键缺失应触发全量"
+    );
+
+    perfrollup::rebuild_history(&db).unwrap();
+    assert_eq!(
+        db.setting_get(perfrollup::PAYLOAD_VERSION_KEY).unwrap(),
+        Some(perfrollup::PAYLOAD_VERSION.to_string()),
+        "全量重建后必须写版本键"
+    );
+    assert!(
+        !perfrollup::needs_full_rebuild(&db).unwrap(),
+        "第二次启动不应全量"
+    );
+
+    db.setting_set(perfrollup::PAYLOAD_VERSION_KEY, "0")
+        .unwrap();
+    assert!(
+        perfrollup::needs_full_rebuild(&db).unwrap(),
+        "版本不一致应全量"
+    );
+
+    db.setting_set(
+        perfrollup::PAYLOAD_VERSION_KEY,
+        &perfrollup::PAYLOAD_VERSION.to_string(),
+    )
+    .unwrap();
+    let bucket = perfrollup::hour_bucket(current_hour() - Duration::hours(3));
+    db.conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET payload = '{ broken' WHERE bucket = ?1",
+            [&bucket],
+        )
+        .unwrap();
+    assert!(
+        !perfrollup::needs_full_rebuild(&db).unwrap(),
+        "损坏行不得导致无限全量重建"
+    );
+
+    db.conn()
+        .execute("DELETE FROM hourly_performance_rollups", [])
+        .unwrap();
+    assert!(perfrollup::needs_full_rebuild(&db).unwrap(), "表为空应全量");
+}
+
+#[test]
+fn archived_corrupt_rollup_is_kept_without_full_rebuild() {
+    let (_dir, db) = test_db("archived-corrupt");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let old_bucket = perfrollup::hour_bucket(current_hour() - Duration::hours(4));
+    db.conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET payload = '{ broken' WHERE bucket = ?1",
+            [&old_bucket],
+        )
+        .unwrap();
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(current_hour() - Duration::hours(3)).to_rfc3339(),
+    )
+    .unwrap();
+
+    assert!(
+        !perfrollup::needs_full_rebuild(&db).unwrap(),
+        "归档水位前的坏行不得触发全量重建"
+    );
+    perfrollup::rebuild_history(&db).unwrap();
+
+    let kept: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM hourly_performance_rollups WHERE bucket = ?1",
+            [&old_bucket],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "归档水位前的旧行必须保留，不能删除后重建为空");
 }

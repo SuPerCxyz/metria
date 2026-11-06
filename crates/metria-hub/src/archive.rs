@@ -169,6 +169,8 @@ pub fn run(db: &HubDb) -> Result<ArchiveReport, StorageError> {
             ..Default::default()
         });
     }
+    // 与性能预聚合 / rollup 重建互斥：避免重建在明细被分批删除的中间状态读取数据。
+    let _guard = db.rebuild_guard();
     let target = (Utc::now() - Duration::days(policy.retention_days)).to_rfc3339();
     let Some(earliest) = earliest_detail(db) else {
         return Ok(ArchiveReport {

@@ -3,12 +3,15 @@
 import React from 'react'
 import { format, isSameDay } from 'date-fns'
 import { cn } from '../../lib/utils'
-import { Calendar } from '../ui/calendar'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import TimePicker from '../ui/TimePicker'
+import InlineErrorBoundary from '../common/InlineErrorBoundary'
 import { quickRange } from '../../services/format'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { createPresetRange } from '../../hooks/timeRangeState'
+
+const createLazyCalendar = () => React.lazy(() => import('../ui/calendar').then((module) => ({ default: module.Calendar })))
+const LazyCalendar = createLazyCalendar()
 
 const PRESETS = [
   { key: 'today', label: '今天' },
@@ -22,6 +25,29 @@ const PRESETS = [
   { key: '14d', label: '最近 14 天' },
   { key: '30d', label: '最近 30 天' },
 ]
+
+function CalendarSlot(props) {
+  return (
+    <InlineErrorBoundary
+      fallback={() => (
+        <div className="flex h-72 w-72 flex-col items-center justify-center gap-2 text-xs text-amber-600 dark:text-amber-400">
+          <span>日历加载失败</span>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="rounded-lg border border-amber-300 px-3 py-1.5 text-xs hover:bg-amber-50 dark:border-amber-700 dark:hover:bg-amber-400/10"
+          >
+            刷新重试
+          </button>
+        </div>
+      )}
+    >
+      <React.Suspense fallback={<div className="flex h-72 w-72 items-center justify-center text-xs text-gray-400 dark:text-gray-500">加载日历…</div>}>
+        <LazyCalendar {...props} />
+      </React.Suspense>
+    </InlineErrorBoundary>
+  )
+}
 
 export default function TimeRangePicker({ className }) {
   const { range, setRange } = useTimeRange()
@@ -151,10 +177,10 @@ export default function TimeRangePicker({ className }) {
                 </button>
               ))}
             </div>
-            {/* 日历（右侧，时间输入在日历下方） */}
+            {/* 日历（右侧，时间输入在日历下方）；chunk 失败只降级日历区域，不影响快捷范围。 */}
             <div className="flex flex-col gap-1">
               <div className="relative">
-                <Calendar mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
+                <CalendarSlot mode="range" defaultMonth={draft?.from || fromDate} selected={selected} onSelect={onSelect} />
               </div>
               {/* 起始/结束时间选择（日历下方，左右对齐日历） */}
               {draft?.from && draft?.to ? (

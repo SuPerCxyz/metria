@@ -26,12 +26,97 @@ const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 const CODE_TTL: Duration = Duration::from_secs(60);
 /// discovery / token / userinfo 请求超时。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// discovery 默认缓存时间。
+const DISCOVERY_DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
+/// 尊重 Cache-Control 时的最小/最大缓存时间。
+const DISCOVERY_MIN_TTL: Duration = Duration::from_secs(60);
+const DISCOVERY_MAX_TTL: Duration = Duration::from_secs(60 * 60);
+/// 刷新失败时允许使用 stale discovery 的最长时间。
+const DISCOVERY_STALE_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// OIDC 运行时状态：待验证授权请求与一次性交换码。
 #[derive(Debug, Default)]
 pub struct OidcRuntime {
     pending: Mutex<HashMap<String, Pending>>,
     codes: Mutex<HashMap<String, CodeGrant>>,
+    discovery: DiscoveryCache,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDiscovery {
+    discovery: Discovery,
+    fetched_at: Instant,
+    ttl: Duration,
+    issuer: String,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryCache {
+    entry: Mutex<Option<CachedDiscovery>>,
+    fetch_lock: Mutex<()>,
+}
+
+impl DiscoveryCache {
+    fn fresh(&self, issuer: &str) -> Option<Discovery> {
+        let entry = self.entry.lock().ok()?;
+        let cached = entry.as_ref()?;
+        (cached.issuer == issuer && cached.fetched_at.elapsed() < cached.ttl)
+            .then(|| cached.discovery.clone())
+    }
+
+    /// 缓存命中直接返回；过期时单飞刷新，失败最多回退 24h 的 stale 值。
+    fn get_or_fetch<F>(&self, cfg: &OidcConfig, fetch: F) -> Result<Discovery, String>
+    where
+        F: FnOnce() -> Result<(Discovery, Duration), String>,
+    {
+        let issuer = cfg.issuer.trim_end_matches('/').to_string();
+        if let Some(discovery) = self.fresh(&issuer) {
+            return Ok(discovery);
+        }
+        let _guard = self
+            .fetch_lock
+            .lock()
+            .map_err(|_| "OIDC discovery 缓存锁不可用".to_string())?;
+        // 等待期间其他请求可能已完成刷新。
+        if let Some(discovery) = self.fresh(&issuer) {
+            return Ok(discovery);
+        }
+        match fetch() {
+            Ok((discovery, ttl)) => {
+                let ttl = ttl.clamp(DISCOVERY_MIN_TTL, DISCOVERY_MAX_TTL);
+                if let Ok(mut entry) = self.entry.lock() {
+                    *entry = Some(CachedDiscovery {
+                        discovery: discovery.clone(),
+                        fetched_at: Instant::now(),
+                        ttl,
+                        issuer,
+                    });
+                }
+                Ok(discovery)
+            }
+            Err(error) => {
+                let stale = self.entry.lock().ok().and_then(|entry| {
+                    entry.as_ref().and_then(|cached| {
+                        (cached.issuer == issuer
+                            && cached.fetched_at.elapsed() <= DISCOVERY_STALE_MAX)
+                            .then(|| cached.discovery.clone())
+                    })
+                });
+                if let Some(discovery) = stale {
+                    tracing::warn!(%error, "OIDC discovery 刷新失败，使用最近一次有效缓存");
+                    Ok(discovery)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+impl OidcRuntime {
+    fn discovery(&self, cfg: &OidcConfig) -> Result<Discovery, String> {
+        self.discovery.get_or_fetch(cfg, || fetch_discovery(cfg))
+    }
 }
 
 #[derive(Debug)]
@@ -61,7 +146,7 @@ pub(crate) fn password_login_enabled(cfg: &crate::config::HubConfig) -> bool {
 
 // ============ Discovery / Token / Userinfo ============
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Discovery {
     issuer: String,
     authorization_endpoint: String,
@@ -70,7 +155,7 @@ struct Discovery {
     userinfo_endpoint: Option<String>,
 }
 
-fn fetch_discovery(cfg: &OidcConfig) -> Result<Discovery, String> {
+fn fetch_discovery(cfg: &OidcConfig) -> Result<(Discovery, Duration), String> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         cfg.issuer.trim_end_matches('/')
@@ -79,6 +164,11 @@ fn fetch_discovery(cfg: &OidcConfig) -> Result<Discovery, String> {
         .timeout(HTTP_TIMEOUT)
         .call()
         .map_err(|e| format!("获取 OIDC discovery 失败: {e}"))?;
+    let ttl = resp
+        .header("cache-control")
+        .and_then(cache_control_max_age)
+        .map(Duration::from_secs)
+        .unwrap_or(DISCOVERY_DEFAULT_TTL);
     let disc: Discovery = resp
         .into_json()
         .map_err(|e| format!("解析 OIDC discovery 失败: {e}"))?;
@@ -89,7 +179,15 @@ fn fetch_discovery(cfg: &OidcConfig) -> Result<Discovery, String> {
             disc.issuer, cfg.issuer
         ));
     }
-    Ok(disc)
+    Ok((disc, ttl))
+}
+
+fn cache_control_max_age(value: &str) -> Option<u64> {
+    value.split(',').find_map(|part| {
+        part.trim()
+            .strip_prefix("max-age=")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
 }
 
 fn exchange_code(
@@ -273,9 +371,12 @@ pub async fn oidc_login(State(st): State<AppState>, headers: HeaderMap) -> Respo
     let Some(cfg) = st.cfg.oidc.clone() else {
         return json_err(StatusCode::NOT_FOUND, "oidc_disabled", "OIDC 登录未启用");
     };
-    let disc = match fetch_discovery(&cfg) {
-        Ok(d) => d,
-        Err(e) => return redirect_login_error(&e),
+    let runtime = st.oidc.clone();
+    let discovery_cfg = cfg.clone();
+    let disc = match tokio::task::spawn_blocking(move || runtime.discovery(&discovery_cfg)).await {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return redirect_login_error(&e),
+        Err(e) => return redirect_login_error(&format!("OIDC discovery 任务失败: {e}")),
     };
     if disc.authorization_endpoint.is_empty() {
         return redirect_login_error("OIDC discovery 缺少 authorization 端点");
@@ -354,16 +455,25 @@ pub async fn oidc_callback(
         return redirect_login_error("缺少 OIDC authorization code");
     };
 
-    let flow = || -> Result<(String, Option<String>, Option<String>), String> {
-        let disc = fetch_discovery(&cfg)?;
+    let runtime = st.oidc.clone();
+    let discovery_cfg = cfg.clone();
+    let callback_headers = headers.clone();
+    let callback_code = code.to_string();
+    let flow = tokio::task::spawn_blocking(move || {
+        let disc = runtime.discovery(&discovery_cfg)?;
         let userinfo_endpoint = disc
             .userinfo_endpoint
             .clone()
             .ok_or("discovery 缺少 userinfo 端点")?;
-        let redirect = redirect_uri(&cfg, &headers);
-        let access_token = exchange_code(&cfg, &disc.token_endpoint, code, &redirect)?;
+        let redirect = redirect_uri(&discovery_cfg, &callback_headers);
+        let access_token = exchange_code(
+            &discovery_cfg,
+            &disc.token_endpoint,
+            &callback_code,
+            &redirect,
+        )?;
         let ui = fetch_userinfo(&userinfo_endpoint, &access_token)?;
-        if !identity_allowed(&cfg, &ui) {
+        if !identity_allowed(&discovery_cfg, &ui) {
             // 记录实际收到的身份便于排查 IdP 侧账号/claim 配置错误；
             // email 为自托管部署者本人可见的日志，sub 仅输出前缀
             let email_desc = match (&ui.email, ui.email_verified) {
@@ -382,13 +492,18 @@ pub async fn oidc_callback(
         let username = ui.email.clone().unwrap_or_else(|| ui.sub.clone());
         let display_name = ui.name.or(ui.preferred_username);
         let avatar_url = safe_picture_url(ui.picture.as_deref());
-        Ok((username, display_name, avatar_url))
-    };
-    let (username, display_name, avatar_url) = match flow() {
-        Ok(v) => v,
-        Err(e) => {
+        Ok::<(String, Option<String>, Option<String>), String>((username, display_name, avatar_url))
+    })
+    .await;
+    let (username, display_name, avatar_url) = match flow {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "OIDC 登录失败");
             return redirect_login_error(&e);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OIDC 回调任务失败");
+            return redirect_login_error(&format!("OIDC 回调任务失败: {e}"));
         }
     };
 
@@ -558,6 +673,116 @@ mod tests {
         );
         assert!(take_expired(&mut rt.codes.lock().unwrap(), "code1", CODE_TTL).is_some());
         assert!(take_expired(&mut rt.codes.lock().unwrap(), "code1", CODE_TTL).is_none());
+    }
+
+    fn discovery(issuer: &str) -> Discovery {
+        Discovery {
+            issuer: issuer.to_string(),
+            authorization_endpoint: format!("{issuer}/authorize"),
+            token_endpoint: format!("{issuer}/token"),
+            userinfo_endpoint: Some(format!("{issuer}/userinfo")),
+        }
+    }
+
+    #[test]
+    fn cache_control_max_age_is_parsed() {
+        assert_eq!(cache_control_max_age("public, max-age=120"), Some(120));
+        assert_eq!(cache_control_max_age("max-age=0"), Some(0));
+        assert_eq!(cache_control_max_age("no-store"), None);
+    }
+
+    #[test]
+    fn discovery_cache_reuses_and_clamps_ttl() {
+        let cfg = cfg(None, Some("s"));
+        let cache = DiscoveryCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((discovery(&cfg.issuer), Duration::from_secs(5)))
+        };
+        let first = cache.get_or_fetch(&cfg, fetch).unwrap();
+        let second = cache
+            .get_or_fetch(&cfg, || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((discovery(&cfg.issuer), DISCOVERY_DEFAULT_TTL))
+            })
+            .unwrap();
+        assert_eq!(first.issuer, second.issuer);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let entry = cache.entry.lock().unwrap();
+        assert_eq!(entry.as_ref().unwrap().ttl, DISCOVERY_MIN_TTL);
+    }
+
+    #[test]
+    fn discovery_cache_uses_stale_after_refresh_failure_but_not_after_24h() {
+        let cfg = cfg(None, Some("s"));
+        let cache = DiscoveryCache::default();
+        {
+            let mut entry = cache.entry.lock().unwrap();
+            *entry = Some(CachedDiscovery {
+                discovery: discovery(&cfg.issuer),
+                fetched_at: Instant::now() - Duration::from_secs(2 * 3600),
+                ttl: DISCOVERY_DEFAULT_TTL,
+                issuer: cfg.issuer.clone(),
+            });
+        }
+        let stale = cache
+            .get_or_fetch(&cfg, || Err("IdP down".into()))
+            .expect("24h 内应允许 stale fallback");
+        assert_eq!(stale.issuer, cfg.issuer);
+
+        {
+            let mut entry = cache.entry.lock().unwrap();
+            entry.as_mut().unwrap().fetched_at = Instant::now() - Duration::from_secs(25 * 3600);
+        }
+        assert!(cache.get_or_fetch(&cfg, || Err("IdP down".into())).is_err());
+    }
+
+    #[test]
+    fn discovery_cache_rejects_other_issuer_and_single_flights() {
+        let cfg = cfg(None, Some("s"));
+        let cache = DiscoveryCache::default();
+        {
+            let mut entry = cache.entry.lock().unwrap();
+            *entry = Some(CachedDiscovery {
+                discovery: discovery("https://other.example.com"),
+                fetched_at: Instant::now(),
+                ttl: DISCOVERY_DEFAULT_TTL,
+                issuer: "https://other.example.com".into(),
+            });
+        }
+        let refreshed = cache
+            .get_or_fetch(&cfg, || Ok((discovery(&cfg.issuer), DISCOVERY_DEFAULT_TTL)))
+            .unwrap();
+        assert_eq!(refreshed.issuer, cfg.issuer);
+
+        let cache = std::sync::Arc::new(DiscoveryCache::default());
+        let cfg = std::sync::Arc::new(cfg);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let cache = cache.clone();
+                let cfg = cfg.clone();
+                let calls = calls.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_fetch(&cfg, || {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            Ok((discovery(&cfg.issuer), DISCOVERY_DEFAULT_TTL))
+                        })
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "并发登录应共享一次 discovery"
+        );
     }
 
     #[test]

@@ -78,10 +78,10 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
         Ok(None) => {}
         Err(e) => warn!("数据库空间回收跳过: {e}"),
     }
-    // 小时级性能预聚合：启动时建好，首屏请求才不会落到「缺桶」回退路径。
-    match crate::perfrollup::rebuild_history(&db) {
-        Ok(buckets) => info!(buckets, "性能预聚合构建完成"),
-        Err(e) => warn!("性能预聚合构建失败，查询将回退明细: {e}"),
+    // 小时级性能预聚合：迁移完成后按版本/启动开关决定全量或仅近小时增量。
+    // 常规启动不再无条件全历史重建。
+    if let Err(e) = db.init_read_pool() {
+        warn!("只读连接池初始化失败，查询回退写连接: {e}");
     }
 
     // 内置 admin（env 注入）与内置价格目录
@@ -93,6 +93,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
     // 后台维护：周期 rollup 对账 + WAL checkpoint
     spawn_maintenance(db.clone());
+    spawn_perf_rollup_maintenance(db.clone());
 
     // Pull 调度：对配置了 Agent 地址的节点主动拉取（无配置时空转）
 
@@ -108,6 +109,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     spawn_integrity_repair(db.clone());
 
     let collector_token = std::env::var("METRIA_COLLECTOR_TOKEN").ok();
+    let perf_db = db.clone();
     let state = AppState {
         db,
         cfg: cfg.clone(),
@@ -123,16 +125,22 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     // 报告调度：每日/每周/每月三个独立周期任务（未启用时空转）
     crate::report::scheduler::spawn_report_scheduler(state.db.clone(), state.cfg.clone());
 
-    let app = api::app_router(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .fallback(http::static_fallback);
+    let app = http::with_compression(
+        api::app_router(state)
+            .layer(TraceLayer::new_for_http())
+            .layer(CorsLayer::permissive())
+            .fallback(http::static_fallback),
+    );
 
     let listener = TcpListener::bind(cfg.listen).await.map_err(|e| {
         error!(%e, "监听失败");
         e
     })?;
     info!("Hub 已就绪，等待请求");
+
+    // 首次部署/版本升级的全量重建可能超过健康检查超时；先让 HTTP 服务可响应，
+    // 重建放到 blocking 线程后台执行。重建期间 fast_hours 自动按小时回退明细。
+    tokio::task::spawn_blocking(move || start_perf_rollups(&perf_db));
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -189,6 +197,8 @@ fn spawn_integrity_repair(db: db::HubDb) {
             // 任何明细口径修复（计价、时序、子代理、时长起点）之后都要全量重建分桶聚合。
             if full_needed || duration_origin_needed || timings > 0 || subagent_needed {
                 db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
+                // 明细口径修复会移动调用的小时归属，性能预聚合必须同步全量重建。
+                crate::perfrollup::rebuild_history(&db).map_err(|e| e.to_string())?;
             }
             if full_needed {
                 db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
@@ -327,63 +337,120 @@ fn spawn_maintenance(db: db::HubDb) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
             tick.tick().await;
-            // 运维表保留期清理：有界批次，失败只告警不中断服务
-            match db.prune_operational_tables() {
-                Ok(report) if report.deleted() > 0 => info!(
-                    upload_batches = report.upload_batches_deleted,
-                    pricing_matches = report.pricing_matches_deleted,
-                    finished = report.finished,
-                    "运维表保留期清理完成"
-                ),
-                Ok(_) => {}
-                Err(e) => warn!("运维表保留期清理失败: {e}"),
-            }
-            // rollup 对账（最近 24h）
-            match db.reconcile_rollups(1) {
-                Ok(report) => {
-                    if report.drift_buckets > 0 {
-                        warn!(
-                            buckets = report.buckets,
-                            drift = report.drift_buckets,
-                            "rollup 对账发现漂移，触发重建"
-                        );
-                        // 与启动全量重建互斥：已有重建在执行时跳过本轮，避免互相删写。
-                        match db.try_rebuild_rollups(1) {
-                            Ok(Some(rebuilt)) => info!("rollup 重建完成: {rebuilt} 条"),
-                            Ok(None) => info!("已有 rollup 重建在执行，跳过本轮"),
-                            Err(e) => warn!("rollup 重建失败: {e}"),
-                        }
-                    }
-                }
-                Err(e) => warn!("rollup 对账失败: {e}"),
-            }
-            // 明细归档：默认关闭；启用后执行「备份 → 分批删除 → 记水位」。
-            // 用 spawn_blocking 承载，避免备份与删除占住异步执行器。
-            if crate::archive::policy(&db).enabled {
-                let worker = db.clone();
-                match tokio::task::spawn_blocking(move || crate::archive::run(&worker)).await {
-                    Ok(Ok(report)) if !report.skipped => {
-                        info!(deleted = report.deleted, watermark = ?report.watermark, "明细归档完成")
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => warn!("明细归档失败: {e}"),
-                    Err(e) => warn!("明细归档任务未完成: {e}"),
-                }
-            }
-            // 小时级性能预聚合：吸收补采、回填与重新计价对历史小时的改动
-            match crate::perfrollup::rebuild_history(&db) {
-                Ok(buckets) => debug!(buckets, "性能预聚合已刷新"),
-                Err(e) => warn!("性能预聚合刷新失败，查询将回退明细: {e}"),
-            }
-            // WAL checkpoint + 空间回收
-            if let Err(e) = db.wal_checkpoint() {
-                warn!("WAL checkpoint 失败: {e}");
-            }
-            if let Err(e) = db.incremental_vacuum() {
-                warn!("incremental_vacuum 失败: {e}");
+            let worker = db.clone();
+            match tokio::task::spawn_blocking(move || maintenance_cycle(&worker)).await {
+                Ok(()) => {}
+                Err(e) => warn!("后台维护任务异常: {e}"),
             }
         }
     });
+}
+
+/// 6 小时维护周期：同步数据库工作整体在 blocking 线程执行，不占用 async worker。
+fn maintenance_cycle(db: &db::HubDb) {
+    // 运维表保留期清理：有界批次，失败只告警不中断服务
+    match db.prune_operational_tables() {
+        Ok(report) if report.deleted() > 0 => info!(
+            upload_batches = report.upload_batches_deleted,
+            pricing_matches = report.pricing_matches_deleted,
+            finished = report.finished,
+            "运维表保留期清理完成"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("运维表保留期清理失败: {e}"),
+    }
+    // rollup 对账（最近 24h）
+    match db.reconcile_rollups(1) {
+        Ok(report) => {
+            if report.drift_buckets > 0 {
+                warn!(
+                    buckets = report.buckets,
+                    drift = report.drift_buckets,
+                    "rollup 对账发现漂移，触发重建"
+                );
+                // 与启动全量重建互斥：已有重建在执行时跳过本轮，避免互相删写。
+                match db.try_rebuild_rollups(1) {
+                    Ok(Some(rebuilt)) => info!("rollup 重建完成: {rebuilt} 条"),
+                    Ok(None) => info!("已有 rollup 重建在执行，跳过本轮"),
+                    Err(e) => warn!("rollup 重建失败: {e}"),
+                }
+            }
+        }
+        Err(e) => warn!("rollup 对账失败: {e}"),
+    }
+    // 明细归档：默认关闭；启用后执行「备份 → 分批删除 → 记水位」。
+    if crate::archive::policy(db).enabled {
+        match crate::archive::run(db) {
+            Ok(report) if !report.skipped => {
+                info!(deleted = report.deleted, watermark = ?report.watermark, "明细归档完成")
+            }
+            Ok(_) => {}
+            Err(e) => warn!("明细归档失败: {e}"),
+        }
+    }
+    // WAL checkpoint + 空间回收
+    if let Err(e) = db.wal_checkpoint() {
+        warn!("WAL checkpoint 失败: {e}");
+    }
+    if let Err(e) = db.incremental_vacuum() {
+        warn!("incremental_vacuum 失败: {e}");
+    }
+}
+
+/// 性能预聚合近小时增量任务：默认每 5 分钟修正最近 3 个已结束小时。
+fn spawn_perf_rollup_maintenance(db: db::HubDb) {
+    tokio::spawn(async move {
+        // 错开启停与首屏，先让启动路径完成。
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            let worker = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // 与启动/历史修复的全量重建互斥；忙时跳过本轮，下轮重试。
+                let Some(_guard) = worker.try_rebuild_guard() else {
+                    return Ok(None);
+                };
+                crate::perfrollup::rebuild_recent(&worker, 3).map(Some)
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(buckets))) => debug!(buckets, "性能预聚合近小时重建完成"),
+                Ok(Ok(None)) => debug!("性能预聚合重建正在进行，跳过本轮"),
+                Ok(Err(e)) => warn!("性能预聚合近小时重建失败: {e}"),
+                Err(e) => warn!("性能预聚合近小时重建任务异常: {e}"),
+            }
+        }
+    });
+}
+
+/// 启动时的性能预聚合准备：版本升级/显式开关走全量，否则只补最近 3 小时。
+fn start_perf_rollups(db: &db::HubDb) {
+    let force_full = std::env::var("METRIA_PERF_ROLLUP_FULL_REBUILD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let needs_full = match crate::perfrollup::needs_full_rebuild(db) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("检查性能预聚合版本失败，回退全量重建: {e}");
+            true
+        }
+    };
+    if force_full || needs_full {
+        match crate::perfrollup::rebuild_history(db) {
+            Ok(buckets) => info!(buckets, "性能预聚合全量重建完成"),
+            Err(e) => warn!("性能预聚合全量重建失败，查询将按小时回退明细: {e}"),
+        }
+    } else {
+        let Some(_guard) = db.try_rebuild_guard() else {
+            debug!("性能预聚合启动增量跳过：已有重建在执行");
+            return;
+        };
+        match crate::perfrollup::rebuild_recent(db, 3) {
+            Ok(buckets) => info!(buckets, "性能预聚合近小时重建完成"),
+            Err(e) => warn!("性能预聚合近小时重建失败，查询将按小时回退明细: {e}"),
+        }
+    }
 }
 
 fn ensure_admin(db: &db::HubDb) {

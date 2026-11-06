@@ -23,7 +23,7 @@ metria-adapter-api = { path = "../metria-adapter-api" }
 metria-adapter-claude = { path = "../metria-adapter-claude" }
 metria-adapter-codex = { path = "../metria-adapter-codex" }
 metria-adapter-opencode = { path = "../metria-adapter-opencode" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 
 [[bin]]
