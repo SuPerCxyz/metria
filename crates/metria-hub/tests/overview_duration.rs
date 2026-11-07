@@ -210,6 +210,8 @@ async fn archived_range_keeps_honest_nulls() {
         win_from + Duration::minutes(5),
         5 * 60 * 1000,
     );
+    // 生产启动会构建性能预聚合；归档删除明细后 overview 的时长统计依赖它。
+    metria_hub::perfrollup::rebuild_history(&state.db).unwrap();
 
     metria_hub::archive::set_policy(&state.db, true, 1).unwrap();
     let report = metria_hub::archive::run(&state.db).unwrap();

@@ -234,6 +234,9 @@ async fn overview_aggregates_survive_archiving_and_activity_becomes_null() {
             .unwrap();
     }
     state.db.rebuild_rollups(90).unwrap();
+    // 生产启动会构建性能预聚合；归档删除明细后 overview 的时长统计依赖它，
+    // 否则归档水位前缺桶会按设计返回 perf_rollup_unavailable。
+    metria_hub::perfrollup::rebuild_history(&state.db).unwrap();
 
     let get_overview = |token: &str, from: &str, to: &str| -> Value {
         let resp = ureq::get(&format!("{base}/api/v1/overview?from={from}&to={to}"))

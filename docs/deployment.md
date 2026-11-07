@@ -48,6 +48,9 @@ docker compose -f docker/compose.full.yaml --profile demo --profile agent up -d
 | `METRIA_OBSERVE_LEASE_SECONDS` | 86400s | 原生临时观测最长租约；命令退出或租约到期即清理 |
 | `METRIA_LOG` | `info` | 日志级别 |
 
+- `METRIA_LOG=debug`（或 `RUST_LOG=debug`）可开启 tower-http 的请求级日志（method/path/status/latency）。日志不会记录 SQL 参数、Token 或 Secret。
+- 页面查询的 blocking 任务超过 500ms 时，Hub 会以 `warn` 输出 `slow blocking handler`，包含任务标签与耗时；默认 `info` 级别即可见。
+
 ## 4. 网络与安全
 
 - 只暴露 Hub 的 8080 端口；Agent 出站仅连 Hub，客户端目录只读挂载。
@@ -202,4 +205,5 @@ Web 端「节点 → 添加节点」可预先创建节点并生成安装命令�
 
 - Hub 与 Agent 均 SQLite；rollup 增量更新，查询读汇总表。
 - 后台维护：每 6h rollup 对账（发现漂移自动重建最近 24h）+ WAL checkpoint。
+- 晚到补采/重新计价涉及的小时写入 `perf_rollup_dirty_hours`，维护任务按小时合并重建；归档或全量重建占用互斥 guard 时只登记 dirty、保留旧 rollup，下一轮再替换。重建未覆盖全部小时时，水位之后保留 dirty 重试；已落到归档水位之前且无法覆盖的 dirty 会清理（该小时由归档不可用路径返回错误，而不是伪造 0）。进程退出取消时保留 dirty；启动时的历史修复被取消则不写修复完成门控键，下次启动重试。
 - 基准参考：10 万事件写入约 280ms，overview 查询约 20µs；1M 事件基准见 `docs/operations.md`。

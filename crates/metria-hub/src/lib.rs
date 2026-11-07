@@ -110,6 +110,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
     let collector_token = std::env::var("METRIA_COLLECTOR_TOKEN").ok();
     let perf_db = db.clone();
+    let shutdown_db = db.clone();
     let state = AppState {
         db,
         cfg: cfg.clone(),
@@ -143,7 +144,7 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
     tokio::task::spawn_blocking(move || start_perf_rollups(&perf_db));
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_db))
         .await
         .map_err(|e| HubError::Io(std::io::Error::other(e)))?;
     info!("Hub 已退出");
@@ -152,76 +153,90 @@ pub async fn serve(cfg: HubConfig) -> Result<(), HubError> {
 
 /// 新统计口径上线后的幂等历史修复；标记成功后不在每次重启重复生成估算版本。
 fn spawn_integrity_repair(db: db::HubDb) {
-    tokio::task::spawn_blocking(move || {
-        let _heap_release = crate::memory::HeapReleaseGuard;
-        const KEY: &str = "observability_integrity_version";
-        const TIMING_KEY: &str = "observability_timing_repair_version";
-        // v1：子 Agent 会话父级回填 + 会话汇总口径收敛（会话数只含主会话）。
-        // v2：清理历史重复子代理关系（确定性关系 id 上线前的重复行）。
-        const SUBAGENT_KEY: &str = "subagent_parent_repair_version";
-        const SUBAGENT_VERSION: &str = "2";
-        // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
-        const VERSION: &str = "4";
-        // v1：迁移 024 修复 opencode 时长起点后的全量分桶重建（started_at 后移会重排
-        // hourly/daily_rollups 里的 model_call_count；Token/费用/流量聚合有自己的
-        // 时间戳来源，不受时长修复影响）。
-        const DURATION_ORIGIN_KEY: &str = "duration_origin_repair_version";
-        const DURATION_ORIGIN_VERSION: &str = "1";
-        let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
-        let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
-        let subagent_needed =
-            db.setting_get(SUBAGENT_KEY).ok().flatten().as_deref() != Some(SUBAGENT_VERSION);
-        let duration_origin_needed = db
-            .setting_get(DURATION_ORIGIN_KEY)
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(DURATION_ORIGIN_VERSION);
-        if !full_needed && !timing_needed && !subagent_needed && !duration_origin_needed {
-            return;
-        }
-        let result = (|| -> Result<usize, String> {
-            let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
-            // 回填必须在重建之前：重建按主会话口径重放会话计数
-            if subagent_needed {
-                let deduped = db.dedupe_subagent_relations().map_err(|e| e.to_string())?;
-                if deduped > 0 {
-                    info!(deduped, "重复子代理关系已清理");
-                }
-                let backfilled = db.backfill_subagent_parents().map_err(|e| e.to_string())?;
-                info!(backfilled, "子 Agent 会话父级回填完成");
-            }
-            if full_needed {
-                crate::catalog::reprice_from_rules(&db, false)?;
-            }
-            // 任何明细口径修复（计价、时序、子代理、时长起点）之后都要全量重建分桶聚合。
-            if full_needed || duration_origin_needed || timings > 0 || subagent_needed {
-                db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
-                // 明细口径修复会移动调用的小时归属，性能预聚合必须同步全量重建。
-                crate::perfrollup::rebuild_history(&db).map_err(|e| e.to_string())?;
-            }
-            if full_needed {
-                db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
-            }
-            if timing_needed {
-                db.setting_set(TIMING_KEY, VERSION)
-                    .map_err(|e| e.to_string())?;
-            }
-            if subagent_needed {
-                db.setting_set(SUBAGENT_KEY, SUBAGENT_VERSION)
-                    .map_err(|e| e.to_string())?;
-            }
-            if duration_origin_needed {
-                db.setting_set(DURATION_ORIGIN_KEY, DURATION_ORIGIN_VERSION)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(timings)
-        })();
-        match result {
-            Ok(timings) => info!(timings, "历史统计一致性修复完成"),
-            Err(error) => warn!(%error, "历史统计一致性修复失败，将在下次启动重试"),
-        }
+    tokio::task::spawn_blocking(move || match run_integrity_repair(&db) {
+        Ok(timings) => info!(timings, "历史统计一致性修复完成"),
+        Err(error) => warn!(%error, "历史统计一致性修复失败，将在下次启动重试"),
     });
+}
+
+/// 执行一次历史统计一致性修复；取消时返回 Err，调用方不得写门控键。
+fn run_integrity_repair(db: &db::HubDb) -> Result<usize, String> {
+    let _heap_release = crate::memory::HeapReleaseGuard;
+    const KEY: &str = "observability_integrity_version";
+    const TIMING_KEY: &str = "observability_timing_repair_version";
+    // v1：子 Agent 会话父级回填 + 会话汇总口径收敛（会话数只含主会话）。
+    // v2：清理历史重复子代理关系（确定性关系 id 上线前的重复行）。
+    const SUBAGENT_KEY: &str = "subagent_parent_repair_version";
+    const SUBAGENT_VERSION: &str = "2";
+    // v2-v4：Codex Token 归一化回填后，重新计价并重建 usage rollup。
+    const VERSION: &str = "4";
+    // v1：迁移 024 修复 opencode 时长起点后的全量分桶重建（started_at 后移会重排
+    // hourly/daily_rollups 里的 model_call_count；Token/费用/流量聚合有自己的
+    // 时间戳来源，不受时长修复影响）。
+    const DURATION_ORIGIN_KEY: &str = "duration_origin_repair_version";
+    const DURATION_ORIGIN_VERSION: &str = "1";
+    let full_needed = db.setting_get(KEY).ok().flatten().as_deref() != Some(VERSION);
+    let timing_needed = db.setting_get(TIMING_KEY).ok().flatten().as_deref() != Some(VERSION);
+    let subagent_needed =
+        db.setting_get(SUBAGENT_KEY).ok().flatten().as_deref() != Some(SUBAGENT_VERSION);
+    let duration_origin_needed = db
+        .setting_get(DURATION_ORIGIN_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some(DURATION_ORIGIN_VERSION);
+    if !full_needed && !timing_needed && !subagent_needed && !duration_origin_needed {
+        return Ok(0);
+    }
+    // 关机取消后不再开始任何重活；否则会拖慢进程退出并可能写入门控键。
+    if db.is_rebuild_cancelled() {
+        return Err("历史统计一致性修复已取消：未开始重计价/重建".into());
+    }
+
+    let timings = db.repair_legacy_call_timings().map_err(|e| e.to_string())?;
+    // 回填必须在重建之前：重建按主会话口径重放会话计数
+    if subagent_needed {
+        let deduped = db.dedupe_subagent_relations().map_err(|e| e.to_string())?;
+        if deduped > 0 {
+            info!(deduped, "重复子代理关系已清理");
+        }
+        let backfilled = db.backfill_subagent_parents().map_err(|e| e.to_string())?;
+        info!(backfilled, "子 Agent 会话父级回填完成");
+    }
+    if db.is_rebuild_cancelled() {
+        return Err("历史统计一致性修复已取消：未开始重计价/重建".into());
+    }
+    if full_needed {
+        crate::catalog::reprice_from_rules(db, false)?;
+    }
+    // 任何明细口径修复（计价、时序、子代理、时长起点）之后都要全量重建分桶聚合。
+    if full_needed || duration_origin_needed || timings > 0 || subagent_needed {
+        if db.is_rebuild_cancelled() {
+            return Err("历史统计一致性修复已取消：未开始分桶重建".into());
+        }
+        db.rebuild_rollups(36_500).map_err(|e| e.to_string())?;
+        // 明细口径修复会移动调用的小时归属，性能预聚合必须同步全量重建。
+        crate::perfrollup::rebuild_history(db).map_err(|e| e.to_string())?;
+        if db.is_rebuild_cancelled() {
+            return Err("历史统计一致性修复已取消：性能预聚合未完成".into());
+        }
+    }
+    if full_needed {
+        db.setting_set(KEY, VERSION).map_err(|e| e.to_string())?;
+    }
+    if timing_needed {
+        db.setting_set(TIMING_KEY, VERSION)
+            .map_err(|e| e.to_string())?;
+    }
+    if subagent_needed {
+        db.setting_set(SUBAGENT_KEY, SUBAGENT_VERSION)
+            .map_err(|e| e.to_string())?;
+    }
+    if duration_origin_needed {
+        db.setting_set(DURATION_ORIGIN_KEY, DURATION_ORIGIN_VERSION)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(timings)
 }
 
 /// 按环境变量启用外部价格目录。
@@ -408,17 +423,31 @@ fn spawn_perf_rollup_maintenance(db: db::HubDb) {
             let worker = db.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // 与启动/历史修复的全量重建互斥；忙时跳过本轮，下轮重试。
-                let Some(_guard) = worker.try_rebuild_guard() else {
-                    return Ok(None);
+                let recent = {
+                    let Some(_guard) = worker.try_rebuild_guard() else {
+                        return Ok(None);
+                    };
+                    crate::perfrollup::rebuild_recent(&worker, 3)
                 };
-                crate::perfrollup::rebuild_recent(&worker, 3).map(Some)
+                // recent 重建已释放 guard；dirty 重建自行 try_rebuild_guard。
+                let dirty = crate::perfrollup::rebuild_dirty_hours(
+                    &worker,
+                    crate::perfrollup::DEFAULT_DIRTY_BATCH,
+                );
+                match (recent, dirty) {
+                    (Ok(buckets), Ok(dirty)) => Ok(Some((buckets, dirty))),
+                    (Err(e), _) => Err(e),
+                    (_, Err(e)) => Err(e),
+                }
             })
             .await;
             match result {
-                Ok(Ok(Some(buckets))) => debug!(buckets, "性能预聚合近小时重建完成"),
+                Ok(Ok(Some((buckets, dirty)))) => {
+                    debug!(buckets, dirty, "性能预聚合近小时/dirty 重建完成")
+                }
                 Ok(Ok(None)) => debug!("性能预聚合重建正在进行，跳过本轮"),
-                Ok(Err(e)) => warn!("性能预聚合近小时重建失败: {e}"),
-                Err(e) => warn!("性能预聚合近小时重建任务异常: {e}"),
+                Ok(Err(e)) => warn!("性能预聚合近小时/dirty 重建失败: {e}"),
+                Err(e) => warn!("性能预聚合近小时/dirty 重建任务异常: {e}"),
             }
         }
     });
@@ -437,7 +466,22 @@ fn start_perf_rollups(db: &db::HubDb) {
         }
     };
     if force_full || needs_full {
-        match crate::perfrollup::rebuild_history(db) {
+        // 取得 guard 后重新检查：另一个任务可能已完成全量并写入版本键。
+        let _guard = db.rebuild_guard();
+        if !force_full {
+            match crate::perfrollup::needs_full_rebuild(db) {
+                Ok(false) => {
+                    info!("性能预聚合已由其他任务完成全量，跳过重复重建");
+                    return;
+                }
+                Ok(true) => {}
+                Err(e) => warn!("重新检查性能预聚合版本失败，继续全量: {e}"),
+            }
+        }
+        match crate::perfrollup::rebuild_history_locked(db) {
+            Ok(_) if db.is_rebuild_cancelled() => {
+                info!("性能预聚合全量重建已取消/未完成")
+            }
             Ok(buckets) => info!(buckets, "性能预聚合全量重建完成"),
             Err(e) => warn!("性能预聚合全量重建失败，查询将按小时回退明细: {e}"),
         }
@@ -466,7 +510,7 @@ fn ensure_admin(db: &db::HubDb) {
     );
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(db: db::HubDb) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -488,6 +532,8 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+    // 让后台全量重建在下一个窗口边界退出，避免关机时继续写盘。
+    db.cancel_rebuild();
     info!("收到退出信号，正在关闭");
 }
 
@@ -499,3 +545,122 @@ pub fn healthcheck(cfg: &HubConfig) -> Result<(), HubError> {
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod perf_startup_tests {
+    use super::*;
+
+    fn test_db(tag: &str) -> db::HubDb {
+        let dir =
+            std::env::temp_dir().join(format!("metria-perf-start-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = HubConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            database_url: format!("sqlite://{}/hub.db", dir.display()),
+            content_mode: metria_core::ContentMode::Metadata,
+            timezone: chrono_tz::Tz::UTC,
+            log_filter: "error".into(),
+            demo: false,
+            oidc: None,
+        };
+        let db = db::HubDb::open(&cfg).unwrap();
+        db.apply_migrations().unwrap();
+        db
+    }
+
+    fn seed_call(db: &db::HubDb) {
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO model_calls
+                 (id, node_id, collector_id, client_id, source_id, session_id, started_at,
+                  status, call_granularity, created_at, updated_at)
+                 VALUES ('start-call', 'n1', 'c1', 'codex', 's1', 'n1:sess', ?1,
+                         'success', 'call', ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+    }
+
+    fn call_timing_source(db: &db::HubDb) -> Option<String> {
+        db.read_conn()
+            .query_row(
+                "SELECT timing_source FROM model_calls WHERE id = 'start-call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn hourly_rollup_count(db: &db::HubDb) -> i64 {
+        db.read_conn()
+            .query_row("SELECT COUNT(*) FROM hourly_rollups", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn cancelled_integrity_repair_does_not_write_gate_keys() {
+        let db = test_db("integrity-cancel");
+        seed_call(&db);
+        assert_eq!(hourly_rollup_count(&db), 0);
+        assert!(call_timing_source(&db).is_none());
+        db.cancel_rebuild();
+
+        let result = run_integrity_repair(&db);
+        assert!(result.is_err(), "取消必须视为修复未完成");
+        assert_eq!(hourly_rollup_count(&db), 0, "取消后不得执行 rollup 重建");
+        assert!(
+            call_timing_source(&db).is_none(),
+            "取消后不得执行历史时序修复"
+        );
+        for key in [
+            "observability_integrity_version",
+            "observability_timing_repair_version",
+            "subagent_parent_repair_version",
+            "duration_origin_repair_version",
+        ] {
+            assert!(
+                db.setting_get(key).unwrap().is_none(),
+                "取消后不得写门控键 {key}"
+            );
+        }
+
+        db.reset_rebuild_cancel();
+        run_integrity_repair(&db).expect("取消标记重置后应可完成修复");
+        assert!(hourly_rollup_count(&db) > 0, "重试后应完成 rollup 重建");
+        assert!(
+            call_timing_source(&db).is_some(),
+            "重试后应完成历史时序修复"
+        );
+        assert_eq!(
+            db.setting_get("observability_integrity_version").unwrap(),
+            Some("4".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_start_only_runs_one_full_rebuild() {
+        let db = test_db("concurrent");
+        seed_call(&db);
+        db.reset_full_rebuild_count();
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || start_perf_rollups(&db)));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(db.full_rebuild_count(), 1, "并发启动只应执行一次全量重建");
+        assert!(
+            db.setting_get(crate::perfrollup::PAYLOAD_VERSION_KEY)
+                .unwrap()
+                .is_some(),
+            "全量完成后应写版本键"
+        );
+    }
+}

@@ -51,6 +51,15 @@ fn index_columns(conn: &Connection, index: &str) -> Vec<String> {
     rows.filter_map(Result::ok).collect()
 }
 
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn explain(db: &HubDb, sql: &str) -> String {
     let c = db.read_conn();
     let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -104,11 +113,14 @@ fn migration_creates_query_indexes_on_empty_db() {
     let path = dir.join("hub.db");
     let mut conn = open(&path, &DbOptions::default()).unwrap();
     let migrations = load_embedded().unwrap();
-    let applied = migrate(&mut conn, &migrations, Some(27)).unwrap();
+    let applied = migrate(&mut conn, &migrations, Some(28)).unwrap();
 
     assert!(applied.contains(&27), "027 应被应用: {applied:?}");
+    assert!(applied.contains(&28), "028 应被应用: {applied:?}");
+    assert!(table_exists(&conn, "perf_rollup_dirty_hours"));
     assert!(index_names(&conn, "sessions").contains(&"idx_sessions_activity".to_string()));
     assert!(index_names(&conn, "sessions").contains(&"idx_sessions_source_session".to_string()));
+    assert!(index_names(&conn, "sessions").contains(&"idx_sessions_sort_at".to_string()));
     assert!(index_names(&conn, "model_calls").contains(&"idx_calls_client_time".to_string()));
     assert!(index_names(&conn, "usage_events").contains(&"idx_usage_client_time".to_string()));
     assert_eq!(
@@ -159,8 +171,8 @@ fn migration_applies_to_database_with_existing_rows() {
     )
     .unwrap();
 
-    let applied = migrate(&mut conn, &migrations, Some(27)).unwrap();
-    assert_eq!(applied, vec![27]);
+    let applied = migrate(&mut conn, &migrations, Some(28)).unwrap();
+    assert_eq!(applied, vec![27, 28]);
 
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -169,8 +181,10 @@ fn migration_applies_to_database_with_existing_rows() {
     assert_eq!(count("sessions"), 1);
     assert_eq!(count("model_calls"), 1);
     assert_eq!(count("usage_events"), 1);
+    assert!(table_exists(&conn, "perf_rollup_dirty_hours"));
     assert!(index_names(&conn, "sessions").contains(&"idx_sessions_activity".to_string()));
     assert!(index_names(&conn, "sessions").contains(&"idx_sessions_source_session".to_string()));
+    assert!(index_names(&conn, "sessions").contains(&"idx_sessions_sort_at".to_string()));
     assert!(index_names(&conn, "model_calls").contains(&"idx_calls_client_time".to_string()));
     assert!(index_names(&conn, "usage_events").contains(&"idx_usage_client_time".to_string()));
 }
@@ -203,6 +217,20 @@ fn query_plans_use_new_indexes() {
     assert!(
         session_lookup.contains("idx_sessions_source_session"),
         "会话 ULID 解析应命中 source_session_id 索引: {session_lookup}"
+    );
+
+    let call_end_sessions = explain(
+        &db,
+        "SELECT s.id FROM sessions s
+         WHERE ((COALESCE(s.ended_at, s.last_activity_at, s.started_at) >= '2026-01-01T00:00:00Z'
+                 AND COALESCE(s.ended_at, s.last_activity_at, s.started_at) < '2026-02-01T00:00:00Z')
+             OR (s.last_activity_at >= '2026-01-01T00:00:00Z'
+                 AND s.last_activity_at < '2026-02-01T00:00:00Z'))
+         ORDER BY COALESCE(s.ended_at, s.last_activity_at, s.started_at) DESC, s.id DESC LIMIT 100",
+    );
+    assert!(
+        call_end_sessions.contains("idx_sessions_sort_at"),
+        "call_end 会话 OR 应命中会话结束时间表达式索引: {call_end_sessions}"
     );
 
     let calls = explain(
@@ -333,4 +361,21 @@ fn migration_027_build_time_on_existing_data() {
          wal_before={wal_before} wal_after={wal_after}"
     );
     assert_eq!(applied, vec![27]);
+}
+
+#[test]
+fn migration_028_backfills_source_session_index() {
+    let dir = temp_dir("028-backfill");
+    let path = dir.join("hub.db");
+    let mut conn = open(&path, &DbOptions::default()).unwrap();
+    let migrations = load_embedded().unwrap();
+    migrate(&mut conn, &migrations, Some(27)).unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_sessions_source_session", [])
+        .unwrap();
+    assert!(!index_names(&conn, "sessions").contains(&"idx_sessions_source_session".to_string()));
+
+    let applied = migrate(&mut conn, &migrations, Some(28)).unwrap();
+    assert_eq!(applied, vec![28]);
+    assert!(index_names(&conn, "sessions").contains(&"idx_sessions_source_session".to_string()));
+    assert!(index_names(&conn, "sessions").contains(&"idx_sessions_sort_at".to_string()));
 }

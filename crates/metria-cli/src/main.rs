@@ -383,7 +383,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[ignore = "concurrency smoke test; run with --ignored --nocapture"]
     fn blocking_pool_has_headroom_for_queries() {
         let rt = hub_runtime().unwrap();
         rt.block_on(async {

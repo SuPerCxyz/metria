@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::api::{
     add_exclusions, decode_cursor, encode_cursor, json_err, parse_range, range_args, range_filter,
-    run_blocking, AppState, RangeParams,
+    run_blocking_labeled, AppState, RangeParams,
 };
 use crate::db::HubDb;
 use crate::q;
@@ -64,6 +64,15 @@ fn decode_sequence_cursor(raw: &str) -> Result<(i64, String), String> {
         return Err("cursor 无效".to_string());
     }
     Ok((sequence, id))
+}
+
+/// 会话排序时间：call_end 使用会话结束时间，避免 sessions 表没有 completed_at。
+fn session_time_expr(mode: Option<&str>, alias: &str) -> String {
+    if mode == Some("call_end") {
+        format!("COALESCE({alias}.ended_at, {alias}.last_activity_at, {alias}.started_at)")
+    } else {
+        format!("{alias}.started_at")
+    }
 }
 
 type UsageCosts = (Option<i64>, Option<i64>, Option<i64>);
@@ -162,19 +171,30 @@ fn attach_usage_costs(c: &metria_storage::rusqlite::Connection, calls: &mut [ser
 }
 
 pub(crate) async fn overview(State(st): State<AppState>, Query(p): Query<RangeParams>) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("overview", move || {
         let (from, to) = parse_range(&p);
         let (filter, fargs) = range_filter(&p);
         let (call_filter, call_fargs) = range_filter_usage(&p);
         // 时长相关统计统一来自同一份聚合：完整小时读小时级预聚合、带维度筛选或预聚合
         // 缺桶时回退明细。必须在取得连接锁之前计算——内部会自行取锁，Mutex 不可重入。
         let perf_agg: Option<crate::perfrollup::PerfHour> =
-            crate::perfrollup::fast_aggregate(&st.db, from, to, &call_filter).or_else(|| {
-                crate::perfrollup::scan_calls(&st.db, from, to, &call_filter, &call_fargs).ok()
-            });
-        // 归档水位决定活动类字段能否从明细算出。必须在取得连接锁之前读取
-        // （std::sync::Mutex 不可重入，持锁再取锁会把请求永久卡死）。
-        let archived_before = crate::archive::watermark(&st.db);
+            match crate::perfrollup::fast_aggregate(&st.db, from, to, &call_filter) {
+                Ok(Some(agg)) => Some(agg),
+                Ok(None) => crate::perfrollup::scan_calls(
+                    &st.db, from, to, &call_filter, &call_fargs,
+                )
+                .ok(),
+                Err(e) => {
+                    tracing::warn!(%e, "overview 性能预聚合不可用");
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "perf_rollup_unavailable",
+                        &e.to_string(),
+                    );
+                }
+            };
+        // 归档水位决定活动类字段能否从明细算出；走只读连接读取，不抢写连接。
+        let archived_before = crate::archive::watermark_read(&st.db);
         let activity_archived = archived_before
             .as_deref()
             .and_then(|w| DateTime::parse_from_rfc3339(w).ok())
@@ -526,9 +546,11 @@ pub(crate) async fn usage_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || match query_usage_timeseries(&st.db, &p) {
-        Ok(points) => Json(serde_json::json!({ "series": points })).into_response(),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+    run_blocking_labeled("usage_timeseries", move || {
+        match query_usage_timeseries(&st.db, &p) {
+            Ok(points) => Json(serde_json::json!({ "series": points })).into_response(),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+        }
     })
     .await
 }
@@ -540,7 +562,7 @@ pub(crate) async fn usage_filter_options(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_filter_options", move || {
         let (from, to) = parse_range(&p);
         match query_filter_options(&st.db, from, to) {
             Ok(body) => Json(body).into_response(),
@@ -720,9 +742,11 @@ pub(crate) async fn usage_heatmap(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || match query_usage_heatmap(&st.db, &p) {
-        Ok(body) => Json(body).into_response(),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+    run_blocking_labeled("usage_heatmap", move || {
+        match query_usage_heatmap(&st.db, &p) {
+            Ok(body) => Json(body).into_response(),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
+        }
     })
     .await
 }
@@ -742,18 +766,22 @@ fn hourly_heatmap_source(
     fargs: &[SqlValue],
     timezone: &Tz,
 ) -> Result<Vec<(String, crate::perfrollup::HeatmapAgg)>, String> {
-    if let Some(list) = crate::perfrollup::fast_hours(db, from, to, filter) {
-        let aligned = list.iter().all(|(bucket, _)| {
-            DateTime::parse_from_rfc3339(&crate::perfrollup::hour_bucket(*bucket))
-                .map(|ts| ts.with_timezone(timezone).minute() == 0)
-                .unwrap_or(false)
-        });
-        if aligned {
-            return Ok(list
-                .into_iter()
-                .map(|(bucket, agg)| (crate::perfrollup::hour_bucket(bucket), agg.heatmap))
-                .collect());
+    match crate::perfrollup::fast_hours(db, from, to, filter) {
+        Ok(Some(list)) => {
+            let aligned = list.iter().all(|(bucket, _)| {
+                DateTime::parse_from_rfc3339(&crate::perfrollup::hour_bucket(*bucket))
+                    .map(|ts| ts.with_timezone(timezone).minute() == 0)
+                    .unwrap_or(false)
+            });
+            if aligned {
+                return Ok(list
+                    .into_iter()
+                    .map(|(bucket, agg)| (crate::perfrollup::hour_bucket(bucket), agg.heatmap))
+                    .collect());
+            }
         }
+        Ok(None) => {}
+        Err(e) => return Err(e.to_string()),
     }
     let grouped = crate::perfrollup::scan_heatmap_grouped(db, from, to, filter, fargs)
         .map_err(|e| e.to_string())?;
@@ -843,7 +871,7 @@ pub(crate) async fn usage_daily(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || match query_usage_daily(&st.db, &p) {
+    run_blocking_labeled("usage_daily", move || match query_usage_daily(&st.db, &p) {
         Ok(series) => Json(serde_json::json!({ "series": series })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &e),
     })
@@ -1433,7 +1461,7 @@ pub(crate) async fn usage_breakdown(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_breakdown", move || {
         let (from, to) = parse_range(&p);
         let (filter, fargs) = range_filter(&p);
         // 支持多维度汇总（S3.3）：node/client/model/provider/project
@@ -1500,7 +1528,7 @@ pub(crate) async fn usage_breakdown(
 }
 
 pub(crate) async fn list_nodes(State(st): State<AppState>) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("list_nodes", move || {
         let c = st.db.read_conn();
         let mut stmt = q!(c.prepare(
             "SELECT n.id, n.name, n.platform, n.architecture, n.timezone, n.status, n.first_seen_at, n.last_seen_at,
@@ -1537,7 +1565,7 @@ pub(crate) async fn node_detail(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("node_detail", move || {
         let (from, to) = parse_range(&p);
         let c = st.db.read_conn();
         let node = c
@@ -1716,7 +1744,7 @@ pub(crate) async fn node_clients(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("node_clients", move || {
         let c = st.db.read_conn();
         let mut stmt = q!(c.prepare(
             "SELECT client_id, adapter_id, adapter_version, source_path_hash, capabilities, status, client_version, last_scan_at, last_error, last_event_at
@@ -1747,22 +1775,30 @@ pub(crate) async fn node_sessions(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("node_sessions", move || {
         let (from, to) = parse_range(&p);
-        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-        let archived_before = crate::archive::watermark(&st.db);
+        // 归档水位走只读连接读取，避免页面查询抢写连接；仍应在取查询连接之前调用，
+        // 保持“先读水位、再取查询连接”的顺序，便于审查锁顺序。
+        let archived_before = crate::archive::watermark_read(&st.db);
         let c = st.db.read_conn();
         let limit = p.limit.unwrap_or(50).min(500);
-        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        let sort_expr = session_time_expr(p.allocation_mode.as_deref(), "s");
+        // call_end 下恢复 last_activity_at 重叠过滤；排序/游标仍用 sort_expr。
+        let range_filter = if p.allocation_mode.as_deref() == Some("call_end") {
+            format!(
+                "(({sort_expr} >= ?2 AND {sort_expr} < ?3) OR (last_activity_at >= ?2 AND last_activity_at < ?3))"
+            )
+        } else {
+            format!("{sort_expr} >= ?2 AND {sort_expr} < ?3")
+        };
         let (sql, args): (String, Vec<SqlValue>) = if let Some(cur) = &p.cursor {
             match crate::api::decode_cursor(cur) {
                 Some((ts, sid)) => (
                     format!(
-                        "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                         FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL
-                           AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
-                         ORDER BY {tcol} DESC, id DESC LIMIT ?6",
+                        "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, {sort_expr} AS sort_at
+                         FROM sessions s WHERE node_id = ?1 AND {range_filter} AND parent_session_id IS NULL
+                           AND ({sort_expr} < ?4 OR ({sort_expr} = ?4 AND s.id < ?5))
+                         ORDER BY {sort_expr} DESC, s.id DESC LIMIT ?6",
                     ),
                     vec![
                         SqlValue::Text(id.clone()),
@@ -1784,8 +1820,8 @@ pub(crate) async fn node_sessions(
         } else {
             (
                 format!(
-                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens
-                     FROM sessions WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 AND parent_session_id IS NULL ORDER BY {tcol} DESC, id DESC LIMIT ?4",
+                    "SELECT id, source_session_id, client_id, title, primary_model_normalized, started_at, ended_at, message_count, model_call_count, input_tokens, output_tokens, {sort_expr} AS sort_at
+                     FROM sessions s WHERE node_id = ?1 AND {range_filter} AND parent_session_id IS NULL ORDER BY {sort_expr} DESC, s.id DESC LIMIT ?4",
                 ),
                 vec![
                     SqlValue::Text(id),
@@ -1809,12 +1845,13 @@ pub(crate) async fn node_sessions(
                 "model_call_count": r.get::<_, i64>(8)?,
                 "input_tokens": r.get::<_, Option<i64>>(9)?,
                 "output_tokens": r.get::<_, Option<i64>>(10)?,
+                "sort_at": r.get::<_, String>(11)?,
             }))
         },));
         let sessions: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
         let next_cursor = sessions.last().and_then(|v| {
             let id = v.get("id")?.as_str()?;
-            let ts = v.get("started_at")?.as_str()?;
+            let ts = v.get("sort_at")?.as_str()?;
             Some(crate::api::encode_cursor(ts, id))
         });
         Json(serde_json::json!({
@@ -1832,11 +1869,11 @@ pub(crate) async fn node_calls(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("node_calls", move || {
         let (from, to) = parse_range(&p);
-        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-        let archived_before = crate::archive::watermark(&st.db);
+        // 归档水位走只读连接读取，避免页面查询抢写连接；仍应在取查询连接之前调用，
+        // 保持“先读水位、再取查询连接”的顺序，便于审查锁顺序。
+        let archived_before = crate::archive::watermark_read(&st.db);
         let c = st.db.read_conn();
         let limit = p.limit.unwrap_or(50).min(500);
         let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -1844,7 +1881,7 @@ pub(crate) async fn node_calls(
             match crate::api::decode_cursor(cur) {
                 Some((ts, cid)) => (
                     format!(
-                        "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
+                        "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd, completed_at
                          FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3
                            AND ({tcol} < ?4 OR ({tcol} = ?4 AND id < ?5))
                          ORDER BY {tcol} DESC, id DESC LIMIT ?6",
@@ -1869,7 +1906,7 @@ pub(crate) async fn node_calls(
         } else {
             (
                 format!(
-                    "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd
+                    "SELECT id, model_normalized, provider_normalized, started_at, status, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, reported_cost_micro_usd, calculated_cost_micro_usd, completed_at
                      FROM model_calls WHERE node_id = ?1 AND {tcol} >= ?2 AND {tcol} < ?3 ORDER BY {tcol} DESC, id DESC LIMIT ?4",
                 ),
                 vec![
@@ -1894,12 +1931,17 @@ pub(crate) async fn node_calls(
                 "reasoning_tokens": r.get::<_, Option<i64>>(8)?,
                 "reported_cost_micro_usd": r.get::<_, Option<i64>>(9)?,
                 "calculated_cost_micro_usd": r.get::<_, Option<i64>>(10)?,
+                "completed_at": r.get::<_, Option<String>>(11)?,
             }))
         },));
         let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
         let next_cursor = calls.last().and_then(|v| {
             let id = v.get("id")?.as_str()?;
-            let ts = v.get("started_at")?.as_str()?;
+            let ts = if p.allocation_mode.as_deref() == Some("call_end") {
+                v.get("completed_at")?.as_str()?
+            } else {
+                v.get("started_at")?.as_str()?
+            };
             Some(crate::api::encode_cursor(ts, id))
         });
         // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而非「无数据」。
@@ -1917,7 +1959,7 @@ pub(crate) async fn list_clients(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("list_clients", move || {
         let (from, to) = parse_range(&p);
         let (filter, fargs) = range_filter(&p);
         let c = st.db.read_conn();
@@ -1962,7 +2004,7 @@ pub(crate) async fn client_detail(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("client_detail", move || {
         let (from, to) = parse_range(&p);
         let c = st.db.read_conn();
         let cte = rollup_source_cte(2, 3, 4, 5);
@@ -2199,7 +2241,7 @@ pub(crate) async fn client_models(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("client_models", move || {
         let models: Vec<serde_json::Value> = {
             // 块作用域：提前释放 conn 锁，避免与 load_all_rules 重入死锁
             let c = st.db.read_conn();
@@ -2249,7 +2291,7 @@ pub(crate) async fn list_models(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("list_models", move || {
         let (from, to) = parse_range(&p);
         let (filter, fargs) = range_filter(&p);
         let mut models: Vec<serde_json::Value> = {
@@ -2385,7 +2427,7 @@ pub(crate) async fn model_detail(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("model_detail", move || {
         let (from, to) = parse_range(&p);
         // 块作用域：提前释放 conn 锁，避免与 list_pricing_rules 重入死锁
         let (raws, summary, recent_sessions, recent_calls, series) = {
@@ -2575,11 +2617,11 @@ pub(crate) async fn list_calls(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("list_calls", move || {
         let (from, to) = parse_range(&p);
-        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-        let archived_before = crate::archive::watermark(&st.db);
+        // 归档水位走只读连接读取，避免页面查询抢写连接；仍应在取查询连接之前调用，
+        // 保持“先读水位、再取查询连接”的顺序，便于审查锁顺序。
+        let archived_before = crate::archive::watermark_read(&st.db);
         let c = st.db.read_conn();
         let limit = p.limit.unwrap_or(100).min(1000);
         let tcol = crate::api::time_column(p.allocation_mode.as_deref());
@@ -2593,7 +2635,7 @@ pub(crate) async fn list_calls(
                             reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
                             ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
                             observability_source, observability_quality, observed_request_payload_bytes,
-                            observed_response_payload_bytes
+                            observed_response_payload_bytes, completed_at
                          FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
                            AND ({tcol} < ?3 OR ({tcol} = ?3 AND id < ?4))
                          ORDER BY {tcol} DESC, id DESC LIMIT ?5"
@@ -2622,7 +2664,7 @@ pub(crate) async fn list_calls(
                         reported_cost_micro_usd, calculated_cost_micro_usd, estimated_cost_micro_usd,
                         ttft_ms, output_tokens_per_second_milli, first_byte_latency_ms, generation_duration_ms,
                         observability_source, observability_quality, observed_request_payload_bytes,
-                        observed_response_payload_bytes
+                        observed_response_payload_bytes, completed_at
                      FROM model_calls WHERE {tcol} >= ?1 AND {tcol} < ?2
                      ORDER BY {tcol} DESC, id DESC LIMIT ?3"
                 ),
@@ -2658,13 +2700,18 @@ pub(crate) async fn list_calls(
                 "observability_quality": r.get::<_, Option<String>>(19)?,
                 "observed_request_payload_bytes": r.get::<_, Option<i64>>(20)?,
                 "observed_response_payload_bytes": r.get::<_, Option<i64>>(21)?,
+                "completed_at": r.get::<_, Option<String>>(22)?,
             }))
         },));
         let calls: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
         // 生成下一页游标（取最后一条）
         let next_cursor = calls.last().and_then(|v| {
             let id = v.get("id")?.as_str()?;
-            let ts = v.get("started_at")?.as_str()?;
+            let ts = if p.allocation_mode.as_deref() == Some("call_end") {
+                v.get("completed_at")?.as_str()?
+            } else {
+                v.get("started_at")?.as_str()?
+            };
             Some(crate::api::encode_cursor(ts, id))
         });
         // 归档水位：早于该时间的明细已删除，前端据此显示「已归档」而不是「暂无数据」。
@@ -2682,7 +2729,7 @@ pub(crate) async fn call_detail(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("call_detail", move || {
         let c = st.db.read_conn();
         let call = c
             .query_row(
@@ -2763,20 +2810,27 @@ pub(crate) async fn list_sessions(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("list_sessions", move || {
         let (from, to) = parse_range(&p);
-        // 归档水位需要取连接锁读 settings，而 std::sync::Mutex 不可重入，
-        // 必须在取得连接锁之前读取，否则与查询共用的锁会把请求永久卡死。
-        let archived_before = crate::archive::watermark(&st.db);
+        // 归档水位走只读连接读取，避免页面查询抢写连接；仍应在取查询连接之前调用，
+        // 保持“先读水位、再取查询连接”的顺序，便于审查锁顺序。
+        let archived_before = crate::archive::watermark_read(&st.db);
         let c = st.db.read_conn();
         let limit = p.limit.unwrap_or(100).min(1000);
-        let tcol = crate::api::time_column(p.allocation_mode.as_deref());
+        let sort_expr = session_time_expr(p.allocation_mode.as_deref(), "s");
         let (session_filter, session_fargs) = range_filter_sessions(&p);
         // 会话在所选时间范围内仍活跃（last_activity_at 落在范围内）也展示，
         // 而非仅按 started_at 过滤，避免"还在用"的会话从列表消失。
-        let range_overlap = format!(
-            "((s.{tcol} >= ?1 AND s.{tcol} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
-        );
+        // call_end 模式恢复 last_activity_at 重叠语义：仍在活动但 ended_at 在范围外的会话
+        // 也要可见；排序/游标仍使用 sort_expr。
+        let range_overlap = if p.allocation_mode.as_deref() == Some("call_end") {
+            format!(
+                "(({sort_expr} >= ?1 AND {sort_expr} < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
+            )
+        } else {
+            "((s.started_at >= ?1 AND s.started_at < ?2) OR (s.last_activity_at >= ?1 AND s.last_activity_at < ?2))"
+                .to_string()
+        };
         // 默认只返回主 Agent 会话；显式 include_subagents=true 时返回全部。
         let subagent_filter = if p.include_subagents == Some(true) {
             ""
@@ -2802,10 +2856,10 @@ pub(crate) async fn list_sessions(
                             status,
                             CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                                  THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
-                            reasoning_tokens
+                            reasoning_tokens, {sort_expr} AS sort_at
                          FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
-                           AND (s.{tcol} < ?{cursor_index} OR (s.{tcol} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
-                         ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}",
+                           AND ({sort_expr} < ?{cursor_index} OR ({sort_expr} = ?{cursor_index} AND s.id < ?{next_cursor_index}))
+                         ORDER BY {sort_expr} DESC, s.id DESC LIMIT ?{limit_index}",
                         next_cursor_index = cursor_index + 1,
                     ),
                         args,
@@ -2825,9 +2879,9 @@ pub(crate) async fn list_sessions(
                         status,
                         CASE WHEN COALESCE(last_activity_at, ended_at) IS NOT NULL AND started_at IS NOT NULL
                              THEN CAST((julianday(COALESCE(last_activity_at, ended_at)) - julianday(started_at)) * 86400000 AS INTEGER) END AS duration_ms,
-                        reasoning_tokens
+                        reasoning_tokens, {sort_expr} AS sort_at
                      FROM sessions s WHERE {range_overlap} {session_filter} {subagent_filter}
-                     ORDER BY s.{tcol} DESC, s.id DESC LIMIT ?{limit_index}"
+                     ORDER BY {sort_expr} DESC, s.id DESC LIMIT ?{limit_index}"
                 ),
                 args,
             )
@@ -2857,6 +2911,7 @@ pub(crate) async fn list_sessions(
                 "status": r.get::<_, String>(19)?,
                 "duration_ms": r.get::<_, Option<i64>>(20)?,
                 "reasoning_tokens": r.get::<_, Option<i64>>(21)?,
+                "sort_at": r.get::<_, String>(22)?,
             }))
         },));
         let sessions: Vec<serde_json::Value> = rows
@@ -2889,7 +2944,7 @@ pub(crate) async fn list_sessions(
             .collect();
         let next_cursor = sessions.last().and_then(|v| {
             let id = v.get("id")?.as_str()?;
-            let ts = v.get("started_at")?.as_str()?;
+            let ts = v.get("sort_at")?.as_str()?;
             Some(crate::api::encode_cursor(ts, id))
         });
         Json(serde_json::json!({
@@ -2906,7 +2961,7 @@ pub(crate) async fn session_detail(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_detail", move || {
         let c = st.db.read_conn();
         let session = c
             .query_row(
@@ -2986,7 +3041,7 @@ pub(crate) async fn session_calls(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<PageParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_calls", move || {
         let c = st.db.read_conn();
         let paginated = match page_limit(&p) {
             Ok(v) => v,
@@ -3110,7 +3165,7 @@ pub(crate) async fn session_tools(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<PageParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_tools", move || {
         let c = st.db.read_conn();
         let paginated = match page_limit(&p) {
             Ok(v) => v,
@@ -3195,7 +3250,7 @@ pub(crate) async fn session_subagents(
     State(st): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_subagents", move || {
         let c = st.db.read_conn();
         // 同一子会话只保留最早一条关系（历史 Agent 曾按扫描轮次重复写入）
         let mut stmt = q!(c.prepare(
@@ -3329,7 +3384,7 @@ pub(crate) async fn session_timeline(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<PageParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_timeline", move || {
         let c = st.db.read_conn();
         let paginated = match page_limit(&p) {
             Ok(v) => v,
@@ -3419,7 +3474,7 @@ pub(crate) async fn session_stats(
     AxumPath(id): AxumPath<String>,
     Query(p): Query<StatsParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("session_stats", move || {
         let granularity = match p.granularity.as_deref() {
             None | Some("hour") => "hour",
             Some("day") => "day",
@@ -3671,7 +3726,7 @@ pub(crate) async fn data_quality(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("data_quality", move || {
         let (from, to) = parse_range(&p);
         let c = st.db.read_conn();
 
@@ -3863,18 +3918,26 @@ pub(crate) async fn usage_latency(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_latency", move || {
         let (from, to) = parse_range(&p);
         let (mc_filter, mc_fargs) = range_filter_usage(&p);
         // 快速路径读小时级预聚合；带维度筛选或预聚合缺桶时回退明细。
         // 两条路径共用 perfrollup 的累加逻辑，样本数、平均值精确，分位数为直方图近似。
         let duration = match crate::perfrollup::fast_aggregate(&st.db, from, to, &mc_filter) {
-            Some(agg) => agg.duration,
-            None => {
+            Ok(Some(agg)) => agg.duration,
+            Ok(None) => {
                 let agg = q!(crate::perfrollup::scan_calls(
                     &st.db, from, to, &mc_filter, &mc_fargs
                 ));
                 agg.duration
+            }
+            Err(e) => {
+                tracing::warn!(%e, "usage_latency 性能预聚合不可用");
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "perf_rollup_unavailable",
+                    &e.to_string(),
+                );
             }
         };
         Json(serde_json::json!({
@@ -3896,16 +3959,24 @@ pub(crate) async fn usage_performance(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_performance", move || {
         let (from, to) = parse_range(&p);
         let (filter, fargs) = range_filter_usage(&p);
         // 快速路径读小时级预聚合（完整小时）；带维度筛选或预聚合缺桶时回退明细。
         // 两条路径共用 perfrollup 的逐行累加逻辑，保证口径一致。
         let acc = match crate::perfrollup::fast_aggregate(&st.db, from, to, &filter) {
-            Some(agg) => agg,
-            None => q!(crate::perfrollup::scan_calls(
+            Ok(Some(agg)) => agg,
+            Ok(None) => q!(crate::perfrollup::scan_calls(
                 &st.db, from, to, &filter, &fargs
             )),
+            Err(e) => {
+                tracing::warn!(%e, "usage_performance 性能预聚合不可用");
+                return json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "perf_rollup_unavailable",
+                    &e.to_string(),
+                );
+            }
         };
         Json(performance_json(&acc)).into_response()
     })
@@ -4005,19 +4076,30 @@ pub(crate) async fn usage_performance_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_performance_timeseries", move || {
         let (from, to) = parse_range(&p);
         let bucket_secs = bucket_granularity(&p, from, to);
         let (filter, fargs) = range_filter_usage(&p);
         // 无维度筛选且分桶 ≥1 小时时，完整小时读性能预聚合；当前/缺失小时由
         // fast_hours 按小时补明细。24 小时内的 5/15 分钟桶保持明细精确路径。
         if should_use_perf_rollup(bucket_secs, &filter) {
-            if let Some(hours) = crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
-                let (points, _) = perf_hours_to_points(&hours, bucket_secs, "performance");
-                return Json(serde_json::json!({
-                    "series": fill_performance_timeseries(points, from, to, bucket_secs)
-                }))
-                .into_response();
+            match crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
+                Ok(Some(hours)) => {
+                    let (points, _) = perf_hours_to_points(&hours, bucket_secs, "performance");
+                    return Json(serde_json::json!({
+                        "series": fill_performance_timeseries(points, from, to, bucket_secs)
+                    }))
+                    .into_response();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(%e, "usage_performance_timeseries 性能预聚合不可用");
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "perf_rollup_unavailable",
+                        &e.to_string(),
+                    );
+                }
             }
         }
         let c = st.db.read_conn();
@@ -4187,23 +4269,35 @@ pub(crate) async fn usage_latency_timeseries(
     State(st): State<AppState>,
     Query(p): Query<RangeParams>,
 ) -> Response {
-    run_blocking(move || {
+    run_blocking_labeled("usage_latency_timeseries", move || {
         let (from, to) = parse_range(&p);
         let bucket_secs = bucket_granularity(&p, from, to);
         let (mc_filter, mc_fargs) = range_filter_usage(&p);
         // 无筛选且分桶 ≥1 小时：完整小时读性能预聚合，当前/缺失小时按小时补明细；
         // 24 小时内的 5/15 分钟桶继续走明细精确分位数。
         if should_use_perf_rollup(bucket_secs, &mc_filter) {
-            if let Some(hours) = crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
-                let (points, _used_rollup) = perf_hours_to_points(&hours, bucket_secs, "latency");
-                let filled = fill_latency_timeseries(points, from, to, bucket_secs);
-                // 快速路径内即使某些小时回退明细，也由直方图合并计算分位数（近似）；
-                // 纯明细路径在下方单独标 false。
-                return Json(serde_json::json!({
-                    "series": filled,
-                    "quantile_approx": true,
-                }))
-                .into_response();
+            match crate::perfrollup::fast_hours_with_source(&st.db, from, to, "") {
+                Ok(Some(hours)) => {
+                    let (points, _used_rollup) =
+                        perf_hours_to_points(&hours, bucket_secs, "latency");
+                    let filled = fill_latency_timeseries(points, from, to, bucket_secs);
+                    // 快速路径内即使某些小时回退明细，也由直方图合并计算分位数（近似）；
+                    // 纯明细路径在下方单独标 false。
+                    return Json(serde_json::json!({
+                        "series": filled,
+                        "quantile_approx": true,
+                    }))
+                    .into_response();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(%e, "usage_latency_timeseries 性能预聚合不可用");
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "perf_rollup_unavailable",
+                        &e.to_string(),
+                    );
+                }
             }
         }
         let c = st.db.read_conn();
@@ -5107,7 +5201,9 @@ mod query_optimization_tests {
 
         let from = current_hour() - Duration::hours(4);
         let to = Utc::now();
-        let hours = crate::perfrollup::fast_hours_with_source(&db, from, to, "").unwrap();
+        let hours = crate::perfrollup::fast_hours_with_source(&db, from, to, "")
+            .unwrap()
+            .unwrap();
         let (latency, latency_rollup) = perf_hours_to_points(&hours, 3600, "latency");
         let raw = crate::perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
         let latency_count: u64 = latency

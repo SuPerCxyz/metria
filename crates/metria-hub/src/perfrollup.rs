@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
-use metria_storage::rusqlite::{params_from_iter, types::Value as SqlValue};
+use metria_storage::rusqlite::{params, params_from_iter, types::Value as SqlValue};
 use metria_storage::StorageError;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -30,9 +30,18 @@ const SPEED_HIST_MAX: f64 = 100_000.0;
 pub const PAYLOAD_VERSION: u32 = 1;
 /// 全量重建成功后持久化的版本键；用于避免每次启动逐行扫描 payload。
 pub const PAYLOAD_VERSION_KEY: &str = "perf_rollup_payload_version";
+/// 快路径最大范围（90 天）；超过后走明细，避免把全年小时 payload 全部反序列化进内存。
+pub const MAX_FAST_RANGE_HOURS: i64 = 90 * 24;
+/// dirty 队列单轮默认上限。
+pub const DEFAULT_DIRTY_BATCH: usize = 48;
 
 /// 单个分箱的样本数。
 pub type BinCounts = [u32; HIST_BINS];
+
+/// 逐小时聚合结果（bucket, hour）。
+pub type PerfHourList = Vec<(DateTime<Utc>, PerfHour)>;
+/// 逐小时聚合结果，附带该桶是否来自预聚合。
+pub type PerfHourListWithSource = Vec<(DateTime<Utc>, PerfHour, bool)>;
 
 /// 样本值落到第几箱（对数等比边界）。
 fn bin_index(value: f64, max: f64) -> usize {
@@ -653,44 +662,94 @@ fn decode_payload(payload: &str) -> Result<Option<PerfHour>, serde_json::Error> 
 }
 
 /// 读取 `[from, to)` 内可用的完整小时桶；缺失、早建、版本过期均视为“需补桶”。
+///
+/// 归档水位之前的小时明细已删除，无法用明细补齐；这些小时若 payload 旧版本/损坏，
+/// 返回 `ArchivedUnavailable`，调用方必须返回错误而不是回退到空明细伪装成 0。
+enum RollupLoadError {
+    ArchivedUnavailable { bucket: String, reason: String },
+    Storage(StorageError),
+}
+
 fn load_rollup_meta(
     db: &HubDb,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-) -> Result<BTreeMap<DateTime<Utc>, PerfHour>, StorageError> {
+    archive_floor: Option<DateTime<Utc>>,
+) -> Result<BTreeMap<DateTime<Utc>, PerfHour>, RollupLoadError> {
     let mut out = BTreeMap::new();
     if to <= from {
         return Ok(out);
     }
     let c = db.read_conn();
-    let mut stmt = c.prepare(
-        "SELECT bucket, built_at, payload FROM hourly_performance_rollups \
-         WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
-    )?;
-    let mut rows = stmt.query([from.to_rfc3339(), to.to_rfc3339()])?;
-    while let Some(row) = rows.next()? {
-        let bucket_raw: String = row.get(0)?;
-        let built_at_raw: String = row.get(1)?;
-        let payload: String = row.get(2)?;
+    let mut stmt = c
+        .prepare(
+            "SELECT bucket, built_at, payload FROM hourly_performance_rollups \
+             WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        )
+        .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?;
+    let mut rows = stmt
+        .query([from.to_rfc3339(), to.to_rfc3339()])
+        .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?
+    {
+        let bucket_raw: String = row
+            .get(0)
+            .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?;
+        let built_at_raw: String = row
+            .get(1)
+            .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?;
+        let payload: String = row
+            .get(2)
+            .map_err(|e| RollupLoadError::Storage(StorageError::from(e)))?;
         let Some(bucket) = parse_ts(&bucket_raw) else {
             continue;
         };
+        let archived = archive_floor.is_some_and(|floor| bucket < floor);
         let hour_end = bucket + chrono::Duration::hours(1);
         let built_at = match parse_ts(&built_at_raw) {
             Some(ts) => ts,
             None => {
+                if archived {
+                    return Err(RollupLoadError::ArchivedUnavailable {
+                        bucket: bucket_raw,
+                        reason: "built_at 无法解析".into(),
+                    });
+                }
                 debug!(bucket = %bucket_raw, "性能预聚合 built_at 无法解析，按需补桶处理");
                 continue;
             }
         };
         if built_at < hour_end {
+            if archived {
+                return Err(RollupLoadError::ArchivedUnavailable {
+                    bucket: bucket_raw,
+                    reason: "早建桶".into(),
+                });
+            }
             continue;
         }
-        match decode_payload(&payload).map_err(|e| StorageError::Query(e.to_string()))? {
-            Some(hour) => {
+        match decode_payload(&payload) {
+            Ok(Some(hour)) => {
                 out.insert(bucket, hour);
             }
-            None => continue,
+            Ok(None) => {
+                if archived {
+                    return Err(RollupLoadError::ArchivedUnavailable {
+                        bucket: bucket_raw,
+                        reason: "payload 版本不一致".into(),
+                    });
+                }
+            }
+            Err(e) => {
+                if archived {
+                    return Err(RollupLoadError::ArchivedUnavailable {
+                        bucket: bucket_raw,
+                        reason: format!("payload 损坏: {e}"),
+                    });
+                }
+            }
         }
     }
     Ok(out)
@@ -718,22 +777,27 @@ fn build_hours_from_detail(
 /// * 完整小时且 payload 版本一致、`built_at >= hour_end`：读预聚合；
 /// * 缺行、`built_at` 早于小时结束、版本过期：只用该小时明细补齐；
 /// * 连续多个需补小时合并为一次按小时分桶的明细扫描；
-/// * 两端不完整小时与当前未完成小时走明细。
+/// * 两端不完整小时与当前未完成小时走明细；
+/// * 头/尾片段与 >90 天回退按**原始 watermark** 判断是否与已删除明细相交；
+///   完整小时缺桶、payload 损坏或版本过期则按 `ceil_hour(watermark)` 判断，
+///   因为这些小时可能只保留了部分明细，无法完整重建，返回 `Err`。
 ///
-/// 返回 `None` 仅表示本次无法安全给出结果（带维度筛选、DB 错误或 payload 损坏），
-/// 调用方应整体回退明细。单个缺桶不再触发整段回退。
+/// 返回 `None` 仅表示本次无法安全给出结果（带维度筛选、明细扫描/预聚合读取的
+/// DB 错误），调用方应整体回退明细；若范围与归档区间相交，Storage 错误也返回
+/// `Err`，不会静默回退到已归档明细。单个缺桶只按小时补扫明细，不再触发整段回退。
 pub fn fast_hours(
     db: &HubDb,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     filter: &str,
-) -> Option<Vec<(DateTime<Utc>, PerfHour)>> {
-    fast_hours_with_source(db, from, to, filter).map(|hours| {
+) -> Result<Option<PerfHourList>, StorageError> {
+    let hours = fast_hours_with_source(db, from, to, filter)?;
+    Ok(hours.map(|hours| {
         hours
             .into_iter()
             .map(|(bucket, hour, _)| (bucket, hour))
             .collect()
-    })
+    }))
 }
 
 /// 与 [`fast_hours`] 相同，但额外返回每个桶是否来自预聚合。
@@ -746,37 +810,90 @@ pub fn fast_hours_with_source(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     filter: &str,
-) -> Option<Vec<(DateTime<Utc>, PerfHour, bool)>> {
+) -> Result<Option<PerfHourListWithSource>, StorageError> {
     if !filter.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     if to <= from {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
+    }
+
+    // 原始水位用于判断“范围是否与已删除明细相交”；整点 floor 只用于判断
+    // 完整小时能否从明细重建（水位所在小时可能只删除了前半小时的明细）。
+    let archive_watermark = match crate::archive::watermark_read(db) {
+        Some(raw) => match parse_ts(&raw) {
+            Some(ts) => Some(ts),
+            None => {
+                warn!(watermark = %raw, "归档水位无法解析，预聚合快路径按无水位处理");
+                None
+            }
+        },
+        None => None,
+    };
+    let archive_floor = archive_watermark.map(ceil_hour);
+    if to - from > chrono::Duration::hours(MAX_FAST_RANGE_HOURS) {
+        if archive_watermark.is_some_and(|watermark| from < watermark) {
+            warn!(
+                from = %from,
+                to = %to,
+                "性能预聚合范围超过 90 天且包含归档区间，拒绝回退到已归档明细"
+            );
+            return Err(StorageError::Query(
+                "查询范围超过 90 天且包含已归档明细，无法安全回退".into(),
+            ));
+        }
+        debug!(
+            hours = (to - from).num_hours(),
+            "性能预聚合范围超过上限，回退明细"
+        );
+        return Ok(None);
     }
 
     let now = Utc::now();
     let mid_start = ceil_hour(from);
     let mid_end = floor_hour(to).min(floor_hour(now));
-    let mut out: Vec<(DateTime<Utc>, PerfHour, bool)> = Vec::new();
+    let mut out: PerfHourListWithSource = Vec::new();
 
-    // 头部不完整小时。
+    // 头部不完整小时；若头部落在归档水位之前，明细已删除，不能静默少计。
     let head_end = mid_start.min(to);
     if from < head_end {
+        if archive_watermark.is_some_and(|watermark| from < watermark) {
+            warn!(from = %from, head_end = %head_end, "性能预聚合头部片段包含归档区间");
+            return Err(StorageError::Query(format!(
+                "性能预聚合头部片段包含已归档明细（from={from}）"
+            )));
+        }
         match scan_calls(db, from, head_end, "", &[]) {
             Ok(agg) => out.push((floor_hour(from), agg, false)),
             Err(e) => {
                 warn!(error = %e, "性能预聚合头部明细扫描失败，整体回退");
-                return None;
+                return Ok(None);
             }
         }
     }
 
     let full_hours = complete_hours(from, mid_end);
-    let rollups = match load_rollup_meta(db, mid_start, mid_end) {
+    let rollups = match load_rollup_meta(db, mid_start, mid_end, archive_floor) {
         Ok(v) => v,
-        Err(e) => {
+        Err(RollupLoadError::ArchivedUnavailable { bucket, reason }) => {
+            warn!(
+                bucket = %bucket,
+                reason = %reason,
+                "归档水位前的性能预聚合不可用，拒绝回退到已归档明细"
+            );
+            return Err(StorageError::Query(format!(
+                "性能预聚合不可用（bucket={bucket}）: {reason}"
+            )));
+        }
+        Err(RollupLoadError::Storage(e)) => {
+            if archive_watermark.is_some_and(|watermark| from < watermark) {
+                warn!(error = %e, from = %from, "归档区间内读取性能预聚合失败，拒绝回退到已归档明细");
+                return Err(StorageError::Query(format!(
+                    "读取性能预聚合失败且范围包含已归档明细: {e}"
+                )));
+            }
             warn!(error = %e, "读取性能预聚合失败，整体回退");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -792,6 +909,13 @@ pub fn fast_hours_with_source(
         // 连续需补小时合并为一次明细扫描，但仍按小时独立入桶，禁止合并后再拆。
         let run_start = index;
         while index < full_hours.len() && !rollups.contains_key(&full_hours[index]) {
+            if archive_floor.is_some_and(|floor| full_hours[index] < floor) {
+                let bucket = hour_bucket(full_hours[index]);
+                warn!(bucket = %bucket, "性能预聚合缺桶且该小时明细已归档");
+                return Err(StorageError::Query(format!(
+                    "性能预聚合缺桶且明细已归档（bucket={bucket}）"
+                )));
+            }
             index += 1;
         }
         let run = &full_hours[run_start..index];
@@ -801,7 +925,7 @@ pub fn fast_hours_with_source(
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "性能预聚合补桶扫描失败，整体回退");
-                return None;
+                return Ok(None);
             }
         };
         repaired += run.len();
@@ -812,11 +936,17 @@ pub fn fast_hours_with_source(
 
     // 尾部：当前未完成小时或未对齐到整点的结束片段。
     if mid_end >= mid_start && mid_end < to {
+        if archive_watermark.is_some_and(|watermark| mid_end < watermark) {
+            warn!(mid_end = %mid_end, to = %to, "性能预聚合尾部片段包含归档区间");
+            return Err(StorageError::Query(format!(
+                "性能预聚合尾部片段包含已归档明细（mid_end={mid_end}）"
+            )));
+        }
         match scan_calls(db, mid_end, to, "", &[]) {
             Ok(agg) => out.push((floor_hour(mid_end), agg, false)),
             Err(e) => {
                 warn!(error = %e, "性能预聚合尾部明细扫描失败，整体回退");
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -827,7 +957,7 @@ pub fn fast_hours_with_source(
         buckets = out.len(),
         "性能预聚合快速路径"
     );
-    Some(out)
+    Ok(Some(out))
 }
 
 /// 把 [`fast_hours`] 的结果合并成整段聚合（延迟/性能/总览分位数用）。
@@ -836,14 +966,16 @@ pub fn fast_aggregate(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     filter: &str,
-) -> Option<PerfHour> {
+) -> Result<Option<PerfHour>, StorageError> {
     let hours = fast_hours(db, from, to, filter)?;
-    let mut merged = PerfHour::new();
-    for (_, hour) in hours {
-        merged.merge(&hour);
-    }
-    merged.finalize();
-    Some(merged)
+    Ok(hours.map(|hours| {
+        let mut merged = PerfHour::new();
+        for (_, hour) in hours {
+            merged.merge(&hour);
+        }
+        merged.finalize();
+        merged
+    }))
 }
 
 pub fn floor_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
@@ -867,16 +999,63 @@ pub fn ceil_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
 /// 避免「预聚合与明细不一致」。按窗口分批推进，内存与总行数解耦。
 pub fn rebuild_history(db: &HubDb) -> Result<usize, StorageError> {
     let _guard = db.rebuild_guard();
+    rebuild_history_locked(db)
+}
+
+/// 已持有 rebuild guard 的全量重建入口（启动后台任务使用）。
+pub(crate) fn rebuild_history_locked(db: &HubDb) -> Result<usize, StorageError> {
+    #[cfg(test)]
+    db.note_full_rebuild();
     let Some(earliest) = earliest_call_time(db)? else {
         return Ok(0);
     };
+    // 记录全量重建开始时刻：只清理重建开始前已存在的 dirty 标记；
+    // 重建期间新到的晚到补采标记必须保留，等待下一轮 dirty 重建。
+    let rebuild_started_at = Utc::now().to_rfc3339();
     let written = rebuild(db, earliest, Utc::now())?;
+    if db.is_rebuild_cancelled() {
+        warn!("性能预聚合全量重建已取消，不写版本键/不清理 dirty");
+        return Ok(written);
+    }
     // 成功完成全量重建后持久化 payload 版本，后续启动不再逐行解析 payload。
     db.setting_set(PAYLOAD_VERSION_KEY, &PAYLOAD_VERSION.to_string())?;
     if let Err(e) = audit_archived_rollups(db) {
         warn!(error = %e, "归档水位前的性能预聚合审计失败");
     }
+    match clear_dirty_after_full_rebuild(db, &rebuild_started_at) {
+        Ok(0) => {}
+        Ok(cleared) => debug!(cleared, "全量重建后清理 dirty 小时"),
+        Err(e) => warn!(error = %e, "全量重建后清理 dirty 小时失败"),
+    }
     Ok(written)
+}
+
+/// 全量重建成功后清理覆盖范围内的 dirty 行（>= 归档水位；无水位时全部）。
+///
+/// 只删除 `marked_at <= cutoff` 的标记；重建期间新写入的 dirty 行保留。
+fn clear_dirty_after_full_rebuild(db: &HubDb, cutoff: &str) -> Result<usize, StorageError> {
+    let min_bucket = match crate::archive::watermark(db) {
+        Some(raw) => match parse_ts(&raw) {
+            Some(ts) => Some(ceil_hour(ts)),
+            None => {
+                warn!(watermark = %raw, "归档水位无法解析，保留 dirty 行");
+                return Ok(0);
+            }
+        },
+        None => None,
+    };
+    let c = db.conn();
+    match min_bucket {
+        Some(ts) => c.execute(
+            "DELETE FROM perf_rollup_dirty_hours WHERE hour >= ?1 AND marked_at <= ?2",
+            params![hour_bucket(ts), cutoff],
+        ),
+        None => c.execute(
+            "DELETE FROM perf_rollup_dirty_hours WHERE marked_at <= ?1",
+            [cutoff],
+        ),
+    }
+    .map_err(StorageError::from)
 }
 
 /// 只重建最近 `hours` 个已结束小时（默认由维护任务传 3）。
@@ -892,15 +1071,17 @@ pub fn rebuild_recent(db: &HubDb, hours: u32) -> Result<usize, StorageError> {
     rebuild(db, start, end)
 }
 
-/// 失效指定小时（UTC 整点）的性能预聚合，让 `fast_hours` 下次从明细补齐。
+/// 失效指定小时：写入 dirty 队列，并在持有 rebuild guard 时删除对应预聚合行。
 ///
-/// 只删除归档水位所在小时之后的桶；水位之前的明细已归档，删除后无法重建，
-/// 保留旧聚合。返回实际删除的行数。
+/// 只处理归档水位之后、当前整点之前的小时；水位前明细已归档，删除后无法重建，
+/// 保留旧聚合。拿不到 guard（归档/全量重建进行中）时只登记 dirty、保留旧 rollup，
+/// 下一轮 dirty 重建会整体替换，避免归档推进后既无 rollup 又无明细。
+/// 返回登记的小时数。
 pub fn invalidate_hours(db: &HubDb, hours: &[DateTime<Utc>]) -> Result<usize, StorageError> {
     if hours.is_empty() {
         return Ok(0);
     }
-    let min_bucket = match crate::archive::watermark(db) {
+    let min_bucket = match crate::archive::watermark_read(db) {
         Some(raw) => match parse_ts(&raw) {
             Some(ts) => Some(ceil_hour(ts)),
             None => {
@@ -910,9 +1091,13 @@ pub fn invalidate_hours(db: &HubDb, hours: &[DateTime<Utc>]) -> Result<usize, St
         },
         None => None,
     };
+    let now_floor = floor_hour(Utc::now());
     let mut unique = std::collections::BTreeSet::new();
     for hour in hours {
         let bucket = floor_hour(*hour);
+        if bucket >= now_floor {
+            continue;
+        }
         if min_bucket.is_some_and(|min| bucket < min) {
             continue;
         }
@@ -922,17 +1107,178 @@ pub fn invalidate_hours(db: &HubDb, hours: &[DateTime<Utc>]) -> Result<usize, St
         return Ok(0);
     }
 
+    // 与归档/全量重建互斥：拿不到 guard 时只登记 dirty，不删除现有 rollup；
+    // 下一轮 dirty 重建会整体替换，避免归档推进后既无 rollup 又无明细。
+    let guard = db.try_rebuild_guard();
     let c = db.conn();
     let tx = c.unchecked_transaction().map_err(StorageError::from)?;
-    let mut deleted = 0usize;
+    let marked_at = Utc::now().to_rfc3339();
     {
-        let mut stmt = tx.prepare("DELETE FROM hourly_performance_rollups WHERE bucket = ?1")?;
-        for hour in unique {
-            deleted += stmt.execute([hour_bucket(hour)])?;
+        let mut mark = tx.prepare(
+            "INSERT INTO perf_rollup_dirty_hours (hour, marked_at) VALUES (?1, ?2) \
+             ON CONFLICT(hour) DO UPDATE SET marked_at = excluded.marked_at",
+        )?;
+        let mut delete = tx.prepare("DELETE FROM hourly_performance_rollups WHERE bucket = ?1")?;
+        for hour in &unique {
+            let bucket = hour_bucket(*hour);
+            mark.execute(params![bucket, marked_at])?;
+            if guard.is_some() {
+                delete.execute([bucket])?;
+            }
         }
     }
     tx.commit().map_err(StorageError::from)?;
-    Ok(deleted)
+    if guard.is_none() {
+        debug!("失效小时只登记 dirty：重建 guard 被占用，保留现有 rollup");
+    }
+    Ok(unique.len())
+}
+
+/// 重建 dirty 队列中的小时；拿不到 rebuild guard 时返回 0，下一轮再试。
+///
+/// 连续小时合并为一次 `rebuild`；成功后还要校验每个小时 rollup 已存在且
+/// `built_at >= hour_end`，覆盖通过才删除对应 dirty 行。未覆盖的小时若已落到
+/// 归档水位之前，清理 dirty（该小时由 `fast_hours` 返回不可用而不是 0）；
+/// 水位之后仍保留待重试。重建期间被重新标记的小时（`marked_at` 变化）不会被误删。
+pub fn rebuild_dirty_hours(db: &HubDb, max_hours: usize) -> Result<usize, StorageError> {
+    if db.is_rebuild_cancelled() {
+        return Ok(0);
+    }
+    let limit = max_hours.clamp(1, 168) as i64;
+    let rows: Vec<(String, String)> = {
+        let c = db.read_conn();
+        let mut stmt = c.prepare(
+            "SELECT hour, marked_at FROM perf_rollup_dirty_hours ORDER BY hour LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(Result::ok).collect()
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let Some(_guard) = db.try_rebuild_guard() else {
+        return Ok(0);
+    };
+    if db.is_rebuild_cancelled() {
+        return Ok(0);
+    }
+
+    let mut hours: Vec<(DateTime<Utc>, String)> = Vec::new();
+    for (raw, marked_at) in rows {
+        match parse_ts(&raw) {
+            Some(ts) => hours.push((floor_hour(ts), marked_at)),
+            None => {
+                warn!(hour = %raw, "dirty 小时无法解析，删除该记录");
+                let _ = db.conn().execute(
+                    "DELETE FROM perf_rollup_dirty_hours WHERE hour = ?1 AND marked_at = ?2",
+                    params![raw, marked_at],
+                );
+            }
+        }
+    }
+    if hours.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rebuilt = 0usize;
+    let mut index = 0usize;
+    while index < hours.len() {
+        let start = hours[index].0;
+        let mut end = start;
+        let mut next = index + 1;
+        while next < hours.len() && hours[next].0 == end + chrono::Duration::hours(1) {
+            end = hours[next].0;
+            next += 1;
+        }
+        match rebuild(db, start, end + chrono::Duration::hours(1)) {
+            Ok(_) => {
+                if db.is_rebuild_cancelled() {
+                    warn!("dirty 小时重建被取消，保留队列");
+                    break;
+                }
+                if !dirty_range_covered(db, start, end)? {
+                    // 归档水位推进后，水位前的小时已无法从明细重建；继续保留 dirty
+                    // 只会每 5 分钟重试一次。这些小时由 fast_hours 的归档不可用路径
+                    // 返回 Err，因此清理 dirty 不会造成静默少计。
+                    let archive_floor = crate::archive::watermark_read(db)
+                        .as_deref()
+                        .and_then(parse_ts)
+                        .map(ceil_hour);
+                    let mut cleaned = 0usize;
+                    if let Some(floor) = archive_floor {
+                        let c = db.conn();
+                        let mut delete = c.prepare(
+                            "DELETE FROM perf_rollup_dirty_hours WHERE hour = ?1 AND marked_at = ?2",
+                        )?;
+                        for (hour, marked_at) in &hours[index..next] {
+                            if *hour < floor {
+                                warn!(
+                                    hour = %hour_bucket(*hour),
+                                    "dirty 小时已归档且无法覆盖，清理 dirty 记录"
+                                );
+                                cleaned +=
+                                    delete.execute(params![hour_bucket(*hour), marked_at])?;
+                            }
+                        }
+                    }
+                    if cleaned == 0 {
+                        warn!(
+                            start = %start,
+                            end = %end,
+                            "dirty 小时重建未覆盖全部小时，保留 dirty 待重试"
+                        );
+                    } else {
+                        warn!(
+                            start = %start,
+                            end = %end,
+                            cleaned,
+                            "dirty 小时重建未覆盖全部小时，已清理归档区 dirty"
+                        );
+                    }
+                    index = next;
+                    continue;
+                }
+                // 只删除读取时看到的标记；重建期间被重新标记的小时必须保留。
+                let c = db.conn();
+                let mut delete = c.prepare(
+                    "DELETE FROM perf_rollup_dirty_hours WHERE hour = ?1 AND marked_at = ?2",
+                )?;
+                for (hour, marked_at) in &hours[index..next] {
+                    delete.execute(params![hour_bucket(*hour), marked_at])?;
+                }
+                rebuilt += next - index;
+            }
+            Err(e) => {
+                warn!(start = %start, end = %end, error = %e, "dirty 小时重建失败，保留待重试")
+            }
+        }
+        index = next;
+    }
+    Ok(rebuilt)
+}
+
+/// 重建结果是否覆盖 `[start, end]` 的每个小时：行存在且 built_at >= hour_end。
+fn dirty_range_covered(
+    db: &HubDb,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<bool, StorageError> {
+    let c = db.read_conn();
+    let mut stmt = c.prepare(
+        "SELECT COUNT(*) FROM hourly_performance_rollups WHERE bucket = ?1 AND built_at >= ?2",
+    )?;
+    let mut hour = start;
+    while hour <= end {
+        let hour_end = (hour + chrono::Duration::hours(1)).to_rfc3339();
+        let count: i64 = stmt.query_row(params![hour_bucket(hour), hour_end], |r| r.get(0))?;
+        if count == 0 {
+            return Ok(false);
+        }
+        hour += chrono::Duration::hours(1);
+    }
+    Ok(true)
 }
 
 /// 审计归档水位之前无法重建的预聚合行：只告警计数，不删除。
@@ -1222,6 +1568,10 @@ fn build_window(
 /// 按窗口推进（默认 24 小时），单批只保留一个窗口的聚合结果，内存与历史行数解耦，
 /// 满足 `hub-runtime-memory` 对有界处理的要求。
 pub fn rebuild(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<usize, StorageError> {
+    if db.is_rebuild_cancelled() {
+        warn!("性能预聚合重建已取消，跳过本次重建");
+        return Ok(0);
+    }
     // 归档水位之前的小时明细已被删除，重建会把缺口写成不完整聚合并覆盖已有 rollup。
     // 因此从水位所在小时的下一个整点开始；水位无法解析时放弃本次重建。
     let from = match crate::archive::watermark(db) {
@@ -1244,8 +1594,16 @@ pub fn rebuild(db: &HubDb, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<usi
     let mut cursor = floor_hour(from);
     let mut written = 0usize;
     while cursor < to {
+        if db.is_rebuild_cancelled() {
+            warn!(cursor = %cursor, "性能预聚合重建在窗口边界取消");
+            break;
+        }
         let end = (cursor + chrono::Duration::hours(WINDOW_HOURS)).min(to);
         let mut buckets = build_window(db, cursor, end)?;
+        if db.is_rebuild_cancelled() {
+            warn!(cursor = %cursor, "性能预聚合重建在窗口扫描后取消，未写入该窗口");
+            break;
+        }
         // 每个完整小时都要有一行（含没有调用的空小时），否则快速路径的覆盖检查
         // 会因为“缺行”永久失败，预聚合就永远用不上。
         let mut hour = floor_hour(cursor);

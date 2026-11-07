@@ -31,6 +31,8 @@ fn test_db(tag: &str) -> (std::path::PathBuf, HubDb) {
     std::fs::create_dir_all(&dir).unwrap();
     let db = HubDb::open(&test_cfg(&dir)).unwrap();
     db.apply_migrations().unwrap();
+    // 生产启动会初始化只读连接池；测试也按同样形态运行，验证快路径不抢写连接。
+    db.init_read_pool().unwrap();
     (dir, db)
 }
 
@@ -40,6 +42,24 @@ fn current_hour() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(now.year(), now.month(), now.day(), now.hour(), 0, 0)
         .single()
         .unwrap()
+}
+
+fn fast_agg(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    filter: &str,
+) -> Option<perfrollup::PerfHour> {
+    perfrollup::fast_aggregate(db, from, to, filter).unwrap()
+}
+
+fn fast_hrs(
+    db: &HubDb,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    filter: &str,
+) -> Option<Vec<(DateTime<Utc>, perfrollup::PerfHour)>> {
+    perfrollup::fast_hours(db, from, to, filter).unwrap()
 }
 
 /// 插入一批调用：`hour_offset` 为相对当前整点的小时偏移（负数表示过去）。
@@ -159,7 +179,7 @@ fn fast_path_matches_detail_scan_including_quiet_hours() {
     let from = current_hour() - Duration::hours(6);
     let to = Utc::now();
 
-    let fast = perfrollup::fast_aggregate(&db, from, to, "").expect("覆盖完整时应命中快速路径");
+    let fast = fast_agg(&db, from, to, "").expect("覆盖完整时应命中快速路径");
     let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
 
     assert_eq!(fast.call_count, raw.call_count, "调用总数必须一致");
@@ -256,7 +276,7 @@ fn fast_path_matches_detail_scan_including_quiet_hours() {
     );
 
     // 热力图口径
-    let hours = perfrollup::fast_hours(&db, from, to, "").unwrap();
+    let hours = fast_hrs(&db, from, to, "").unwrap();
     let fast_tokens = heatmap_totals(&hours);
     let detail: Vec<(DateTime<Utc>, perfrollup::PerfHour)> = vec![(from, {
         let mut merged = perfrollup::PerfHour::new();
@@ -306,7 +326,7 @@ fn recent_rebuild_matches_full_for_recent_hours() {
         let hour = current_hour() + Duration::hours(offset);
         let start = hour.to_rfc3339();
         let end = (hour + Duration::hours(1)).to_rfc3339();
-        let fast = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "").unwrap();
+        let fast = fast_agg(&db, hour, hour + Duration::hours(1), "").unwrap();
         let raw = perfrollup::scan_calls(&db, hour, hour + Duration::hours(1), "", &[]).unwrap();
         assert_eq!(
             fast.call_count, raw.call_count,
@@ -330,7 +350,7 @@ fn missing_bucket_uses_detail_for_only_that_hour() {
     let from = current_hour() - Duration::hours(6);
     let to = Utc::now();
     assert!(
-        perfrollup::fast_aggregate(&db, from, to, "").is_some(),
+        fast_agg(&db, from, to, "").is_some(),
         "覆盖完整时应命中快速路径"
     );
 
@@ -342,11 +362,11 @@ fn missing_bucket_uses_detail_for_only_that_hour() {
             [&victim],
         )
         .unwrap();
-    let fast = perfrollup::fast_aggregate(&db, from, to, "").expect("单桶缺失不应导致整段回退");
+    let fast = fast_agg(&db, from, to, "").expect("单桶缺失不应导致整段回退");
     let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
     assert_eq!(fast.call_count, raw.call_count);
     assert_eq!(fast.duration.sum, raw.duration.sum);
-    let hours = perfrollup::fast_hours(&db, from, to, "").unwrap();
+    let hours = fast_hrs(&db, from, to, "").unwrap();
     assert!(
         hours
             .iter()
@@ -373,7 +393,7 @@ fn early_built_bucket_is_repaired_from_detail() {
 
     let from = hour;
     let to = hour + Duration::hours(1);
-    let fast = perfrollup::fast_aggregate(&db, from, to, "").unwrap();
+    let fast = fast_agg(&db, from, to, "").unwrap();
     let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
     assert_eq!(
         fast.call_count, raw.call_count,
@@ -381,7 +401,7 @@ fn early_built_bucket_is_repaired_from_detail() {
     );
     assert_eq!(fast.duration.sum, raw.duration.sum);
 
-    let hours = perfrollup::fast_hours(&db, from, to, "").unwrap();
+    let hours = fast_hrs(&db, from, to, "").unwrap();
     assert_eq!(hours.len(), 1);
     assert_eq!(hours[0].1.call_count, raw.call_count);
 }
@@ -400,16 +420,15 @@ fn payload_version_mismatch_uses_detail_for_that_hour() {
         .unwrap();
     let from = current_hour() - Duration::hours(4);
     let to = Utc::now();
-    let fast = perfrollup::fast_aggregate(&db, from, to, "")
-        .expect("版本过期的单桶应回退该小时明细，而不是整段回退");
+    let fast = fast_agg(&db, from, to, "").expect("版本过期的单桶应回退该小时明细，而不是整段回退");
     let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
     assert_eq!(fast.call_count, raw.call_count);
     assert_eq!(fast.duration.sum, raw.duration.sum);
-    assert!(perfrollup::fast_hours(&db, from, to, "").is_some());
+    assert!(fast_hrs(&db, from, to, "").is_some());
 }
 
 #[test]
-fn corrupt_payload_falls_back_entirely() {
+fn corrupt_payload_repairs_from_detail_when_not_archived() {
     let (_dir, db) = test_db("corrupt-payload");
     seed_calls(&db, -3, 10);
     perfrollup::rebuild_history(&db).unwrap();
@@ -420,9 +439,40 @@ fn corrupt_payload_falls_back_entirely() {
             [&bucket],
         )
         .unwrap();
+    let from = current_hour() - Duration::hours(4);
+    let fast = fast_agg(&db, from, Utc::now(), "").expect("水位后损坏应按明细补齐");
+    let raw = perfrollup::scan_calls(&db, from, Utc::now(), "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count);
+    assert!(fast_hrs(&db, from, Utc::now(), "").is_some());
+}
+
+#[test]
+fn archived_corrupt_payload_returns_error_instead_of_zero() {
+    let (_dir, db) = test_db("archived-corrupt-query");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    let bucket = perfrollup::hour_bucket(hour);
+    db.conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET payload = '{ broken' WHERE bucket = ?1",
+            [&bucket],
+        )
+        .unwrap();
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(current_hour() - Duration::hours(3)).to_rfc3339(),
+    )
+    .unwrap();
+
+    let result = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "");
     assert!(
-        perfrollup::fast_hours(&db, current_hour() - Duration::hours(4), Utc::now(), "").is_none(),
-        "payload 损坏必须整体回退，交给明细路径"
+        result.is_err(),
+        "归档水位前损坏必须返回错误，不能回退到已归档明细得到 0"
+    );
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::hours(1), "").is_err(),
+        "fast_hours 同样必须返回错误"
     );
 }
 
@@ -432,13 +482,13 @@ fn current_hour_data_is_visible_without_rebuild() {
     seed_calls(&db, -3, 25);
     perfrollup::rebuild_history(&db).unwrap();
     let from = current_hour() - Duration::hours(5);
-    let before = perfrollup::fast_aggregate(&db, from, Utc::now(), "")
+    let before = fast_agg(&db, from, Utc::now(), "")
         .expect("应命中快速路径")
         .call_count;
 
     // 预聚合之后、当前小时内新到的调用：必须由尾段明细回退立即反映
     seed_calls(&db, 0, 5);
-    let after = perfrollup::fast_aggregate(&db, from, Utc::now(), "")
+    let after = fast_agg(&db, from, Utc::now(), "")
         .expect("应仍命中快速路径")
         .call_count;
     assert_eq!(
@@ -456,7 +506,7 @@ fn dimension_filter_falls_back_to_detail() {
     let from = current_hour() - Duration::hours(5);
     // 预聚合不带维度，任何维度筛选都必须回退明细以保证正确性
     assert!(
-        perfrollup::fast_aggregate(&db, from, Utc::now(), "AND node_id = ?3").is_none(),
+        fast_agg(&db, from, Utc::now(), "AND node_id = ?3").is_none(),
         "带维度筛选时必须回退明细"
     );
     let agg = perfrollup::scan_calls(
@@ -485,7 +535,7 @@ fn fast_path_stays_within_refresh_budget() {
     let to = Utc::now();
 
     let fast_start = Instant::now();
-    let fast = perfrollup::fast_aggregate(&db, from, to, "").expect("应命中快速路径");
+    let fast = fast_agg(&db, from, to, "").expect("应命中快速路径");
     let fast_cost = fast_start.elapsed();
 
     let raw_start = Instant::now();
@@ -533,7 +583,7 @@ fn rebuild_with_unaligned_earliest_keeps_every_hour_complete() {
 
     perfrollup::rebuild_history(&db).unwrap();
     let from = current_hour() - Duration::hours(6);
-    let fast = perfrollup::fast_aggregate(&db, from, Utc::now(), "").expect("应命中快速路径");
+    let fast = fast_agg(&db, from, Utc::now(), "").expect("应命中快速路径");
     let raw = perfrollup::scan_calls(&db, from, Utc::now(), "", &[]).unwrap();
     assert_eq!(
         fast.call_count, raw.call_count,
@@ -542,7 +592,7 @@ fn rebuild_with_unaligned_earliest_keeps_every_hour_complete() {
     assert_eq!(fast.duration.sum, raw.duration.sum);
 
     // 逐桶核对：每个有明细的小时，预聚合 call_count 必须与明细一致
-    let hours = perfrollup::fast_hours(&db, from, Utc::now(), "").unwrap();
+    let hours = fast_hrs(&db, from, Utc::now(), "").unwrap();
     let missing: Vec<String> = {
         let conn = db.conn();
         let mut bad = Vec::new();
@@ -585,8 +635,7 @@ fn cross_hour_short_range_falls_back_instead_of_single_bucket() {
     let base = current_hour() - Duration::hours(3);
     let from = base + Duration::minutes(50);
     let to = base + Duration::hours(1) + Duration::minutes(10);
-    let list = perfrollup::fast_hours(&db, from, to, "")
-        .expect("跨小时短区间应由逐小时明细补齐，而不是整段回退");
+    let list = fast_hrs(&db, from, to, "").expect("跨小时短区间应由逐小时明细补齐，而不是整段回退");
     assert_eq!(list.len(), 2, "跨小时短区间应产出两个独立小时桶");
     assert_eq!(
         list.iter().map(|(_, hour)| hour.call_count).sum::<u64>(),
@@ -595,15 +644,14 @@ fn cross_hour_short_range_falls_back_instead_of_single_bucket() {
             .call_count,
         "逐小时补齐不得重复计数"
     );
-    let fast = perfrollup::fast_aggregate(&db, from, to, "").unwrap();
+    let fast = fast_agg(&db, from, to, "").unwrap();
     let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
     assert_eq!(fast.call_count, raw.call_count);
 
     // 单个小时内的区间仍可安全压成一个桶
     let single = base + Duration::minutes(10);
     let single_end = base + Duration::minutes(50);
-    let list = perfrollup::fast_hours(&db, single, single_end, "")
-        .expect("同一小时内的区间应命中快速路径");
+    let list = fast_hrs(&db, single, single_end, "").expect("同一小时内的区间应命中快速路径");
     assert_eq!(list.len(), 1, "同一小时区间只应产出一个桶");
 
     // 回退路径的口径仍与明细一致（不因回退而变慢或变错）
@@ -617,7 +665,7 @@ fn late_call_invalidates_old_perf_rollup() {
     seed_calls(&db, -4, 20);
     perfrollup::rebuild_history(&db).unwrap();
     let hour = current_hour() - Duration::hours(4);
-    let before = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "")
+    let before = fast_agg(&db, hour, hour + Duration::hours(1), "")
         .unwrap()
         .call_count;
 
@@ -625,7 +673,7 @@ fn late_call_invalidates_old_perf_rollup() {
     let deleted = perfrollup::invalidate_hours(&db, &[hour]).unwrap();
     assert_eq!(deleted, 1, "应删除目标小时的预聚合行");
 
-    let fast = perfrollup::fast_aggregate(&db, hour, hour + Duration::hours(1), "").unwrap();
+    let fast = fast_agg(&db, hour, hour + Duration::hours(1), "").unwrap();
     let raw = perfrollup::scan_calls(&db, hour, hour + Duration::hours(1), "", &[]).unwrap();
     assert_eq!(fast.call_count, raw.call_count, "失效后应按明细补齐");
     assert_eq!(fast.call_count, before + 1, "补采事件必须被计入且只计一次");
@@ -714,4 +762,596 @@ fn archived_corrupt_rollup_is_kept_without_full_rebuild() {
         )
         .unwrap();
     assert_eq!(kept, 1, "归档水位前的旧行必须保留，不能删除后重建为空");
+}
+
+fn dirty_hours(db: &HubDb) -> Vec<String> {
+    let c = db.read_conn();
+    let mut stmt = c
+        .prepare("SELECT hour FROM perf_rollup_dirty_hours ORDER BY hour")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+fn perf_rows_for(db: &HubDb, hour: DateTime<Utc>) -> i64 {
+    db.read_conn()
+        .query_row(
+            "SELECT COUNT(*) FROM hourly_performance_rollups WHERE bucket = ?1",
+            [perfrollup::hour_bucket(hour)],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn dirty_hour_is_rebuilt_and_cleared() {
+    let (_dir, db) = test_db("dirty-rebuild");
+    seed_calls(&db, -4, 20);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    let before = fast_agg(&db, hour, hour + Duration::hours(1), "")
+        .unwrap()
+        .call_count;
+
+    seed_extra_call(&db, -4, "call-dirty-extra");
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+    assert_eq!(dirty_hours(&db), vec![perfrollup::hour_bucket(hour)]);
+    assert_eq!(perf_rows_for(&db, hour), 0, "失效后应删除预聚合行");
+
+    let rebuilt = perfrollup::rebuild_dirty_hours(&db, 48).unwrap();
+    assert!(rebuilt >= 1);
+    assert!(dirty_hours(&db).is_empty(), "重建成功后应清空 dirty");
+    let fast = fast_agg(&db, hour, hour + Duration::hours(1), "").unwrap();
+    let raw = perfrollup::scan_calls(&db, hour, hour + Duration::hours(1), "", &[]).unwrap();
+    assert_eq!(fast.call_count, raw.call_count);
+    assert_eq!(fast.call_count, before + 1, "补采事件只计一次");
+}
+
+#[test]
+fn dirty_hours_kept_when_rebuild_guard_is_busy() {
+    let (_dir, db) = test_db("dirty-guard");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perf_rows_for(&db, hour), 1);
+
+    let guard = db.rebuild_guard();
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+    assert_eq!(dirty_hours(&db).len(), 1, "guard 被占用时仍登记 dirty");
+    assert_eq!(
+        perf_rows_for(&db, hour),
+        1,
+        "guard 被占用时不得删除现有 rollup，避免归档推进后既无 rollup 又无明细"
+    );
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 0);
+    drop(guard);
+
+    assert!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap() >= 1);
+    assert!(dirty_hours(&db).is_empty());
+}
+
+#[test]
+fn archived_hour_is_not_dirtied_or_deleted() {
+    let (_dir, db) = test_db("dirty-archived");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perf_rows_for(&db, hour), 1);
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(current_hour() - Duration::hours(3)).to_rfc3339(),
+    )
+    .unwrap();
+
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 0);
+    assert!(dirty_hours(&db).is_empty(), "水位前不得写 dirty");
+    assert_eq!(perf_rows_for(&db, hour), 1, "水位前不得删除预聚合行");
+}
+
+#[test]
+fn full_rebuild_clears_dirty_hours() {
+    let (_dir, db) = test_db("dirty-full-clear");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+    assert_eq!(dirty_hours(&db).len(), 1);
+
+    perfrollup::rebuild_history(&db).unwrap();
+    assert!(
+        dirty_hours(&db).is_empty(),
+        "全量重建成功应清理覆盖范围 dirty"
+    );
+    assert_eq!(perf_rows_for(&db, hour), 1);
+}
+
+#[test]
+fn cancelled_full_rebuild_does_not_write_version_key() {
+    let (_dir, db) = test_db("cancel-full");
+    seed_calls(&db, -30, 10);
+    seed_calls(&db, -1, 10);
+    db.cancel_rebuild();
+    let written = perfrollup::rebuild_history(&db).unwrap();
+    assert_eq!(written, 0);
+    assert!(
+        db.setting_get(perfrollup::PAYLOAD_VERSION_KEY)
+            .unwrap()
+            .is_none(),
+        "取消后不得写版本键"
+    );
+    db.reset_rebuild_cancel();
+}
+
+#[test]
+fn fast_path_range_cap_is_90_days() {
+    let (_dir, db) = test_db("range-cap");
+    seed_calls(&db, -1, 10);
+    let to = Utc::now();
+    let from_90 = to - Duration::days(90);
+    assert!(
+        perfrollup::fast_hours(&db, from_90, to, "")
+            .unwrap()
+            .is_some(),
+        "90 天内应走快路径"
+    );
+    let from_91 = to - Duration::days(91);
+    assert!(
+        perfrollup::fast_hours(&db, from_91, to, "")
+            .unwrap()
+            .is_none(),
+        "超过 90 天应回退明细"
+    );
+}
+
+#[test]
+fn full_rebuild_keeps_newer_dirty_marks() {
+    let (_dir, db) = test_db("dirty-newer");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    db.conn()
+        .execute(
+            "INSERT INTO perf_rollup_dirty_hours (hour, marked_at) VALUES (?1, ?2)",
+            [
+                perfrollup::hour_bucket(hour),
+                "2999-01-01T00:00:00+00:00".to_string(),
+            ],
+        )
+        .unwrap();
+
+    perfrollup::rebuild_history(&db).unwrap();
+    assert_eq!(
+        dirty_hours(&db).len(),
+        1,
+        "全量重建开始后新写入的 dirty 标记必须保留"
+    );
+}
+
+fn dirty_mark(db: &HubDb, hour: DateTime<Utc>) -> Option<String> {
+    db.read_conn()
+        .query_row(
+            "SELECT marked_at FROM perf_rollup_dirty_hours WHERE hour = ?1",
+            [perfrollup::hour_bucket(hour)],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+fn built_at_for(db: &HubDb, hour: DateTime<Utc>) -> String {
+    db.read_conn()
+        .query_row(
+            "SELECT built_at FROM hourly_performance_rollups WHERE bucket = ?1",
+            [perfrollup::hour_bucket(hour)],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn fast_path_does_not_wait_for_writer_connection() {
+    let (_dir, db) = test_db("fast-no-writer");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let from = current_hour() - Duration::hours(5);
+    let to = Utc::now();
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_db = db.clone();
+    let holder = std::thread::spawn(move || {
+        let c = holder_db.conn();
+        let tx = c.unchecked_transaction().unwrap();
+        tx.execute(
+            "UPDATE settings SET value = value WHERE key = 'archive_watermark'",
+            [],
+        )
+        .unwrap();
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        tx.rollback().unwrap();
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("写事务应在超时前持有连接");
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let query_db = db.clone();
+    let worker = std::thread::spawn(move || {
+        let result = perfrollup::fast_aggregate(&query_db, from, to, "")
+            .map(|agg| agg.map(|agg| agg.call_count));
+        result_tx.send(result).unwrap();
+    });
+    let result = result_rx.recv_timeout(std::time::Duration::from_secs(5));
+
+    // 无论成功失败都先释放写事务，避免测试线程泄漏。
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    let result = result.expect("快路径不得等待写连接/写事务");
+    assert!(result.unwrap().is_some(), "应命中快速路径");
+    worker.join().unwrap();
+}
+
+#[test]
+fn fast_path_over_90_days_with_archived_range_returns_error() {
+    let (_dir, db) = test_db("range-cap-archived");
+    seed_calls(&db, -1, 10);
+    let to = Utc::now();
+    let from_91 = to - Duration::days(91);
+    let watermark = (to - Duration::days(60)).to_rfc3339();
+    db.setting_set(metria_hub::archive::KEY_ARCHIVE_WATERMARK, &watermark)
+        .unwrap();
+
+    assert!(
+        perfrollup::fast_hours(&db, from_91, to, "").is_err(),
+        "超过 90 天且包含归档区间必须返回错误，不能静默回退到已归档明细"
+    );
+
+    let early_watermark = (from_91 - Duration::days(1)).to_rfc3339();
+    db.setting_set(metria_hub::archive::KEY_ARCHIVE_WATERMARK, &early_watermark)
+        .unwrap();
+    assert!(
+        perfrollup::fast_hours(&db, from_91, to, "")
+            .unwrap()
+            .is_none(),
+        "完全位于水位之后的超长范围仍可回退明细"
+    );
+
+    // 水位落在 from_91 所在小时内但早于 from_91：旧 floor 判断会误报，
+    // 原始水位判断应允许回退明细。
+    let to_aligned = current_hour() + Duration::minutes(30) + Duration::seconds(30);
+    let from_91_aligned = to_aligned - Duration::days(91);
+    let in_hour_watermark = from_91_aligned - Duration::minutes(10);
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &in_hour_watermark.to_rfc3339(),
+    )
+    .unwrap();
+    assert!(
+        perfrollup::fast_hours(&db, from_91_aligned, to_aligned, "")
+            .unwrap()
+            .is_none(),
+        "from 在原始水位之后、整点 floor 之前时不得误报归档"
+    );
+}
+
+#[test]
+fn fast_path_uses_raw_watermark_for_head_and_tail_fragments() {
+    let (_dir, db) = test_db("raw-watermark-fragments");
+    seed_calls(&db, -4, 20);
+    perfrollup::rebuild_history(&db).unwrap();
+    // 预聚合之后补采一条 45 分调用，确保水位后的头部片段确实从明细读到数据。
+    seed_extra_call(&db, -4, "raw-watermark-extra");
+    let hour = current_hour() - Duration::hours(4);
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::minutes(30)).to_rfc3339(),
+    )
+    .unwrap();
+
+    // from 在原始水位之后、ceil_hour(watermark) 之前：明细仍在，必须正常回退。
+    let from = hour + Duration::minutes(40);
+    let to = hour + Duration::minutes(50);
+    let fast = perfrollup::fast_hours(&db, from, to, "")
+        .unwrap()
+        .expect("水位后的头部片段应回退明细");
+    let raw = perfrollup::scan_calls(&db, from, to, "", &[]).unwrap();
+    assert_eq!(
+        fast.iter().map(|(_, hour)| hour.call_count).sum::<u64>(),
+        raw.call_count,
+        "水位后的头部片段必须按明细扫描，不得少计"
+    );
+
+    // from 在原始水位之前：归档区头部片段必须返回错误。
+    assert!(
+        perfrollup::fast_hours(&db, hour + Duration::minutes(10), to, "").is_err(),
+        "水位前的头部片段必须返回错误"
+    );
+
+    // 尾部起点在原始水位之前、终点在水位之后：必须返回错误。
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::minutes(40), "").is_err(),
+        "包含归档区的尾部片段必须返回错误"
+    );
+
+    // 头/尾完全在原始水位之后：应正常回退明细。
+    let tail = perfrollup::fast_hours(
+        &db,
+        hour + Duration::minutes(30),
+        hour + Duration::hours(1) + Duration::minutes(10),
+        "",
+    )
+    .unwrap()
+    .expect("水位后的尾部片段应回退明细");
+    assert!(!tail.is_empty());
+}
+
+#[test]
+fn fast_path_storage_error_with_archived_range_returns_error() {
+    let (_dir, db) = test_db("storage-archived");
+    let hour = current_hour() - Duration::hours(4);
+    // 模拟预聚合读取失败（如 SQLITE_BUSY / 表损坏）：把表改名即可让 prepare 失败。
+    db.conn()
+        .execute(
+            "ALTER TABLE hourly_performance_rollups RENAME TO hourly_performance_rollups_bak",
+            [],
+        )
+        .unwrap();
+
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::hours(1), "")
+            .unwrap()
+            .is_none(),
+        "无归档时读取失败可以回退明细"
+    );
+
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::minutes(30)).to_rfc3339(),
+    )
+    .unwrap();
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::hours(1), "").is_err(),
+        "归档区间内读取失败必须返回错误，不能回退到已删除明细"
+    );
+}
+
+#[test]
+fn fast_path_rejects_archived_missing_head_and_tail_fragments() {
+    let (_dir, db) = test_db("archived-fragments");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+
+    // 缺桶：水位前的小时被删除后无法用明细补齐。
+    db.conn()
+        .execute(
+            "DELETE FROM hourly_performance_rollups WHERE bucket = ?1",
+            [perfrollup::hour_bucket(hour)],
+        )
+        .unwrap();
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::hours(1) + Duration::minutes(10)).to_rfc3339(),
+    )
+    .unwrap();
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::hours(1), "").is_err(),
+        "归档区缺桶必须返回错误"
+    );
+
+    // 恢复该小时 rollup 后测试片段；清空水位才能让 rebuild 覆盖归档前的小时。
+    db.conn()
+        .execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [metria_hub::archive::KEY_ARCHIVE_WATERMARK],
+        )
+        .unwrap();
+    perfrollup::rebuild_history(&db).unwrap();
+
+    // 头部片段：from 落在归档区，明细已删除。
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::minutes(30)).to_rfc3339(),
+    )
+    .unwrap();
+    assert!(
+        perfrollup::fast_hours(
+            &db,
+            hour + Duration::minutes(10),
+            hour + Duration::hours(1),
+            ""
+        )
+        .is_err(),
+        "归档区头部片段必须返回错误"
+    );
+
+    // 尾部片段：to 的整点部分落在归档区，尾部明细已删除。
+    db.conn()
+        .execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [metria_hub::archive::KEY_ARCHIVE_WATERMARK],
+        )
+        .unwrap();
+    perfrollup::rebuild_history(&db).unwrap();
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::hours(2) + Duration::minutes(10)).to_rfc3339(),
+    )
+    .unwrap();
+    assert!(
+        perfrollup::fast_hours(
+            &db,
+            hour,
+            hour + Duration::hours(1) + Duration::minutes(10),
+            ""
+        )
+        .is_err(),
+        "归档区尾部片段必须返回错误"
+    );
+}
+
+#[test]
+fn consecutive_dirty_hours_rebuild_in_one_window() {
+    let (_dir, db) = test_db("dirty-consecutive");
+    seed_calls(&db, -5, 10);
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let first = current_hour() - Duration::hours(5);
+    let second = current_hour() - Duration::hours(4);
+    assert_eq!(
+        perfrollup::invalidate_hours(&db, &[first, second]).unwrap(),
+        2
+    );
+
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 2);
+    assert!(dirty_hours(&db).is_empty());
+    assert_eq!(
+        built_at_for(&db, first),
+        built_at_for(&db, second),
+        "连续小时应合并到同一次 rebuild，共享同一 built_at"
+    );
+}
+
+#[test]
+fn dirty_hour_survives_rebuild_failure_and_retries() {
+    let (_dir, db) = test_db("dirty-failure");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+
+    db.conn()
+        .execute("ALTER TABLE model_calls RENAME TO model_calls_bak", [])
+        .unwrap();
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 0);
+    assert_eq!(dirty_hours(&db).len(), 1, "重建失败必须保留 dirty 待重试");
+
+    db.conn()
+        .execute("ALTER TABLE model_calls_bak RENAME TO model_calls", [])
+        .unwrap();
+    assert!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap() >= 1);
+    assert!(dirty_hours(&db).is_empty());
+}
+
+#[test]
+fn archived_uncovered_dirty_hour_is_cleaned() {
+    let (_dir, db) = test_db("dirty-uncovered-archived");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+
+    // 归档水位推进到该小时之后：明细已删除，rebuild 被 clamp 到水位，无法覆盖该小时。
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour + Duration::hours(2)).to_rfc3339(),
+    )
+    .unwrap();
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 0);
+    assert!(
+        dirty_hours(&db).is_empty(),
+        "归档区不可覆盖的 dirty 必须清理，避免每 5 分钟永久重试"
+    );
+    assert!(
+        perfrollup::fast_hours(&db, hour, hour + Duration::hours(1), "").is_err(),
+        "该小时必须由归档不可用路径返回错误，而不是伪造 0"
+    );
+}
+
+#[test]
+fn uncovered_dirty_hour_after_watermark_is_kept() {
+    let (_dir, db) = test_db("dirty-uncovered-kept");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+    // 水位在该小时之前：该小时属于水位之后，未覆盖时必须保留。
+    db.setting_set(
+        metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+        &(hour - Duration::hours(1)).to_rfc3339(),
+    )
+    .unwrap();
+
+    // 模拟 rebuild 成功返回但 rollup 未真正落库：水位之后的小时仍应保留重试。
+    db.conn()
+        .execute(
+            "CREATE TRIGGER drop_rebuilt_rollup AFTER INSERT ON hourly_performance_rollups
+             BEGIN
+               DELETE FROM hourly_performance_rollups WHERE bucket = NEW.bucket;
+             END",
+            [],
+        )
+        .unwrap();
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 0);
+    assert_eq!(
+        dirty_hours(&db).len(),
+        1,
+        "水位之后未覆盖的小时必须保留 dirty 待重试"
+    );
+
+    db.conn()
+        .execute("DROP TRIGGER drop_rebuilt_rollup", [])
+        .unwrap();
+    assert!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap() >= 1);
+    assert!(dirty_hours(&db).is_empty());
+}
+
+#[test]
+fn current_hour_is_not_dirtied() {
+    let (_dir, db) = test_db("dirty-current");
+    assert_eq!(
+        perfrollup::invalidate_hours(&db, &[current_hour(), current_hour() + Duration::hours(1)])
+            .unwrap(),
+        0
+    );
+    assert!(dirty_hours(&db).is_empty(), "当前/未来小时不得写 dirty");
+}
+
+#[test]
+fn dirty_mark_added_during_rebuild_is_preserved() {
+    let (_dir, db) = test_db("dirty-remark");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+    let old_mark = dirty_mark(&db, hour).unwrap();
+
+    // 模拟重建写入 rollup 时同一小时又被晚到补采重新标记。
+    db.conn()
+        .execute(
+            "CREATE TRIGGER dirty_remark AFTER INSERT ON hourly_performance_rollups
+             BEGIN
+               UPDATE perf_rollup_dirty_hours SET marked_at = '2999-01-01T00:00:00+00:00'
+               WHERE hour = NEW.bucket;
+             END",
+            [],
+        )
+        .unwrap();
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 1);
+    assert_eq!(dirty_hours(&db).len(), 1, "重建期间的新标记不得删除");
+    assert_ne!(dirty_mark(&db, hour).unwrap(), old_mark);
+
+    db.conn().execute("DROP TRIGGER dirty_remark", []).unwrap();
+    assert!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap() >= 1);
+    assert!(dirty_hours(&db).is_empty());
+}
+
+#[test]
+fn cancelled_dirty_rebuild_keeps_queue_without_writing_window() {
+    let (_dir, db) = test_db("dirty-cancel");
+    seed_calls(&db, -4, 10);
+    perfrollup::rebuild_history(&db).unwrap();
+    let hour = current_hour() - Duration::hours(4);
+    assert_eq!(perfrollup::invalidate_hours(&db, &[hour]).unwrap(), 1);
+
+    db.cancel_rebuild();
+    let written = perfrollup::rebuild(&db, hour, hour + Duration::hours(1)).unwrap();
+    assert_eq!(written, 0, "取消后不得写入该窗口");
+    assert_eq!(perf_rows_for(&db, hour), 0);
+    assert_eq!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap(), 0);
+    assert_eq!(dirty_hours(&db).len(), 1, "取消时必须保留 dirty");
+
+    db.reset_rebuild_cancel();
+    assert!(perfrollup::rebuild_dirty_hours(&db, 48).unwrap() >= 1);
+    assert!(dirty_hours(&db).is_empty());
 }

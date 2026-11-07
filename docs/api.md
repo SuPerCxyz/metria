@@ -29,6 +29,13 @@
 分析图表支持用逗号分隔的 `exclude_client_ids` / `exclude_models` 排除多个 Agent 或模型；
 适用于 `/overview`、`/usage/timeseries`、`/usage/breakdown` 和 `/usage/latency*`，用于图例隐藏后的联动统计。
 
+- `allocation_mode=call_end`：calls 按 `completed_at` 排序/过滤；sessions 排序/游标使用 `COALESCE(ended_at, last_activity_at, started_at)`，过滤同时保留 `last_activity_at` 重叠语义（仍在活动但结束时间在范围外的会话不会漏掉）。
+- 归档水位之前的性能预聚合若为旧版本、损坏或缺失，`/overview`、`/usage/latency`、`/usage/performance` 及其 `/timeseries` 返回 500 `perf_rollup_unavailable`；`/usage/daily`、`/usage/heatmap` 由同一性能预聚合数据源驱动，错误码为 500 `db_error`。这些端点都不回退到已归档明细伪造 0。
+- `/usage/timeseries` 不读性能预聚合，错误码为 500 `db_error`。
+- 查询范围超过 90 天且包含归档水位之前的小时时，同样返回不可用错误；完全位于水位之后的超长范围仍可回退明细。
+- 前端会话详情分页列表在顶栏刷新时重置游标并重新请求第一页；分页请求计入刷新窗口，失败会显示刷新失败。
+- 使用分析页仅在「延迟」标签或详情标签请求 `/usage/latency`；延迟趋势 `/usage/latency/timeseries` 仅在「延迟」标签请求。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/overview` | 汇总统计卡片（读 rollup） |

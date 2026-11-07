@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::HubConfig;
 use crate::db::HubDb;
+use metria_storage::rusqlite::params_from_iter;
 use metria_storage::rusqlite::types::Value as SqlValue;
 
 pub mod handlers_cursor;
@@ -288,13 +289,36 @@ pub(crate) async fn run_blocking<F>(f: F) -> Response
 where
     F: FnOnce() -> Response + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    run_blocking_labeled("blocking", f).await
+}
+
+/// 带任务标签的 blocking 封装；超过 500ms 用 warn 记录，默认 info 级别可见。
+///
+/// 只记录标签与耗时，不记录 SQL 参数、Token 或其他敏感数据。
+pub(crate) async fn run_blocking_labeled<F>(label: &'static str, f: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(f).await;
+    let elapsed = started.elapsed();
+    if elapsed >= std::time::Duration::from_millis(500) {
+        tracing::warn!(
+            label,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow blocking handler"
+        );
+    }
+    match result {
         Ok(response) => response,
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "blocking_task_failed",
-            &e.to_string(),
-        ),
+        Err(e) => {
+            tracing::warn!(label, error = %e, "blocking handler failed");
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "blocking_task_failed",
+                &e.to_string(),
+            )
+        }
     }
 }
 
@@ -1133,6 +1157,8 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
     let perf_invalidate_cutoff =
         crate::perfrollup::floor_hour(Utc::now()) - chrono::Duration::hours(3);
     let mut perf_hours_to_invalidate: HashSet<DateTime<Utc>> = HashSet::new();
+    // usage 的 model_call_id 对应的调用可能跨小时；批次结束后单次查询补齐。
+    let mut usage_call_ids: HashSet<String> = HashSet::new();
     // 每个批次只构造一次引擎，使新 usage 在落库和 rollup 前立即得到费用。
     let pricing_engine = crate::catalog::pricing_engine(&st.db);
     let session_map = st.db.session_key_map(&serde_json::json!({
@@ -1280,6 +1306,15 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
                         }
                     }
                 }
+                if ev.kind == "usage" {
+                    if let Some(call_id) = v
+                        .get("model_call_id")
+                        .and_then(|x| x.as_str())
+                        .filter(|id| !id.is_empty())
+                    {
+                        usage_call_ids.insert(call_id.to_string());
+                    }
+                }
                 if is_new {
                     accepted.push(ev.event_id.clone());
                     // 子 Agent 会话不计入会话汇总（session_count 等），其 call/usage 照常计入
@@ -1330,6 +1365,31 @@ pub(crate) fn process_batch(st: &AppState, batch: &UploadBatch, bytes: i64) -> U
         if let Err(e) = st.db.rollup_events(&refs) {
             tracing::warn!(%e, "批量写入 rollup 失败");
         }
+    }
+
+    if !usage_call_ids.is_empty() {
+        let ids: Vec<String> = usage_call_ids.into_iter().collect();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!("SELECT started_at FROM model_calls WHERE id IN ({placeholders})");
+        let c = st.db.read_conn();
+        match c.prepare(&sql) {
+            Ok(mut stmt) => {
+                match stmt.query_map(params_from_iter(ids), |r| r.get::<_, String>(0)) {
+                    Ok(rows) => {
+                        for started_at in rows.flatten() {
+                            if let Ok(ts) = DateTime::parse_from_rfc3339(&started_at) {
+                                let hour = crate::perfrollup::floor_hour(ts.with_timezone(&Utc));
+                                if hour < perf_invalidate_cutoff {
+                                    perf_hours_to_invalidate.insert(hour);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "查询 usage 关联调用小时失败"),
+                }
+            }
+            Err(e) => tracing::warn!(%e, "准备 usage 关联调用小时查询失败"),
+        };
     }
 
     if !perf_hours_to_invalidate.is_empty() {
@@ -1858,11 +1918,100 @@ mod ingest_batch_tests {
 
         let fast =
             crate::perfrollup::fast_aggregate(&st.db, hour, hour + chrono::Duration::hours(1), "")
+                .unwrap()
                 .unwrap();
         let raw =
             crate::perfrollup::scan_calls(&st.db, hour, hour + chrono::Duration::hours(1), "", &[])
                 .unwrap();
         assert_eq!(fast.call_count, raw.call_count, "失效后应按明细补齐");
         assert_eq!(fast.call_count, 2, "两条调用各计一次");
+    }
+
+    #[test]
+    fn usage_call_cross_hour_invalidates_both_hours() {
+        let st = test_state("perf-cross-hour");
+        let call_hour = crate::perfrollup::floor_hour(Utc::now()) - chrono::Duration::hours(4);
+        let usage_hour = call_hour - chrono::Duration::hours(1);
+        let call_started = (call_hour + chrono::Duration::minutes(10)).to_rfc3339();
+        let usage_timestamp = (usage_hour + chrono::Duration::minutes(20)).to_rfc3339();
+        let sid = "perf-cross";
+        let session_key = format!("n1:{sid}");
+        let session_payload = json!({
+            "id": format!("ulid-{sid}"),
+            "source_session_id": sid,
+            "node_id": "n1",
+            "collector_id": "c1",
+            "source_id": "src1",
+            "client_id": "codex",
+            "started_at": call_started,
+            "last_activity_at": call_started,
+            "status": "active",
+            "created_at": call_started
+        });
+        assert!(st.db.upsert_session(&session_payload).unwrap());
+        let call_payload = json!({
+            "id": "perf-cross-call",
+            "source_call_id": "perf-cross-call",
+            "node_id": "n1",
+            "collector_id": "c1",
+            "source_id": "src1",
+            "client_id": "codex",
+            "session_id": format!("ulid-{sid}"),
+            "model_normalized": "gpt-5.6-sol",
+            "started_at": call_started,
+            "completed_at": (call_hour + chrono::Duration::minutes(11)).to_rfc3339(),
+            "status": "success",
+            "call_granularity": "call",
+            "duration_ms": 1000
+        });
+        assert!(st.db.insert_call(&call_payload, &session_key).unwrap());
+
+        let usage_payload = json!({
+            "event_id": "perf-cross-usage",
+            "schema_version": 1,
+            "node_id": "n1",
+            "collector_id": "c1",
+            "source_id": "src1",
+            "client_id": "codex",
+            "adapter_id": "codex",
+            "adapter_version": "0.1.0",
+            "model_call_id": "perf-cross-call",
+            "session_id": format!("ulid-{sid}"),
+            "timestamp": usage_timestamp,
+            "provider_normalized": "openai",
+            "model_normalized": "gpt-5.6-sol",
+            "usage": {"input": 10, "output": 5},
+            "cost": {},
+            "quality": {"usage_source": "reported", "granularity": "call", "confidence": 1.0}
+        });
+        let resp = process_batch(
+            &st,
+            &batch(vec![
+                BatchEvent {
+                    kind: "session".into(),
+                    event_id: "event-session-perf-cross".into(),
+                    payload: session_payload,
+                },
+                BatchEvent {
+                    kind: "usage".into(),
+                    event_id: "perf-cross-usage".into(),
+                    payload: usage_payload,
+                },
+            ]),
+            0,
+        );
+        assert!(resp.ok);
+
+        let dirty: Vec<String> = {
+            let c = st.db.read_conn();
+            let mut stmt = c
+                .prepare("SELECT hour FROM perf_rollup_dirty_hours ORDER BY hour")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.filter_map(Result::ok).collect()
+        };
+        assert_eq!(dirty.len(), 2, "call/usage 跨小时应失效两个小时");
+        assert!(dirty.contains(&crate::perfrollup::hour_bucket(call_hour)));
+        assert!(dirty.contains(&crate::perfrollup::hour_bucket(usage_hour)));
     }
 }

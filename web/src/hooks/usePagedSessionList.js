@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../services/api'
+import { markRefreshFailure, sharedRequest } from './useQuery'
 
-export function usePagedSessionList(path, field, limit = 100) {
+export function usePagedSessionList(path, field, limit = 100, fetcher = api) {
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(null)
   const [hasMore, setHasMore] = useState(false)
@@ -14,18 +15,41 @@ export function usePagedSessionList(path, field, limit = 100) {
   const cursorRef = useRef(null)
   const hasMoreRef = useRef(false)
   const loadingRef = useRef(false)
+  const abortRef = useRef(null)
+  const mountedRef = useRef(true)
+
+  // 卸载时取消本组件自己的等待；共享请求的其他消费者仍可拿到结果。
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      abortRef.current?.abort()
+      abortRef.current = null
+    }
+  }, [])
 
   const fetchPage = useCallback(async (nextCursor, replace) => {
     const requestId = requestRef.current + 1
     requestRef.current = requestId
+    // 新的分页/刷新请求取代旧请求：先取消旧等待，避免卸载或切换时泄漏。
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
     loadingRef.current = true
     if (replace) setLoading(true)
     else setLoadingMore(true)
     try {
       const params = new URLSearchParams({ limit: String(limit) })
       if (nextCursor) params.set('cursor', nextCursor)
-      const data = await api(`${path}?${params.toString()}`)
-      if (requestRef.current !== requestId) return
+      const url = `${path}?${params.toString()}`
+      // 走 sharedRequest：计入顶栏刷新窗口的活动计数，并复用同一套请求生命周期。
+      // 传入本组件自己的 signal，卸载时只取消自己的等待。
+      const data = await sharedRequest(
+        `paged:${path}:${nextCursor || 'first'}:${requestId}`,
+        (options) => fetcher(url, options),
+        { signal: controller.signal },
+      )
+      if (!mountedRef.current || requestRef.current !== requestId) return
       const page = Array.isArray(data?.[field]) ? data[field] : []
       setItems((previous) => {
         if (replace) return page
@@ -38,15 +62,18 @@ export function usePagedSessionList(path, field, limit = 100) {
       setHasMore(hasMoreRef.current)
       setError(null)
     } catch (e) {
-      if (requestRef.current === requestId) setError(e)
+      if (!mountedRef.current || requestRef.current !== requestId) return
+      if (e?.name === 'AbortError') return
+      markRefreshFailure()
+      setError(e)
     } finally {
-      if (requestRef.current === requestId) {
+      if (mountedRef.current && requestRef.current === requestId) {
         loadingRef.current = false
         setLoading(false)
         setLoadingMore(false)
       }
     }
-  }, [field, limit, path])
+  }, [fetcher, field, limit, path])
 
   useEffect(() => {
     cursorRef.current = null

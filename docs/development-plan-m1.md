@@ -65,6 +65,7 @@
 | 调用时长采集根因修复：opencode 改用 per-message `time.created` 作计时起点（turn 起点退出计时 + 6h 回看上界）、claude 诚实置空、入库 24h 软降级 + `first_response_at` 协议校验、迁移 024 存量修复（fr 代理 256,644 行 + claude 5,364 行 + `>6h` 残差 16 行）与 settings 门控全量重建；全库时长 101,963h→1,949.3h（−98.1%）、`duration>6h=0`（OpenSpec `fix-duration-collection-origin`） | ✅ 已交付：随 `c5fc540` 提交推送；Hub 镜像（本地 `sha256:ee0c86685d28` 直传）与唯一节点 aitools（=本机）Agent 同批更新（备份 `metria.bak-20260924-duration`、重启后轮询 errors=0）；生产 024 执行 16s/0 告警、部署前后双库 15 项不变量全过（codex 存量 133,803 行逐行不变、usage 存量逐行不变、rollup=明细 403,498）、迁移漏行=0、窗口内旧 Agent 36 行虚增 3.03h 属已披露窗口风险；§12.2 副本双轨验证（SQL 1.5s、17/17 不变量）；OpenSpec 已同步 4 ADDED/11 场景并归档 `archive/2026-09-24-fix-duration-collection-origin`，`validate --all` 37/37、结构自检通过 | 2026-09-24 |
 | 移除指标卡右上角环比百分比徽标并清理上一周期查询 | ✅ 完成 | 2026-10-20 |
 | 页面性能优化：预聚合缺桶/迟到小时修复、只读连接池、增量重计价（部分索引 + 变化集传播）、会话明细 keyset 分页与全量统计接口、字体子集 945KB→10.5KB、首屏 JS gzip 273KB→198KB（OpenSpec `optimize-hub-page-performance`） | ✅ 实现与门禁完成，已部署 lstable；线上 daily/heatmap 查询 48x/36x | 2026-11-07 |
+| 页面性能硬化（第二轮）：dirty 小时队列驱动晚到补采重建、归档水位边界返回不可用而非伪造 0、重建取消与启动去重、`call_end` 排序/游标、慢查询日志、前端刷新窗口与延迟请求门控及真实 DOM 测试；迁移 028 补 dirty 表与会话表达式索引（OpenSpec `optimize-hub-page-performance`） | ✅ 实现与门禁完成，已部署 lstable（schema 28、healthy）；线上 7d daily 5.11ms、30d daily 21.2ms | 2026-11-07 |
 
 ### Agent 轮询扫描 I/O 与内存优化记录（2026-09-21）
 

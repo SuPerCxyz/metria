@@ -124,6 +124,21 @@ pub fn watermark(db: &HubDb) -> Option<String> {
     db.setting_get(KEY_ARCHIVE_WATERMARK).ok().flatten()
 }
 
+/// 只读归档水位：页面查询走读连接，避免与写事务抢 `db.conn()` 锁。
+///
+/// 调用方不得在已持有同一读连接池连接时调用；当前调用点都在取查询连接之前。
+pub fn watermark_read(db: &HubDb) -> Option<String> {
+    db.with_read(|c| {
+        c.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [KEY_ARCHIVE_WATERMARK],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    })
+}
+
 /// 当前最早的可查明细时间（`model_calls.started_at` 最小值）。
 pub fn earliest_detail(db: &HubDb) -> Option<String> {
     let c = db.conn();

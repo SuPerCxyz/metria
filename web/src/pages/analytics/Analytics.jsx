@@ -11,6 +11,7 @@ import { ErrorState, LoadingSkeleton, EmptyState } from '../../components/feedba
 import { api, q, usageRangeParams } from '../../services/api'
 import { useQuery } from '../../hooks/useQuery'
 import { useVisibleQuery } from '../../hooks/useVisibleQuery'
+import { latencySeriesEnabled, latencySummaryEnabled } from './latencyQueries'
 import { useTimeRange } from '../../hooks/useTimeRange'
 import { useNodeFilter } from '../../hooks/useNodeFilter'
 import { useNodeNames } from '../../hooks/useNodeNames'
@@ -60,15 +61,16 @@ export default function Analytics() {
     () => api(`/usage/timeseries${q(detailSeriesParams)}`),
     { enabled: detailMode }
   )
-  // 延迟摘要卡在详情标签也要用（B5 回归）：摘要常开，仅 timeseries 跟随延迟标签。
+  // 延迟摘要卡在详情标签也要用（B5 回归）；但非延迟/非详情标签不请求。
   const latency = useQuery(
     `latency${q(scopedParams)}`,
-    () => api(`/usage/latency${q(scopedParams)}`)
+    () => api(`/usage/latency${q(scopedParams)}`),
+    { enabled: latencySummaryEnabled(tab) },
   )
   const latencySeries = useQuery(
     `latency-ts${q(scopedParams)}`,
     () => api(`/usage/latency/timeseries${q(scopedParams)}`),
-    { enabled: tab === 'latency' }
+    { enabled: latencySeriesEnabled(tab) },
   )
   const performance = useVisibleQuery(
     `performance${q(scopedParams)}`,

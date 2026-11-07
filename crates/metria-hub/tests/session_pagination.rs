@@ -588,3 +588,196 @@ async fn session_stats_exposes_average_duration() {
         "无 duration 样本时平均值必须为 null，不能填 0"
     );
 }
+
+async fn paginate_ids(base: &str, token: &str, path: &str, field: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(next) => format!(
+                "{base}{path}{}cursor={next}",
+                if path.contains('?') { '&' } else { '?' }
+            ),
+            None => format!("{base}{path}"),
+        };
+        let (page, _) = get_json(&url, token);
+        ids.extend(
+            page[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string()),
+        );
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+        assert!(ids.len() <= 100, "分页不得循环");
+    }
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_end_pagination_uses_completed_at_for_all_list_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, db) = spawn_hub(dir.path()).await;
+    let token = admin_token(&base);
+
+    {
+        let c = db.conn();
+        for (index, (started, completed)) in [
+            ("2026-08-10T10:00:00Z", "2026-08-10T10:50:00Z"),
+            ("2026-08-10T10:10:00Z", "2026-08-10T10:40:00Z"),
+            ("2026-08-10T10:20:00Z", "2026-08-10T10:30:00Z"),
+            ("2026-08-10T10:30:00Z", "2026-08-10T10:20:00Z"),
+            ("2026-08-10T10:40:00Z", "2026-08-10T10:10:00Z"),
+            ("2026-08-10T10:50:00Z", "2026-08-10T10:00:00Z"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            c.execute(
+                "INSERT INTO model_calls
+                 (id,node_id,collector_id,client_id,source_id,session_id,started_at,completed_at,
+                  status,call_granularity,created_at,updated_at)
+                 VALUES (?1,'n1','c1','codex','s1','sess-ce',?2,?3,'success','call',?2,?2)",
+                params![format!("ce-call-{index}"), started, completed],
+            )
+            .unwrap();
+        }
+        for (index, ended) in [
+            "2026-08-10T09:00:00Z",
+            "2026-08-10T09:10:00Z",
+            "2026-08-10T09:20:00Z",
+            "2026-08-10T09:30:00Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            c.execute(
+                "INSERT INTO sessions
+                 (id,source_session_id,node_id,collector_id,source_id,client_id,started_at,
+                  ended_at,last_activity_at,status,created_at,updated_at)
+                 VALUES (?1,?1,'n1','c1','s1','codex','2026-08-10T08:00:00Z',?2,?2,
+                         'ended','2026-08-10T08:00:00Z','2026-08-10T08:00:00Z')",
+                params![format!("ce-sess-{index}"), ended],
+            )
+            .unwrap();
+        }
+    }
+
+    let range = "from=2026-08-10T00:00:00Z&to=2026-08-11T00:00:00Z";
+    let expected_calls = vec![
+        "ce-call-0",
+        "ce-call-1",
+        "ce-call-2",
+        "ce-call-3",
+        "ce-call-4",
+        "ce-call-5",
+    ];
+    let expected_sessions = vec!["ce-sess-3", "ce-sess-2", "ce-sess-1", "ce-sess-0"];
+
+    let calls = paginate_ids(
+        &base,
+        &token,
+        &format!("/api/v1/calls?allocation_mode=call_end&limit=2&{range}"),
+        "calls",
+    )
+    .await;
+    assert_eq!(calls, expected_calls, "list_calls 必须按 completed_at 分页");
+
+    let sessions = paginate_ids(
+        &base,
+        &token,
+        &format!("/api/v1/sessions?allocation_mode=call_end&limit=2&{range}"),
+        "sessions",
+    )
+    .await;
+    assert_eq!(
+        sessions, expected_sessions,
+        "list_sessions 必须按会话结束时间分页"
+    );
+
+    let node_calls = paginate_ids(
+        &base,
+        &token,
+        &format!("/api/v1/nodes/n1/calls?allocation_mode=call_end&limit=2&{range}"),
+        "calls",
+    )
+    .await;
+    assert_eq!(
+        node_calls, expected_calls,
+        "node_calls 必须按 completed_at 分页"
+    );
+
+    let node_sessions = paginate_ids(
+        &base,
+        &token,
+        &format!("/api/v1/nodes/n1/sessions?allocation_mode=call_end&limit=2&{range}"),
+        "sessions",
+    )
+    .await;
+    assert_eq!(
+        node_sessions, expected_sessions,
+        "node_sessions 必须按会话结束时间分页"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_end_sessions_keep_ties_and_last_activity_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, db) = spawn_hub(dir.path()).await;
+    let token = admin_token(&base);
+
+    {
+        let c = db.conn();
+        // 同一 ended_at 的并列会话：跨页必须无重漏。
+        for index in 0..5 {
+            c.execute(
+                "INSERT INTO sessions
+                 (id,source_session_id,node_id,collector_id,source_id,client_id,started_at,
+                  ended_at,last_activity_at,status,created_at,updated_at)
+                 VALUES (?1,?1,'n1','c1','s1','codex','2026-08-10T09:00:00Z',
+                         '2026-08-10T10:00:00Z','2026-08-10T10:00:00Z','ended',
+                         '2026-08-10T09:00:00Z','2026-08-10T09:00:00Z')",
+                params![format!("tie-{index}")],
+            )
+            .unwrap();
+        }
+        // ended_at 在范围外、last_activity_at 在范围内：必须按重叠语义可见。
+        c.execute(
+            "INSERT INTO sessions
+             (id,source_session_id,node_id,collector_id,source_id,client_id,started_at,
+              ended_at,last_activity_at,status,created_at,updated_at)
+             VALUES ('overlap-1','overlap-1','n1','c1','s1','codex','2026-08-09T22:00:00Z',
+                     '2026-08-09T23:00:00Z','2026-08-10T10:30:00Z','ended',
+                     '2026-08-09T22:00:00Z','2026-08-09T22:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // 两个时间都在范围外：不得可见。
+        c.execute(
+            "INSERT INTO sessions
+             (id,source_session_id,node_id,collector_id,source_id,client_id,started_at,
+              ended_at,last_activity_at,status,created_at,updated_at)
+             VALUES ('outside-1','outside-1','n1','c1','s1','codex','2026-08-08T22:00:00Z',
+                     '2026-08-08T23:00:00Z','2026-08-08T23:00:00Z','ended',
+                     '2026-08-08T22:00:00Z','2026-08-08T22:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let range = "from=2026-08-10T00:00:00Z&to=2026-08-11T00:00:00Z";
+    let expected = vec!["tie-4", "tie-3", "tie-2", "tie-1", "tie-0", "overlap-1"];
+    for path in [
+        format!("/api/v1/sessions?allocation_mode=call_end&limit=2&{range}"),
+        format!("/api/v1/nodes/n1/sessions?allocation_mode=call_end&limit=2&{range}"),
+    ] {
+        let ids = paginate_ids(&base, &token, &path, "sessions").await;
+        assert_eq!(ids, expected, "{path} 并列游标/重叠过滤结果不一致");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{path} 跨页不得重复");
+        assert!(!ids.contains(&"outside-1".to_string()));
+    }
+}

@@ -1,23 +1,21 @@
+import '../../test-support/setup-dom.js'
+
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { Chart } from 'chart.js'
+import './ChartjsConfig.jsx'
 
-const source = readFileSync(new URL('./ChartjsConfig.jsx', import.meta.url), 'utf8')
-
-test('Chart.js uses explicit registration instead of chart.js/auto', () => {
-  assert.equal(source.includes("from 'chart.js/auto'"), false)
-  for (const name of [
-    'LineController',
-    'BarController',
-    'LineElement',
-    'PointElement',
-    'BarElement',
-    'CategoryScale',
-    'LinearScale',
-    'Tooltip',
-    'Legend',
-    'Filler',
-  ]) {
-    assert.ok(source.includes(name), `missing Chart.js registration: ${name}`)
+test('Chart.js registry contains the explicitly registered components', () => {
+  for (const id of ['line', 'bar']) {
+    assert.ok(Chart.registry.getController(id), `缺少 controller: ${id}`)
+  }
+  for (const id of ['line', 'point', 'bar']) {
+    assert.ok(Chart.registry.getElement(id), `缺少 element: ${id}`)
+  }
+  for (const id of ['category', 'linear']) {
+    assert.ok(Chart.registry.getScale(id), `缺少 scale: ${id}`)
+  }
+  for (const id of ['tooltip', 'legend', 'filler']) {
+    assert.ok(Chart.registry.getPlugin(id), `缺少 plugin: ${id}`)
   }
 })

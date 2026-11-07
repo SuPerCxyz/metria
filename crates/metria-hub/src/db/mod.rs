@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -56,9 +56,14 @@ pub struct HubDb {
     busy_timeout_ms: u64,
     /// 串行化 rollup 重建：同一时间只允许一个重建任务执行。
     rebuild_lock: Arc<Mutex<()>>,
+    /// 进程退出时取消正在进行的性能预聚合重建。
+    rebuild_cancel: Arc<AtomicBool>,
     /// 测试用：统计会话聚合刷新次数，验证批次内每会话只刷新一次。
     #[cfg(test)]
     refresh_agg_calls: Arc<AtomicUsize>,
+    /// 测试用：统计全量性能预聚合重建次数。
+    #[cfg(test)]
+    full_rebuilds: Arc<AtomicUsize>,
 }
 
 /// 可安全返回给 Web 的用户资料。
@@ -171,8 +176,11 @@ impl HubDb {
             read_pool_size,
             busy_timeout_ms: metria_storage::DbOptions::default().busy_timeout_ms,
             rebuild_lock: Arc::new(Mutex::new(())),
+            rebuild_cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             refresh_agg_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            full_rebuilds: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -235,6 +243,39 @@ impl HubDb {
     /// 尝试获取重建锁；已有重建在跑时返回 None（周期任务使用，避免与全量重建互相删写）。
     pub fn try_rebuild_guard(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
         self.rebuild_lock.try_lock().ok()
+    }
+
+    /// 请求取消正在进行的性能预聚合重建（进程退出时调用）。
+    pub fn cancel_rebuild(&self) {
+        self.rebuild_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// 重置取消标志（测试与下一次显式重建使用）。
+    pub fn reset_rebuild_cancel(&self) {
+        self.rebuild_cancel.store(false, Ordering::Relaxed);
+    }
+
+    /// 当前重建是否已被取消。
+    pub fn is_rebuild_cancelled(&self) -> bool {
+        self.rebuild_cancel.load(Ordering::Relaxed)
+    }
+
+    /// 测试用：记录一次全量性能预聚合重建。
+    #[cfg(test)]
+    pub(crate) fn note_full_rebuild(&self) {
+        self.full_rebuilds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 测试用：本库全量重建次数。
+    #[cfg(test)]
+    pub(crate) fn full_rebuild_count(&self) -> usize {
+        self.full_rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// 测试用：重置全量重建计数。
+    #[cfg(test)]
+    pub(crate) fn reset_full_rebuild_count(&self) {
+        self.full_rebuilds.store(0, Ordering::Relaxed);
     }
 
     pub fn apply_migrations(&self) -> Result<Vec<i64>, StorageError> {

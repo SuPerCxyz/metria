@@ -2515,3 +2515,61 @@ async fn subagent_sessions_are_excluded_and_visible_in_parent_detail() {
         "去重后关系列表不应包含重复子会话"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_corrupt_perf_rollup_returns_500_not_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, state) = spawn_hub(dir.path()).await;
+    let hour = metria_hub::perfrollup::floor_hour(chrono::Utc::now()) - chrono::Duration::hours(4);
+    let started = (hour + chrono::Duration::minutes(10)).to_rfc3339();
+    assert!(state
+        .db
+        .insert_call(
+            &json!({
+                "id": "archived-corrupt-call",
+                "node_id": "n1",
+                "collector_id": "c1",
+                "client_id": "codex",
+                "source_id": "s1",
+                "session_id": "n1:sess",
+                "started_at": started,
+                "completed_at": (hour + chrono::Duration::minutes(11)).to_rfc3339(),
+                "status": "success",
+                "call_granularity": "call",
+                "duration_ms": 1000
+            }),
+            "n1:sess",
+        )
+        .unwrap());
+    metria_hub::perfrollup::rebuild_history(&state.db).unwrap();
+    let bucket = metria_hub::perfrollup::hour_bucket(hour);
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE hourly_performance_rollups SET payload = '{ broken' WHERE bucket = ?1",
+            [&bucket],
+        )
+        .unwrap();
+    state
+        .db
+        .setting_set(
+            metria_hub::archive::KEY_ARCHIVE_WATERMARK,
+            &(hour + chrono::Duration::minutes(30)).to_rfc3339(),
+        )
+        .unwrap();
+
+    let token = admin_token(&base);
+    let from = hour.to_rfc3339();
+    let to = (hour + chrono::Duration::hours(1)).to_rfc3339();
+    match ureq::get(&format!("{base}/api/v1/overview?from={from}&to={to}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Err(ureq::Error::Status(code, _)) => {
+            assert_eq!(code, 500, "归档水位前损坏必须返回 500，不能回退成 0")
+        }
+        Ok(response) => panic!("期望 500，得到 {}", response.status()),
+        Err(other) => panic!("期望 500，得到 {other:?}"),
+    }
+}
