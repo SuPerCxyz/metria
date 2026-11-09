@@ -156,7 +156,7 @@ mod tests {
         );
         assert_eq!(cache_control(&asset("index.html", true)), "no-cache");
         assert_eq!(
-            cache_control(&asset("fonts/MapleMono-Medium-subset.woff2", false)),
+            cache_control(&asset("fonts/MapleMono-Medium.woff2", false)),
             "public, max-age=86400"
         );
     }

@@ -39,15 +39,16 @@ pub fn guess_mime(path: &str) -> &'static str {
     }
 }
 
-/// 旧版 CSS 可能仍请求 `/static/static/fonts/MapleMono-Medium.woff2`。
-/// 保留一个版本的兼容映射，避免旧缓存 CSS 在发布后 404。
+/// 旧版 CSS 可能仍请求 `/static/static/fonts/*` 或已删除的子集字体。
+/// 统一映射到完整字体，避免旧缓存 CSS 在发布后 404 或落到 SPA fallback。
 const LEGACY_FONT_PATHS: &[&str] = &[
     "static/fonts/MapleMono-Medium.woff2",
     "static/fonts/MapleMono-Medium-subset.woff2",
     "fonts/MapleMono-Medium.woff2",
+    "fonts/MapleMono-Medium-subset.woff2",
 ];
 
-const SUBSET_FONT_PATH: &str = "fonts/MapleMono-Medium-subset.woff2";
+const FULL_FONT_PATH: &str = "fonts/MapleMono-Medium.woff2";
 
 fn embedded(path: &str) -> Option<StaticAsset> {
     let file = Assets::get(path)?;
@@ -65,7 +66,7 @@ pub fn lookup(static_path: &str) -> Option<StaticAsset> {
         return Some(asset);
     }
     if LEGACY_FONT_PATHS.contains(&static_path) {
-        if let Some(asset) = embedded(SUBSET_FONT_PATH) {
+        if let Some(asset) = embedded(FULL_FONT_PATH) {
             return Some(asset);
         }
     }
@@ -102,9 +103,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_font_path_maps_to_subset() {
-        let asset = lookup("static/fonts/MapleMono-Medium.woff2").expect("legacy font");
-        assert_eq!(asset.path, SUBSET_FONT_PATH);
-        assert_eq!(asset.mime, "font/woff2");
+    fn legacy_font_path_maps_to_full_font() {
+        for path in [
+            "static/fonts/MapleMono-Medium.woff2",
+            "static/fonts/MapleMono-Medium-subset.woff2",
+            "fonts/MapleMono-Medium-subset.woff2",
+        ] {
+            let asset = lookup(path).expect("legacy font");
+            assert_eq!(asset.path, FULL_FONT_PATH, "{path} 应映射到完整字体");
+            assert_eq!(asset.mime, "font/woff2");
+        }
     }
 }

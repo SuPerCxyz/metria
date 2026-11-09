@@ -103,33 +103,41 @@ async fn static_assets_have_cache_validators_and_head_support() {
     assert_eq!(spa.status(), 200);
     assert_eq!(spa.header("cache-control"), Some("no-cache"));
 
-    let font = ureq::get(&format!(
-        "{base}/static/fonts/MapleMono-Medium-subset.woff2"
-    ))
-    .call()
-    .unwrap();
+    let font = ureq::get(&format!("{base}/static/fonts/MapleMono-Medium.woff2"))
+        .call()
+        .unwrap();
     assert_eq!(font.status(), 200);
     assert_eq!(font.header("content-type"), Some("font/woff2"));
     assert_eq!(font.header("cache-control"), Some("public, max-age=86400"));
+    assert_eq!(font.header("content-length"), Some("945164"));
     let mut font_bytes = Vec::new();
     font.into_reader().read_to_end(&mut font_bytes).unwrap();
-    assert!(font_bytes.len() < 20 * 1024, "font subset 必须 ≤20KB");
+    assert_eq!(
+        font_bytes.len(),
+        945_164,
+        "完整 Maple Mono 字体大小必须为 945,164 字节"
+    );
 
-    // 旧 CSS 的 /static/static/fonts/* 兼容一个版本。
-    let legacy = ureq::get(&format!(
-        "{base}/static/static/fonts/MapleMono-Medium.woff2"
-    ))
-    .call()
-    .unwrap();
-    assert_eq!(legacy.status(), 200);
-    assert_eq!(legacy.header("content-type"), Some("font/woff2"));
+    // 旧 CSS 的 /static/static/fonts/* 与已删除的 subset 路径都兼容到完整字体。
+    for legacy_path in [
+        "static/static/fonts/MapleMono-Medium.woff2",
+        "static/static/fonts/MapleMono-Medium-subset.woff2",
+        "static/fonts/MapleMono-Medium-subset.woff2",
+    ] {
+        let legacy = ureq::get(&format!("{base}/{legacy_path}")).call().unwrap();
+        assert_eq!(legacy.status(), 200, "{legacy_path}");
+        assert_eq!(legacy.header("content-type"), Some("font/woff2"));
+        assert_eq!(
+            legacy.header("cache-control"),
+            Some("public, max-age=86400")
+        );
+        assert_eq!(legacy.header("content-length"), Some("945164"));
+    }
 
-    let compressed_font = ureq::get(&format!(
-        "{base}/static/fonts/MapleMono-Medium-subset.woff2"
-    ))
-    .set("Accept-Encoding", "gzip")
-    .call()
-    .unwrap();
+    let compressed_font = ureq::get(&format!("{base}/static/fonts/MapleMono-Medium.woff2"))
+        .set("Accept-Encoding", "gzip")
+        .call()
+        .unwrap();
     assert!(
         compressed_font.header("content-encoding").is_none(),
         "woff2 不得二次压缩"
