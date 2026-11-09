@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "NODE_OPTIONS='--import ./test-support/register-jsx.mjs' node --test"
+    "test": "node --import ./test-support/register-jsx.mjs --test"
   },
   "overrides": {
     "nanoid": "3.3.18"
